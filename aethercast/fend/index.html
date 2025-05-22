@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Aethercast Frontend</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Aethercast Podcasts</h1>
+
+        <div id="status-area">
+            <h2>Status</h2>
+            <p id="status-message">Loading...</p>
+        </div>
+
+        <div id="snippets-area">
+            <h2>Available Snippets (Topics)</h2>
+            <div id="snippets-list">
+                <!-- Snippets will be loaded here by JavaScript -->
+            </div>
+        </div>
+
+        <div id="player-area" class="hidden">
+            <h2>Podcast Player (Simulated Stream)</h2>
+            <h3 id="player-title"></h3>
+            <div id="player-stream-output">
+                <!-- Simulated audio stream messages will appear here -->
+            </div>
+            <button id="close-stream-button" class="hidden">Close Stream</button>
+        </div>
+    </div>
+
+    <!-- Socket.IO client library -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
