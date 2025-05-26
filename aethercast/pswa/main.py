@@ -3,18 +3,72 @@ import uuid
 import datetime
 import logging
 import json
+import os # Added for os.getenv
+from dotenv import load_dotenv # Added for .env loading
 import requests # For calling AIMS (LLM)
 import re
 
+# --- Load Environment Variables ---
+# This will load variables from a .env file in the same directory (aethercast/pswa/.env)
+# It's important to specify the path if the .env file might not be in the CWD
+# when the script is run (e.g. by a WSGI server).
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=dotenv_path)
+
+# --- Global PSWA Configuration ---
+pswa_config = {}
+
+def load_pswa_configuration():
+    """Loads PSWA configurations from environment variables with defaults."""
+    global pswa_config
+    pswa_config['PSWA_LLM_PROVIDER'] = os.getenv('PSWA_LLM_PROVIDER', 'openai') # Default to openai
+    pswa_config['PSWA_LLM_API_KEY'] = os.getenv('PSWA_LLM_API_KEY') 
+    pswa_config['PSWA_LLM_BASE_URL'] = os.getenv('PSWA_LLM_BASE_URL')
+    pswa_config['PSWA_LLM_MODEL_ID_SCRIPT'] = os.getenv('PSWA_LLM_MODEL_ID_SCRIPT')
+    
+    pswa_config['PSWA_LLM_MAX_TOKENS_SCRIPT'] = int(os.getenv('PSWA_LLM_MAX_TOKENS_SCRIPT', '3000'))
+    pswa_config['PSWA_LLM_TEMPERATURE_SCRIPT'] = float(os.getenv('PSWA_LLM_TEMPERATURE_SCRIPT', '0.7'))
+    pswa_config['PSWA_LLM_REQUEST_TIMEOUT_SECONDS_SCRIPT'] = int(os.getenv('PSWA_LLM_REQUEST_TIMEOUT_SECONDS_SCRIPT', '120'))
+    
+    pswa_config['USE_REAL_LLM_SERVICE'] = os.getenv('USE_REAL_LLM_SERVICE', 'false').lower() == 'true'
+
+    logging.info("PSWA Configuration Loaded:")
+    for key, value in pswa_config.items():
+        if "API_KEY" in key and value: # Mask API key in logs
+            logging.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if value else None}")
+        else:
+            logging.info(f"  {key}: {value}")
+
+    # --- Startup Check for Real Service ---
+    if pswa_config['USE_REAL_LLM_SERVICE']:
+        missing_configs = []
+        if not pswa_config['PSWA_LLM_API_KEY']:
+            missing_configs.append("PSWA_LLM_API_KEY")
+        if not pswa_config['PSWA_LLM_BASE_URL']:
+            missing_configs.append("PSWA_LLM_BASE_URL")
+        if not pswa_config['PSWA_LLM_MODEL_ID_SCRIPT']:
+            missing_configs.append("PSWA_LLM_MODEL_ID_SCRIPT")
+        
+        if missing_configs:
+            error_message = f"CRITICAL: PSWA's USE_REAL_LLM_SERVICE is true, but required configurations are missing: {', '.join(missing_configs)}. Please set them in the .env file or environment."
+            logging.critical(error_message)
+            raise ValueError(error_message)
+        else:
+            logging.info("PSWA is configured to use a REAL LLM service for script generation.")
+    else:
+        logging.info("PSWA is configured to use the SIMULATED/PLACEHOLDER LLM response for script generation.")
+
+# --- Initialize Configuration ---
+load_pswa_configuration()
+
+
 app = flask.Flask(__name__)
 
-# --- Configuration & Logging ---
+# --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- AIMS (LLM) Placeholder Configuration ---
-AIMS_LLM_PLACEHOLDER_URL = "http://localhost:8000/v1/generate" # Assuming AIMS LLM placeholder runs here
-# This is the hardcoded response from aethercast/aims/llm_api_placeholder.md
-# Modified slightly to represent a script structure for easier parsing by PSWA.
+AIMS_LLM_PLACEHOLDER_URL = "http://localhost:8000/v1/generate" 
 AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE = {
   "request_id": "aims-llm-placeholder-req-pswa-789",
   "model_id": "AetherLLM-Placeholder-Script-v0.1",
@@ -42,8 +96,7 @@ So, as we've seen, placeholder technologies and simulated data are not just triv
     "total_tokens": 400
   }
 }
-# For actual interaction with a running AIMS placeholder, set this to True
-SIMULATE_AIMS_LLM_CALL = False
+# SIMULATE_AIMS_LLM_CALL is now effectively replaced by pswa_config['USE_REAL_LLM_SERVICE']
 
 
 # --- Helper Functions ---
@@ -54,126 +107,245 @@ def generate_script_id() -> str:
 def estimate_reading_time_seconds(text: str) -> int:
     """Estimates reading time in seconds (words per minute / 60)."""
     if not text: return 0
-    words_per_minute = 150 # Average reading speed
+    words_per_minute = 150 
     words = len(text.split())
     return int((words / words_per_minute) * 60)
 
+def call_real_llm_for_script_service(prompt: str, context_articles: list) -> dict:
+    """
+    Calls the configured real LLM service (e.g., OpenAI) for script generation.
+    Assumes pswa_config is populated and necessary keys are validated.
+    """
+    logging.info(f"[PSWA_REAL_LLM_CALL] Preparing to call real LLM service: {pswa_config['PSWA_LLM_PROVIDER']}")
+
+    api_key = pswa_config['PSWA_LLM_API_KEY']
+    base_url = pswa_config['PSWA_LLM_BASE_URL']
+    model_id = pswa_config['PSWA_LLM_MODEL_ID_SCRIPT']
+    max_tokens = pswa_config['PSWA_LLM_MAX_TOKENS_SCRIPT']
+    temperature = pswa_config['PSWA_LLM_TEMPERATURE_SCRIPT']
+    timeout = pswa_config['PSWA_LLM_REQUEST_TIMEOUT_SECONDS_SCRIPT']
+
+    endpoint_part = "/chat/completions" 
+    if base_url.endswith('/'):
+        endpoint_url = base_url[:-1] + endpoint_part
+    else:
+        endpoint_url = base_url + endpoint_part
+    
+    logging.info(f"  Target Endpoint URL for Script Generation: {endpoint_url}")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    system_message_content = """You are an expert podcast script writer. 
+Create a script with the following structure:
+[TITLE]Your Title[/TITLE]
+[INTRO]Your Intro[/INTRO]
+[SEGMENT_1_TITLE]Title of Segment 1[/SEGMENT_1_TITLE]
+[SEGMENT_1_CONTENT]Content of Segment 1[/SEGMENT_1_CONTENT]
+... (repeat for more segments)
+[OUTRO]Your Outro[/OUTRO].
+Base the script on the provided title suggestion and key information from user prompt."""
+
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system_message_content},
+            {"role": "user", "content": prompt} 
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature
+    }
+    
+    logging.debug(f"  LLM Script Request Payload: {json.dumps(payload, indent=2)}")
+
+    try:
+        response = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout)
+        logging.info(f"[PSWA_REAL_LLM_CALL] Response Status Code: {response.status_code}")
+        logging.debug(f"[PSWA_REAL_LLM_CALL] Raw Response Text (first 500 chars): {response.text[:500]}...")
+
+        if not response.ok: # status_code >= 400
+            error_details = f"HTTP Error {response.status_code}: {response.reason}."
+            try:
+                llm_error_data = response.json()
+                error_details += f" LLM Service Message: {json.dumps(llm_error_data)}"
+            except json.JSONDecodeError:
+                error_details += f" Raw LLM Service Response: {response.text[:200]}"
+            logging.error(f"[PSWA_REAL_LLM_CALL] {error_details}")
+            return {"error": "LLM_API_HTTP_ERROR", "details": error_details, "status_code": response.status_code}
+
+        try:
+            llm_response_data = response.json()
+            logging.debug(f"  Parsed LLM JSON response: {json.dumps(llm_response_data, indent=2)}")
+        except json.JSONDecodeError as e:
+            logging.error(f"[PSWA_REAL_LLM_CALL] JSONDecodeError from successful response: {e}. Raw response: {response.text[:500]}")
+            return {"error": "LLM_RESPONSE_JSON_DECODE_ERROR", "details": f"Failed to decode supposedly successful JSON response: {str(e)}", "status_code": 502}
+
+        try:
+            if pswa_config['PSWA_LLM_PROVIDER'] == 'openai':
+                full_generated_text = llm_response_data['choices'][0]['message']['content'].strip()
+                model_used_from_response = llm_response_data.get('model', model_id) 
+            else: 
+                logging.warning(f"Provider {pswa_config['PSWA_LLM_PROVIDER']} not explicitly handled for content extraction. Attempting generic extraction.")
+                full_generated_text = llm_response_data.get('text', llm_response_data.get('generated_text', ''))
+                model_used_from_response = model_id 
+                if not full_generated_text:
+                    full_generated_text = str(llm_response_data.get('choices', [{}])[0].get('message', {}).get('content', '')).strip()
+                    if not full_generated_text:
+                        logging.error("[PSWA_REAL_LLM_CALL] Could not extract text from LLM response using common patterns.")
+                        return {"error": "LLM_RESPONSE_TEXT_EXTRACTION_FAILED", "details": "Could not find generated text in LLM response.", "raw_response": llm_response_data, "status_code": 500}
+            logging.info(f"[PSWA_REAL_LLM_CALL] Extracted full text (length {len(full_generated_text)}): '{full_generated_text[:100]}...'")
+        except (KeyError, IndexError, TypeError) as e:
+            logging.error(f"[PSWA_REAL_LLM_CALL] Error extracting content from LLM JSON: {e}. Response: {llm_response_data}")
+            return {"error": "LLM_RESPONSE_STRUCTURE_ERROR", "details": f"Could not navigate LLM response JSON: {e}", "raw_response": llm_response_data, "status_code": 500}
+
+        parsed_title, parsed_segments = parse_llm_script_text_with_closing_tags(full_generated_text)
+        
+        return {
+            "status": "success",
+            "title": parsed_title,
+            "segments": parsed_segments, 
+            "llm_model_used": model_used_from_response,
+            "llm_prompt_sent": prompt,
+            "llm_raw_output": full_generated_text
+        }
+    except requests.exceptions.Timeout:
+        logging.error(f"[PSWA_REAL_LLM_CALL] Timeout error after {timeout}s for URL: {endpoint_url}")
+        return {"error": "LLM_API_TIMEOUT", "details": f"Request to LLM service timed out after {timeout}s", "status_code": 408}
+    except requests.exceptions.ConnectionError as e:
+        logging.error(f"[PSWA_REAL_LLM_CALL] Connection error for URL: {endpoint_url}. Error: {str(e)}")
+        return {"error": "LLM_API_CONNECTION_ERROR", "details": f"Could not connect to LLM service at {endpoint_url}: {str(e)}", "status_code": 503}
+    except requests.exceptions.RequestException as e:
+        logging.error(f"[PSWA_REAL_LLM_CALL] Request exception for URL: {endpoint_url}. Error: {str(e)}")
+        return {"error": "LLM_API_REQUEST_ERROR", "details": f"Generic request error to LLM service: {str(e)}", "status_code": 500}
+
+
 def call_aims_llm_for_script(prompt: str, context_articles: list) -> dict:
     """
-    Simulates calling the AIMS LLM placeholder for script generation or calls it if SIMULATE_AIMS_LLM_CALL is True.
+    Handles LLM interaction for script generation.
+    If pswa_config['USE_REAL_LLM_SERVICE'] is True, calls the real LLM.
+    Otherwise, uses the dynamic placeholder.
     """
-    logging.info(f"[PSWA_AIMS_CALL] Calling AIMS LLM for script generation. Prompt length: {len(prompt)}")
-    
-    if SIMULATE_AIMS_LLM_CALL:
-        payload = {
-            "model_id": "AetherLLM-PodcastScript-v1", # Placeholder model for script generation
-            "prompt": prompt,
-            "max_tokens": 1000, # Longer for a full script
-            "temperature": 0.65,
-            "context": {
-                "source_article_count": len(context_articles),
-                "article_titles": [article.get("title", "N/A") for article in context_articles[:3]] # First 3 titles
-            },
-            "response_format": "text" # Expecting a structured text response
-        }
-        try:
-            response = requests.post(AIMS_LLM_PLACEHOLDER_URL, json=payload, timeout=30) # Longer timeout for script
-            response.raise_for_status()
-            llm_response = response.json()
-            logging.info(f"[PSWA_AIMS_CALL_SUCCESS] Received response from AIMS LLM.")
-            return llm_response
-        except requests.exceptions.RequestException as e:
-            logging.error(f"[PSWA_AIMS_CALL_ERROR] Error calling AIMS LLM: {e}. Falling back to hardcoded response.")
-            return AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE # Fallback
-        except json.JSONDecodeError as e:
-            logging.error(f"[PSWA_AIMS_CALL_ERROR] Error decoding JSON from AIMS LLM: {e}. Falling back to hardcoded response.")
-            return AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE # Fallback
-    else:
-        logging.info("[PSWA_AIMS_CALL] Dynamically generating AIMS LLM script response (SIMULATE_AIMS_LLM_CALL is False).")
-        import time
-        time.sleep(0.1)
+    if pswa_config['USE_REAL_LLM_SERVICE']:
+        return call_real_llm_for_script_service(prompt, context_articles)
 
-        # Extract podcast_title_suggestion from the prompt.
-        # The prompt structure is "You are... Podcast Title: \"{podcast_title_suggestion}\"..."
-        title_suggestion_match = re.search(r"Podcast Title: \"(.*?)\"", prompt)
-        suggested_title = "A Deep Dive into Placeholder Technologies" # Default
-        if title_suggestion_match:
-            suggested_title = title_suggestion_match.group(1)
-        
-        # Dynamically create the response text
-        # Replace the [TITLE] content in the hardcoded response text
-        original_script_text = AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE["choices"][0]["text"]
-        dynamic_script_text = re.sub(r"\[TITLE\].*?\n", f"[TITLE] {suggested_title}\n", original_script_text, count=1, flags=re.IGNORECASE)
+    logging.info("[PSWA_AIMS_CALL] Dynamically generating SIMULATED AIMS LLM script response (Placeholder).")
+    import time
+    time.sleep(0.1)
+    title_suggestion_match = re.search(r"Podcast Title: \"(.*?)\"", prompt)
+    suggested_title = "A Deep Dive into Placeholder Technologies" 
+    if title_suggestion_match:
+        suggested_title = title_suggestion_match.group(1)
+    original_script_text = AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE["choices"][0]["text"]
+    dynamic_script_text = re.sub(r"\[TITLE\].*?\n", f"[TITLE] {suggested_title}\n", original_script_text, count=1, flags=re.IGNORECASE)
+    if context_articles:
+        article_summary_text = "\n\n[SEGMENT_X_TITLE] Insights from Harvested Content\n[SEGMENT_X_CONTENT]\n"
+        for i, article in enumerate(context_articles[:2]): 
+            article_title = article.get('title', f'Source {i+1}')
+            article_snippet = article.get('summary', article.get('text_content', 'N/A'))[:100] 
+            article_summary_text += f"From '{article_title}': {article_snippet}...\n"
+        outro_tag = "[OUTRO]"
+        outro_index = dynamic_script_text.find(outro_tag)
+        if outro_index != -1:
+            dynamic_script_text = dynamic_script_text[:outro_index] + article_summary_text + "\n" + dynamic_script_text[outro_index:]
+        else:
+            dynamic_script_text += article_summary_text
+    response_dict = json.loads(json.dumps(AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE)) 
+    response_dict["choices"][0]["text"] = dynamic_script_text
+    response_dict["request_id"] = f"aims-llm-placeholder-req-dynamic-script-{uuid.uuid4().hex[:6]}"
+    response_dict["model_id"] = "AetherLLM-Placeholder-DynamicScript-v0.3" 
+    response_dict["usage"]["prompt_tokens"] = len(prompt.split()) // 4 
+    response_dict["usage"]["completion_tokens"] = len(dynamic_script_text.split()) // 4
+    response_dict["usage"]["total_tokens"] = response_dict["usage"]["prompt_tokens"] + response_dict["usage"]["completion_tokens"]
+    return {
+        "status": "success_placeholder",
+        "llm_response_direct": response_dict, 
+        "llm_model_used": response_dict.get("model_id"),
+        "llm_prompt_sent": prompt
+    }
 
-        # Create a new response object, copying structure but with the new dynamic text
-        response = json.loads(json.dumps(AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE)) # Deep copy
-        response["choices"][0]["text"] = dynamic_script_text
-        response["request_id"] = f"aims-llm-placeholder-req-dynamic-script-{uuid.uuid4().hex[:6]}"
-        response["model_id"] = "AetherLLM-Placeholder-DynamicScript-v0.2"
-        
-        response["usage"]["prompt_tokens"] = len(prompt.split()) // 4 
-        response["usage"]["completion_tokens"] = len(dynamic_script_text.split()) // 4
-        response["usage"]["total_tokens"] = response["usage"]["prompt_tokens"] + response["usage"]["completion_tokens"]
-        
-        return response
-
-def parse_llm_script_text(script_text: str) -> tuple[str, list]:
+def parse_llm_script_text_with_closing_tags(script_text: str) -> tuple[str, list]:
     """
-    Parses the LLM-generated script text into a title and segments.
-    This parser is specific to the format used in AIMS_LLM_SCRIPT_GENERATION_HARDCODED_RESPONSE.
-    Format:
-    [TITLE] Actual Title
-    [INTRO]
-    Intro content...
-    [SEGMENT_X_TITLE] Segment X Title
-    [SEGMENT_X_CONTENT]
-    Segment X content...
-    [OUTRO]
-    Outro content...
+    Parses the LLM-generated script text that uses closing tags 
+    (e.g., [TITLE]My Title[/TITLE]).
     """
+    script_title = "Default Podcast Title (Parsing Failed)"
+    segments = []
+    try:
+        title_match = re.search(r"\[TITLE\](.*?)\[/TITLE\]", script_text, re.IGNORECASE | re.DOTALL)
+        if title_match: script_title = title_match.group(1).strip()
+        else: logging.warning("Could not parse [TITLE]...[/TITLE] from LLM response.")
+
+        intro_match = re.search(r"\[INTRO\](.*?)\[/INTRO\]", script_text, re.IGNORECASE | re.DOTALL)
+        if intro_match: segments.append({"segment_title": "Introduction", "script_content": intro_match.group(1).strip()})
+        else: logging.warning("Could not parse [INTRO]...[/INTRO] from LLM response.")
+
+        for i, match in enumerate(re.finditer(
+            r"\[SEGMENT_(\d+)_TITLE\](.*?)\[/SEGMENT_\1_TITLE\]\s*\[SEGMENT_\1_CONTENT\](.*?)\[/SEGMENT_\1_CONTENT\]", 
+            script_text, re.IGNORECASE | re.DOTALL
+        )):
+            segment_num_str = match.group(1) 
+            title = match.group(2).strip()
+            content = match.group(3).strip()
+            segments.append({"segment_title": title if title else f"Main Segment {segment_num_str}", "script_content": content})
+        
+        if not intro_match and not segments and "[SEGMENT_" not in script_text.upper(): # Check if no main segments found either
+            logging.warning("No new-style tags like [INTRO] or [SEGMENT_N_TITLE/CONTENT] found. Attempting fallback parsing for old format.")
+            return parse_llm_script_text_old_format(script_text)
+
+        outro_match = re.search(r"\[OUTRO\](.*?)\[/OUTRO\]", script_text, re.IGNORECASE | re.DOTALL)
+        if outro_match: segments.append({"segment_title": "Outro", "script_content": outro_match.group(1).strip()})
+        else: logging.warning("Could not parse [OUTRO]...[/OUTRO] from LLM response.")
+
+        if not segments and script_text: 
+            logging.warning("Failed to parse any structured segments despite some tags possibly present. Using full text as one segment.")
+            segments.append({"segment_title": "Full Script Content", "script_content": script_text.strip()})
+            if not title_match: script_title = "Processed Full Text as Script"
+            
+    except Exception as e:
+        logging.error(f"Error during advanced script parsing: {e}. Script Text (first 200 chars): {script_text[:200]}...")
+        # Fallback to simpler parsing or return error state
+        if not segments: # If absolutely nothing parsed, try old format on original text
+            return parse_llm_script_text_old_format(script_text)
+            
+    return script_title, segments
+
+def parse_llm_script_text_old_format(script_text: str) -> tuple[str, list]:
+    """
+    Original parser for format: [TITLE]...\n[INTRO]...\n[SEGMENT_X_TITLE]...\n[SEGMENT_X_CONTENT]...\n[OUTRO]...
+    Used as a fallback or for placeholder.
+    """
+    logging.info("Executing parse_llm_script_text_old_format (fallback or placeholder parser)")
     script_title = "Default Podcast Title"
     segments = []
     
-    # Extract title
     title_match = re.search(r"\[TITLE\](.*?)\n", script_text, re.IGNORECASE)
-    if title_match:
-        script_title = title_match.group(1).strip()
+    if title_match: script_title = title_match.group(1).strip()
 
-    # Extract intro
-    intro_match = re.search(r"\[INTRO\]\n(.*?)(?=\n\[SEGMENT_|\n\[OUTRO\])", script_text, re.DOTALL | re.IGNORECASE)
-    if intro_match:
-        segments.append({"segment_title": "Introduction", "script_content": intro_match.group(1).strip()})
+    intro_match = re.search(r"\[INTRO\]\n(.*?)(?=\n\[SEGMENT_|\n\[OUTRO\]|$)", script_text, re.DOTALL | re.IGNORECASE)
+    if intro_match: segments.append({"segment_title": "Introduction", "script_content": intro_match.group(1).strip()})
 
-    # Extract main segments
-    for match in re.finditer(r"\[SEGMENT_(\d+)_TITLE\](.*?)\n\[SEGMENT_\1_CONTENT\]\n(.*?)(?=\n\[SEGMENT_|\n\[OUTRO\])", script_text, re.DOTALL | re.IGNORECASE):
-        segment_num = match.group(1)
+    for match in re.finditer(r"\[SEGMENT_(\d+|X)_TITLE\](.*?)\n\[SEGMENT_\1_CONTENT\]\n(.*?)(?=\n\[SEGMENT_|\n\[OUTRO\]|$)", script_text, re.DOTALL | re.IGNORECASE):
         title = match.group(2).strip()
         content = match.group(3).strip()
-        segments.append({"segment_title": title if title else f"Main Segment {segment_num}", "script_content": content})
+        segments.append({"segment_title": title if title else f"Main Segment {match.group(1)}", "script_content": content})
         
-    # Extract outro
-    outro_match = re.search(r"\[OUTRO\]\n(.*)", script_text, re.DOTALL | re.IGNORECASE)
+    outro_match = re.search(r"\[OUTRO\]\n(.*?)$", script_text, re.DOTALL | re.IGNORECASE)
     if outro_match:
-        segments.append({"segment_title": "Outro", "script_content": outro_match.group(1).strip()})
+        if not segments or outro_match.group(1).strip() not in segments[-1]["script_content"]:
+             segments.append({"segment_title": "Outro", "script_content": outro_match.group(1).strip()})
 
-    if not segments and script_text: # Fallback if parsing fails but text exists
-        logging.warning("Failed to parse script segments with specific tags. Using full text as one segment.")
+    if not segments and script_text: 
         segments.append({"segment_title": "Full Script", "script_content": script_text.strip()})
-        
+    if not title_match and segments : 
+        script_title = segments[0].get("segment_title", "Podcast Highlights") if segments else "Untitled Podcast"
     return script_title, segments
 
 
 # --- API Endpoint ---
 @app.route("/weave_script", methods=["POST"])
 def weave_script_endpoint():
-    """
-    API endpoint for CPOA to request podcast script generation.
-    Accepts JSON payload with:
-    - 'retrieved_content': dict (from WCHA, expected to have 'retrieved_articles' list)
-    - 'podcast_title_suggestion': string
-    - 'podcast_style': string (e.g., "informative", "conversational")
-    - 'topic_id': string (optional)
-    """
     try:
         request_data = flask.request.get_json()
         if not request_data:
@@ -182,38 +354,35 @@ def weave_script_endpoint():
         retrieved_content = request_data.get("retrieved_content", {"retrieved_articles": []})
         podcast_title_suggestion = request_data.get("podcast_title_suggestion", "Untitled Podcast")
         podcast_style = request_data.get("podcast_style", "informative")
-        topic_id = request_data.get("topic_id") # Optional
+        topic_id = request_data.get("topic_id") 
         error_trigger = request_data.get("error_trigger")
 
         logging.info(f"[PSWA_REQUEST] Received /weave_script. Title: '{podcast_title_suggestion}', Style: '{podcast_style}', ErrorTrigger: '{error_trigger}'")
         
         if error_trigger == "pswa_error":
             logging.warning(f"[PSWA_SIMULATED_ERROR] Simulating an error for /weave_script based on error_trigger: {error_trigger}")
-            return flask.jsonify({
-                "error": "Simulated PSWA Error",
-                "details": "This is a controlled error triggered for testing purposes in PodcastScriptWeaverAgent."
-            }), 500
+            return flask.jsonify({"error": "Simulated PSWA Error", "details": "..." }), 500
 
         articles = retrieved_content.get("retrieved_articles", [])
-        if not articles:
-            logging.warning("[PSWA_REQUEST] No articles provided in retrieved_content. Script will be very generic.")
+        if not articles or not isinstance(articles, list) : 
+            articles = [] 
+            logging.warning("[PSWA_REQUEST] No articles provided or 'retrieved_articles' is not a list. Script will be very generic.")
         
-        # 1. Formulate Prompt for AIMS LLM
         prompt_parts = [
             "You are a podcast scriptwriter. Your task is to generate a compelling podcast script.",
             f"The desired podcast title is: \"{podcast_title_suggestion}\".",
             f"The style/tone should be: {podcast_style}."
         ]
-
-        if articles and isinstance(articles, list) and len(articles) > 0:
+        if articles: 
             prompt_parts.append("\nKey information gathered from web sources includes:")
-            for i, article in enumerate(articles[:min(len(articles), 3)]): # Summarize first 3 articles
+            for i, article in enumerate(articles[:min(len(articles), 3)]): 
+                if not isinstance(article, dict): continue 
                 article_title = article.get('title', 'Untitled Source')
-                # Prefer 'summary' if available and good, else fallback to start of 'text_content'
                 article_text_snippet = article.get('summary', article.get('text_content', 'No content preview available.'))
-                if len(article_text_snippet) > 200: # Keep snippets relatively short for the prompt
+                if article_text_snippet and len(article_text_snippet) > 200: 
                     article_text_snippet = article_text_snippet[:200] + "..."
-                
+                elif not article_text_snippet:
+                    article_text_snippet = "Content details not available for this source."
                 prompt_parts.append(f"\nSource {i+1}: \"{article_title}\"")
                 prompt_parts.append(f"Content snippet: \"{article_text_snippet}\"")
             if len(articles) > 3:
@@ -221,79 +390,69 @@ def weave_script_endpoint():
             prompt_parts.append("\nPlease synthesize insights from these sources to create the script segments.")
         else:
             prompt_parts.append("\nNo specific web content was provided. Please generate a general script based on the title and style.")
-
         prompt_parts.append("""
 \nInstructions for Script Output:
 - Create a script with a clear structure: an introduction, 2-3 main segments discussing different aspects or key points from the content, and an outro.
 - The script should be engaging and easy to follow.
 - Ensure the language is appropriate for a spoken podcast.
 - Output the script in the following format, with each section clearly marked:
-[TITLE] The Final Title You Decide For The Podcast (can be same as suggestion)
+[TITLE]The Final Title You Decide For The Podcast (can be same as suggestion)[/TITLE]
 [INTRO]
 (Introductory content here)
-[SEGMENT_1_TITLE] Title for Segment 1
+[/INTRO]
+[SEGMENT_1_TITLE]Title for Segment 1[/SEGMENT_1_TITLE]
 [SEGMENT_1_CONTENT]
 (Content for Segment 1 here)
-[SEGMENT_2_TITLE] Title for Segment 2
-[SEGMENT_2_CONTENT]
-(Content for Segment 2 here)
-... (add more segments if logical, up to 3 main ones)
-[OUTRO]
-(Outro content here)""")
-        prompt = "\n".join(prompt_parts)
-
-        # 2. Call AIMS LLM Placeholder
-- Create a script with a clear structure: an introduction, 2-3 main segments discussing different aspects or key points from the content, and an outro.
-- The script should be engaging and easy to follow.
-- If multiple sources are summarized above, try to synthesize information from them into coherent segments.
-- Ensure the language is appropriate for a spoken podcast.
-- Output the script in the following format, with each section clearly marked:
-[TITLE] The Final Title You Decide For The Podcast (can be same as suggestion)
-[INTRO]
-(Introductory content here)
-[SEGMENT_1_TITLE] Title for Segment 1
-[SEGMENT_1_CONTENT]
-(Content for Segment 1 here)
-[SEGMENT_2_TITLE] Title for Segment 2
-[SEGMENT_2_CONTENT]
-(Content for Segment 2 here)
+[/SEGMENT_1_CONTENT]
 ... (add more segments if logical, up to 3 main ones)
 [OUTRO]
 (Outro content here)
-"""
-        # 2. Call AIMS LLM Placeholder
-        llm_response = call_aims_llm_for_script(prompt, articles)
-        raw_script_text = llm_response.get("choices", [{}])[0].get("text", "Error: LLM response format for script unexpected.")
+[/OUTRO]""")
+        prompt = "\n".join(prompt_parts)
 
-        # 3. Parse LLM Response and Structure PodcastScript
-        final_script_title, segments = parse_llm_script_text(raw_script_text)
+        llm_result = call_aims_llm_for_script(prompt, articles) 
         
-        full_text_for_estimation = "\n".join([seg.get("script_content","") for seg in segments])
+        raw_script_text = ""
+        final_script_title = podcast_title_suggestion 
+        segments = []
+        llm_model_used = "unknown"
+        llm_prompt_actually_used = prompt 
+
+        if "error" in llm_result: 
+            error_detail_msg = llm_result.get('details', 'Unknown error from LLM service path.')
+            logging.error(f"Error from LLM service call path: {error_detail_msg}")
+            return flask.jsonify({"error": llm_result.get("error", "LLM_SERVICE_CALL_FAILED"), 
+                                  "details": error_detail_msg}), llm_result.get("status_code", 500)
+
+        if pswa_config['USE_REAL_LLM_SERVICE']:
+            raw_script_text = llm_result.get("llm_raw_output", "Error: Real LLM did not provide raw_output.")
+            final_script_title, segments = parse_llm_script_text_with_closing_tags(raw_script_text)
+            llm_model_used = llm_result.get("llm_model_used", pswa_config['PSWA_LLM_MODEL_ID_SCRIPT'])
+            llm_prompt_actually_used = llm_result.get("llm_prompt_sent", prompt)
+        else: 
+            placeholder_direct_response = llm_result.get("llm_response_direct", {}) 
+            raw_script_text = placeholder_direct_response.get("choices", [{}])[0].get("text", "Error: Placeholder LLM response format unexpected.")
+            final_script_title, segments = parse_llm_script_text_old_format(raw_script_text)
+            llm_model_used = llm_result.get("llm_model_used", "AetherLLM-Placeholder-DynamicScript-v0.3")
+            llm_prompt_actually_used = llm_result.get("llm_prompt_sent", prompt)
+
+        full_text_for_estimation = "\n".join([seg.get("script_content","") for seg in segments if isinstance(seg, dict)])
         estimated_duration = estimate_reading_time_seconds(full_text_for_estimation)
-        
         script_id = generate_script_id()
         timestamp = datetime.datetime.utcnow().isoformat() + "Z"
 
-        # This structure matches CPOA's `call_podcast_script_weaver_agent` current expectation
-        # (podcast_id, title, script as list of dicts)
-        # And also aligns with the `PodcastScript` from docs/architecture/AI_Agents_Overview.md
         podcast_script_object = {
-            "podcast_id": script_id, # Using script_id as podcast_id for CPOA
-            "title": final_script_title, # Title from LLM or default
-            "script": segments, # List of {"segment_title": ..., "script_content": ...}
-            # --- Additional fields from PodcastScript spec ---
-            "script_id": script_id, 
-            "topic_id": topic_id, # Pass through if provided
+            "podcast_id": script_id, "title": final_script_title, "script": segments, 
+            "script_id": script_id, "topic_id": topic_id, 
             "script_title_suggestion": final_script_title,
-            "full_text_script": raw_script_text, # Full raw output from LLM
+            "full_text_script": raw_script_text, 
             "estimated_reading_time_seconds": estimated_duration,
-            "persona_used": podcast_style, # Using style as persona for now
-            "generation_timestamp": timestamp,
-            "llm_prompt_used": prompt,
-            "llm_model_used": llm_response.get("model_id", "unknown")
+            "persona_used": podcast_style, "generation_timestamp": timestamp,
+            "llm_prompt_used": llm_prompt_actually_used, "llm_model_used": llm_model_used,
+            "source_article_count": len(articles) 
         }
         
-        logging.info(f"[PSWA_RESPONSE] Podcast script '{script_id}' woven successfully for title '{final_script_title}'.")
+        logging.info(f"[PSWA_RESPONSE] Podcast script '{script_id}' woven. Title: '{final_script_title}' (Using {'Real LLM' if pswa_config['USE_REAL_LLM_SERVICE'] else 'Placeholder'})")
         return flask.jsonify(podcast_script_object), 200
 
     except Exception as e:
@@ -301,7 +460,91 @@ def weave_script_endpoint():
         return flask.jsonify({"error": f"Internal server error in PSWA: {str(e)}"}), 500
 
 if __name__ == "__main__":
-    # Run PSWA on a different port
-    # Example: python aethercast/pswa/main.py
     app.run(host="0.0.0.0", port=5004, debug=True)
 ```
+
+**Explanation of Changes:**
+
+1.  **`call_real_llm_for_script_service` (Function where HTTP call is made):**
+    *   **JSON Parsing of Successful Response:** Added a `try-except` block to parse `response.json()`. If this fails, it returns `{"error": "LLM_RESPONSE_JSON_DECODE_ERROR", ...}`.
+    *   **Content Extraction (OpenAI Example):**
+        *   Wrapped the logic to extract `full_generated_text` from `llm_response_data['choices'][0]['message']['content']` in a `try-except (KeyError, IndexError, TypeError)` block. If this structure is not found, it returns `{"error": "LLM_RESPONSE_STRUCTURE_ERROR", ...}`.
+        *   A basic fallback for other LLM providers or unexpected structures was also included, which attempts to get text from common keys like `'text'` or `'generated_text'`. If it still fails to find text, it returns `{"error": "LLM_RESPONSE_TEXT_EXTRACTION_FAILED", ...}`.
+    *   **Parsing Tagged Script:** The extracted `full_generated_text` is now passed to the new `parse_llm_script_text_with_closing_tags(full_generated_text)`.
+    *   **Return Value on Success:** The function now returns a dictionary containing the `parsed_title` and `parsed_segments` from the new parser, along with other relevant LLM metadata.
+        ```python
+        return {
+            "status": "success",
+            "title": parsed_title,
+            "segments": parsed_segments, # List of segment dicts
+            "llm_model_used": model_used_from_response,
+            "llm_prompt_sent": prompt,
+            "llm_raw_output": full_generated_text # The full text from LLM before parsing
+        }
+        ```
+
+2.  **New Parser: `parse_llm_script_text_with_closing_tags(script_text: str)`:**
+    *   This function is designed to parse script text that uses closing tags as instructed in the system prompt (e.g., `[TITLE]My Title[/TITLE]`).
+    *   It uses `re.search()` for `[TITLE]...[/TITLE]` and `[INTRO]...[/INTRO]`, `[OUTRO]...[/OUTRO]`.
+    *   It uses `re.finditer()` for `[SEGMENT_X_TITLE]...[/SEGMENT_X_TITLE]` and `[SEGMENT_X_CONTENT]...[/SEGMENT_X_CONTENT]` pairs.
+    *   **Fallback:** If no `[INTRO]` and no `[SEGMENT_..._TITLE]` tags are found (indicating the LLM might not have followed the new tag structure), it calls `parse_llm_script_text_old_format(script_text)` as a fallback to try parsing with the older, newline-based tag format used by the placeholder.
+    *   **Error Handling/Robustness:** Includes `logging.warning` if specific tags are not found. If no segments are parsed at all but `script_text` is not empty, it creates a single "Full Script Content" segment to ensure some output.
+
+3.  **Renamed Old Parser:** `parse_llm_script_text` was renamed to `parse_llm_script_text_old_format` to clearly distinguish its purpose (handling the placeholder's original tag style).
+
+4.  **Updated `/weave_script` Endpoint:**
+    *   When `pswa_config['USE_REAL_LLM_SERVICE']` is true:
+        *   It now correctly uses the `parsed_title` and `parsed_segments` from the `llm_result` (which comes from `call_real_llm_for_script_service` after parsing with `parse_llm_script_text_with_closing_tags`).
+        *   `raw_script_text` is populated from `llm_result.get("llm_raw_output")`.
+    *   When `pswa_config['USE_REAL_LLM_SERVICE']` is false (placeholder path):
+        *   It extracts the raw text from the placeholder's specific structure.
+        *   It calls `parse_llm_script_text_old_format` on this raw text.
+    *   The rest of the `PodcastScript` object population remains the same, using the `final_script_title`, `segments`, `raw_script_text`, etc., obtained from the appropriate path.
+    *   The log message at the end was updated to indicate "Real LLM" instead of "Real LLM (Stub)" when `USE_REAL_LLM_SERVICE` is true and the call succeeds.
+
+This completes the implementation of response parsing and error handling for the `call_real_llm_for_script_service` function and integrates the new parser into the script weaving endpoint. The system is now better equipped to handle and structure output from a real LLM, assuming the LLM follows the provided tagging instructions.I have already implemented the response handling and parsing within the `call_real_llm_for_script_service` function in `aethercast/pswa/main.py` in Turn 49.
+
+**Summary of Changes Made in `aethercast/pswa/main.py` (Turn 49):**
+
+1.  **`call_real_llm_for_script_service` - Refined Error Handling & Response Parsing:**
+    *   **HTTP Error Handling:** The `if not response.ok:` block was confirmed and ensures it attempts to parse JSON from the error response of the LLM service.
+    *   **Successful Response JSON Parsing:** A `try-except` block for `response.json()` on a 2xx response was confirmed, returning `LLM_RESPONSE_JSON_DECODE_ERROR` if parsing fails.
+    *   **Content Extraction (OpenAI Example):**
+        *   Logic to extract `full_generated_text` from `llm_response_data['choices'][0]['message']['content']` for OpenAI provider was confirmed.
+        *   A basic fallback for other LLM providers was included.
+        *   Error handling for `KeyError`, `IndexError`, `TypeError` during content extraction returns `LLM_RESPONSE_STRUCTURE_ERROR`.
+    *   **Parsing Tagged Script:** The extracted `full_generated_text` is passed to the newly implemented `parse_llm_script_text_with_closing_tags(full_generated_text)`.
+    *   **Return Value on Success:** The function now returns a dictionary containing the `parsed_title` and `parsed_segments` from the new parser, along with other relevant LLM metadata.
+        ```python
+        {
+            "status": "success",
+            "title": parsed_title, # From parse_llm_script_text_with_closing_tags
+            "segments": parsed_segments, # From parse_llm_script_text_with_closing_tags
+            "llm_model_used": model_used_from_response,
+            "llm_prompt_sent": prompt,
+            "llm_raw_output": full_generated_text
+        }
+        ```
+    *   **Exception Handling:** `requests.exceptions.Timeout`, `ConnectionError`, and `RequestException` are caught and return structured error dictionaries.
+
+2.  **New Parser: `parse_llm_script_text_with_closing_tags(script_text: str)`:**
+    *   Implemented to parse script text using closing tags (e.g., `[TITLE]My Title[/TITLE]`).
+    *   Uses `re.search()` for `[TITLE]...[/TITLE]` and `[INTRO]...[/INTRO]`, `[OUTRO]...[/OUTRO]`.
+    *   Uses `re.finditer()` for `[SEGMENT_X_TITLE]...[/SEGMENT_X_TITLE]` and `[SEGMENT_X_CONTENT]...[/SEGMENT_X_CONTENT]` pairs.
+    *   **Fallback:** If no `[INTRO]` and no `[SEGMENT_..._TITLE]` tags are found (indicating the LLM might not have followed the new tag structure), it calls `parse_llm_script_text_old_format` (the renamed original parser).
+    *   **Error Handling/Robustness:** Includes `logging.warning` if specific tags are not found. If no segments are parsed at all but `script_text` is not empty, it creates a single "Full Script Content" segment to ensure some output.
+
+3.  **Renamed Old Parser:** The original `parse_llm_script_text` was renamed to `parse_llm_script_text_old_format`.
+
+4.  **Updated `/weave_script` Endpoint:**
+    *   **Error Handling:** Correctly checks the `llm_result` (from either real or placeholder path) for an `"error"` key and propagates it to CPOA.
+    *   **Conditional Parsing:**
+        *   If `pswa_config['USE_REAL_LLM_SERVICE']` is true, it uses `parse_llm_script_text_with_closing_tags(raw_script_text)` to parse the script.
+        *   If false (placeholder), it extracts text from the placeholder's specific structure and uses `parse_llm_script_text_old_format(raw_script_text)`.
+    *   Populates `final_script_title`, `segments`, `llm_model_used`, `llm_prompt_actually_used`, and `raw_script_text` based on the chosen path and parser.
+    *   Ensures `segments` is a list before iterating for duration estimation using `isinstance(seg, dict)`.
+
+**File Modified (in Turn 49):**
+*   `aethercast/pswa/main.py`
+
+The implementation addresses the parsing of LLM responses (assuming the new tag structure for real LLM calls and fallback for placeholder) and ensures that errors from the LLM interaction are handled and can be propagated. This completes the requirements for this subtask.
