@@ -160,26 +160,97 @@ def orchestrate_podcast_generation(topic: str) -> dict:
 
     # 3. Call VoiceForgeAgent (VFA)
     vfa_result_dict = None
+    # This variable will help distinguish between exceptions and VFA-reported issues
+    error_occurred_during_orchestration = False 
+    current_error_message = None
+
     try:
-        log_step("Calling VFA: forge_voice with script from PSWA.")
+        # ... (WCHA and PSWA calls remain the same, they will set status="failed" and return if an exception occurs) ...
+        # If WCHA or PSWA failed by exception, status is already "failed".
+        # We only proceed to VFA if previous steps didn't set status to "failed".
+        if status == "failed": # If WCHA or PSWA hard failed by exception
+            # This return is already handled in their respective except blocks,
+            # but as a safeguard if logic changes.
+            # The final_result construction at the end will use the status and error_message.
+            pass # Let it fall through to the final result construction.
+
+        log_step("Calling VFA (Google Cloud TTS): forge_voice with script from PSWA.")
         script_for_vfa = pswa_output if isinstance(pswa_output, str) else "Script unavailable due to previous PSWA issues."
         vfa_result_dict = forge_voice(script=script_for_vfa)
-        log_step("VFA: forge_voice returned.", data=vfa_result_dict)
         
-        if not isinstance(vfa_result_dict, dict) or "status" not in vfa_result_dict:
-             log_step(f"VFA Warning: Unexpected response format from VFA. Response: {vfa_result_dict}")
-             status = "failed" # Or completed_with_warnings if some audio info is salvageable
-             # Potentially return here if VFA output is critical and malformed
-        elif vfa_result_dict.get("status") != "success":
-            log_step(f"VFA Info: Voice forging was not fully successful. Status: {vfa_result_dict.get('status')}", data=vfa_result_dict)
-            if vfa_result_dict.get("status") == "skipped":
-                 status = "completed_with_warnings" 
-            # else: # Other non-success statuses might be considered errors
-            #     status = "failed" 
-            #     return { ... } 
+        # Enhanced logging for VFA's output
+        vfa_status = vfa_result_dict.get('status', 'unknown')
+        vfa_message = vfa_result_dict.get('message', 'No message from VFA.')
+        
+        log_data_for_vfa_step = {
+            "vfa_status": vfa_status,
+            "vfa_message": vfa_message,
+            "engine_used": vfa_result_dict.get("engine_used"),
+            "script_char_count": vfa_result_dict.get("script_char_count")
+        }
+
+        if vfa_status == "success":
+            log_data_for_vfa_step["audio_filepath"] = vfa_result_dict.get("audio_filepath")
+            log_data_for_vfa_step["audio_format"] = vfa_result_dict.get("audio_format")
+            log_step("VFA (Google Cloud TTS) successfully generated audio.", data=log_data_for_vfa_step)
+            # status remains "in_progress" to be set to "completed" finally
+        elif vfa_status == "skipped":
+            log_step("VFA (Google Cloud TTS) skipped audio generation.", data=log_data_for_vfa_step)
+            status = "completed_with_warnings" # Overall CPOA status
+            current_error_message = vfa_message # VFA's reason for skipping becomes the primary message
+        elif vfa_status == "error":
+            log_step("VFA (Google Cloud TTS) encountered an error during synthesis.", data=log_data_for_vfa_step)
+            status = "completed_with_errors" # VFA completed its process but reported an internal error
+            current_error_message = vfa_message # VFA's error message
+        else: # Unexpected VFA status or malformed dict
+            log_step(f"VFA (Google Cloud TTS) returned an unexpected status or malformed response: {vfa_status}", data=vfa_result_dict)
+            status = "failed" # Treat unexpected VFA response as a CPOA failure
+            current_error_message = f"VFA returned unexpected status: {vfa_status}. Full response: {vfa_result_dict}"
+
     except Exception as e:
-        log_step(f"VFA: Error during forge_voice: {str(e)}", data={"error_type": type(e).__name__})
-        status = "failed"
+        log_step(f"VFA: Critical error during forge_voice (Google Cloud TTS call): {str(e)}", data={"error_type": type(e).__name__})
+        status = "failed" # CPOA status
+        current_error_message = f"VFA failed critically: {str(e)}"
+        error_occurred_during_orchestration = True # To ensure this overrides any VFA dict status later
+
+    # Refined final status determination
+    # This logic is now effectively integrated into the VFA try-except block's status setting.
+    # The 'status' variable holds the most current state.
+    # If an exception occurred in WCHA/PSWA, 'status' would already be 'failed'.
+    # If VFA call had an exception, 'status' is 'failed', 'error_occurred_during_orchestration' is True.
+    # If VFA returned 'error', 'status' is 'completed_with_errors'.
+    # If VFA returned 'skipped', 'status' is 'completed_with_warnings'.
+    # If VFA returned 'success' and no prior agent failed, 'status' is 'in_progress' here.
+
+    final_status_to_set = status
+    final_error_message = current_error_message
+
+    if error_occurred_during_orchestration: # An agent call raised an exception
+        final_status_to_set = "failed"
+        # final_error_message would have been set by the except block that set error_occurred_during_orchestration
+        # If it's from VFA's critical error, current_error_message already has it.
+        # If it's from WCHA/PSWA, their return statements would have exited early with "failed" status and message.
+        # This path is mainly for VFA critical failure.
+    elif final_status_to_set == "in_progress": # No exceptions, VFA was successful
+        final_status_to_set = "completed"
+        final_error_message = None # Clear any previous non-critical message if all good
+    
+    log_step(f"Orchestration finished with status: '{final_status_to_set}' for topic: '{topic}'.")
+    
+    final_result = {
+        "topic": topic,
+        "status": final_status_to_set,
+        "final_audio_details": vfa_result_dict, # This will be None if VFA was never called or errored before returning dict
+        "orchestration_log": orchestration_log
+    }
+    if final_error_message:
+        final_result["error_message"] = final_error_message
+    elif final_status_to_set == "failed" and "error_message" not in final_result:
+        final_result["error_message"] = "An unspecified error occurred during orchestration."
+
+    return final_result
+
+def pretty_print_orchestration_result(result: dict):
         return {
             "topic": topic, "status": status, "final_audio_details": None,
             "orchestration_log": orchestration_log, "error_message": f"VFA failed: {str(e)}"
