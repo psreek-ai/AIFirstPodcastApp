@@ -3,14 +3,141 @@ import uuid
 import random
 import logging
 import json
+import os
+from dotenv import load_dotenv
+import requests
 
-app = flask.Flask(__name__)
+# Load environment variables from .env file
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+load_dotenv(dotenv_path=dotenv_path)
+
+# --- Application Configuration ---
+tda_config = {
+    "TDA_NEWS_API_KEY": os.getenv("TDA_NEWS_API_KEY"),
+    "TDA_NEWS_API_BASE_URL": os.getenv("TDA_NEWS_API_BASE_URL", "https://newsapi.org/v2/"),
+    "TDA_NEWS_API_ENDPOINT": os.getenv("TDA_NEWS_API_ENDPOINT", "everything"),
+    "TDA_NEWS_DEFAULT_KEYWORDS": os.getenv("TDA_NEWS_DEFAULT_KEYWORDS", "AI,technology,science").split(','),
+    "TDA_NEWS_DEFAULT_LANGUAGE": os.getenv("TDA_NEWS_DEFAULT_LANGUAGE", "en"),
+    "USE_REAL_NEWS_API": os.getenv("USE_REAL_NEWS_API", "False").lower() == "true",
+}
 
 # --- Configuration & Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# Startup Check for API Key
+if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
+    logging.error("CRITICAL: USE_REAL_NEWS_API is True, but TDA_NEWS_API_KEY is not set. Real News API calls will fail.")
+    # Optionally, raise an error to prevent startup without API key:
+    # raise ValueError("TDA_NEWS_API_KEY is required when USE_REAL_NEWS_API is True")
+else:
+    logging.info(f"TDA Configuration: USE_REAL_NEWS_API is set to {tda_config['USE_REAL_NEWS_API']}")
+    if tda_config["USE_REAL_NEWS_API"]:
+        logging.info("TDA will attempt to use the real NewsAPI.org.")
+    else:
+        logging.info("TDA will use simulated data sources.")
+
+app = flask.Flask(__name__)
+
 # --- Placeholder Data Sources ---
 # Simulates data fetched from various news APIs, RSS feeds, etc.
+
+def call_real_news_api(keywords: list[str] = None, categories: list[str] = None, language: str = None, country: str = None) -> list[dict]:
+    """
+    Calls the NewsAPI.org to fetch articles, parses the response, and transforms articles into TopicObjects.
+    Returns a list of TopicObject dictionaries or an empty list if an error occurs.
+    """
+    global tda_config, generate_topic_id # Ensure access to global tda_config and generate_topic_id
+    if not tda_config["TDA_NEWS_API_KEY"]:
+        logging.error("call_real_news_api: Missing TDA_NEWS_API_KEY. Cannot make request.")
+        return []
+
+    base_url = tda_config["TDA_NEWS_API_BASE_URL"]
+    endpoint = tda_config["TDA_NEWS_API_ENDPOINT"]
+    api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+    params = {}
+    # query_keywords will be used for both API call and TopicObject keywords
+    query_keywords = keywords if keywords else tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]
+    if query_keywords:
+        # Ensure query_keywords is a list of strings for consistent use later
+        if isinstance(query_keywords, str):
+            query_keywords = [kw.strip() for kw in query_keywords.split(',')]
+        params["q"] = ",".join(query_keywords)
+
+
+    if endpoint == "top-headlines": # Specific params for 'top-headlines'
+        if categories: # NewsAPI expects a single category for 'top-headlines'
+            params["category"] = categories[0] if isinstance(categories, list) else categories
+        if country:
+            params["country"] = country
+    
+    current_language = language if language else tda_config["TDA_NEWS_DEFAULT_LANGUAGE"]
+    if current_language:
+        params["language"] = current_language
+    
+    headers = {
+        "X-Api-Key": tda_config["TDA_NEWS_API_KEY"]
+    }
+
+    logging.info(f"Calling NewsAPI: URL={api_url}, Params={params}")
+    topic_objects = []
+
+    try:
+        response = requests.get(api_url, headers=headers, params=params, timeout=10)
+        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
+        
+        response_json = response.json()
+
+        if response_json.get("status") != "ok":
+            logging.error(f"NewsAPI returned error status: {response_json.get('status')}. Message: {response_json.get('message')}")
+            return []
+
+        articles = response_json.get("articles", [])
+        
+        for article in articles:
+            title = article.get('title', 'No title provided')
+            description = article.get('description', 'No summary available')
+            article_url = article.get('url')
+            source_name = article.get('source', {}).get('name', 'Unknown Source')
+            published_at = article.get('publishedAt')
+
+            topic_object = {
+                "topic_id": generate_topic_id(),
+                "source_feed_name": "news_api",
+                "title_suggestion": title,
+                "summary": description if description else "No summary available.",
+                "keywords": query_keywords, # Use the same keywords used for the search
+                "potential_sources": [{
+                    "url": article_url,
+                    "title": title,
+                    "source_name": source_name
+                }],
+                "relevance_score": 0.8, # Default relevance for API-sourced topics
+                "publication_date": published_at,
+                "category_suggestion": "News" # Default category
+            }
+            topic_objects.append(topic_object)
+        
+        return topic_objects
+
+    except requests.exceptions.JSONDecodeError as json_err:
+        logging.error(f"Failed to decode JSON from NewsAPI: {json_err}. Response text: {response.text if 'response' in locals() else 'N/A'}")
+        return []
+    except requests.exceptions.HTTPError as http_err:
+        logging.error(f"HTTP error occurred: {http_err} - {http_err.response.text if http_err.response else 'No response text'}")
+        return []
+    except requests.exceptions.ConnectionError as conn_err:
+        logging.error(f"Connection error occurred: {conn_err}")
+        return []
+    except requests.exceptions.Timeout as timeout_err:
+        logging.error(f"Timeout error occurred: {timeout_err}")
+        return []
+    except requests.exceptions.RequestException as req_err: # Catch any other request-related errors
+        logging.error(f"An unexpected error occurred with the NewsAPI request: {req_err}")
+        return []
+    # Default return for any other unhandled issues within this function, though try/except should cover most.
+    return []
+
 SIMULATED_DATA_SOURCES = [
     {
         "source_name": "Tech Chronicle",
@@ -137,10 +264,48 @@ def discover_topics_endpoint():
                 "details": "This is a controlled error triggered for testing purposes in TopicDiscoveryAgent."
             }), 500
 
-        discovered_topics = identify_topics_from_sources(query=query, limit=limit)
+        # global tda_config # tda_config is already globally accessible
+        
+        discovered_topics = []
+        if tda_config["USE_REAL_NEWS_API"]:
+            logging.info(f"Using REAL News API for /discover_topics. Query: '{query}'")
+            request_keywords = [k.strip() for k in query.split(',')] if query else None
+            
+            # call_real_news_api expects a list of keywords.
+            # It does not currently use 'limit' directly; NewsAPI handles result size.
+            # We will slice the result if a limit is needed post-fetch.
+            raw_topics_from_api = call_real_news_api(
+                keywords=request_keywords, 
+                language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")
+                # categories and country are not passed here, call_real_news_api uses defaults or endpoint specific logic
+            )
+            
+            if raw_topics_from_api:
+                # Sort by relevance_score if available, assuming higher is better.
+                # The current call_real_news_api sets a static 0.8, so sorting won't do much unless changed.
+                # For now, we'll just take the list as is.
+                # raw_topics_from_api.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+                
+                # Apply limit if specified
+                if limit > 0 and isinstance(limit, int):
+                    discovered_topics = raw_topics_from_api[:limit]
+                else:
+                    discovered_topics = raw_topics_from_api
+            else:
+                discovered_topics = [] # Ensure it's an empty list if API returns nothing or error
+        
+        else:
+            logging.info(f"Using SIMULATED data for /discover_topics. Query: '{query}', Limit: {limit}")
+            discovered_topics = identify_topics_from_sources(query=query, limit=limit)
 
         if not discovered_topics:
-            return flask.jsonify({"message": "No topics discovered for the given query.", "topics": []}), 200
+            # Provide a more specific message if using the real API and no topics were found
+            message = "No topics discovered."
+            if tda_config["USE_REAL_NEWS_API"]:
+                 message = "No topics discovered from NewsAPI for the given query."
+            else:
+                 message = "No topics discovered from simulated sources for the given query."
+            return flask.jsonify({"message": message, "topics": []}), 200
 
         # This is the structure CPOA's `call_topic_discovery_agent` expects
         response_data = {"discovered_topics": discovered_topics}
