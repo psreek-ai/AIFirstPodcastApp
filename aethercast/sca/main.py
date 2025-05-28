@@ -418,52 +418,52 @@ def craft_snippet_endpoint():
 if __name__ == "__main__":
     # load_sca_configuration() is called when the module is imported.
     app.run(host="0.0.0.0", port=5002, debug=True)
-```
-
-**Explanation of Changes:**
-
-1.  **Imports:** Added `import os` and `from dotenv import load_dotenv`.
-2.  **`load_dotenv()` Call:** `load_dotenv()` is called at the module level to load variables from `aethercast/sca/.env` (if it exists) into environment variables.
-3.  **`sca_config` Dictionary:** A global dictionary `sca_config` is initialized.
-4.  **`load_sca_configuration()` Function:**
-    *   This new function is defined to populate `sca_config`.
-    *   It uses `os.getenv("VAR_NAME", "default_value")` to fetch each configuration variable.
-    *   **Type Conversion:** `int()`, `float()`, and `str.lower() == 'true'` are used for appropriate type conversions.
-    *   **Defaults:** Sensible defaults are provided for most settings, except for `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID`.
-    *   **Logging:** It logs the loaded configuration (masking the API key for security).
-    *   **Startup Check:**
-        *   If `sca_config['USE_REAL_LLM_SERVICE']` is `True`, it checks if `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID` have been set.
-        *   If any are missing, a critical error is logged, and a `ValueError` is raised. This will prevent the Flask app from starting if it's misconfigured for real LLM use.
-5.  **Configuration Initialization:** `load_sca_configuration()` is called once at the module level to load the configuration when the script starts.
-6.  **Accessing Configuration:**
-    *   The `call_aims_llm_placeholder` function was updated to check `sca_config['USE_REAL_LLM_SERVICE']` (though the actual real LLM call logic is deferred to a new `call_real_llm_service` function).
-    *   A placeholder `call_real_llm_service` function is added, which logs that it would use `sca_config` values. This function will be fully implemented in the next subtask.
-    *   The `/craft_snippet` endpoint now decides which LLM calling function to use based on `sca_config['USE_REAL_LLM_SERVICE']`.
-    *   The `SIMULATE_AIMS_LLM_CALL` global boolean is now effectively replaced by `sca_config['USE_REAL_LLM_SERVICE']`.
-
-This implementation ensures that SCA loads its configuration from environment variables (populated from `.env` for local development), provides defaults, performs a critical startup check if configured for a real LLM service, and makes the configuration accessible globally within the agent. The actual use of these configurations for a real LLM call is stubbed out in `call_real_llm_service` and will be the focus of the next subtask.**Explanation of Changes:**
-
-1.  **Imports:** Added `import os` and `from dotenv import load_dotenv`.
-2.  **`load_dotenv()` Call:** `load_dotenv()` is called at the top of the script (module level) to load variables from a potential `.env` file located in the same directory (`aethercast/sca/.env`) into actual environment variables that `os.getenv()` can access.
-3.  **`sca_config` Global Dictionary:** A global dictionary `sca_config` is initialized to store the application's configuration.
-4.  **`load_sca_configuration()` Function:**
-    *   This new function is responsible for populating the `sca_config` dictionary.
-    *   It fetches each expected configuration variable from environment variables using `os.getenv("VAR_NAME", "default_value")`.
-    *   **Type Conversion:** It performs necessary type conversions:
-        *   `int()` for `SCA_LLM_MAX_TOKENS_SNIPPET` and `SCA_LLM_REQUEST_TIMEOUT_SECONDS`.
-        *   `float()` for `SCA_LLM_TEMPERATURE_SNIPPET`.
-        *   `str.lower() == 'true'` for `USE_REAL_LLM_SERVICE` to convert it to a boolean.
-    *   **Defaults:** Sensible default values are provided for most settings (e.g., 'openai' for provider, '150' for max tokens, 'false' for `USE_REAL_LLM_SERVICE`). API keys, base URLs, and model IDs specific to the real service do not have defaults and must be provided if `USE_REAL_LLM_SERVICE` is true.
-    *   **Logging:** After loading, it logs the effective configuration values. API keys are masked in the logs for security (only last 4 characters shown).
-    *   **Startup Check (Critical):**
-        *   If `sca_config['USE_REAL_LLM_SERVICE']` evaluates to `True`, the function checks if `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID` have been set (i.e., are not `None`).
-        *   If any of these essential configurations for using a real LLM service are missing, a critical error message is logged, and a `ValueError` is raised. This is designed to stop the Flask application from starting if it's misconfigured for real LLM usage, preventing runtime errors later.
-5.  **Configuration Initialization:** `load_sca_configuration()` is called once when the module is first imported, ensuring the configuration is loaded and checked before the Flask app object is created or any routes are defined.
-6.  **Accessing Configuration:**
-    *   The `sca_config` dictionary is globally accessible within the `sca/main.py` script.
-    *   The `/craft_snippet` route handler now uses `sca_config['USE_REAL_LLM_SERVICE']` to decide whether to call the (newly added placeholder) `call_real_llm_service` function or the existing `call_aims_llm_placeholder` function (which handles the dynamic hardcoded responses).
-    *   The `call_aims_llm_placeholder` function was also slightly modified: if `sca_config['USE_REAL_LLM_SERVICE']` is true but this placeholder function is somehow called, it logs a warning, as this would indicate a logic flaw (the real LLM path should have been taken).
-    *   A new placeholder function `call_real_llm_service` was added. It currently logs the provider, base URL, and model ID from `sca_config` and returns a placeholder error message indicating it's not fully implemented. This function will be the target for implementing actual LLM API calls in the next subtask.
-    *   The old global boolean `SIMULATE_AIMS_LLM_CALL` is now effectively superseded by `sca_config['USE_REAL_LLM_SERVICE']`.
-
-This implementation ensures that the SCA loads its configuration from environment variables (which can be populated by a `.env` file for local development via `python-dotenv`), provides defaults for non-sensitive parameters, performs a critical check for essential settings if configured to use a real LLM, and makes these configurations available for use within the application. The actual HTTP calls using these configurations are stubbed for the next subtask.
+# ```
+# 
+# **Explanation of Changes:**
+# 
+# 1.  **Imports:** Added `import os` and `from dotenv import load_dotenv`.
+# 2.  **`load_dotenv()` Call:** `load_dotenv()` is called at the module level to load variables from `aethercast/sca/.env` (if it exists) into environment variables.
+# 3.  **`sca_config` Dictionary:** A global dictionary `sca_config` is initialized.
+# 4.  **`load_sca_configuration()` Function:**
+#     *   This new function is defined to populate `sca_config`.
+#     *   It uses `os.getenv("VAR_NAME", "default_value")` to fetch each configuration variable.
+#     *   **Type Conversion:** `int()`, `float()`, and `str.lower() == 'true'` are used for appropriate type conversions.
+#     *   **Defaults:** Sensible defaults are provided for most settings, except for `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID`.
+#     *   **Logging:** It logs the loaded configuration (masking the API key for security).
+#     *   **Startup Check:**
+#         *   If `sca_config['USE_REAL_LLM_SERVICE']` is `True`, it checks if `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID` have been set.
+#         *   If any are missing, a critical error is logged, and a `ValueError` is raised. This will prevent the Flask app from starting if it's misconfigured for real LLM use.
+# 5.  **Configuration Initialization:** `load_sca_configuration()` is called once at the module level to load the configuration when the script starts.
+# 6.  **Accessing Configuration:**
+#     *   The `call_aims_llm_placeholder` function was updated to check `sca_config['USE_REAL_LLM_SERVICE']` (though the actual real LLM call logic is deferred to a new `call_real_llm_service` function).
+#     *   A placeholder `call_real_llm_service` function is added, which logs that it would use `sca_config` values. This function will be fully implemented in the next subtask.
+#     *   The `/craft_snippet` endpoint now decides which LLM calling function to use based on `sca_config['USE_REAL_LLM_SERVICE']`.
+#     *   The `SIMULATE_AIMS_LLM_CALL` global boolean is now effectively replaced by `sca_config['USE_REAL_LLM_SERVICE']`.
+# 
+# This implementation ensures that SCA loads its configuration from environment variables (populated from `.env` for local development), provides defaults, performs a critical startup check if configured for a real LLM service, and makes the configuration accessible globally within the agent. The actual use of these configurations for a real LLM call is stubbed out in `call_real_llm_service` and will be the focus of the next subtask.**Explanation of Changes:**
+# 
+# 1.  **Imports:** Added `import os` and `from dotenv import load_dotenv`.
+# 2.  **`load_dotenv()` Call:** `load_dotenv()` is called at the top of the script (module level) to load variables from a potential `.env` file located in the same directory (`aethercast/sca/.env`) into actual environment variables that `os.getenv()` can access.
+# 3.  **`sca_config` Global Dictionary:** A global dictionary `sca_config` is initialized to store the application's configuration.
+# 4.  **`load_sca_configuration()` Function:**
+#     *   This new function is responsible for populating the `sca_config` dictionary.
+#     *   It fetches each expected configuration variable from environment variables using `os.getenv("VAR_NAME", "default_value")`.
+#     *   **Type Conversion:** It performs necessary type conversions:
+#         *   `int()` for `SCA_LLM_MAX_TOKENS_SNIPPET` and `SCA_LLM_REQUEST_TIMEOUT_SECONDS`.
+#         *   `float()` for `SCA_LLM_TEMPERATURE_SNIPPET`.
+#         *   `str.lower() == 'true'` for `USE_REAL_LLM_SERVICE` to convert it to a boolean.
+#     *   **Defaults:** Sensible default values are provided for most settings (e.g., 'openai' for provider, '150' for max tokens, 'false' for `USE_REAL_LLM_SERVICE`). API keys, base URLs, and model IDs specific to the real service do not have defaults and must be provided if `USE_REAL_LLM_SERVICE` is true.
+#     *   **Logging:** After loading, it logs the effective configuration values. API keys are masked in the logs for security (only last 4 characters shown).
+#     *   **Startup Check (Critical):**
+#         *   If `sca_config['USE_REAL_LLM_SERVICE']` evaluates to `True`, the function checks if `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID` have been set (i.e., are not `None`).
+#         *   If any of these essential configurations for using a real LLM service are missing, a critical error message is logged, and a `ValueError` is raised. This is designed to stop the Flask application from starting if it's misconfigured for real LLM usage, preventing runtime errors later.
+# 5.  **Configuration Initialization:** `load_sca_configuration()` is called once when the module is first imported, ensuring the configuration is loaded and checked before the Flask app object is created or any routes are defined.
+# 6.  **Accessing Configuration:**
+#     *   The `sca_config` dictionary is globally accessible within the `sca/main.py` script.
+#     *   The `/craft_snippet` route handler now uses `sca_config['USE_REAL_LLM_SERVICE']` to decide whether to call the (newly added placeholder) `call_real_llm_service` function or the existing `call_aims_llm_placeholder` function (which handles the dynamic hardcoded responses).
+#     *   The `call_aims_llm_placeholder` function was also slightly modified: if `sca_config['USE_REAL_LLM_SERVICE']` is true but this placeholder function is somehow called, it logs a warning, as this would indicate a logic flaw (the real LLM path should have been taken).
+#     *   A new placeholder function `call_real_llm_service` was added. It currently logs the provider, base URL, and model ID from `sca_config` and returns a placeholder error message indicating it's not fully implemented. This function will be the target for implementing actual LLM API calls in the next subtask.
+#     *   The old global boolean `SIMULATE_AIMS_LLM_CALL` is now effectively superseded by `sca_config['USE_REAL_LLM_SERVICE']`.
+# 
+# This implementation ensures that the SCA loads its configuration from environment variables (which can be populated by a `.env` file for local development via `python-dotenv`), provides defaults for non-sensitive parameters, performs a critical check for essential settings if configured to use a real LLM, and makes these configurations available for use within the application. The actual HTTP calls using these configurations are stubbed for the next subtask.

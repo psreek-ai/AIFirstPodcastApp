@@ -461,90 +461,90 @@ def weave_script_endpoint():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5004, debug=True)
-```
-
-**Explanation of Changes:**
-
-1.  **`call_real_llm_for_script_service` (Function where HTTP call is made):**
-    *   **JSON Parsing of Successful Response:** Added a `try-except` block to parse `response.json()`. If this fails, it returns `{"error": "LLM_RESPONSE_JSON_DECODE_ERROR", ...}`.
-    *   **Content Extraction (OpenAI Example):**
-        *   Wrapped the logic to extract `full_generated_text` from `llm_response_data['choices'][0]['message']['content']` in a `try-except (KeyError, IndexError, TypeError)` block. If this structure is not found, it returns `{"error": "LLM_RESPONSE_STRUCTURE_ERROR", ...}`.
-        *   A basic fallback for other LLM providers or unexpected structures was also included, which attempts to get text from common keys like `'text'` or `'generated_text'`. If it still fails to find text, it returns `{"error": "LLM_RESPONSE_TEXT_EXTRACTION_FAILED", ...}`.
-    *   **Parsing Tagged Script:** The extracted `full_generated_text` is now passed to the new `parse_llm_script_text_with_closing_tags(full_generated_text)`.
-    *   **Return Value on Success:** The function now returns a dictionary containing the `parsed_title` and `parsed_segments` from the new parser, along with other relevant LLM metadata.
-        ```python
-        return {
-            "status": "success",
-            "title": parsed_title,
-            "segments": parsed_segments, # List of segment dicts
-            "llm_model_used": model_used_from_response,
-            "llm_prompt_sent": prompt,
-            "llm_raw_output": full_generated_text # The full text from LLM before parsing
-        }
-        ```
-
-2.  **New Parser: `parse_llm_script_text_with_closing_tags(script_text: str)`:**
-    *   This function is designed to parse script text that uses closing tags as instructed in the system prompt (e.g., `[TITLE]My Title[/TITLE]`).
-    *   It uses `re.search()` for `[TITLE]...[/TITLE]` and `[INTRO]...[/INTRO]`, `[OUTRO]...[/OUTRO]`.
-    *   It uses `re.finditer()` for `[SEGMENT_X_TITLE]...[/SEGMENT_X_TITLE]` and `[SEGMENT_X_CONTENT]...[/SEGMENT_X_CONTENT]` pairs.
-    *   **Fallback:** If no `[INTRO]` and no `[SEGMENT_..._TITLE]` tags are found (indicating the LLM might not have followed the new tag structure), it calls `parse_llm_script_text_old_format(script_text)` as a fallback to try parsing with the older, newline-based tag format used by the placeholder.
-    *   **Error Handling/Robustness:** Includes `logging.warning` if specific tags are not found. If no segments are parsed at all but `script_text` is not empty, it creates a single "Full Script Content" segment to ensure some output.
-
-3.  **Renamed Old Parser:** `parse_llm_script_text` was renamed to `parse_llm_script_text_old_format` to clearly distinguish its purpose (handling the placeholder's original tag style).
-
-4.  **Updated `/weave_script` Endpoint:**
-    *   When `pswa_config['USE_REAL_LLM_SERVICE']` is true:
-        *   It now correctly uses the `parsed_title` and `parsed_segments` from the `llm_result` (which comes from `call_real_llm_for_script_service` after parsing with `parse_llm_script_text_with_closing_tags`).
-        *   `raw_script_text` is populated from `llm_result.get("llm_raw_output")`.
-    *   When `pswa_config['USE_REAL_LLM_SERVICE']` is false (placeholder path):
-        *   It extracts the raw text from the placeholder's specific structure.
-        *   It calls `parse_llm_script_text_old_format` on this raw text.
-    *   The rest of the `PodcastScript` object population remains the same, using the `final_script_title`, `segments`, `raw_script_text`, etc., obtained from the appropriate path.
-    *   The log message at the end was updated to indicate "Real LLM" instead of "Real LLM (Stub)" when `USE_REAL_LLM_SERVICE` is true and the call succeeds.
-
-This completes the implementation of response parsing and error handling for the `call_real_llm_for_script_service` function and integrates the new parser into the script weaving endpoint. The system is now better equipped to handle and structure output from a real LLM, assuming the LLM follows the provided tagging instructions.I have already implemented the response handling and parsing within the `call_real_llm_for_script_service` function in `aethercast/pswa/main.py` in Turn 49.
-
-**Summary of Changes Made in `aethercast/pswa/main.py` (Turn 49):**
-
-1.  **`call_real_llm_for_script_service` - Refined Error Handling & Response Parsing:**
-    *   **HTTP Error Handling:** The `if not response.ok:` block was confirmed and ensures it attempts to parse JSON from the error response of the LLM service.
-    *   **Successful Response JSON Parsing:** A `try-except` block for `response.json()` on a 2xx response was confirmed, returning `LLM_RESPONSE_JSON_DECODE_ERROR` if parsing fails.
-    *   **Content Extraction (OpenAI Example):**
-        *   Logic to extract `full_generated_text` from `llm_response_data['choices'][0]['message']['content']` for OpenAI provider was confirmed.
-        *   A basic fallback for other LLM providers was included.
-        *   Error handling for `KeyError`, `IndexError`, `TypeError` during content extraction returns `LLM_RESPONSE_STRUCTURE_ERROR`.
-    *   **Parsing Tagged Script:** The extracted `full_generated_text` is passed to the newly implemented `parse_llm_script_text_with_closing_tags(full_generated_text)`.
-    *   **Return Value on Success:** The function now returns a dictionary containing the `parsed_title` and `parsed_segments` from the new parser, along with other relevant LLM metadata.
-        ```python
-        {
-            "status": "success",
-            "title": parsed_title, # From parse_llm_script_text_with_closing_tags
-            "segments": parsed_segments, # From parse_llm_script_text_with_closing_tags
-            "llm_model_used": model_used_from_response,
-            "llm_prompt_sent": prompt,
-            "llm_raw_output": full_generated_text
-        }
-        ```
-    *   **Exception Handling:** `requests.exceptions.Timeout`, `ConnectionError`, and `RequestException` are caught and return structured error dictionaries.
-
-2.  **New Parser: `parse_llm_script_text_with_closing_tags(script_text: str)`:**
-    *   Implemented to parse script text using closing tags (e.g., `[TITLE]My Title[/TITLE]`).
-    *   Uses `re.search()` for `[TITLE]...[/TITLE]` and `[INTRO]...[/INTRO]`, `[OUTRO]...[/OUTRO]`.
-    *   Uses `re.finditer()` for `[SEGMENT_X_TITLE]...[/SEGMENT_X_TITLE]` and `[SEGMENT_X_CONTENT]...[/SEGMENT_X_CONTENT]` pairs.
-    *   **Fallback:** If no `[INTRO]` and no `[SEGMENT_..._TITLE]` tags are found (indicating the LLM might not have followed the new tag structure), it calls `parse_llm_script_text_old_format` (the renamed original parser).
-    *   **Error Handling/Robustness:** Includes `logging.warning` if specific tags are not found. If no segments are parsed at all but `script_text` is not empty, it creates a single "Full Script Content" segment to ensure some output.
-
-3.  **Renamed Old Parser:** The original `parse_llm_script_text` was renamed to `parse_llm_script_text_old_format`.
-
-4.  **Updated `/weave_script` Endpoint:**
-    *   **Error Handling:** Correctly checks the `llm_result` (from either real or placeholder path) for an `"error"` key and propagates it to CPOA.
-    *   **Conditional Parsing:**
-        *   If `pswa_config['USE_REAL_LLM_SERVICE']` is true, it uses `parse_llm_script_text_with_closing_tags(raw_script_text)` to parse the script.
-        *   If false (placeholder), it extracts text from the placeholder's specific structure and uses `parse_llm_script_text_old_format(raw_script_text)`.
-    *   Populates `final_script_title`, `segments`, `llm_model_used`, `llm_prompt_actually_used`, and `raw_script_text` based on the chosen path and parser.
-    *   Ensures `segments` is a list before iterating for duration estimation using `isinstance(seg, dict)`.
-
-**File Modified (in Turn 49):**
-*   `aethercast/pswa/main.py`
-
-The implementation addresses the parsing of LLM responses (assuming the new tag structure for real LLM calls and fallback for placeholder) and ensures that errors from the LLM interaction are handled and can be propagated. This completes the requirements for this subtask.
+# ```
+# 
+# **Explanation of Changes:**
+# 
+# 1.  **`call_real_llm_for_script_service` (Function where HTTP call is made):**
+#     *   **JSON Parsing of Successful Response:** Added a `try-except` block to parse `response.json()`. If this fails, it returns `{"error": "LLM_RESPONSE_JSON_DECODE_ERROR", ...}`.
+#     *   **Content Extraction (OpenAI Example):**
+#         *   Wrapped the logic to extract `full_generated_text` from `llm_response_data['choices'][0]['message']['content']` in a `try-except (KeyError, IndexError, TypeError)` block. If this structure is not found, it returns `{"error": "LLM_RESPONSE_STRUCTURE_ERROR", ...}`.
+#         *   A basic fallback for other LLM providers or unexpected structures was also included, which attempts to get text from common keys like `'text'` or `'generated_text'`. If it still fails to find text, it returns `{"error": "LLM_RESPONSE_TEXT_EXTRACTION_FAILED", ...}`.
+#     *   **Parsing Tagged Script:** The extracted `full_generated_text` is now passed to the new `parse_llm_script_text_with_closing_tags(full_generated_text)`.
+#     *   **Return Value on Success:** The function now returns a dictionary containing the `parsed_title` and `parsed_segments` from the new parser, along with other relevant LLM metadata.
+#         ```python
+#         return {
+#             "status": "success",
+#             "title": parsed_title,
+#             "segments": parsed_segments, # List of segment dicts
+#             "llm_model_used": model_used_from_response,
+#             "llm_prompt_sent": prompt,
+#             "llm_raw_output": full_generated_text # The full text from LLM before parsing
+#         }
+#         ```
+# 
+# 2.  **New Parser: `parse_llm_script_text_with_closing_tags(script_text: str)`:**
+#     *   This function is designed to parse script text that uses closing tags as instructed in the system prompt (e.g., `[TITLE]My Title[/TITLE]`).
+#     *   It uses `re.search()` for `[TITLE]...[/TITLE]` and `[INTRO]...[/INTRO]`, `[OUTRO]...[/OUTRO]`.
+#     *   It uses `re.finditer()` for `[SEGMENT_X_TITLE]...[/SEGMENT_X_TITLE]` and `[SEGMENT_X_CONTENT]...[/SEGMENT_X_CONTENT]` pairs.
+#     *   **Fallback:** If no `[INTRO]` and no `[SEGMENT_..._TITLE]` tags are found (indicating the LLM might not have followed the new tag structure), it calls `parse_llm_script_text_old_format(script_text)` as a fallback to try parsing with the older, newline-based tag format used by the placeholder.
+#     *   **Error Handling/Robustness:** Includes `logging.warning` if specific tags are not found. If no segments are parsed at all but `script_text` is not empty, it creates a single "Full Script Content" segment to ensure some output.
+# 
+# 3.  **Renamed Old Parser:** `parse_llm_script_text` was renamed to `parse_llm_script_text_old_format` to clearly distinguish its purpose (handling the placeholder's original tag style).
+# 
+# 4.  **Updated `/weave_script` Endpoint:**
+#     *   When `pswa_config['USE_REAL_LLM_SERVICE']` is true:
+#         *   It now correctly uses the `parsed_title` and `parsed_segments` from the `llm_result` (which comes from `call_real_llm_for_script_service` after parsing with `parse_llm_script_text_with_closing_tags`).
+#         *   `raw_script_text` is populated from `llm_result.get("llm_raw_output")`.
+#     *   When `pswa_config['USE_REAL_LLM_SERVICE']` is false (placeholder path):
+#         *   It extracts the raw text from the placeholder's specific structure.
+#         *   It calls `parse_llm_script_text_old_format` on this raw text.
+#     *   The rest of the `PodcastScript` object population remains the same, using the `final_script_title`, `segments`, `raw_script_text`, etc., obtained from the appropriate path.
+#     *   The log message at the end was updated to indicate "Real LLM" instead of "Real LLM (Stub)" when `USE_REAL_LLM_SERVICE` is true and the call succeeds.
+# 
+# This completes the implementation of response parsing and error handling for the `call_real_llm_for_script_service` function and integrates the new parser into the script weaving endpoint. The system is now better equipped to handle and structure output from a real LLM, assuming the LLM follows the provided tagging instructions.I have already implemented the response handling and parsing within the `call_real_llm_for_script_service` function in `aethercast/pswa/main.py` in Turn 49.
+# 
+# **Summary of Changes Made in `aethercast/pswa/main.py` (Turn 49):**
+# 
+# 1.  **`call_real_llm_for_script_service` - Refined Error Handling & Response Parsing:**
+#     *   **HTTP Error Handling:** The `if not response.ok:` block was confirmed and ensures it attempts to parse JSON from the error response of the LLM service.
+#     *   **Successful Response JSON Parsing:** A `try-except` block for `response.json()` on a 2xx response was confirmed, returning `LLM_RESPONSE_JSON_DECODE_ERROR` if parsing fails.
+#     *   **Content Extraction (OpenAI Example):**
+#         *   Logic to extract `full_generated_text` from `llm_response_data['choices'][0]['message']['content']` for OpenAI provider was confirmed.
+#         *   A basic fallback for other LLM providers was included.
+#         *   Error handling for `KeyError`, `IndexError`, `TypeError` during content extraction returns `LLM_RESPONSE_STRUCTURE_ERROR`.
+#     *   **Parsing Tagged Script:** The extracted `full_generated_text` is passed to the newly implemented `parse_llm_script_text_with_closing_tags(full_generated_text)`.
+#     *   **Return Value on Success:** The function now returns a dictionary containing the `parsed_title` and `parsed_segments` from the new parser, along with other relevant LLM metadata.
+#         ```python
+#         {
+#             "status": "success",
+#             "title": parsed_title, # From parse_llm_script_text_with_closing_tags
+#             "segments": parsed_segments, # From parse_llm_script_text_with_closing_tags
+#             "llm_model_used": model_used_from_response,
+#             "llm_prompt_sent": prompt,
+#             "llm_raw_output": full_generated_text
+#         }
+#         ```
+#     *   **Exception Handling:** `requests.exceptions.Timeout`, `ConnectionError`, and `RequestException` are caught and return structured error dictionaries.
+# 
+# 2.  **New Parser: `parse_llm_script_text_with_closing_tags(script_text: str)`:**
+#     *   Implemented to parse script text using closing tags (e.g., `[TITLE]My Title[/TITLE]`).
+#     *   Uses `re.search()` for `[TITLE]...[/TITLE]` and `[INTRO]...[/INTRO]`, `[OUTRO]...[/OUTRO]`.
+#     *   Uses `re.finditer()` for `[SEGMENT_X_TITLE]...[/SEGMENT_X_TITLE]` and `[SEGMENT_X_CONTENT]...[/SEGMENT_X_CONTENT]` pairs.
+#     *   **Fallback:** If no `[INTRO]` and no `[SEGMENT_..._TITLE]` tags are found (indicating the LLM might not have followed the new tag structure), it calls `parse_llm_script_text_old_format` (the renamed original parser).
+#     *   **Error Handling/Robustness:** Includes `logging.warning` if specific tags are not found. If no segments are parsed at all but `script_text` is not empty, it creates a single "Full Script Content" segment to ensure some output.
+# 
+# 3.  **Renamed Old Parser:** The original `parse_llm_script_text` was renamed to `parse_llm_script_text_old_format`.
+# 
+# 4.  **Updated `/weave_script` Endpoint:**
+#     *   **Error Handling:** Correctly checks the `llm_result` (from either real or placeholder path) for an `"error"` key and propagates it to CPOA.
+#     *   **Conditional Parsing:**
+#         *   If `pswa_config['USE_REAL_LLM_SERVICE']` is true, it uses `parse_llm_script_text_with_closing_tags(raw_script_text)` to parse the script.
+#         *   If false (placeholder), it extracts text from the placeholder's specific structure and uses `parse_llm_script_text_old_format(raw_script_text)`.
+#     *   Populates `final_script_title`, `segments`, `llm_model_used`, `llm_prompt_actually_used`, and `raw_script_text` based on the chosen path and parser.
+#     *   Ensures `segments` is a list before iterating for duration estimation using `isinstance(seg, dict)`.
+# 
+# **File Modified (in Turn 49):**
+# *   `aethercast/pswa/main.py`
+# 
+# The implementation addresses the parsing of LLM responses (assuming the new tag structure for real LLM calls and fallback for placeholder) and ensures that errors from the LLM interaction are handled and can be propagated. This completes the requirements for this subtask.

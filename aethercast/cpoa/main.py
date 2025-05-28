@@ -363,6 +363,6 @@ def get_task_status_endpoint(task_id: str):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
-```
-CPOA error handling implemented. Now for FEND error display.
-I'll read `aethercast/fend/app.js` and modify it to display errors from failed CPOA tasks.
+# ```  <- This seems to be a leftover from a previous edit, should be removed or be part of a comment.
+# CPOA error handling implemented. Now for FEND error display.
+# I'll read `aethercast/fend/app.js` and modify it to display errors from failed CPOA tasks.

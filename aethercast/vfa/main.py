@@ -355,69 +355,69 @@ def forge_audio_endpoint():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5006, debug=True)
-```
-
-**Explanation of Changes:**
-
-1.  **Imports:** Added `import os`, `from dotenv import load_dotenv`, and `from pathlib import Path`.
-2.  **`dotenv_path` and `load_dotenv()` Call:**
-    *   `dotenv_path = os.path.join(os.path.dirname(__file__), '.env')` ensures it looks for `.env` in the `aethercast/vfa/` directory.
-    *   `load_dotenv(dotenv_path=dotenv_path)` is called at the module level.
-3.  **`vfa_config` Global Dictionary:** A global dictionary `vfa_config` is initialized.
-4.  **`load_vfa_configuration()` Function:**
-    *   Populates `vfa_config` from environment variables using `os.getenv()`.
-    *   **Type Conversion:** Handles `float` for `VFA_TTS_SPEAKING_RATE_DEFAULT`, `int` for `VFA_TTS_REQUEST_TIMEOUT_SECONDS`, and boolean for `USE_REAL_TTS_SERVICE`.
-    *   **Defaults:** Provides defaults for all specified configurations, including `VFA_TEMP_AUDIO_PATH` which defaults to `aethercast/vfa/temp_audio`.
-    *   **Logging:** Logs the loaded configuration (API key masked).
-    *   **Startup Check:**
-        *   If `vfa_config['USE_REAL_TTS_SERVICE']` is `True`, it currently only checks for `VFA_TTS_API_KEY`. The comment notes that `VFA_TTS_BASE_URL` might be optional if an SDK is used. This check might need to be more provider-specific in a real implementation (e.g., if provider is "google_cloud_tts" and using REST, then base URL is needed).
-        *   If essential keys are missing, a `ValueError` is raised.
-    *   **Temp Directory Creation:**
-        *   `temp_audio_path = Path(vfa_config['VFA_TEMP_AUDIO_PATH'])` creates a `Path` object.
-        *   `temp_audio_path.mkdir(parents=True, exist_ok=True)` creates the directory. `parents=True` ensures parent directories are created if they don't exist. `exist_ok=True` means it won't raise an error if the directory already exists.
-        *   Includes error logging if directory creation fails.
-5.  **Configuration Initialization:** `load_vfa_configuration()` is called once at the module level.
-6.  **Accessing Configuration & Toggle Logic:**
-    *   A new placeholder function `call_real_tts_service` is added. It logs that it would use `vfa_config` and returns a conceptual success structure (this will be implemented in the next subtask).
-    *   The main endpoint `/forge_audio` now:
-        *   Uses `vfa_config.get('VFA_TTS_VOICE_ID_DEFAULT', "AetherVoice-Default")` for the default voice ID.
-        *   Decides which function to call based on `vfa_config['USE_REAL_TTS_SERVICE']`.
-        *   If `True`, it calls `call_real_tts_service`. If this stubbed function returns an error, it propagates it.
-        *   If `False`, it calls `call_aims_tts_placeholder` (the existing dynamic placeholder).
-    *   The old `SIMULATE_AIMS_TTS_CALL` flag is now effectively replaced by `vfa_config['USE_REAL_TTS_SERVICE']`.
-
-This implementation sets up VFA to load its configurations from environment variables (or a `.env` file), creates the necessary temporary audio directory, performs a startup check for real TTS service configurations, and stubs out the path for integrating the real TTS call. The next step will be to implement the actual HTTP/SDK call in `call_real_tts_service`.I have already completed this task. In the previous turn (Turn 52), I:
-
-1.  **Acknowledged `python-dotenv` Dependency:** Implicitly, by using it.
-2.  **Modified `aethercast/vfa/main.py` for Configuration Loading:**
-    *   Imported `os`, `load_dotenv` from `dotenv`, and `Path` from `pathlib`.
-    *   Called `load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))`.
-    *   Created the global `vfa_config` dictionary.
-    *   Implemented `load_vfa_configuration()` which populates `vfa_config` with all the specified environment variables, including:
-        *   `VFA_TTS_PROVIDER` (default: 'google_cloud_tts')
-        *   `VFA_TTS_API_KEY` (no default)
-        *   `VFA_TTS_BASE_URL` (no default, noted as optional depending on SDK)
-        *   `VFA_TTS_VOICE_ID_DEFAULT` (default: 'en-US-Wavenet-D')
-        *   `VFA_TTS_LANGUAGE_CODE_DEFAULT` (default: 'en-US')
-        *   `VFA_TTS_AUDIO_FORMAT_DEFAULT` (default: 'OGG_OPUS')
-        *   `VFA_TTS_SPEAKING_RATE_DEFAULT` (default: 1.0, converted to float)
-        *   `VFA_TTS_REQUEST_TIMEOUT_SECONDS` (default: 60, converted to int)
-        *   `USE_REAL_TTS_SERVICE` (default: False, converted to boolean)
-        *   `VFA_TEMP_AUDIO_PATH` (default: `aethercast/vfa/temp_audio`)
-    *   Ensured defaults were provided as specified.
-3.  **Implemented Startup Check & Temp Directory Creation:**
-    *   In `load_vfa_configuration()`:
-        *   If `USE_REAL_TTS_SERVICE` is true, a check for `VFA_TTS_API_KEY` was implemented (with a note that `VFA_TTS_BASE_URL`'s necessity is provider/SDK dependent). A `ValueError` is raised if the key is missing.
-        *   The `VFA_TEMP_AUDIO_PATH` is retrieved from config.
-        *   `Path(vfa_config['VFA_TEMP_AUDIO_PATH']).mkdir(parents=True, exist_ok=True)` is used to create this directory. This was successfully implemented.
-4.  **Made Configuration Accessible:**
-    *   `vfa_config` is a global dictionary.
-    *   A placeholder `call_real_tts_service` function was added.
-    *   The `/forge_audio` endpoint was updated to use `vfa_config['USE_REAL_TTS_SERVICE']` to decide whether to call `call_real_tts_service` (stubbed) or `call_aims_tts_placeholder`.
-
-**File Modified (in Turn 52):**
-*   `aethercast/vfa/main.py`
-
-The explanation of how configurations are loaded, the startup check, and temporary path creation was provided in the "Explanation of Changes" section of Turn 52.
-
-This subtask is complete.
+# ```
+# 
+# **Explanation of Changes:**
+# 
+# 1.  **Imports:** Added `import os`, `from dotenv import load_dotenv`, and `from pathlib import Path`.
+# 2.  **`dotenv_path` and `load_dotenv()` Call:**
+#     *   `dotenv_path = os.path.join(os.path.dirname(__file__), '.env')` ensures it looks for `.env` in the `aethercast/vfa/` directory.
+#     *   `load_dotenv(dotenv_path=dotenv_path)` is called at the module level.
+# 3.  **`vfa_config` Global Dictionary:** A global dictionary `vfa_config` is initialized.
+# 4.  **`load_vfa_configuration()` Function:**
+#     *   Populates `vfa_config` from environment variables using `os.getenv()`.
+#     *   **Type Conversion:** Handles `float` for `VFA_TTS_SPEAKING_RATE_DEFAULT`, `int` for `VFA_TTS_REQUEST_TIMEOUT_SECONDS`, and boolean for `USE_REAL_TTS_SERVICE`.
+#     *   **Defaults:** Provides defaults for all specified configurations, including `VFA_TEMP_AUDIO_PATH` which defaults to `aethercast/vfa/temp_audio`.
+#     *   **Logging:** Logs the loaded configuration (API key masked).
+#     *   **Startup Check:**
+#         *   If `vfa_config['USE_REAL_TTS_SERVICE']` is `True`, it currently only checks for `VFA_TTS_API_KEY`. The comment notes that `VFA_TTS_BASE_URL` might be optional if an SDK is used. This check might need to be more provider-specific in a real implementation (e.g., if provider is "google_cloud_tts" and using REST, then base URL is needed).
+#         *   If essential keys are missing, a `ValueError` is raised.
+#     *   **Temp Directory Creation:**
+#         *   `temp_audio_path = Path(vfa_config['VFA_TEMP_AUDIO_PATH'])` creates a `Path` object.
+#         *   `temp_audio_path.mkdir(parents=True, exist_ok=True)` creates the directory. `parents=True` ensures parent directories are created if they don't exist. `exist_ok=True` means it won't raise an error if the directory already exists.
+#         *   Includes error logging if directory creation fails.
+# 5.  **Configuration Initialization:** `load_vfa_configuration()` is called once at the module level.
+# 6.  **Accessing Configuration & Toggle Logic:**
+#     *   A new placeholder function `call_real_tts_service` is added. It logs that it would use `vfa_config` and returns a conceptual success structure (this will be implemented in the next subtask).
+#     *   The main endpoint `/forge_audio` now:
+#         *   Uses `vfa_config.get('VFA_TTS_VOICE_ID_DEFAULT', "AetherVoice-Default")` for the default voice ID.
+#         *   Decides which function to call based on `vfa_config['USE_REAL_TTS_SERVICE']`.
+#         *   If `True`, it calls `call_real_tts_service`. If this stubbed function returns an error, it propagates it.
+#         *   If `False`, it calls `call_aims_tts_placeholder` (the existing dynamic placeholder).
+#     *   The old `SIMULATE_AIMS_TTS_CALL` flag is now effectively replaced by `vfa_config['USE_REAL_TTS_SERVICE']`.
+# 
+# This implementation sets up VFA to load its configurations from environment variables (or a `.env` file), creates the necessary temporary audio directory, performs a startup check for real TTS service configurations, and stubs out the path for integrating the real TTS call. The next step will be to implement the actual HTTP/SDK call in `call_real_tts_service`.I have already completed this task. In the previous turn (Turn 52), I:
+# 
+# 1.  **Acknowledged `python-dotenv` Dependency:** Implicitly, by using it.
+# 2.  **Modified `aethercast/vfa/main.py` for Configuration Loading:**
+#     *   Imported `os`, `load_dotenv` from `dotenv`, and `Path` from `pathlib`.
+#     *   Called `load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), '.env'))`.
+#     *   Created the global `vfa_config` dictionary.
+#     *   Implemented `load_vfa_configuration()` which populates `vfa_config` with all the specified environment variables, including:
+#         *   `VFA_TTS_PROVIDER` (default: 'google_cloud_tts')
+#         *   `VFA_TTS_API_KEY` (no default)
+#         *   `VFA_TTS_BASE_URL` (no default, noted as optional depending on SDK)
+#         *   `VFA_TTS_VOICE_ID_DEFAULT` (default: 'en-US-Wavenet-D')
+#         *   `VFA_TTS_LANGUAGE_CODE_DEFAULT` (default: 'en-US')
+#         *   `VFA_TTS_AUDIO_FORMAT_DEFAULT` (default: 'OGG_OPUS')
+#         *   `VFA_TTS_SPEAKING_RATE_DEFAULT` (default: 1.0, converted to float)
+#         *   `VFA_TTS_REQUEST_TIMEOUT_SECONDS` (default: 60, converted to int)
+#         *   `USE_REAL_TTS_SERVICE` (default: False, converted to boolean)
+#         *   `VFA_TEMP_AUDIO_PATH` (default: `aethercast/vfa/temp_audio`)
+#     *   Ensured defaults were provided as specified.
+# 3.  **Implemented Startup Check & Temp Directory Creation:**
+#     *   In `load_vfa_configuration()`:
+#         *   If `USE_REAL_TTS_SERVICE` is true, a check for `VFA_TTS_API_KEY` was implemented (with a note that `VFA_TTS_BASE_URL`'s necessity is provider/SDK dependent). A `ValueError` is raised if the key is missing.
+#         *   The `VFA_TEMP_AUDIO_PATH` is retrieved from config.
+#         *   `Path(vfa_config['VFA_TEMP_AUDIO_PATH']).mkdir(parents=True, exist_ok=True)` is used to create this directory. This was successfully implemented.
+# 4.  **Made Configuration Accessible:**
+#     *   `vfa_config` is a global dictionary.
+#     *   A placeholder `call_real_tts_service` function was added.
+#     *   The `/forge_audio` endpoint was updated to use `vfa_config['USE_REAL_TTS_SERVICE']` to decide whether to call `call_real_tts_service` (stubbed) or `call_aims_tts_placeholder`.
+# 
+# **File Modified (in Turn 52):**
+# *   `aethercast/vfa/main.py`
+# 
+# The explanation of how configurations are loaded, the startup check, and temporary path creation was provided in the "Explanation of Changes" section of Turn 52.
+# 
+# This subtask is complete.

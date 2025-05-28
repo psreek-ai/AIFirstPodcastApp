@@ -88,4 +88,3 @@ if __name__ == '__main__':
     # allow_unsafe_werkzeug=True is for development with Werkzeug dev server.
     # In production, use a proper WSGI server like Gunicorn with eventlet or gevent.
     socketio.run(app, host='0.0.0.0', port=5005, debug=True, allow_unsafe_werkzeug=True)
-```
