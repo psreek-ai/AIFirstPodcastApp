@@ -119,17 +119,39 @@ def orchestrate_podcast_generation(topic: str) -> dict:
 
     # 2. Call PodcastScriptWeaverAgent (PSWA)
     pswa_output = None
+    # Define known PSWA error prefixes/patterns
+    PSWA_ERROR_PREFIXES = [
+        "OpenAI library not available",
+        "Error: OPENAI_API_KEY environment variable",
+        "OpenAI API Error:",
+        "An unexpected error occurred during LLM call:",
+        "[ERROR] Insufficient content provided" # Error from the LLM itself via prompt instruction
+    ]
+
     try:
-        log_step(f"Calling PSWA: weave_script with content from WCHA and topic '{topic}'.")
         content_for_pswa = wcha_output if isinstance(wcha_output, str) else "Content unavailable due to previous WCHA issues."
+        log_step(f"Calling PSWA (LLM): weave_script for topic '{topic}'. Content length: {len(content_for_pswa)} chars.", 
+                 data={"topic": topic, "content_preview": content_for_pswa[:100] + "..."})
+        
         pswa_output = weave_script(content=content_for_pswa, topic=topic)
-        log_step("PSWA: weave_script returned.", data={"script_snippet": pswa_output[:200] + "..." if pswa_output else "N/A"}) # Log snippet
-        if not isinstance(pswa_output, str) or not pswa_output:
-            log_step("PSWA Warning: Generated script is empty or not a string.")
-            # Depending on requirements, this might be a failure point.
-            # For now, we'll let it proceed to VFA, which should handle empty scripts.
+        
+        pswa_output_stripped = pswa_output.strip() if pswa_output else ""
+        is_pswa_error = False
+        if not pswa_output_stripped:
+            is_pswa_error = True
+            log_step("PSWA (LLM) Warning: Returned empty script.", data=pswa_output)
+        else:
+            for prefix in PSWA_ERROR_PREFIXES:
+                if pswa_output_stripped.startswith(prefix):
+                    is_pswa_error = True
+                    log_step("PSWA (LLM) indicated an error or failed to generate a script.", data=pswa_output)
+                    break
+        
+        if not is_pswa_error:
+            log_step("PSWA (LLM) successfully generated script.", data={"script_snippet": pswa_output_stripped[:200] + "..."})
+
     except Exception as e:
-        log_step(f"PSWA: Error during weave_script: {str(e)}", data={"error_type": type(e).__name__})
+        log_step(f"PSWA: Critical error during weave_script (LLM call): {str(e)}", data={"error_type": type(e).__name__})
         status = "failed"
         return {
             "topic": topic, "status": status, "final_audio_details": None,
