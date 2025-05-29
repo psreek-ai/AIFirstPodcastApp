@@ -3,37 +3,44 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Aethercast Frontend</title>
+    <title>Aethercast - AI Powered Podcasts</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="container">
-        <h1>Aethercast Podcasts</h1>
+        <header>
+            <h1>Aethercast - Your Personal AI Podcast Generator</h1>
+        </header>
 
-        <div id="status-area">
-            <h2>Status</h2>
-            <p id="status-message">Loading...</p>
-        </div>
+        <main>
+            <section class="input-section">
+                <h2>Create Your Podcast</h2>
+                <label for="topic-input">Enter Topic:</label>
+                <input type="text" id="topic-input" name="topic" placeholder="e.g., The Future of AI">
+                <button id="generate-btn">Generate Podcast</button>
+            </section>
 
-        <div id="snippets-area">
-            <h2>Available Snippets (Topics)</h2>
-            <div id="snippets-list">
-                <!-- Snippets will be loaded here by JavaScript -->
-            </div>
-        </div>
+            <section class="output-section">
+                <h2>Podcast Output</h2>
+                <div id="status-messages">
+                    <p>Please enter a topic and click 'Generate Podcast' to begin.</p>
+                </div>
+                <div id="podcast-display" class="hidden">
+                    <h3 id="podcast-topic-title"></h3>
+                    <audio id="audio-player" controls src=""></audio>
+                    <div class="podcast-metadata-display">
+                        <h4>Generation Details:</h4>
+                        <pre id="generation-details-log"></pre> 
+                    </div>
+                </div>
+            </section>
+        </main>
 
-        <div id="player-area" class="hidden">
-            <h2>Podcast Player (Simulated Stream)</h2>
-            <h3 id="player-title"></h3>
-            <div id="player-stream-output">
-                <!-- Simulated audio stream messages will appear here -->
-            </div>
-            <button id="close-stream-button" class="hidden">Close Stream</button>
-        </div>
+        <footer>
+            <p>&copy; 2024 Aethercast AI. All rights reserved.</p>
+        </footer>
     </div>
 
-    <!-- Socket.IO client library -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
     <script src="app.js"></script>
 </body>
 </html>

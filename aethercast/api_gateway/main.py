@@ -1,8 +1,8 @@
 import sys
 import os
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file, send_from_directory # Added send_from_directory
 import uuid 
-import sqlite3 # Added
+import sqlite3
 from datetime import datetime # Added
 import json # Added
 
@@ -81,9 +81,30 @@ if not app.debug and not app.logger.handlers: # Check if handlers are already ad
     # For simplicity, if flask's app.logger is not yet fully configured, print will be used in init_db
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - API_GW - %(message)s')
 
+# --- Frontend Directory Path ---
+# Assuming this main.py is in aethercast/api_gateway/
+# FEND_DIR should point to aethercast/fend/
+FEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'fend'))
+
 
 # --- Remove Global Storage PODCAST_FILE_MAP ---
 # PODCAST_FILE_MAP = {} # This line is now removed.
+
+# --- Static Frontend File Serving ---
+@app.route('/')
+def serve_index():
+    app.logger.info(f"Serving index.html from: {FEND_DIR}")
+    return send_from_directory(FEND_DIR, 'index.html')
+
+@app.route('/style.css')
+def serve_style():
+    app.logger.info(f"Serving style.css from: {FEND_DIR}")
+    return send_from_directory(FEND_DIR, 'style.css')
+
+@app.route('/app.js')
+def serve_script():
+    app.logger.info(f"Serving app.js from: {FEND_DIR}")
+    return send_from_directory(FEND_DIR, 'app.js')
 
 # --- Health Check Endpoint ---
 @app.route('/health', methods=['GET'])
