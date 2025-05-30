@@ -1,8 +1,11 @@
+import logging
 import sys
 import os
-import json
-import logging
-from datetime import datetime
+import json # Ensure this is present
+import sqlite3 # Add this
+from datetime import datetime # Add this
+import uuid # Add this
+from typing import Optional, Dict, Any, List # Add this
 
 # Ensure the 'aethercast' directory (which is one level up from 'cpoa', 'wcha', etc.)
 # is in the Python path. This allows for imports like 'from aethercast.wcha.main import ...'
@@ -23,9 +26,49 @@ if repo_root_dir not in sys.path:
     sys.path.insert(0, repo_root_dir)
 
 # Now the imports should work assuming the simple agent files exist
-from aethercast.wcha.main import harvest_content, harvest_from_url # Updated import
-from aethercast.pswa.main import weave_script
-from aethercast.vfa.main import forge_voice
+try:
+    from aethercast.wcha.main import get_content_for_topic # Changed import
+    from aethercast.pswa.main import weave_script
+    from aethercast.vfa.main import forge_voice
+    # TODO: Later, consider importing actual error indicators from agent modules if they define them
+    # from aethercast.wcha.main import WCHA_ERROR_INDICATORS as WCHA_ERRORS_FROM_MODULE
+    CPOA_IMPORTS_SUCCESSFUL = True
+    CPOA_MISSING_IMPORT_ERROR = None
+except ImportError as e:
+    CPOA_IMPORTS_SUCCESSFUL = False
+    CPOA_MISSING_IMPORT_ERROR = f"CPOA critical import error: {e}. One or more agent modules (WCHA, PSWA, VFA) are missing or have issues."
+    # Define placeholder functions if imports fail, so CPOA can still be 'loaded' by API Gateway
+    def get_content_for_topic(topic: str, max_sources: int = 3) -> str:
+        return f"Error: WCHA module not loaded. Cannot get content for topic '{topic}'."
+    def weave_script(content: str, topic: str) -> str:
+        return "Error: PSWA module not loaded. Cannot weave script."
+    def forge_voice(script: str, output_filename_prefix: str = "podcast_audio") -> Dict[str, Any]:
+        return {"status": "error", "message": "Error: VFA module not loaded. Cannot forge voice.", "audio_filepath": None}
+
+# Global Error Indicator Constants (Fallbacks/Defaults)
+# These are used if not overridden by actual imports from agent modules
+WCHA_ERROR_INDICATORS = (
+    "Error: WCHA module not loaded", 
+    "WCHA Error: Necessary web scraping libraries not installed.", 
+    "Error during web search", 
+    "WCHA: No search results", 
+    "WCHA: Failed to harvest usable content",
+    "Error fetching URL", # From old harvest_from_url
+    "Failed to fetch URL", # From old harvest_from_url
+    "No paragraph text found", # From old harvest_from_url
+    "Content at URL", # From old harvest_from_url
+    "Cannot 'harvest_from_url'", # From old harvest_from_url
+    "No pre-defined content found" # From old harvest_content
+)
+PSWA_ERROR_PREFIXES = (
+    "Error: PSWA module not loaded", 
+    "OpenAI library not available", 
+    "Error: OPENAI_API_KEY", 
+    "OpenAI API Error:", 
+    "[ERROR] Insufficient content", 
+    "An unexpected error occurred during LLM call"
+)
+# VFA errors are typically handled by its dictionary output's 'status' and 'message' keys.
 
 # --- Logging Configuration ---
 # BasicConfig should be called only once. If other modules also call it,
@@ -36,219 +79,166 @@ logger = logging.getLogger(__name__)
 if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(message)s')
 
-
-# --- Topic to URL Mapping ---
-TOPIC_TO_URL_MAP = {
-    "ai in healthcare": "https://en.wikipedia.org/wiki/Artificial_intelligence_in_healthcare",
-    "space exploration": "https://en.wikipedia.org/wiki/Space_exploration",
-    # "climate change" is in WCHA's mock data, but we can choose to map it or not.
-    # Let's map it to test live fetching for it.
-    "climate change": "https://en.wikipedia.org/wiki/Climate_change",
-    # Example of a topic that will NOT be in this map, but IS in WCHA mock data:
-    # "quantum computing" (assuming it's added to WCHA SIMULATED_WEB_CONTENT for testing)
-}
+# TOPIC_TO_URL_MAP has been removed as WCHA's get_content_for_topic will use web search.
 
 def get_timestamp() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
-def orchestrate_podcast_generation(topic: str) -> dict:
+def _update_task_status_in_db(db_path: str, task_id: str, new_status: str, error_msg: Optional[str] = None) -> None:
+    """Updates the status, last_updated_timestamp, and error_message for a task in the database."""
+    logger.info(f"Task {task_id}: Attempting to update DB status to '{new_status}'. Error msg: '{error_msg if error_msg else 'None'}'")
+    timestamp = datetime.now().isoformat() # Use current time for DB update
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        # This assumes 'podcasts' table has 'podcast_id', 'status', 'last_updated_timestamp', 'error_message'
+        # The 'cpoa_details' and 'audio_filepath' are set by the API gateway thread after orchestration completes.
+        cursor.execute(
+            "UPDATE podcasts SET status = ?, last_updated_timestamp = ?, error_message = ? WHERE podcast_id = ?",
+            (new_status, timestamp, error_msg, task_id)
+        )
+        conn.commit()
+        logger.info(f"Task {task_id}: Successfully updated DB status to '{new_status}'.")
+    except sqlite3.Error as e:
+        logger.error(f"CPOA: Database error for task {task_id} updating to status {new_status}: {type(e).__name__} - {e}")
+    except Exception as e:
+        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id}: {type(e).__name__} - {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Dict[str, Any]:
     """
     Orchestrates the podcast generation by calling WCHA, PSWA, and VFA in sequence.
-    Uses live web harvesting if topic is mapped, otherwise uses mock data.
+    Uses web search via WCHA's get_content_for_topic.
+    Updates task status in a database.
     """
-    orchestration_log = []
-    status = "pending" # Initial status
+    orchestration_log: List[Dict[str, Any]] = []
+    # Initialize vfa_result_dict with a 'not_run' status. This will be updated if VFA is reached.
+    vfa_result_dict: Dict[str, Any] = {"status": "not_run", "message": "VFA not reached.", "audio_filepath": None}
+    current_orchestration_stage: str = "initialization"
+    # final_cpoa_status and final_error_message will be determined by the outcome of the steps.
+    # Initialize them here to ensure they are always defined before the finally block.
+    final_cpoa_status: str = "pending" 
+    final_error_message: Optional[str] = None
 
-    def log_step(message: str, data: any = None):
-        timestamped_message = f"[{get_timestamp()}] {message}"
-        logger.info(timestamped_message) # Use module-specific logger
-        log_entry = {"timestamp": get_timestamp(), "message": message}
+    def log_step(message: str, data: Optional[Dict[str, Any]] = None) -> None:
+        timestamp = datetime.now().isoformat()
+        log_entry: Dict[str, Any] = {"timestamp": timestamp, "message": message}
+        log_data_str = "N/A"
         if data is not None:
             try:
-                log_entry["data"] = json.dumps(data, indent=2) if isinstance(data, (dict, list)) else str(data)
+                log_data_str = json.dumps(data) 
             except TypeError: 
-                log_entry["data"] = str(data)
+                try:
+                    log_data_str = str(data)
+                except Exception:
+                    log_data_str = "Data could not be serialized or converted to string"
+        
+        preview_limit = 500  # To prevent excessively long log lines
+        log_entry["data_preview"] = log_data_str[:preview_limit] + "..." if len(log_data_str) > preview_limit else log_data_str
+        
         orchestration_log.append(log_entry)
+        # Also log to the main CPOA logger for real-time visibility if needed
+        logger.info(f"Task {task_id} @ {current_orchestration_stage}: {message} - Data Preview: {log_entry['data_preview']}")
 
-    log_step(f"Orchestration started for topic: '{topic}'.")
-    status = "in_progress"
-
-    # 1. Call WebContentHarvesterAgent (WCHA) with new logic
-    wcha_output = None
-    normalized_topic = topic.lower().strip() if topic else ""
+    # Check for import issues first
+    if not CPOA_IMPORTS_SUCCESSFUL:
+        critical_error_msg = str(CPOA_MISSING_IMPORT_ERROR) # Should be set if CPOA_IMPORTS_SUCCESSFUL is False
+        log_step(f"CPOA critical failure: Missing agent imports. {critical_error_msg}")
+        final_cpoa_status = "failed"
+        final_error_message = critical_error_msg
+        # The _update_task_status_in_db will be called in the 'finally' block
     
-    try:
-        if normalized_topic in TOPIC_TO_URL_MAP:
-            mapped_url = TOPIC_TO_URL_MAP[normalized_topic]
-            log_step(f"Topic '{normalized_topic}' found in URL map. Attempting live harvest from: {mapped_url}")
-            wcha_output = harvest_from_url(mapped_url)
-            log_step(f"WCHA: harvest_from_url for '{mapped_url}' returned.", data=wcha_output)
+    else: # Proceed with orchestration only if imports were successful
+        try:
+            log_step(f"Orchestration started for topic: '{topic}'")
+            current_orchestration_stage = "processing_wcha"
+            _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
 
-            # Content Validation & Fallback
-            # Check for common error indicators or empty content from harvest_from_url
-            is_error_or_empty = not wcha_output or \
-                                wcha_output.startswith("Error fetching URL") or \
-                                wcha_output.startswith("Failed to fetch URL") or \
-                                wcha_output.startswith("No paragraph text found") or \
-                                wcha_output.startswith("Content at URL") or \
-                                wcha_output.startswith("Cannot 'harvest_from_url'")
+            log_step("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
+            # Assuming get_content_for_topic is defined and imported
+            wcha_output = get_content_for_topic(topic=topic) 
+            log_step("WCHA finished.", data={"output_length": len(wcha_output)})
 
-            if is_error_or_empty:
-                log_step(f"WCHA: Live harvest from '{mapped_url}' failed or returned no meaningful content. Falling back to mock harvest for topic '{topic}'.", data={"reason": wcha_output})
-                wcha_output = harvest_content(topic=topic) # Fallback call
-                log_step(f"WCHA: Fallback harvest_content for '{topic}' returned.", data=wcha_output)
-            else:
-                log_step(f"WCHA: Successfully harvested content from URL '{mapped_url}'.")
-        else:
-            log_step(f"Topic '{normalized_topic}' not in URL map. Using mock harvest for topic '{topic}'.")
-            wcha_output = harvest_content(topic=topic)
-            log_step(f"WCHA: Mock harvest_content for '{topic}' returned.", data=wcha_output)
+            # Check WCHA_ERROR_INDICATORS (ensure this constant is defined in CPOA, possibly imported or hardcoded)
+            if not wcha_output or any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
+                final_error_message = str(wcha_output) if wcha_output else "WCHA returned no content or an error string."
+                log_step(f"WCHA indicated failure: {final_error_message}", data={"wcha_output": wcha_output})
+                final_cpoa_status = "failed" 
+                # Raise an exception to be caught by the main try-except block, which will update DB.
+                raise Exception(f"WCHA critical failure: {final_error_message}")
 
-        # Additional check for "No pre-defined content found" from mock harvest, if it was used
-        if isinstance(wcha_output, str) and wcha_output.startswith("No pre-defined content found"):
-            log_step(f"WCHA Warning: Final content is a 'not found' message. Content: '{wcha_output}'")
-            # PSWA will handle this by using its placeholder.
+            current_orchestration_stage = "processing_pswa"
+            _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
+            
+            log_step("Calling PSWA (weave_script with LLM)...", data={"content_length": len(wcha_output), "topic": topic})
+            # Assuming weave_script is defined and imported
+            pswa_output = weave_script(content=wcha_output, topic=topic)
+            log_step("PSWA finished.", data={"output_length": len(pswa_output)})
+            
+            # Check PSWA_ERROR_PREFIXES (ensure this constant is defined in CPOA)
+            if not pswa_output or any(str(pswa_output).startswith(prefix) for prefix in PSWA_ERROR_PREFIXES):
+                final_error_message = str(pswa_output) if pswa_output else "PSWA returned no script or an error string."
+                log_step(f"PSWA indicated failure: {final_error_message}", data={"pswa_output": pswa_output})
+                final_cpoa_status = "failed"
+                raise Exception(f"PSWA critical failure: {final_error_message}")
 
-    except Exception as e:
-        log_step(f"WCHA: Critical error during content harvesting: {str(e)}", data={"error_type": type(e).__name__})
-        status = "failed"
-        return {
-            "topic": topic, "status": status, "final_audio_details": None,
-            "orchestration_log": orchestration_log, "error_message": f"WCHA failed critically: {str(e)}"
-        }
+            current_orchestration_stage = "processing_vfa"
+            _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
+            
+            log_step("Calling VFA (forge_voice with TTS)...", data={"script_length": len(pswa_output)})
+            # Assuming forge_voice is defined and imported
+            vfa_result_dict = forge_voice(script=pswa_output)
+            log_step("VFA finished.", data=vfa_result_dict)
 
-    # 2. Call PodcastScriptWeaverAgent (PSWA)
-    pswa_output = None
-    # Define known PSWA error prefixes/patterns
-    PSWA_ERROR_PREFIXES = [
-        "OpenAI library not available",
-        "Error: OPENAI_API_KEY environment variable",
-        "OpenAI API Error:",
-        "An unexpected error occurred during LLM call:",
-        "[ERROR] Insufficient content provided" # Error from the LLM itself via prompt instruction
-    ]
+            vfa_status = vfa_result_dict.get("status")
+            if vfa_status == "success":
+                final_cpoa_status = "completed"
+                final_error_message = None # Clear any previous non-critical error
+            elif vfa_status == "skipped":
+                final_cpoa_status = "completed_with_warnings"
+                final_error_message = vfa_result_dict.get("message", "VFA skipped audio generation.")
+            elif vfa_status == "error": 
+                final_cpoa_status = "completed_with_errors" 
+                final_error_message = vfa_result_dict.get("message", "VFA reported an internal error.")
+            else: # Unknown status from VFA or VFA indicated a more critical failure
+                final_cpoa_status = "failed"
+                final_error_message = f"VFA returned an unknown or failure status: '{vfa_status}'. Details: {vfa_result_dict.get('message')}"
+                log_step(f"VFA failure: {final_error_message}", data=vfa_result_dict)
+                # For an unknown/critical VFA failure, we might also want to raise an exception if it means subsequent steps are impossible
+                # For now, setting status to "failed" and logging is the primary path.
 
-    try:
-        content_for_pswa = wcha_output if isinstance(wcha_output, str) else "Content unavailable due to previous WCHA issues."
-        log_step(f"Calling PSWA (LLM): weave_script for topic '{topic}'. Content length: {len(content_for_pswa)} chars.", 
-                 data={"topic": topic, "content_preview": content_for_pswa[:100] + "..."})
-        
-        pswa_output = weave_script(content=content_for_pswa, topic=topic)
-        
-        pswa_output_stripped = pswa_output.strip() if pswa_output else ""
-        is_pswa_error = False
-        if not pswa_output_stripped:
-            is_pswa_error = True
-            log_step("PSWA (LLM) Warning: Returned empty script.", data=pswa_output)
-        else:
-            for prefix in PSWA_ERROR_PREFIXES:
-                if pswa_output_stripped.startswith(prefix):
-                    is_pswa_error = True
-                    log_step("PSWA (LLM) indicated an error or failed to generate a script.", data=pswa_output)
-                    break
-        
-        if not is_pswa_error:
-            log_step("PSWA (LLM) successfully generated script.", data={"script_snippet": pswa_output_stripped[:200] + "..."})
-
-    except Exception as e:
-        log_step(f"PSWA: Critical error during weave_script (LLM call): {str(e)}", data={"error_type": type(e).__name__})
-        status = "failed"
-        return {
-            "topic": topic, "status": status, "final_audio_details": None,
-            "orchestration_log": orchestration_log, "error_message": f"PSWA failed: {str(e)}"
-        }
-
-    # 3. Call VoiceForgeAgent (VFA)
-    vfa_result_dict = None
-    # This variable will help distinguish between exceptions and VFA-reported issues
-    error_occurred_during_orchestration = False 
-    current_error_message = None
-
-    try:
-        # ... (WCHA and PSWA calls remain the same, they will set status="failed" and return if an exception occurs) ...
-        # If WCHA or PSWA failed by exception, status is already "failed".
-        # We only proceed to VFA if previous steps didn't set status to "failed".
-        if status == "failed": # If WCHA or PSWA hard failed by exception
-            # This return is already handled in their respective except blocks,
-            # but as a safeguard if logic changes.
-            # The final_result construction at the end will use the status and error_message.
-            pass # Let it fall through to the final result construction.
-
-        log_step("Calling VFA (Google Cloud TTS): forge_voice with script from PSWA.")
-        script_for_vfa = pswa_output if isinstance(pswa_output, str) else "Script unavailable due to previous PSWA issues."
-        vfa_result_dict = forge_voice(script=script_for_vfa)
-        
-        # Enhanced logging for VFA's output
-        vfa_status = vfa_result_dict.get('status', 'unknown')
-        vfa_message = vfa_result_dict.get('message', 'No message from VFA.')
-        
-        log_data_for_vfa_step = {
-            "vfa_status": vfa_status,
-            "vfa_message": vfa_message,
-            "engine_used": vfa_result_dict.get("engine_used"),
-            "script_char_count": vfa_result_dict.get("script_char_count")
-        }
-
-        if vfa_status == "success":
-            log_data_for_vfa_step["audio_filepath"] = vfa_result_dict.get("audio_filepath")
-            log_data_for_vfa_step["audio_format"] = vfa_result_dict.get("audio_format")
-            log_step("VFA (Google Cloud TTS) successfully generated audio.", data=log_data_for_vfa_step)
-            # status remains "in_progress" to be set to "completed" finally
-        elif vfa_status == "skipped":
-            log_step("VFA (Google Cloud TTS) skipped audio generation.", data=log_data_for_vfa_step)
-            status = "completed_with_warnings" # Overall CPOA status
-            current_error_message = vfa_message # VFA's reason for skipping becomes the primary message
-        elif vfa_status == "error":
-            log_step("VFA (Google Cloud TTS) encountered an error during synthesis.", data=log_data_for_vfa_step)
-            status = "completed_with_errors" # VFA completed its process but reported an internal error
-            current_error_message = vfa_message # VFA's error message
-        else: # Unexpected VFA status or malformed dict
-            log_step(f"VFA (Google Cloud TTS) returned an unexpected status or malformed response: {vfa_status}", data=vfa_result_dict)
-            status = "failed" # Treat unexpected VFA response as a CPOA failure
-            current_error_message = f"VFA returned unexpected status: {vfa_status}. Full response: {vfa_result_dict}"
-
-    except Exception as e:
-        log_step(f"VFA: Critical error during forge_voice (Google Cloud TTS call): {str(e)}", data={"error_type": type(e).__name__})
-        status = "failed" # CPOA status
-        current_error_message = f"VFA failed critically: {str(e)}"
-        error_occurred_during_orchestration = True # To ensure this overrides any VFA dict status later
-
-    # Refined final status determination
-    # This logic is now effectively integrated into the VFA try-except block's status setting.
-    # The 'status' variable holds the most current state.
-    # If an exception occurred in WCHA/PSWA, 'status' would already be 'failed'.
-    # If VFA call had an exception, 'status' is 'failed', 'error_occurred_during_orchestration' is True.
-    # If VFA returned 'error', 'status' is 'completed_with_errors'.
-    # If VFA returned 'skipped', 'status' is 'completed_with_warnings'.
-    # If VFA returned 'success' and no prior agent failed, 'status' is 'in_progress' here.
-
-    final_status_to_set = status
-    final_error_message = current_error_message
-
-    if error_occurred_during_orchestration: # An agent call raised an exception
-        final_status_to_set = "failed"
-        # final_error_message would have been set by the except block that set error_occurred_during_orchestration
-        # If it's from VFA's critical error, current_error_message already has it.
-        # If it's from WCHA/PSWA, their return statements would have exited early with "failed" status and message.
-        # This path is mainly for VFA critical failure.
-    elif final_status_to_set == "in_progress": # No exceptions, VFA was successful
-        final_status_to_set = "completed"
-        final_error_message = None # Clear any previous non-critical message if all good
+        except Exception as e:
+            # This block catches exceptions from agent calls that were not handled by prefix checks (if they raise),
+            # or exceptions raised by CPOA itself (like the WCHA/PSWA critical failures above).
+            logger.error(f"CPOA: Critical error during orchestration for task {task_id} (at stage '{current_orchestration_stage}'): {type(e).__name__} - {e}", exc_info=True)
+            if not final_error_message: # Preserve specific error if already set by a prefix check + raise
+                final_error_message = f"Critical orchestration error at {current_orchestration_stage} stage: {type(e).__name__} - {str(e)}"
+            log_step(f"Critical orchestration error: {final_error_message}")
+            final_cpoa_status = "failed" # Ensure status is 'failed'
+            
+            # Ensure vfa_result_dict reflects error if exception happened before or during VFA call
+            if current_orchestration_stage != "processing_vfa" or vfa_result_dict.get('status') == 'not_run':
+                 vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
     
-    log_step(f"Orchestration finished with status: '{final_status_to_set}' for topic: '{topic}'.")
-    
-    final_result = {
+    # This final DB update happens regardless of CPOA_IMPORTS_SUCCESSFUL outcome or try/except block.
+    # It ensures the DB reflects the final_cpoa_status determined by the logic above.
+    _update_task_status_in_db(db_path, task_id, final_cpoa_status, error_msg=final_error_message)
+    log_step(f"Orchestration ended with overall status: {final_cpoa_status}.")
+
+    # The CPOA result dictionary, which will be used by the API Gateway thread
+    # to do the *final* update to the cpoa_details column in the database.
+    cpoa_final_result = {
+        "task_id": task_id,
         "topic": topic,
-        "status": final_status_to_set,
-        "final_audio_details": vfa_result_dict, # This will be None if VFA was never called or errored before returning dict
+        "status": final_cpoa_status, 
+        "error_message": final_error_message,
+        "final_audio_details": vfa_result_dict, 
         "orchestration_log": orchestration_log
     }
-    if final_error_message:
-        final_result["error_message"] = final_error_message
-    elif final_status_to_set == "failed" and "error_message" not in final_result:
-        final_result["error_message"] = "An unspecified error occurred during orchestration."
-
-    return final_result
+    return cpoa_final_result
 
 def pretty_print_orchestration_result(result: dict):
         return {
