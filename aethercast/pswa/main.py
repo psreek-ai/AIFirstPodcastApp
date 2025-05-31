@@ -1,6 +1,66 @@
 import logging
 import os
+from dotenv import load_dotenv # Added
 from flask import Flask, request, jsonify
+
+# --- Load Environment Variables ---
+load_dotenv() # Added
+
+# --- PSWA Configuration ---
+pswa_config = {}
+
+def load_pswa_configuration():
+    """Loads PSWA configurations from environment variables with defaults."""
+    global pswa_config
+    pswa_config['OPENAI_API_KEY'] = os.getenv("OPENAI_API_KEY")
+    pswa_config['PSWA_LLM_MODEL'] = os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo")
+    pswa_config['PSWA_LLM_TEMPERATURE'] = float(os.getenv("PSWA_LLM_TEMPERATURE", "0.7"))
+    pswa_config['PSWA_LLM_MAX_TOKENS'] = int(os.getenv("PSWA_LLM_MAX_TOKENS", "1500"))
+
+    default_system_message = "You are a podcast scriptwriter tasked with creating well-structured podcast scripts."
+    pswa_config['PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE'] = os.getenv("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", default_system_message)
+
+    default_user_template = """You are an expert podcast scriptwriter. Your goal is to create an engaging and informative podcast script based on the provided topic and content.
+
+Topic: "{topic}"
+
+Provided Content:
+---
+{content}
+---
+
+Please structure your script as follows, using the exact formatting cues:
+[TITLE] Your Podcast Title Here
+[INTRO] A brief introduction to the topic and what the podcast will cover.
+[SEGMENT_1_TITLE] Title for the first main segment.
+[SEGMENT_1_CONTENT] Detailed content for the first segment, derived from the provided content.
+(You can add more segments like [SEGMENT_2_TITLE], [SEGMENT_2_CONTENT] if the content warrants it, typically 1-2 main segments are enough for a short podcast unless content is very rich.)
+[OUTRO] A concluding summary and call to action or final thought.
+
+Ensure the tone is informative yet engaging for a general audience.
+The script should be well-organized and flow naturally.
+Only output the script itself, with no additional commentary before or after.
+If the provided content is sparse or insufficient to generate a full script as described, please indicate this by starting the script with: "[ERROR] Insufficient content provided to generate a full podcast script for the topic: {topic}" and do not generate the rest of the script structure."""
+    pswa_config['PSWA_DEFAULT_PROMPT_USER_TEMPLATE'] = os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE", default_user_template)
+
+    pswa_config['PSWA_HOST'] = os.getenv("PSWA_HOST", "0.0.0.0")
+    pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
+    pswa_config['PSWA_DEBUG'] = os.getenv("PSWA_DEBUG", "True").lower() == "true"
+
+    logger.info("--- PSWA Configuration ---")
+    for key, value in pswa_config.items():
+        if "API_KEY" in key and value:
+            logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
+        elif key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
+            logger.info(f"  {key}: Loaded (length: {len(value)})") # Log length for long strings
+        else:
+            logger.info(f"  {key}: {value}")
+    logger.info("--- End PSWA Configuration ---")
+
+    if not pswa_config['OPENAI_API_KEY']:
+        logger.error("CRITICAL: OPENAI_API_KEY is not set. PSWA will not be able to function.")
+        # Optionally raise an error here if you want to prevent startup
+        # raise ValueError("OPENAI_API_KEY is required for PSWA to operate.")
 
 # --- Attempt to import OpenAI library ---
 try:
@@ -37,6 +97,8 @@ else:
     if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
 
+# Load configuration at startup
+load_pswa_configuration()
 
 def weave_script(content: str, topic: str) -> str:
     """
@@ -49,9 +111,9 @@ def weave_script(content: str, topic: str) -> str:
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
         return error_msg
 
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key: # Checks for None or empty string
-        error_msg = "Error: OPENAI_API_KEY environment variable is not set or empty."
+    api_key = pswa_config.get("OPENAI_API_KEY")
+    if not api_key:
+        error_msg = "Error: OPENAI_API_KEY is not configured." # Updated message
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
         return error_msg
     openai.api_key = api_key
@@ -59,49 +121,37 @@ def weave_script(content: str, topic: str) -> str:
     # Handle empty topic or content before constructing the prompt for LLM
     if not topic:
         logger.warning("[PSWA_LLM_LOGIC] Topic is empty or None. Using a generic topic for prompt.")
-        topic = "an interesting subject"
+        topic = "an interesting subject" # This will be used in the user prompt template
         
     if not content:
-        logger.warning(f"[PSWA_LLM_LOGIC] Content for topic '{topic}' is empty or None. Using placeholder content for prompt.")
-        # The prompt itself will instruct the LLM on how to handle insufficient content.
-        # We can pass a note in the content field or rely on the prompt's instruction.
-        content = "No specific content was provided. Please generate a general script based on the topic."
-        # Alternatively, we could directly return the insufficient content message as specified in prompt,
-        # but let's try having LLM do it for consistency.
+        logger.warning(f"[PSWA_LLM_LOGIC] Content for topic '{topic}' is empty or None. Relying on prompt to handle.")
+        content = "No specific content was provided. Please generate a general script based on the topic." # This will be used in the user prompt template
 
-    prompt = f'''You are an expert podcast scriptwriter. Your goal is to create an engaging and informative podcast script based on the provided topic and content.
+    # Construct the user prompt using the configured template
+    user_prompt_template = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE', "")
+    try:
+        user_prompt = user_prompt_template.format(topic=topic, content=content)
+    except KeyError as e:
+        logger.error(f"[PSWA_LLM_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt.")
+        # Fallback to a very basic prompt if template formatting fails
+        user_prompt = f"Topic: {topic}\nContent: {content}\n\nGenerate a podcast script."
 
-Topic: "{topic}"
 
-Provided Content:
----
-{content}
----
+    system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE', "You are a podcast scriptwriter.")
+    llm_model = pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo")
+    temperature = pswa_config.get('PSWA_LLM_TEMPERATURE', 0.7)
+    max_tokens = pswa_config.get('PSWA_LLM_MAX_TOKENS', 1500)
 
-Please structure your script as follows, using the exact formatting cues:
-[TITLE] Your Podcast Title Here
-[INTRO] A brief introduction to the topic and what the podcast will cover.
-[SEGMENT_1_TITLE] Title for the first main segment.
-[SEGMENT_1_CONTENT] Detailed content for the first segment, derived from the provided content.
-(You can add more segments like [SEGMENT_2_TITLE], [SEGMENT_2_CONTENT] if the content warrants it, typically 1-2 main segments are enough for a short podcast unless content is very rich.)
-[OUTRO] A concluding summary and call to action or final thought.
-
-Ensure the tone is informative yet engaging for a general audience.
-The script should be well-organized and flow naturally.
-Only output the script itself, with no additional commentary before or after.
-If the provided content is sparse or insufficient to generate a full script as described, please indicate this by starting the script with: "[ERROR] Insufficient content provided to generate a full podcast script for the topic: {topic}" and do not generate the rest of the script structure.
-'''
-
-    logger.info("[PSWA_LLM_LOGIC] Sending request to OpenAI API...")
+    logger.info(f"[PSWA_LLM_LOGIC] Sending request to OpenAI API. Model: {llm_model}, Temp: {temperature}, MaxTokens: {max_tokens}")
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-3.5-turbo",
+            model=llm_model,
             messages=[
-                {"role": "system", "content": "You are a podcast scriptwriter tasked with creating well-structured podcast scripts."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": system_message},
+                {"role": "user", "content": user_prompt}
             ],
-            temperature=0.7, 
-            max_tokens=1500 
+            temperature=temperature,
+            max_tokens=max_tokens
         )
         script_text = response.choices[0].message['content'].strip()
         logger.info("[PSWA_LLM_LOGIC] Successfully received script from OpenAI API.")
@@ -166,13 +216,20 @@ if __name__ == "__main__":
     # The original CLI test logic can be kept for direct script testing if needed,
     # but the primary execution mode will now be the Flask app.
 
-    # Start Flask app
-    # Consider environment variables for host, port, debug for more flexibility
-    host = os.getenv("PSWA_HOST", "0.0.0.0")
-    port = int(os.getenv("PSWA_PORT", 5004))
-    debug_mode = os.getenv("PSWA_DEBUG", "True").lower() == "true"
+    # Start Flask app using configured values
+    host = pswa_config.get("PSWA_HOST", "0.0.0.0")
+    port = pswa_config.get("PSWA_PORT", 5004)
+    debug_mode = pswa_config.get("PSWA_DEBUG", True)
 
     print(f"\n--- PSWA LLM Service starting on {host}:{port} (Debug: {debug_mode}) ---")
+    # Check if API key is present before trying to run, as it's critical
+    if not pswa_config.get("OPENAI_API_KEY"):
+        print("CRITICAL ERROR: OPENAI_API_KEY is not set. The application will not function correctly.")
+        print("Please set the OPENAI_API_KEY environment variable.")
+        # Depending on desired behavior, could exit here:
+        # import sys
+        # sys.exit(1)
+
     app.run(host=host, port=port, debug=debug_mode)
 
     # Original CLI test (can be commented out or removed if Flask is the sole interface)

@@ -128,25 +128,32 @@ def call_aims_llm_placeholder(prompt: str, topic_info: dict) -> dict:
         "llm_prompt_sent": prompt
     }
 
-# Placeholder for the function that will call the real LLM service
-# This will be implemented in the next subtask.
 def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
     """
-    Calls the configured real LLM service (e.g., OpenAI).
+    Calls the configured real LLM service.
+    Currently supports 'openai' provider.
     Assumes sca_config is populated and necessary keys are validated if USE_REAL_LLM_SERVICE is true.
     """
-    logging.info(f"[SCA_REAL_LLM_CALL] Preparing to call real LLM service: {sca_config['SCA_LLM_PROVIDER']}")
+    provider = sca_config.get('SCA_LLM_PROVIDER', 'openai')
+    logging.info(f"[SCA_REAL_LLM_CALL] Preparing to call real LLM service. Provider: {provider}")
 
-    api_key = sca_config['SCA_LLM_API_KEY']
-    base_url = sca_config['SCA_LLM_BASE_URL']
-    model_id = sca_config['SCA_LLM_MODEL_ID']
-    max_tokens = sca_config['SCA_LLM_MAX_TOKENS_SNIPPET']
-    temperature = sca_config['SCA_LLM_TEMPERATURE_SNIPPET']
-    timeout = sca_config['SCA_LLM_REQUEST_TIMEOUT_SECONDS']
+    if provider != 'openai':
+        logging.warning(f"LLM provider '{provider}' is not supported by this implementation. Only 'openai' is currently supported.")
+        return {"error": "UNSUPPORTED_LLM_PROVIDER", "details": f"Provider '{provider}' not supported."}
 
-    # --- Construct Endpoint URL (Example for OpenAI) ---
-    # For OpenAI, the chat completions endpoint is typically "/v1/chat/completions"
-    # Ensure base_url doesn't have a trailing slash if the endpoint part starts with one.
+    api_key = sca_config.get('SCA_LLM_API_KEY')
+    base_url = sca_config.get('SCA_LLM_BASE_URL')
+    model_id = sca_config.get('SCA_LLM_MODEL_ID')
+    max_tokens = sca_config.get('SCA_LLM_MAX_TOKENS_SNIPPET')
+    temperature = sca_config.get('SCA_LLM_TEMPERATURE_SNIPPET')
+    timeout = sca_config.get('SCA_LLM_REQUEST_TIMEOUT_SECONDS')
+
+    # Ensure critical OpenAI configs are present (should be caught at startup, but double check)
+    if not all([api_key, base_url, model_id]):
+        logging.error("[SCA_REAL_LLM_CALL] Critical OpenAI configurations (API Key, Base URL, Model ID) are missing.")
+        return {"error": "LLM_CONFIG_MISSING", "details": "OpenAI API Key, Base URL, or Model ID is not configured."}
+
+    # Construct Endpoint URL for OpenAI
     endpoint_part = "/chat/completions" 
     if base_url.endswith('/'):
         endpoint_url = base_url[:-1] + endpoint_part
@@ -155,19 +162,18 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
     
     logging.info(f"  Target Endpoint URL: {endpoint_url}")
 
-    # --- Request Headers ---
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
 
-    # --- Request Payload (Example for OpenAI Chat Completions) ---
-    # This structure can be adapted if sca_config['SCA_LLM_PROVIDER'] indicates a different service.
-    # For now, we'll assume OpenAI's structure.
+    # System prompt guides the LLM for easy parsing: Title on first line, content on subsequent.
+    system_content = "You are a helpful assistant that crafts concise and engaging podcast snippets, including a title and a short paragraph of content. The title should be on its own line first, followed by the snippet content on the next line(s)."
+
     payload = {
         "model": model_id,
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant that crafts concise and engaging podcast snippets, including a title and a short paragraph of content."},
+            {"role": "system", "content": system_content},
             {"role": "user", "content": prompt} 
         ],
         "max_tokens": max_tokens,
@@ -179,101 +185,98 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
     try:
         response = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout)
         logging.info(f"[SCA_REAL_LLM_CALL] Response Status Code: {response.status_code}")
-        logging.debug(f"[SCA_REAL_LLM_CALL] Raw Response Text: {response.text[:500]}...") # Log first 500 chars
 
-        if not response.ok:
-            # HTTP error (4xx or 5xx)
-            error_details = f"HTTP Error {response.status_code}: {response.reason}."
-            try:
-                agent_error_data = response.json()
-                error_details += f" LLM Service Msg: {agent_error_data}"
-            except json.JSONDecodeError:
-                error_details += f" Raw LLM Service Response: {response.text[:200]}" # First 200 chars
-            logging.error(f"[SCA_REAL_LLM_CALL] {error_details}")
-            return {"error": "LLM_HTTP_ERROR", "details": error_details, "status_code": response.status_code}
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
 
-        # --- 1. JSON Parsing ---
-        try:
-            llm_response_data = response.json()
-            logging.debug(f"  Parsed LLM JSON response: {json.dumps(llm_response_data, indent=2)}")
-        except json.JSONDecodeError as e:
-            logging.error(f"[SCA_REAL_LLM_CALL] JSONDecodeError: {e}. Raw response: {response.text[:500]}")
-            return {"error": "LLM_RESPONSE_JSON_DECODE_ERROR", "details": str(e), "status_code": 502} # Bad Gateway
+        llm_response_data = response.json()
+        logging.debug(f"  Parsed LLM JSON response: {json.dumps(llm_response_data, indent=2)}")
 
-        # --- 2. Extracting Content (OpenAI Example) ---
-        try:
-            # Assuming OpenAI's Chat Completions structure
-            # This path might need adjustment for other providers based on sca_config['SCA_LLM_PROVIDER']
-            if sca_config['SCA_LLM_PROVIDER'] == 'openai':
-                full_generated_text = llm_response_data['choices'][0]['message']['content'].strip()
-                model_used = llm_response_data.get('model', sca_config['SCA_LLM_MODEL_ID'])
-            else: # Basic fallback for other providers or unexpected structure
-                logging.warning(f"Provider {sca_config['SCA_LLM_PROVIDER']} not explicitly handled for content extraction. Attempting generic extraction or fallback.")
-                # A very generic attempt, assuming 'text' might be a key. This is unlikely to be robust.
-                full_generated_text = llm_response_data.get('text', 
-                                    llm_response_data.get('generated_text', 
-                                    str(llm_response_data.get('choices', [{}])[0].get('message', {}).get('content', '')))).strip()
-                model_used = llm_response_data.get('model', sca_config['SCA_LLM_MODEL_ID'])
-                if not full_generated_text:
-                     logging.error("[SCA_REAL_LLM_CALL] Could not extract text from LLM response using common patterns.")
-                     return {"error": "LLM_RESPONSE_TEXT_EXTRACTION_FAILED", "details": "Could not find generated text in LLM response.", "raw_response": llm_response_data}
-            
-            logging.info(f"[SCA_REAL_LLM_CALL] Extracted full text (length {len(full_generated_text)}): '{full_generated_text[:100]}...'")
+        full_generated_text = llm_response_data['choices'][0]['message']['content'].strip()
+        model_used = llm_response_data.get('model', model_id)
 
-        except (KeyError, IndexError, TypeError) as e:
-            logging.error(f"[SCA_REAL_LLM_CALL] Error extracting content from LLM JSON: {e}. Response: {llm_response_data}")
-            return {"error": "LLM_RESPONSE_STRUCTURE_ERROR", "details": f"Could not navigate LLM response JSON: {e}", "raw_response": llm_response_data}
+        logging.info(f"[SCA_REAL_LLM_CALL] Extracted full text (length {len(full_generated_text)}) from model '{model_used}': '{full_generated_text[:100]}...'")
 
-        # --- 3. Separating Title and Snippet (Strategy A: Newline Separation) ---
+        # Parse Title and Content
         snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}" # Default
-        snippet_text_content = full_generated_text
+        snippet_text_content = full_generated_text # Default
 
-        newline_index = full_generated_text.find('\n')
-        if newline_index != -1:
-            potential_title = full_generated_text[:newline_index].strip()
-            # Basic validation for title (e.g., not too long, not just whitespace)
-            if 0 < len(potential_title) < 150: # Max 150 chars for a title
+        if '\n' in full_generated_text:
+            parts = full_generated_text.split('\n', 1)
+            potential_title = parts[0].strip()
+            if 0 < len(potential_title) < 200: # Max 200 chars for a title, and not empty
                 snippet_title = potential_title
-                snippet_text_content = full_generated_text[newline_index+1:].strip()
+                snippet_text_content = parts[1].strip() if len(parts) > 1 else ""
+                if not snippet_text_content: # If content became empty after title extraction
+                    logging.warning("Snippet content is empty after title extraction based on newline. Using full text as content and default title.")
+                    snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}" # Reset title
+                    snippet_text_content = full_generated_text # Keep full text for content
             else:
-                logging.warning(f"Newline found, but first line either empty or too long for a title ('{potential_title[:50]}...'). Using full text as content.")
+                logging.warning(f"Newline found, but first line ('{potential_title[:50]}...') invalid as title. Using full text as content.")
         else:
-            logging.warning("No newline found in LLM output to separate title and content. Using full text as content and generating default title.")
+            logging.warning("No newline found in LLM output to separate title. Using full text as content and default title.")
 
-        if not snippet_text_content: # If content became empty after title extraction
-            logging.warning("Snippet content is empty after title extraction. Using full text as content and default title.")
-            snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
+        # Final check if title and content are accidentally the same (e.g. LLM returned only one line)
+        if snippet_title == snippet_text_content and snippet_text_content == full_generated_text:
+             snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}" # Reset title to default
+
+        if not snippet_text_content: # Ensure content is not empty if title took everything
             snippet_text_content = full_generated_text
+            if snippet_title == full_generated_text: # If title is still the full text, make a generic title
+                 snippet_title = f"AI-Generated Snippet on {topic_info.get('title_suggestion', 'Topic')}"
 
 
-        # --- 4. & 5. Populating and Returning SnippetDataObject ---
-        # Note: snippet_id, topic_id, generation_timestamp, audio_url are populated in the main endpoint
-        # This function focuses on returning the LLM-derived parts.
         return {
             "status": "success",
             "title": snippet_title,
             "text_content": snippet_text_content,
-            "summary": snippet_text_content, # For now, summary is same as text_content
+            "summary": snippet_text_content,
             "llm_model_used": model_used,
-            "llm_prompt_sent": prompt, # For debugging, include the sent prompt
-            "llm_raw_output": full_generated_text # Full raw output from LLM for debugging
+            "llm_prompt_sent": prompt,
+            "llm_raw_output": full_generated_text
         }
 
+    except requests.exceptions.HTTPError as e_http:
+        error_details = f"HTTP Error {e_http.response.status_code}: {e_http.response.reason}."
+        try:
+            error_payload = e_http.response.json()
+            error_details += f" LLM Service Msg: {error_payload}"
+        except json.JSONDecodeError:
+            error_details += f" Raw LLM Service Response: {e_http.response.text[:200]}"
+        logging.error(f"[SCA_REAL_LLM_CALL] {error_details}", exc_info=True)
+        return {"error": "LLM_HTTP_ERROR", "details": error_details, "status_code": e_http.response.status_code}
+
     except requests.exceptions.Timeout:
-        logging.error(f"[SCA_REAL_LLM_CALL] Timeout error after {timeout}s for URL: {endpoint_url}")
+        logging.error(f"[SCA_REAL_LLM_CALL] Timeout error after {timeout}s for URL: {endpoint_url}", exc_info=True)
         return {"error": "LLM_REQUEST_TIMEOUT", "details": "Request to LLM service timed out", "status_code": 408}
-    except requests.exceptions.RequestException as e:
-        logging.error(f"[SCA_REAL_LLM_CALL] Request exception: {e}")
-        return {"error": "LLM_REQUEST_EXCEPTION", "details": str(e), "status_code": 500}
+
+    except requests.exceptions.RequestException as e_req:
+        logging.error(f"[SCA_REAL_LLM_CALL] Request exception: {e_req}", exc_info=True)
+        return {"error": "LLM_REQUEST_EXCEPTION", "details": str(e_req), "status_code": 500} # Generic 500 for other request issues
+
+    except json.JSONDecodeError as e_json:
+        logging.error(f"[SCA_REAL_LLM_CALL] JSONDecodeError parsing LLM response: {e_json}. Raw response: {response.text[:500] if 'response' in locals() else 'N/A'}", exc_info=True)
+        return {"error": "LLM_RESPONSE_JSON_DECODE_ERROR", "details": str(e_json), "status_code": 502} # Bad Gateway
+
+    except (KeyError, IndexError, TypeError) as e_extract:
+        logging.error(f"[SCA_REAL_LLM_CALL] Error extracting content from LLM JSON: {e_extract}. Response: {llm_response_data if 'llm_response_data' in locals() else 'N/A'}", exc_info=True)
+        return {"error": "LLM_RESPONSE_STRUCTURE_ERROR", "details": f"Could not navigate LLM response JSON: {e_extract}"}
+
+    except Exception as e_unexpected: # Catch-all for any other unexpected error
+        logging.error(f"[SCA_REAL_LLM_CALL] Unexpected error: {e_unexpected}", exc_info=True)
+        return {"error": "LLM_UNEXPECTED_ERROR", "details": str(e_unexpected)}
 
 
 def parse_llm_response_for_snippet(llm_response_text: str) -> tuple[str, str]:
     """
     Parses the text from the LLM response to extract a title and content.
-    This is a very basic parser for the known hardcoded response format.
-    A real LLM might return structured JSON or require more sophisticated parsing.
+    This function was primarily for the placeholder's specific format.
+    For the real LLM call, parsing is now handled directly in `call_real_llm_service`
+    based on newline separation as guided by the system prompt.
+    This function can be kept for reference or removed if no longer used by the placeholder path.
     """
+    logging.debug(f"[SCA_DEPRECATED_PARSER] parse_llm_response_for_snippet called with text: '{llm_response_text[:100]}...'")
     try:
+        # This parsing logic is specific to the old placeholder format.
         title_part_key = "generic title: '"
         content_part_key = "generic content: '"
 
@@ -283,27 +286,24 @@ def parse_llm_response_for_snippet(llm_response_text: str) -> tuple[str, str]:
         if title_start_index != -1 and content_start_index != -1:
             title_start = title_start_index + len(title_part_key)
             title_end = llm_response_text.find("'", title_start)
-            extracted_title = llm_response_text[title_start:title_end] if title_end != -1 else "Default Snippet Title"
+            extracted_title = llm_response_text[title_start:title_end] if title_end != -1 else "Default Snippet Title (from old parser)"
 
             content_start = content_start_index + len(content_part_key)
-            search_after_content_key = llm_response_text[content_start:]
-            period_quote_end = search_after_content_key.rfind(".'")
-            if period_quote_end != -1 : 
-                 content_end = content_start + period_quote_end
-            else: 
-                closing_quote_end = search_after_content_key.rfind("'")
-                if closing_quote_end != -1:
-                    content_end = content_start + closing_quote_end
-                else: 
-                    content_end = len(llm_response_text)
-            extracted_content = llm_response_text[content_start:content_end]
+            # Simplified content extraction for the old format
+            content_end = llm_response_text.rfind("'") # Find the last quote
+            if content_end > content_start : #Ensure quote is after content_start
+                 extracted_content = llm_response_text[content_start:content_end]
+            else: # Fallback if quote parsing is difficult
+                 extracted_content = llm_response_text[content_start:]
+
+
             return extracted_title, extracted_content
         else:
-            logging.warning(f"Could not parse title/content from LLM response: '{llm_response_text[:100]}...' Using defaults.")
-            return "Default Snippet Title", llm_response_text 
+            logging.warning(f"Could not parse title/content using old placeholder logic: '{llm_response_text[:100]}...' Using defaults.")
+            return "Default Snippet Title (from old parser)", llm_response_text
     except Exception as e:
-        logging.error(f"Error parsing LLM response: {e}. Text: '{llm_response_text[:100]}...'")
-        return "Error Parsing Title", "Error parsing content from LLM."
+        logging.error(f"Error parsing LLM response with old placeholder logic: {e}. Text: '{llm_response_text[:100]}...'")
+        return "Error Parsing Title (old parser)", "Error parsing content from LLM (old parser)."
 
 
 # --- API Endpoint ---

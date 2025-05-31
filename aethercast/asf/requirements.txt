@@ -1,0 +1,4 @@
+Flask>=2.0.0
+Flask-SocketIO>=5.0.0
+python-dotenv>=0.20.0
+eventlet>=0.30.0

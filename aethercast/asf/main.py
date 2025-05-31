@@ -4,20 +4,58 @@ from flask_socketio import SocketIO, emit, join_room, leave_room
 import logging
 import time
 import os # Added for os.path.exists
+from dotenv import load_dotenv # Added
+import uuid # Added for default secret key
 
-app = flask.Flask(__name__)
-app.config['SECRET_KEY'] = 'aethercast_secret_asf!' # Secret key for session management
-socketio = SocketIO(app, cors_allowed_origins="*") # Allow all origins for simplicity in dev
+# --- Load Environment Variables ---
+load_dotenv() # Added
 
-# --- Logging Configuration ---
+# --- ASF Configuration ---
+asf_config = {}
+
+def load_asf_configuration():
+    """Loads ASF configurations from environment variables with defaults."""
+    global asf_config
+    default_secret = str(uuid.uuid4())
+    asf_config['ASF_SECRET_KEY'] = os.getenv('ASF_SECRET_KEY', default_secret)
+    if asf_config['ASF_SECRET_KEY'] == default_secret:
+        logger.warning(f"Using default generated ASF_SECRET_KEY: {default_secret}. Please set a persistent secret key in your environment for production.")
+
+    asf_config['ASF_CORS_ALLOWED_ORIGINS'] = os.getenv('ASF_CORS_ALLOWED_ORIGINS', '*')
+    asf_config['ASF_CHUNK_SIZE'] = int(os.getenv('ASF_CHUNK_SIZE', '4096'))
+    asf_config['ASF_STREAM_SLEEP_INTERVAL'] = float(os.getenv('ASF_STREAM_SLEEP_INTERVAL', '0.01'))
+
+    asf_config['ASF_HOST'] = os.getenv("ASF_HOST", '0.0.0.0')
+    asf_config['ASF_PORT'] = int(os.getenv("ASF_PORT", 5006))
+    asf_config['ASF_DEBUG_MODE'] = os.getenv("ASF_DEBUG", "True").lower() == "true"
+
+    logger.info("--- ASF Configuration ---")
+    for key, value in asf_config.items():
+        if "SECRET_KEY" in key and value: # Mask secret key
+            logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
+        else:
+            logger.info(f"  {key}: {value}")
+    logger.info("--- End ASF Configuration ---")
+
+# --- Logging Configuration (must be set up before load_asf_configuration uses logger) ---
 # Use app.logger if available and not the root logger to integrate with Flask's logging
-if app.logger and app.logger.name != 'root':
-    logger = app.logger
-    logger.setLevel(logging.INFO) # Ensure Flask's logger level is set if using it
+# This initial app object is temporary, just to get the logger context.
+# It will be replaced by the fully configured one.
+_temp_app_for_logger = flask.Flask(__name__)
+if _temp_app_for_logger.logger and _temp_app_for_logger.logger.name != 'root':
+    logger = _temp_app_for_logger.logger
+    logger.setLevel(logging.INFO)
 else:
-    # Fallback to basicConfig if not using Flask's logger or it's the root logger
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - ASF - %(message)s')
     logger = logging.getLogger(__name__)
+
+# Load configuration at startup
+load_asf_configuration()
+
+# --- Flask App and SocketIO Setup ---
+app = flask.Flask(__name__)
+app.config['SECRET_KEY'] = asf_config['ASF_SECRET_KEY']
+socketio = SocketIO(app, cors_allowed_origins=asf_config['ASF_CORS_ALLOWED_ORIGINS'])
 
 
 # --- Global Data Structures ---
@@ -71,11 +109,13 @@ def handle_join_stream(data):
     emit('stream_status', {'status': 'joined', 'stream_id': stream_id, 'message': f'Successfully joined stream {stream_id}. Preparing to stream audio.'}, room=stream_id)
     logger.info(f"ASF: Starting audio stream for {stream_id} from {filepath}")
 
+    chunk_size = asf_config.get('ASF_CHUNK_SIZE', 4096)
+    stream_sleep_interval = asf_config.get('ASF_STREAM_SLEEP_INTERVAL', 0.01)
+
     try:
         emit('audio_control', {'event': 'start_of_stream', 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
         logger.info(f"ASF: Sent start_of_stream for stream_id: {stream_id}")
 
-        chunk_size = 4096  # 4KB chunks
         with open(filepath, 'rb') as audio_file:
             sequence_number = 0
             while True:
@@ -89,8 +129,7 @@ def handle_join_stream(data):
                 socketio.emit('audio_chunk', audio_chunk, namespace='/api/v1/podcasts/stream', room=stream_id)
                 logger.debug(f"ASF: Sent audio chunk {sequence_number} for stream {stream_id} (size: {len(audio_chunk)} bytes)")
                 sequence_number += 1
-                socketio.sleep(0.01) # Small sleep to yield control, adjust as needed for flow control.
-                                     # Actual pacing depends on client consumption and network.
+                socketio.sleep(stream_sleep_interval) # Use configured sleep interval
 
         emit('audio_control', {'event': 'end_of_stream', 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
         logger.info(f"ASF: Sent end_of_stream for stream_id: {stream_id} from file {filepath}")
@@ -150,12 +189,14 @@ def notify_new_audio():
 
 
 if __name__ == '__main__':
-    asf_port = int(os.getenv("ASF_PORT", 5006)) # Default to 5006, allow override
-    asf_host = os.getenv("ASF_HOST", '0.0.0.0')
-    asf_debug_mode = os.getenv("ASF_DEBUG", "True").lower() == "true"
+    asf_host = asf_config.get('ASF_HOST')
+    asf_port = asf_config.get('ASF_PORT')
+    asf_debug_mode = asf_config.get('ASF_DEBUG_MODE')
 
     logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {asf_host}:{asf_port} (Debug: {asf_debug_mode})...")
     # The host '0.0.0.0' makes it accessible externally if needed.
     # allow_unsafe_werkzeug=True is for development with Werkzeug dev server.
     # In production, use a proper WSGI server like Gunicorn with eventlet or gevent.
-    socketio.run(app, host=asf_host, port=asf_port, debug=asf_debug_mode, allow_unsafe_werkzeug=True)
+    # For eventlet, you would typically run: `eventlet_wsgi.server(eventlet.listen((asf_host, asf_port)), app)`
+    # but socketio.run handles this for development.
+    socketio.run(app, host=asf_host, port=asf_port, debug=asf_debug_mode, allow_unsafe_werkzeug=True if asf_debug_mode else False)

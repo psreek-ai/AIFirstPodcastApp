@@ -19,10 +19,22 @@ tda_config = {
     "TDA_NEWS_DEFAULT_KEYWORDS": os.getenv("TDA_NEWS_DEFAULT_KEYWORDS", "AI,technology,science").split(','),
     "TDA_NEWS_DEFAULT_LANGUAGE": os.getenv("TDA_NEWS_DEFAULT_LANGUAGE", "en"),
     "USE_REAL_NEWS_API": os.getenv("USE_REAL_NEWS_API", "False").lower() == "true",
+    "TDA_NEWS_PAGE_SIZE": int(os.getenv("TDA_NEWS_PAGE_SIZE", "25")), # Added
+    "TDA_NEWS_REQUEST_TIMEOUT": int(os.getenv("TDA_NEWS_REQUEST_TIMEOUT", "15")), # Added
+    "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"), # Added
 }
 
 # --- Configuration & Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Log loaded configuration
+logging.info("--- TDA Configuration ---")
+for key, value in tda_config.items():
+    if "API_KEY" in key and value:
+        logging.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
+    else:
+        logging.info(f"  {key}: {value}")
+logging.info("--- End TDA Configuration ---")
 
 # Startup Check for API Key
 if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
@@ -30,11 +42,14 @@ if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
     # Optionally, raise an error to prevent startup without API key:
     # raise ValueError("TDA_NEWS_API_KEY is required when USE_REAL_NEWS_API is True")
 else:
-    logging.info(f"TDA Configuration: USE_REAL_NEWS_API is set to {tda_config['USE_REAL_NEWS_API']}")
-    if tda_config["USE_REAL_NEWS_API"]:
-        logging.info("TDA will attempt to use the real NewsAPI.org.")
+    # This specific logging about API usage is fine here, complements the general config log.
+    if tda_config["USE_REAL_NEWS_API"] and tda_config["TDA_NEWS_API_KEY"]:
+        logging.info("TDA is configured to use the REAL News API.")
+    elif tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
+        # This case is already covered by the critical error log above, but good for clarity if not raising error.
+        logging.warning("TDA is configured to use REAL News API but KEY IS MISSING.")
     else:
-        logging.info("TDA will use simulated data sources.")
+        logging.info("TDA is configured to use SIMULATED data sources.")
 
 app = flask.Flask(__name__)
 
@@ -57,33 +72,39 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
 
     params = {}
     # query_keywords will be used for both API call and TopicObject keywords
-    query_keywords = keywords if keywords else tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]
-    if query_keywords:
-        # Ensure query_keywords is a list of strings for consistent use later
-        if isinstance(query_keywords, str):
-            query_keywords = [kw.strip() for kw in query_keywords.split(',')]
-        params["q"] = ",".join(query_keywords)
-
+    query_keywords_list = keywords if keywords else tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]
+    if query_keywords_list:
+        # Ensure query_keywords_list is a list of strings
+        if isinstance(query_keywords_list, str): # Should not happen if default is already a list
+            query_keywords_list = [kw.strip() for kw in query_keywords_list.split(',')]
+        # For NewsAPI 'q' parameter, join with " OR " for multiple keywords for broader search,
+        # or " AND " for more specific. Using " OR " for discovery.
+        params["q"] = " OR ".join(query_keywords_list)
 
     if endpoint == "top-headlines": # Specific params for 'top-headlines'
         if categories: # NewsAPI expects a single category for 'top-headlines'
             params["category"] = categories[0] if isinstance(categories, list) else categories
-        if country:
+        if country: # Add country if provided and using top-headlines
             params["country"] = country
+        # 'q' is also usable with top-headlines, but country/category are more common.
     
     current_language = language if language else tda_config["TDA_NEWS_DEFAULT_LANGUAGE"]
     if current_language:
         params["language"] = current_language
     
+    params["pageSize"] = tda_config.get("TDA_NEWS_PAGE_SIZE", 25)
+
     headers = {
-        "X-Api-Key": tda_config["TDA_NEWS_API_KEY"]
+        "X-Api-Key": tda_config["TDA_NEWS_API_KEY"],
+        "User-Agent": tda_config.get("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1")
     }
 
-    logging.info(f"Calling NewsAPI: URL={api_url}, Params={params}")
+    request_timeout = tda_config.get("TDA_NEWS_REQUEST_TIMEOUT", 15)
+    logging.info(f"Calling NewsAPI: URL={api_url}, Params={params}, Timeout={request_timeout}s")
     topic_objects = []
 
     try:
-        response = requests.get(api_url, headers=headers, params=params, timeout=10)
+        response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
         response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
         
         response_json = response.json()
@@ -95,29 +116,46 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
         articles = response_json.get("articles", [])
         
         for article in articles:
-            title = article.get('title', 'No title provided')
-            description = article.get('description', 'No summary available')
+            title = article.get('title')
+            if not title or title == "[Removed]": # Skip articles with no title or removed content
+                continue
+
+            description = article.get('description')
+            content = article.get('content') # NewsAPI often truncates content, description might be better
+            summary_text = description if description else content if content else "No summary available."
+            # Remove incomplete sentence artifacts like "[+1234 chars]"
+            if summary_text.endswith(" chars]") and summary_text[-10:].startswith("[+"):
+                summary_text = summary_text[:summary_text.rfind("[+")].strip()
+            if not summary_text: # If still empty
+                summary_text = "Content details not available."
+
+
             article_url = article.get('url')
             source_name = article.get('source', {}).get('name', 'Unknown Source')
             published_at = article.get('publishedAt')
 
+            # Use the original list of keywords that formed the query for this TopicObject
+            # This ensures the keywords reflect the search intent.
+            topic_keywords = query_keywords_list
+
             topic_object = {
                 "topic_id": generate_topic_id(),
-                "source_feed_name": "news_api",
+                "source_feed_name": "news_api_org", # More specific
                 "title_suggestion": title,
-                "summary": description if description else "No summary available.",
-                "keywords": query_keywords, # Use the same keywords used for the search
+                "summary": summary_text,
+                "keywords": topic_keywords,
                 "potential_sources": [{
                     "url": article_url,
-                    "title": title,
-                    "source_name": source_name
+                    "title": title, # Source title is the article title itself
+                    "source_name": source_name # e.g., "CNN", "BBC News"
                 }],
-                "relevance_score": 0.8, # Default relevance for API-sourced topics
+                "relevance_score": round(random.uniform(0.6, 0.9), 2), # More varied default relevance
                 "publication_date": published_at,
-                "category_suggestion": "News" # Default category
+                "category_suggestion": "News" # Default, can be enhanced later
             }
             topic_objects.append(topic_object)
         
+        logging.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI.")
         return topic_objects
 
     except requests.exceptions.JSONDecodeError as json_err:

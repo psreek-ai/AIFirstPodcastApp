@@ -1,5 +1,6 @@
 import sys
 import os
+from dotenv import load_dotenv # Added
 from flask import Flask, jsonify, request, send_file, send_from_directory # Added send_from_directory
 import uuid 
 import sqlite3
@@ -19,13 +20,14 @@ project_root = os.path.dirname(parent_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+load_dotenv() # Added
+
 # --- Service URLs ---
-TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5001/discover_topics") # Note: Port 5001 is default for API GW. TDA should be on a different port. Correcting to typical TDA port.
 TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics") # Assuming TDA is on 5000 as per typical setup.
 
 
 # --- Database Configuration ---
-DATABASE_FILE = 'aethercast_podcasts.db' # Will be created in the same dir as this script (api_gateway)
+DATABASE_FILE = os.getenv("DATABASE_FILE", "aethercast_podcasts.db") # Will be created in the same dir as this script (api_gateway)
                                          # For production, choose a more persistent location.
 
 DB_SCHEMA_SQL = """
@@ -109,6 +111,15 @@ if not app.debug and not app.logger.handlers: # Check if handlers are already ad
     # Ensure logging is configured before init_db might try to use app.logger
     # For simplicity, if flask's app.logger is not yet fully configured, print will be used in init_db
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - API_GW - %(message)s')
+
+# Log loaded configuration after app is initialized, so app.logger is available
+with app.app_context():
+    app.logger.info("--- API Gateway Configuration ---")
+    app.logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}")
+    app.logger.info(f"DATABASE_FILE: {DATABASE_FILE}")
+    # FEND_DIR is derived, but we can log its final value
+    app.logger.info(f"FEND_DIR: {FEND_DIR}")
+    app.logger.info("--- End API Gateway Configuration ---")
 
 # --- Frontend Directory Path ---
 # Assuming this main.py is in aethercast/api_gateway/
