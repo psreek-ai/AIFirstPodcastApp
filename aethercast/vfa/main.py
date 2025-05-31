@@ -107,15 +107,77 @@ def get_current_audio_encoding():
     return selected_encoding
 
 
-def forge_voice(script: str) -> dict:
+def forge_voice(script_input: dict) -> dict: # Changed input from script: str to script_input: dict
     """
-    Generates audio from a script using Google Cloud Text-to-Speech
+    Generates audio from a structured script dictionary using Google Cloud Text-to-Speech
     and saves it to a shared directory.
     Returns a dictionary with audio generation details, including a stream_id, or error information.
     """
-    script_char_count = len(script)
     stream_id = f"strm_{uuid.uuid4().hex}" # Generate stream_id early
-    logger.info(f"[VFA_TTS_LOGIC] forge_voice called for stream_id: {stream_id}. Script char count: {script_char_count}")
+    text_to_synthesize = ""
+    original_topic = "Unknown Topic" # Default if not found in script_input
+
+    if not isinstance(script_input, dict):
+        logger.warning(f"[VFA_TTS_LOGIC] Stream {stream_id}: Received script_input is not a dictionary. Attempting to process as raw string. Input type: {type(script_input)}")
+        # This path handles backward compatibility or direct string tests, but logs a warning.
+        text_to_synthesize = str(script_input) # Convert to string just in case
+        # We don't have segment info here, so script_char_count will be based on the raw string.
+    else:
+        original_topic = script_input.get("topic", original_topic)
+        # Check for PSWA error messages first using full_raw_script
+        full_raw_script = script_input.get("full_raw_script", "")
+        if any(full_raw_script.startswith(prefix) for prefix in PSWA_ERROR_PREFIXES):
+            message = f"Script for topic '{original_topic}' appears to be an error message from PSWA, audio generation skipped."
+            logger.warning(f"[VFA_TTS_LOGIC] Stream {stream_id}: {message} Raw Script: '{full_raw_script[:100]}...'")
+            return {
+                "status": "skipped", "message": message, "audio_filepath": None, "stream_id": stream_id,
+                "script_char_count": len(full_raw_script), "engine_used": "google_cloud_tts"
+            }
+
+        segments = script_input.get("segments", [])
+        if segments:
+            # Concatenate content from all segments, ensuring title and content are joined.
+            # Segments from PSWA should have 'segment_title' (which is the actual title string)
+            # and 'content'.
+            # We only want to synthesize the actual content parts.
+            # The prompt for PSWA was: "[TITLE]Title\n[INTRO]Intro content\n[SEGMENT_1_TITLE]Seg1 Title\n[SEGMENT_1_CONTENT]Seg1 Content..."
+            # The parser in PSWA now produces:
+            # "segments": [ {"segment_title": "INTRO", "content": "..."}, {"segment_title": "Seg1 Title string", "content": "Seg1 Content string"}, ...]
+            # So, we should synthesize the title (if it's part of the audible script, e.g. a segment title) and then the content.
+            # For a podcast, typically you'd read out the main title, then intro, then segment titles and their content.
+            # Let's synthesize: Title + Intro Content + Seg1 Title + Seg1 Content + ... + Outro Content
+
+            tts_parts = []
+            podcast_title_from_script = script_input.get("title", original_topic)
+            if podcast_title_from_script and not podcast_title_from_script.startswith("Error: Insufficient Content"):
+                 tts_parts.append(f"{podcast_title_from_script}.") # Announce the main title
+
+            for segment in segments:
+                # segment_title from PSWA's parser is the actual title string of the segment (e.g. "Personalized Learning")
+                # or "INTRO", "OUTRO".
+                seg_title = segment.get("segment_title", "")
+                seg_content = segment.get("content", "")
+
+                if seg_title and seg_title not in ["INTRO", "OUTRO"] and seg_title != "ERROR": # For named segments
+                    tts_parts.append(f"{seg_title}.") # Announce segment title
+                if seg_content:
+                    tts_parts.append(seg_content)
+
+            text_to_synthesize = "\n\n".join(tts_parts)
+            logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}: Extracted text for TTS from structured script. Topic: '{original_topic}'.")
+        elif full_raw_script: # Fallback to full_raw_script if no segments
+            logger.warning(f"[VFA_TTS_LOGIC] Stream {stream_id}: No segments found in structured script for topic '{original_topic}'. Falling back to 'full_raw_script'.")
+            text_to_synthesize = full_raw_script
+        else:
+            logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: No 'segments' or 'full_raw_script' found in script_input for topic '{original_topic}'. Cannot synthesize.")
+            return {
+                "status": "error", "message": "Invalid script structure: Missing segments and raw script.",
+                "audio_filepath": None, "stream_id": stream_id,
+                "script_char_count": 0, "engine_used": "google_cloud_tts"
+            }
+
+    script_char_count = len(text_to_synthesize)
+    logger.info(f"[VFA_TTS_LOGIC] forge_voice called for stream_id: {stream_id}. Topic: '{original_topic}'. Effective script char count for TTS: {script_char_count}")
 
     # Use configurations from vfa_config
     shared_audio_dir = vfa_config.get('VFA_SHARED_AUDIO_DIR')
@@ -123,7 +185,6 @@ def forge_voice(script: str) -> dict:
     tts_lang_code = vfa_config.get('VFA_TTS_LANG_CODE')
     min_script_length = vfa_config.get('VFA_MIN_SCRIPT_LENGTH')
     current_audio_encoding_enum = get_current_audio_encoding()
-
 
     if not VFA_IMPORTS_SUCCESSFUL:
         error_msg = f"Google Cloud Text-to-Speech library not available. {VFA_MISSING_IMPORT_ERROR}"
@@ -135,37 +196,29 @@ def forge_voice(script: str) -> dict:
 
     if not vfa_config.get("GOOGLE_APPLICATION_CREDENTIALS"):
         error_msg = "Error: GOOGLE_APPLICATION_CREDENTIALS environment variable not set."
-        logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: {error_msg}")
+        logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id} (Topic: {original_topic}): {error_msg}")
         return {
             "status": "error", "message": error_msg, "audio_filepath": None, "stream_id": stream_id,
             "script_char_count": script_char_count, "engine_used": "google_cloud_tts_no_credentials"
         }
-
-    # Check for PSWA error strings or very short scripts
-    is_pswa_error = any(script.startswith(prefix) for prefix in PSWA_ERROR_PREFIXES)
-    if is_pswa_error:
-        message = "Script appears to be an error message from PSWA, audio generation skipped."
-        logger.warning(f"[VFA_TTS_LOGIC] Stream {stream_id}: {message} Script: '{script[:100]}...'")
-        return {
-            "status": "skipped", "message": message, "audio_filepath": None, "stream_id": stream_id,
-            "script_char_count": script_char_count, "engine_used": "google_cloud_tts"
-        }
     
-    if not script or script_char_count < min_script_length:
-        message = f"Script too short (length {script_char_count} < {min_script_length} chars), audio generation skipped."
+    # The PSWA error check is now done above based on structured input.
+    # This check is for the final text_to_synthesize.
+    if not text_to_synthesize or script_char_count < min_script_length:
+        message = f"Text to synthesize is too short (length {script_char_count} < {min_script_length} chars) for topic '{original_topic}', audio generation skipped."
         logger.warning(f"[VFA_TTS_LOGIC] Stream {stream_id}: {message}")
         return {
             "status": "skipped", "message": message, "audio_filepath": None, "stream_id": stream_id,
             "script_char_count": script_char_count, "engine_used": "google_cloud_tts"
         }
 
-    # If script is valid for TTS
+    # If text_to_synthesize is valid for TTS
     try:
-        os.makedirs(shared_audio_dir, exist_ok=True) # Ensure shared directory exists
+        os.makedirs(shared_audio_dir, exist_ok=True)
         logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}: Ensured shared audio directory exists: {shared_audio_dir}")
 
         client = texttospeech.TextToSpeechClient()
-        synthesis_input = texttospeech.SynthesisInput(text=script)
+        synthesis_input = texttospeech.SynthesisInput(text=text_to_synthesize)
         voice = texttospeech.VoiceSelectionParams(
             language_code=tts_lang_code, name=tts_voice_name
         )
@@ -230,16 +283,21 @@ def handle_forge_voice():
         logger.error("[VFA_FLASK_ENDPOINT] No JSON payload received.")
         return jsonify({"status": "error", "message": "No JSON payload received"}), 400
 
-    script = data.get('script')
+    script_payload = data.get('script') # This should be the structured script dict
 
-    if script is None: # Checking for None specifically, as empty string is handled by forge_voice
+    if script_payload is None:
         logger.error("[VFA_FLASK_ENDPOINT] 'script' parameter missing from JSON payload.")
         return jsonify({"status": "error", "message": "Missing 'script' parameter"}), 400
 
-    logger.info(f"[VFA_FLASK_ENDPOINT] Calling forge_voice for script (first 100 chars): '{script[:100]}...'")
-    result = forge_voice(script)
+    if not isinstance(script_payload, dict):
+        logger.error(f"[VFA_FLASK_ENDPOINT] 'script' parameter is not a dictionary (type: {type(script_payload)}). Payload: {str(script_payload)[:200]}")
+        return jsonify({"status": "error", "message": "'script' parameter must be a valid JSON object (dictionary)."}), 400
 
-    status_code = 500 # Default for error
+
+    logger.info(f"[VFA_FLASK_ENDPOINT] Calling forge_voice with script data for topic: '{script_payload.get('topic', 'N/A')}'")
+    result = forge_voice(script_payload) # Pass the whole dict
+
+    status_code = 500 # Default for "error" status from forge_voice
     if result.get("status") == "success":
         status_code = 200
         logger.info(f"[VFA_FLASK_ENDPOINT] forge_voice returned success: {result.get('message')}")

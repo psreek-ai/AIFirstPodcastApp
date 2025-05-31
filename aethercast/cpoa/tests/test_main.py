@@ -135,8 +135,17 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     def test_successful_run(self, mock_get_content, mock_requests_retry, mock_update_db):
         mock_get_content.return_value = "Detailed content about a fascinating topic."
 
+        # PSWA now returns a structured script
+        mock_pswa_structured_script = {
+            "script_id": "pswa_script_123",
+            "topic": "Test Topic", # Should match input topic to PSWA
+            "title": "A Brilliant Podcast Title",
+            "full_raw_script": "[TITLE]A Brilliant Podcast Title\n[INTRO]Intro here.",
+            "segments": [{"segment_title": "INTRO", "content": "Intro here."}],
+            "llm_model_used": "gpt-test"
+        }
         mock_pswa_response = MagicMock(status_code=200)
-        mock_pswa_response.json.return_value = {"script_text": "A brilliant podcast script."}
+        mock_pswa_response.json.return_value = mock_pswa_structured_script
         
         mock_vfa_response = MagicMock(status_code=200)
         mock_vfa_response.json.return_value = {
@@ -149,12 +158,22 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         mock_asf_response.json.return_value = {"message": "ASF notified"}
 
         def requests_side_effect(method, url, **kwargs):
-            if url == cpoa_main.PSWA_SERVICE_URL: return mock_pswa_response
-            if url == cpoa_main.VFA_SERVICE_URL: return mock_vfa_response
-            if url == cpoa_main.ASF_NOTIFICATION_URL: return mock_asf_response
-            m = MagicMock(status_code=500)
-            m.json.return_value={"error": "Unknown URL"}
-            return m # Should not happen
+            if url == cpoa_main.PSWA_SERVICE_URL:
+                return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL:
+                # Check that VFA is called with the structured script from PSWA
+                self.assertIn("json", kwargs)
+                self.assertIsInstance(kwargs["json"]["script"], dict)
+                self.assertEqual(kwargs["json"]["script"]["script_id"], "pswa_script_123")
+                return mock_vfa_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL:
+                return mock_asf_response
+            # Fallback for unexpected calls
+            error_response = MagicMock(status_code=500)
+            error_response.json.return_value = {"error": f"Unexpected URL in test: {url}"}
+            # Ensure the mock for raise_for_status is also set up if requests_with_retry uses it internally on the returned obj
+            error_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=error_response)
+            return error_response
         mock_requests_retry.side_effect = requests_side_effect
 
         result = cpoa_main.orchestrate_podcast_generation("Test Topic", "task_podcast_001", "dummy.db")
@@ -194,36 +213,58 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     def test_pswa_http_error(self, mock_get_content, mock_requests_retry, mock_update_db):
         mock_get_content.return_value = "Some content"
         
-        # Mock PSWA call to raise HTTPError after retries (retry_count is 1 from setUp)
-        # The actual response object for HTTPError needs a status_code.
-        mock_response = MagicMock()
-        mock_response.status_code = 503
-        mock_response.json.return_value = {"error": "PSWA service unavailable"} # Example error payload
-        mock_response.text = '{"error": "PSWA service unavailable"}'
+        mock_pswa_error_response = MagicMock()
+        mock_pswa_error_response.status_code = 503 # Simulate a server error from PSWA
+        mock_pswa_error_response.json.return_value = {"error": "PSWA service overloaded"}
+        mock_pswa_error_response.text = '{"error": "PSWA service overloaded"}'
         
-        # requests_with_retry is expected to raise RequestException (or a subclass like HTTPError)
-        # if all retries fail.
-        mock_requests_retry.side_effect = requests.exceptions.HTTPError(
-            "PSWA service unavailable", response=mock_response
-        )
+        # Configure requests_with_retry for PSWA to raise HTTPError
+        # Need to ensure it's raised only for PSWA call if other calls exist in the same test scope for mock_requests_retry
+        def selective_pswa_fail_side_effect(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL:
+                raise requests.exceptions.HTTPError("PSWA service error", response=mock_pswa_error_response)
+            # Provide generic success for other potential calls if any, or specific mocks if needed
+            generic_success = MagicMock(status_code=200)
+            generic_success.json.return_value = {"status": "generic_ok"}
+            return generic_success
+        mock_requests_retry.side_effect = selective_pswa_fail_side_effect
+
 
         result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Fail", "task_pswa_fail_001", "dummy.db")
 
         self.assertEqual(result['status'], "failed_pswa_request_exception")
         self.assertIn("PSWA service call failed after retries", result['error_message'])
-        self.assertIn("503", result['error_message']) # Check if status code is in the message
+        self.assertIn("503", result['error_message'])
         
-        # retry_count is 1, so requests_with_retry should be called once for PSWA
-        pswa_call_made = False
-        for call_args in mock_requests_retry.call_args_list:
-            if call_args[0][1] == cpoa_main.PSWA_SERVICE_URL: # Check if URL matches PSWA
-                pswa_call_made = True
-                break
-        self.assertTrue(pswa_call_made)
-        # self.assertEqual(mock_requests_retry.call_count, 1) # This would be true if only PSWA was called
+        # Ensure PSWA call was attempted
+        pswa_attempted = any(call[0][1] == cpoa_main.PSWA_SERVICE_URL for call in mock_requests_retry.call_args_list)
+        self.assertTrue(pswa_attempted, "requests_with_retry was not called for PSWA URL")
 
         last_db_call_args = mock_update_db.call_args_list[-1][0]
         self.assertEqual(last_db_call_args[2], "failed_pswa_request_exception")
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_pswa_returns_malformed_script(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Some content"
+
+        mock_pswa_malformed_response = MagicMock(status_code=200)
+        # Missing 'segments' key, which is essential for VFA processing later
+        mock_pswa_malformed_response.json.return_value = {
+            "script_id": "pswa_script_malformed", "title": "Malformed Title"
+            # "segments" key is missing
+        }
+        # This mock_requests_retry will only be for the PSWA call in this test.
+        mock_requests_retry.return_value = mock_pswa_malformed_response
+
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Malformed", "task_pswa_malformed_001", "dummy.db")
+
+        self.assertEqual(result['status'], "failed_pswa_bad_script_structure")
+        self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
+
+        last_db_call_args = mock_update_db.call_args_list[-1][0]
+        self.assertEqual(last_db_call_args[2], "failed_pswa_bad_script_structure")
 
 
     @patch.object(cpoa_main, '_update_task_status_in_db')
@@ -232,10 +273,15 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     def test_vfa_failure_http_error(self, mock_get_content, mock_requests_retry, mock_update_db):
         mock_get_content.return_value = "Some content for VFA test"
 
+        # PSWA returns valid structured script
+        mock_pswa_structured_script = {
+            "script_id": "pswa_script_vfa_test", "topic": "VFA Test", "title": "VFA Test Title",
+            "full_raw_script": "Raw script", "segments": [{"segment_title": "INTRO", "content": "Intro"}]
+        }
         mock_pswa_response = MagicMock(status_code=200)
-        mock_pswa_response.json.return_value = {"script_text": "A script for VFA test."}
+        mock_pswa_response.json.return_value = mock_pswa_structured_script
 
-        # Mock VFA call to raise HTTPError
+
         mock_vfa_error_response = MagicMock(status_code=500)
         mock_vfa_error_response.json.return_value = {"message": "VFA internal server error"}
         mock_vfa_error_response.text = '{"message": "VFA internal server error"}'
@@ -244,9 +290,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             if url == cpoa_main.PSWA_SERVICE_URL:
                 return mock_pswa_response
             if url == cpoa_main.VFA_SERVICE_URL:
-                # This will be raised by requests_with_retry after its attempts
+                # Check that VFA is called with the structured script
+                self.assertEqual(kwargs["json"]["script"]["script_id"], "pswa_script_vfa_test")
                 raise requests.exceptions.HTTPError("VFA service error", response=mock_vfa_error_response)
-            return MagicMock(status_code=404) # Should not be called for other URLs in this test
+            return MagicMock(status_code=404)
         mock_requests_retry.side_effect = requests_side_effect
 
         result = cpoa_main.orchestrate_podcast_generation("Test Topic VFA Fail", "task_vfa_fail_001", "dummy.db")

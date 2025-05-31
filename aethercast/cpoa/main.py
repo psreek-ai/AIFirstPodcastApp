@@ -234,29 +234,29 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
                 response = requests_with_retry("post", PSWA_SERVICE_URL,
                                                max_retries=retry_count, backoff_factor=backoff_factor,
                                                json=pswa_payload, timeout=180) # Increased timeout for LLM
-                # response.raise_for_status() # This is handled by requests_with_retry now
-                pswa_response_json = response.json()
-                pswa_output = pswa_response_json.get("script_text")
+                # response.raise_for_status() is handled by requests_with_retry
 
-                if response.status_code == 200 and pswa_response_json.get("error"): # PSWA service's own error reporting
-                    final_error_message = f"PSWA service returned 200 OK but with an error in payload: {pswa_response_json.get('error')}"
-                    log_step(final_error_message, data=pswa_response_json)
-                    final_cpoa_status = "failed_pswa_logical_error"
-                    raise Exception(f"PSWA logical error: {final_error_message}")
+                # PSWA now returns a structured script object.
+                # A 200 OK from PSWA (ensured by requests_with_retry) means a valid structured script.
+                # If PSWA had an internal error (like parsing LLM output or insufficient content),
+                # it should have returned a non-200 code, which requests_with_retry would raise as HTTPError.
+                structured_script_from_pswa = response.json()
+                log_step("PSWA Service finished successfully. Received structured script.",
+                         data={"script_id": structured_script_from_pswa.get("script_id"),
+                               "title": structured_script_from_pswa.get("title")})
 
-                if not pswa_output:
-                    final_error_message = "PSWA service returned success status but no script_text or error in payload."
-                    log_step(f"PSWA service call issue: {final_error_message}", data=pswa_response_json)
-                    final_cpoa_status = "failed_pswa_no_script"
-                    raise Exception(f"PSWA service failure: {final_error_message}")
+                # Validate essential parts of the structured script from PSWA
+                if not isinstance(structured_script_from_pswa, dict) or \
+                   not structured_script_from_pswa.get("script_id") or \
+                   not structured_script_from_pswa.get("title") or \
+                   not isinstance(structured_script_from_pswa.get("segments"), list): # Segments should be a list (can be empty)
+                    final_error_message = "PSWA service returned invalid or malformed structured script (missing script_id, title, or segments list)."
+                    log_step(final_error_message, data=structured_script_from_pswa)
+                    final_cpoa_status = "failed_pswa_bad_script_structure"
+                    raise Exception(f"PSWA critical failure: {final_error_message}")
 
-                if any(str(pswa_output).startswith(prefix) for prefix in PSWA_PAYLOAD_ERROR_PREFIXES): # Fallback check
-                    final_error_message = str(pswa_output)
-                    log_step(f"PSWA service returned 200 OK but script content indicates error: {final_error_message}", data={"pswa_output_preview": pswa_output[:200]})
-                    final_cpoa_status = "failed_pswa_script_error"
-                    raise Exception(f"PSWA logical error in content: {final_error_message}")
-
-                log_step("PSWA Service finished successfully.", data={"output_length": len(pswa_output)})
+                # VFA has been updated to expect this structured_script_from_pswa dictionary
+                # in the 'script' field of its payload.
 
             except requests.exceptions.RequestException as e_req: # Includes HTTPError from requests_with_retry if max retries failed for 5xx or non-retryable 4xx
                 pswa_err_payload_str = "N/A"
@@ -281,12 +281,14 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
             current_orchestration_stage = "vfa_audio_generation" # More specific stage
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
 
-            log_step("Calling VFA Service (forge_voice)...", data={"url": VFA_SERVICE_URL, "script_length": len(pswa_output)})
+            log_step("Calling VFA Service (forge_voice)...",
+                     data={"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id")})
             try:
-                vfa_payload = {"script": pswa_output}
+                # VFA expects the entire structured script from PSWA in its "script" field
+                vfa_payload = {"script": structured_script_from_pswa}
                 response = requests_with_retry("post", VFA_SERVICE_URL,
                                                max_retries=retry_count, backoff_factor=backoff_factor,
-                                               json=vfa_payload, timeout=90) # TTS can also take time
+                                               json=vfa_payload, timeout=90)
                 vfa_result_dict = response.json() # VFA service returns the dict directly
                 log_step("VFA Service finished.", data=vfa_result_dict)
 

@@ -96,53 +96,199 @@ else:
     logger = logging.getLogger(__name__) # Use module-specific logger
     if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
+    # Ensure load_pswa_configuration is called after logger is configured if it uses logger.
+    # If logger was just configured, and pswa_config is empty, reload.
+    if not pswa_config: # Check if it's empty
+        load_pswa_configuration() # Call it if it wasn't called or completed due to logger
 
-# Load configuration at startup
-load_pswa_configuration()
+# Ensure configuration is loaded at startup if not already by the above check
+if not pswa_config:
+    load_pswa_configuration()
 
-def weave_script(content: str, topic: str) -> str:
+
+import uuid # For script_id
+import re # For parsing
+
+def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
     """
-    Generates a podcast script using the OpenAI GPT-3.5-turbo model.
+    Parses the raw text output from the LLM into a structured script dictionary.
+    """
+    script_id = f"pswa_script_{uuid.uuid4().hex}"
+
+    # Default values
+    parsed_script = {
+        "script_id": script_id,
+        "topic": topic,
+        "title": f"Podcast on {topic}", # Default title
+        "full_raw_script": raw_script_text,
+        "segments": [],
+        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo") # Get from config
+    }
+
+    # Check for critical LLM-reported error first
+    if raw_script_text.startswith("[ERROR] Insufficient content"):
+        logger.warning(f"[PSWA_PARSING] LLM indicated insufficient content for topic '{topic}'.")
+        # No specific segments, title might not be relevant.
+        # The full_raw_script already contains the error.
+        # The endpoint will handle returning this as an error to CPOA.
+        # For structured output, we can reflect this.
+        parsed_script["title"] = f"Error: Insufficient Content for {topic}"
+        parsed_script["segments"].append({
+            "segment_title": "ERROR",
+            "content": raw_script_text
+        })
+        return parsed_script # Return early with error reflected in structure
+
+    # Regex to find all tagged sections. Dotall for multiline content.
+    # Order of tags in this regex matters for segment ordering if not strictly sequential.
+    # This regex finds a tag, then captures everything until the next tag or end of string.
+    # It's a bit greedy, so we process sequentially.
+
+    # Define tags we expect, including optional segment numbers
+    # This version tries to capture specific known tags and then generic segments.
+    # It's more robust to capture all [TAG] Content patterns and then map them.
+
+    # Simpler approach: Split by lines and process lines that are tags
+    # and lines that are content.
+
+    # Let's use a regex to find all [TAG_NAME] occurrences and the text that follows them.
+    # This regex captures the tag name (e.g., TITLE, INTRO, SEGMENT_1_TITLE)
+    # and the content until the next tag or end of string.
+
+    # Revised parsing strategy:
+    # 1. Extract [TITLE]Value
+    # 2. Then process the rest for [TAG]Content pairs sequentially.
+
+    title_match = re.search(r"\[TITLE\](.*?)\n", raw_script_text, re.IGNORECASE)
+    if title_match:
+        parsed_script["title"] = title_match.group(1).strip()
+
+    # Find all other tags and their content.
+    # This regex looks for a tag like [ANY_TAG_NAME_HERE] and captures the tag name and the content following it.
+    # The content is captured non-greedily (.*?) until a lookahead assertion finds the next tag or end of string.
+    pattern = re.compile(r"\[([A-Z0-9_]+)\](.*?)(?=\n\[[A-Z0-9_]+\]|\Z)", re.IGNORECASE | re.DOTALL)
+
+    # We skip [TITLE] as it's handled separately for the main title.
+    # For segments, we need to pair up _TITLE and _CONTENT.
+
+    current_segment_title = None
+
+    # More direct parsing based on known tags in sequence:
+    tag_sequence = ["INTRO", "SEGMENT_1_TITLE", "SEGMENT_1_CONTENT",
+                    "SEGMENT_2_TITLE", "SEGMENT_2_CONTENT", # Optional
+                    "SEGMENT_3_TITLE", "SEGMENT_3_CONTENT", # Optional
+                    "OUTRO"]
+
+    # Simple split-based parser, less reliant on complex regex for flow
+    lines = raw_script_text.splitlines()
+    current_tag_content = []
+    active_tag = None
+
+    for line in lines:
+        line = line.strip()
+        # Check if line is a tag
+        match = re.fullmatch(r"\[([A-Z0-9_]+)\]", line, re.IGNORECASE)
+        if match:
+            if active_tag and current_tag_content: # Save previous tag's content
+                if active_tag.upper() == "TITLE" and not parsed_script["title"]: # If title wasn't caught by initial regex
+                    parsed_script["title"] = "\n".join(current_tag_content).strip()
+                else:
+                    parsed_script["segments"].append({
+                        "segment_title": active_tag,
+                        "content": "\n".join(current_tag_content).strip()
+                    })
+            active_tag = match.group(1).upper() # Normalize tag name
+            current_tag_content = []
+            if active_tag == "TITLE" and parsed_script["title"] == f"Podcast on {topic}":
+                # If we already have a title from the initial regex, this [TITLE] tag in body is ignored
+                # or could be treated as a segment if needed. For now, main title is prioritized.
+                pass
+        elif active_tag:
+            current_tag_content.append(line)
+
+    # Add the last captured segment
+    if active_tag and current_tag_content:
+         if active_tag.upper() == "TITLE" and parsed_script["title"] == f"Podcast on {topic}":
+             parsed_script["title"] = "\n".join(current_tag_content).strip()
+         else:
+            parsed_script["segments"].append({
+                "segment_title": active_tag,
+                "content": "\n".join(current_tag_content).strip()
+            })
+
+    # Post-process to pair up SEGMENT_X_TITLE and SEGMENT_X_CONTENT
+    processed_segments = []
+    i = 0
+    while i < len(parsed_script["segments"]):
+        segment = parsed_script["segments"][i]
+        title = segment["segment_title"]
+        content = segment["content"]
+
+        if title.endswith("_TITLE") and (i + 1 < len(parsed_script["segments"])):
+            next_segment = parsed_script["segments"][i+1]
+            if next_segment["segment_title"] == title.replace("_TITLE", "_CONTENT"):
+                processed_segments.append({
+                    "segment_title": content, # The content of _TITLE tag is the actual title string
+                    "content": next_segment["content"]
+                })
+                i += 1 # Skip next segment as it's consumed
+            else: # Title without matching content, treat as simple segment
+                processed_segments.append({"segment_title": title, "content": content})
+        elif title in ["INTRO", "OUTRO"]:
+             processed_segments.append({"segment_title": title, "content": content})
+        elif not title.endswith("_CONTENT"): # Other non-content tags, or content for a title already processed
+            processed_segments.append({"segment_title": title, "content": content})
+        i += 1
+    parsed_script["segments"] = processed_segments
+
+    # Basic validation: Ensure essential parts are present
+    if not parsed_script["title"] or not any(s["segment_title"] == "INTRO" for s in parsed_script["segments"]):
+        logger.warning(f"[PSWA_PARSING] Critical tags ([TITLE] or [INTRO]) missing or failed to parse for topic '{topic}'. LLM Output: '{raw_script_text[:200]}...'")
+        # Decide if this is a critical parsing failure. For now, we'll return what we have.
+        # Could add an error flag to parsed_script here.
+
+    return parsed_script
+
+
+def weave_script(content: str, topic: str) -> dict: # Return type changed to dict
+    """
+    Generates a podcast script using the configured LLM and parses it into a structured dict.
+    Returns a dictionary, which will include an 'error' key if something went wrong,
+    or the structured script data on success.
     """
     logger.info(f"[PSWA_LLM_LOGIC] weave_script called with topic: '{topic}'")
 
     if not PSWA_IMPORTS_SUCCESSFUL:
         error_msg = f"OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}"
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
-        return error_msg
+        return {"error": "PSWA_IMPORT_ERROR", "details": error_msg}
 
     api_key = pswa_config.get("OPENAI_API_KEY")
     if not api_key:
-        error_msg = "Error: OPENAI_API_KEY is not configured." # Updated message
+        error_msg = "Error: OPENAI_API_KEY is not configured."
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
-        return error_msg
+        return {"error": "PSWA_CONFIG_ERROR_API_KEY", "details": error_msg}
     openai.api_key = api_key
 
-    # Handle empty topic or content before constructing the prompt for LLM
-    if not topic:
-        logger.warning("[PSWA_LLM_LOGIC] Topic is empty or None. Using a generic topic for prompt.")
-        topic = "an interesting subject" # This will be used in the user prompt template
+    current_topic = topic if topic else "an interesting subject"
+    current_content = content if content else "No specific content was provided. Please generate a general script based on the topic."
         
-    if not content:
-        logger.warning(f"[PSWA_LLM_LOGIC] Content for topic '{topic}' is empty or None. Relying on prompt to handle.")
-        content = "No specific content was provided. Please generate a general script based on the topic." # This will be used in the user prompt template
-
-    # Construct the user prompt using the configured template
-    user_prompt_template = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE', "")
+    user_prompt_template = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE')
     try:
-        user_prompt = user_prompt_template.format(topic=topic, content=content)
+        user_prompt = user_prompt_template.format(topic=current_topic, content=current_content)
     except KeyError as e:
-        logger.error(f"[PSWA_LLM_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt.")
-        # Fallback to a very basic prompt if template formatting fails
-        user_prompt = f"Topic: {topic}\nContent: {content}\n\nGenerate a podcast script."
+        logger.error(f"[PSWA_LLM_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt structure.")
+        user_prompt = f"Topic: {current_topic}\nContent: {current_content}\n\nPlease generate a podcast script with [TITLE], [INTRO], [SEGMENT_1_TITLE], [SEGMENT_1_CONTENT], and [OUTRO]."
 
-
-    system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE', "You are a podcast scriptwriter.")
-    llm_model = pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo")
-    temperature = pswa_config.get('PSWA_LLM_TEMPERATURE', 0.7)
-    max_tokens = pswa_config.get('PSWA_LLM_MAX_TOKENS', 1500)
+    system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE')
+    llm_model = pswa_config.get('PSWA_LLM_MODEL')
+    temperature = pswa_config.get('PSWA_LLM_TEMPERATURE')
+    max_tokens = pswa_config.get('PSWA_LLM_MAX_TOKENS')
 
     logger.info(f"[PSWA_LLM_LOGIC] Sending request to OpenAI API. Model: {llm_model}, Temp: {temperature}, MaxTokens: {max_tokens}")
+    raw_script_text = None
+    llm_model_used = llm_model # Default to configured model
+
     try:
         response = openai.ChatCompletion.create(
             model=llm_model,
@@ -153,17 +299,29 @@ def weave_script(content: str, topic: str) -> str:
             temperature=temperature,
             max_tokens=max_tokens
         )
-        script_text = response.choices[0].message['content'].strip()
-        logger.info("[PSWA_LLM_LOGIC] Successfully received script from OpenAI API.")
-        return script_text
-    except openai.error.OpenAIError as e: # Catch specific OpenAI errors
+        raw_script_text = response.choices[0].message['content'].strip()
+        llm_model_used = response.model # Get actual model used from response
+        logger.info(f"[PSWA_LLM_LOGIC] Successfully received script from OpenAI API (model: {llm_model_used}). Length: {len(raw_script_text)}")
+
+        # Check for LLM-indicated error before parsing
+        if raw_script_text.startswith("[ERROR] Insufficient content"):
+            logger.warning(f"[PSWA_LLM_LOGIC] LLM indicated insufficient content for topic '{current_topic}'.")
+            # This will be handled by the endpoint to return a 400 type error to CPOA.
+            # The structured parser will also reflect this.
+            # Pass it to the parser to get a consistent structure.
+
+        parsed_script = parse_llm_script_output(raw_script_text, current_topic)
+        parsed_script["llm_model_used"] = llm_model_used # Ensure this is updated
+        return parsed_script
+
+    except openai.error.OpenAIError as e:
         error_msg = f"OpenAI API Error: {type(e).__name__} - {str(e)}"
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
-        return error_msg
-    except Exception as e: # Catch other potential errors (network, etc.)
+        return {"error": "PSWA_OPENAI_API_ERROR", "details": error_msg, "raw_script_text_if_any": raw_script_text}
+    except Exception as e:
         error_msg = f"An unexpected error occurred during LLM call: {type(e).__name__} - {str(e)}"
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}", exc_info=True)
-        return error_msg
+        return {"error": "PSWA_UNEXPECTED_LLM_ERROR", "details": error_msg, "raw_script_text_if_any": raw_script_text}
 
 # --- Flask Endpoint ---
 @app.route('/weave_script', methods=['POST'])
@@ -188,28 +346,48 @@ def handle_weave_script():
         return jsonify({"error": f"Missing required parameters: {', '.join(missing_params)}"}), 400
 
     logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script with topic: '{topic}'")
-    script_or_error = weave_script(content, topic)
+    result_data = weave_script(content, topic) # This now returns a dictionary
 
-    # Error Handling based on known error prefixes from weave_script
-    error_prefixes_500 = [
-        "OpenAI library not available",
-        "Error: OPENAI_API_KEY",
-        "OpenAI API Error:",
-        "An unexpected error occurred" # General LLM call error
-    ]
-    error_prefix_400 = "[ERROR] Insufficient content"
+    if "error" in result_data:
+        error_type = result_data.get("error")
+        error_details = result_data.get("details")
+        logger.error(f"[PSWA_FLASK_ENDPOINT] Error from weave_script: {error_type} - {error_details}")
 
-    for prefix in error_prefixes_500:
-        if script_or_error.startswith(prefix):
-            logger.error(f"[PSWA_FLASK_ENDPOINT] weave_script returned 500-type error: {script_or_error}")
-            return jsonify({"error": script_or_error}), 500
+        # Determine appropriate HTTP status code based on error type
+        if error_type in ["PSWA_IMPORT_ERROR", "PSWA_CONFIG_ERROR_API_KEY", "PSWA_OPENAI_API_ERROR", "PSWA_UNEXPECTED_LLM_ERROR"]:
+            return jsonify({"error": error_type, "message": error_details}), 500 # Internal server type errors
+        # Add other specific error mappings if needed
+        else: # Generic internal error
+            return jsonify({"error": "PSWA_PROCESSING_ERROR", "message": error_details}), 500
 
-    if script_or_error.startswith(error_prefix_400):
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] weave_script returned 400-type error: {script_or_error}")
-        return jsonify({"error": script_or_error}), 400
+    # Special handling for LLM-indicated insufficient content error
+    # The parser puts the error message into the first segment's content.
+    if result_data.get("segments") and result_data["segments"][0]["segment_title"] == "ERROR" and \
+       result_data["segments"][0]["content"].startswith("[ERROR] Insufficient content"):
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] Insufficient content indicated by LLM for topic '{topic}'.")
+        # Return the raw error message from LLM as 'error' field, with 400 status
+        return jsonify({"error": result_data["segments"][0]["content"], "details": "LLM indicated content was insufficient."}), 400
 
-    logger.info("[PSWA_FLASK_ENDPOINT] Successfully generated script.")
-    return jsonify({"script_text": script_or_error})
+    # Check if parsing itself failed to find critical elements, even if LLM call succeeded
+    if not result_data.get("title") or not any(s["segment_title"] == "INTRO" for s in result_data.get("segments",[])):
+         logger.error(f"[PSWA_FLASK_ENDPOINT] Failed to parse essential script structure (TITLE/INTRO) from LLM output for topic '{topic}'.")
+         return jsonify({"error": "PSWA_SCRIPT_PARSING_FAILURE",
+                         "message": "Failed to parse essential script structure from LLM output.",
+                         "raw_output_preview": result_data.get("full_raw_script","")[:200] + "..."}), 500
+
+
+    logger.info("[PSWA_FLASK_ENDPOINT] Successfully generated and structured script.")
+    # The main 'script_text' key is still useful for CPOA if it expects the full raw script.
+    # The structured version is now also available under 'structured_script'.
+    # For now, let's return the structured script as the primary payload.
+    # CPOA will need to be updated to expect this.
+    # For now, to maintain compatibility with CPOA expecting "script_text", we send that.
+    # The structured data can be added alongside.
+    # Decision: Send the raw script text in "script_text" and the new structure in "structured_script_details"
+
+    # Per requirements, the endpoint should return the structured script.
+    # CPOA will be updated to handle this structured response.
+    return jsonify(result_data)
 
 
 if __name__ == "__main__":

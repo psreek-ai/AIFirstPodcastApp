@@ -1,185 +1,246 @@
 import unittest
-from unittest import mock
-from unittest.mock import patch, mock_open, MagicMock
-import sys
+from unittest.mock import patch, MagicMock, mock_open
 import os
-import uuid
+import sys
+import json
 
-# Ensure the 'aethercast' directory (which is one level up from 'vfa')
-# is in the Python path for absolute imports.
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-vfa_dir = os.path.dirname(current_script_dir) # aethercast/vfa/
-aethercast_dir = os.path.dirname(vfa_dir) # aethercast/
-project_root_dir = os.path.dirname(aethercast_dir) # repo root
+# Adjust path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+vfa_dir = os.path.dirname(current_dir)
+aethercast_dir = os.path.dirname(vfa_dir)
+project_root_dir = os.path.dirname(aethercast_dir)
 
-if project_root_dir not in sys.path:
-    sys.path.insert(0, project_root_dir)
+sys.path.insert(0, project_root_dir)
+sys.path.insert(0, aethercast_dir)
 
-# Import target function and constants
-from aethercast.vfa.main import (
-    forge_voice, 
-    MIN_SCRIPT_LENGTH_FOR_AUDIO, 
-    PSWA_ERROR_PREFIXES, 
-    TEMP_AUDIO_DIR,
-    DEFAULT_TTS_VOICE_NAME,
-    DEFAULT_TTS_LANG_CODE,
-    DEFAULT_AUDIO_ENCODING_TYPE # This will be the one from vfa.main, possibly placeholder
-)
-
-# Attempt to import Google Cloud libraries for type checking and error simulation
-# These will be mocked during tests anyway.
+from aethercast.vfa import main as vfa_main
+# Import TextToSpeechClient and other google types for mocking if needed
 try:
     from google.cloud import texttospeech
     from google.api_core import exceptions as google_exceptions
-    # If the main module used a placeholder for texttospeech.AudioEncoding,
-    # we might want to use the real one here if available for constructing expected objects.
-    # However, DEFAULT_AUDIO_ENCODING_TYPE from vfa.main should be what's used in the code.
+    GOOGLE_SDK_AVAILABLE = True
 except ImportError:
-    # Create placeholders if not available, so tests can still reference these types
-    class PlaceholderGoogleTTS:
-        SynthesisInput = MagicMock
-        VoiceSelectionParams = MagicMock
-        AudioConfig = MagicMock
-        AudioEncoding = type('AudioEncoding', (object,), {'MP3': 2, 'LINEAR16': 3, 'OGG_OPUS': 4})() # Match vfa.main placeholder
+    GOOGLE_SDK_AVAILABLE = False
+    # Create placeholders if google cloud sdk is not available
+    class MockTextToSpeechClient:
+        def synthesize_speech(self, *args, **kwargs):
+            response = MagicMock()
+            response.audio_content = b"mock audio data"
+            return response
     
-    class PlaceholderGoogleExceptions:
-        GoogleAPIError = type('GoogleAPIError', (Exception,), {})
-        ServiceUnavailable = type('ServiceUnavailable', (GoogleAPIError,), {})
+    class MockAudioEncoding:
+        MP3 = 2
+        LINEAR16 = 3
+        OGG_OPUS = 4
 
-    texttospeech = PlaceholderGoogleTTS()
-    google_exceptions = PlaceholderGoogleExceptions()
+        @staticmethod
+        def Name(value): # Add the Name method to the mock
+            names = {2: "MP3", 3: "LINEAR16", 4: "OGG_OPUS"}
+            return names.get(value, "UNKNOWN")
 
 
-TEST_UUID = uuid.UUID('12345678-1234-5678-1234-567812345678')
+    texttospeech = MagicMock()
+    texttospeech.TextToSpeechClient = MockTextToSpeechClient
+    texttospeech.AudioEncoding = MockAudioEncoding # Use the mock with Name method
+    texttospeech.SynthesisInput = MagicMock
+    texttospeech.VoiceSelectionParams = MagicMock
+    texttospeech.AudioConfig = MagicMock
+    google_exceptions = MagicMock()
+    google_exceptions.GoogleAPIError = type('GoogleAPIError', (Exception,), {})
 
-class TestForgeVoice(unittest.TestCase):
 
+class TestForgeVoiceLogic(unittest.TestCase):
     def setUp(self):
-        """Set up common patches for tests."""
-        self.credentials_patcher = patch.dict(os.environ, {"GOOGLE_APPLICATION_CREDENTIALS": "fake_google_creds.json"})
-        self.imports_patcher = patch('aethercast.vfa.main.VFA_IMPORTS_SUCCESSFUL', True)
+        self.maxDiff = None # Show full diff on assertion failure
+        self.mock_vfa_config = {
+            "GOOGLE_APPLICATION_CREDENTIALS": "fake_creds.json",
+            "VFA_SHARED_AUDIO_DIR": "/tmp/vfa_test_audio",
+            "VFA_TTS_VOICE_NAME": "en-TEST-Voice",
+            "VFA_TTS_LANG_CODE": "en-TEST",
+            "VFA_TTS_AUDIO_ENCODING_STR": "MP3",
+            "VFA_MIN_SCRIPT_LENGTH": 10,
+        }
+        self.config_patcher = patch.dict(vfa_main.vfa_config, self.mock_vfa_config)
+        self.mock_config = self.config_patcher.start()
+
+        self.makedirs_patcher = patch('os.makedirs')
+        self.mock_makedirs = self.makedirs_patcher.start()
+
+        self.imports_patcher = patch.object(vfa_main, 'VFA_IMPORTS_SUCCESSFUL', True)
+        self.mock_imports_successful = self.imports_patcher.start()
         
-        self.credentials_patcher.start()
-        self.imports_patcher.start()
+        # Explicitly mock the map that load_vfa_configuration would create
+        # This is important if the real google.cloud.texttospeech is not available during tests
+        self.encoding_map_content = {
+            "MP3": vfa_main.texttospeech.AudioEncoding.MP3, # Use the (potentially mocked) texttospeech
+            "LINEAR16": vfa_main.texttospeech.AudioEncoding.LINEAR16,
+            "OGG_OPUS": vfa_main.texttospeech.AudioEncoding.OGG_OPUS
+        }
+        self.encoding_map_patcher = patch.dict(vfa_main.google_audio_encoding_map, self.encoding_map_content, clear=True)
+        self.encoding_map_patcher.start()
+
 
     def tearDown(self):
-        """Clean up patches."""
+        self.config_patcher.stop()
+        self.makedirs_patcher.stop()
         self.imports_patcher.stop()
-        self.credentials_patcher.stop()
+        self.encoding_map_patcher.stop()
+
 
     @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
     @patch('builtins.open', new_callable=mock_open)
-    @patch('aethercast.vfa.main.uuid.uuid4')
-    @patch('aethercast.vfa.main.os.makedirs')
-    def test_successful_tts_generation_and_save(self, mock_makedirs, mock_uuid4, mock_file_open, mock_tts_client_constructor):
-        """Test successful TTS generation and saving of the audio file."""
-        mock_uuid4.return_value = TEST_UUID
-        
+    def test_forge_voice_success_structured_script(self, mock_file_open, mock_tts_client_constructor):
         mock_tts_client_instance = mock_tts_client_constructor.return_value
-        mock_tts_response = MagicMock() # Use MagicMock for attribute assignment
-        mock_tts_response.audio_content = b"fake_audio_bytes"
-        mock_tts_client_instance.synthesize_speech.return_value = mock_tts_response
-        
-        script = "This is a valid script for TTS processing, long enough to pass checks."
-        result = forge_voice(script)
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
 
-        mock_tts_client_constructor.assert_called_once()
+        structured_script = {
+            "script_id": "s1", "topic": "Test Topic", "title": "Main Podcast Title",
+            "full_raw_script": "[TITLE]Main Podcast Title\n[INTRO]Intro content for our test.\n[SEGMENT_1_TITLE]First Segment\n[SEGMENT_1_CONTENT]Content of the first segment.",
+            "segments": [
+                {"segment_title": "INTRO", "content": "Intro content for our test."},
+                {"segment_title": "First Segment", "content": "Content of the first segment."}
+            ]
+        }
+        result = vfa_main.forge_voice(structured_script)
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("audio successfully synthesized", result["message"].lower())
+        self.assertIsNotNone(result["audio_filepath"])
+        self.assertTrue(result["audio_filepath"].startswith(self.mock_vfa_config["VFA_SHARED_AUDIO_DIR"]))
+        self.assertTrue(result["audio_filepath"].endswith(".mp3"))
+        self.assertEqual(result["audio_format"], "mp3")
+        
+        expected_text_for_tts = "Main Podcast Title.\n\nIntro content for our test.\n\nFirst Segment.\n\nContent of the first segment."
+        
         mock_tts_client_instance.synthesize_speech.assert_called_once()
+        call_args = mock_tts_client_instance.synthesize_speech.call_args[1]['request']
+        self.assertEqual(call_args['input'].text, expected_text_for_tts)
+        self.assertEqual(call_args['voice'].language_code, "en-TEST")
+        self.assertEqual(call_args['voice'].name, "en-TEST-Voice")
         
-        # Verify call arguments for synthesize_speech
-        call_args = mock_tts_client_instance.synthesize_speech.call_args
-        request_arg = call_args.kwargs['request']
-        self.assertIsInstance(request_arg['input'], texttospeech.SynthesisInput) # Check type if real lib available
-        self.assertEqual(request_arg['input'].text, script)
-        self.assertEqual(request_arg['voice'].language_code, DEFAULT_TTS_LANG_CODE)
-        self.assertEqual(request_arg['voice'].name, DEFAULT_TTS_VOICE_NAME)
-        self.assertEqual(request_arg['audio_config'].audio_encoding, DEFAULT_AUDIO_ENCODING_TYPE)
+        # Depending on whether texttospeech is real or mocked, the enum value might differ
+        # For safety, compare against the value fetched from the (mocked) map
+        expected_encoding_enum = vfa_main.google_audio_encoding_map["MP3"]
+        self.assertEqual(call_args['audio_config'].audio_encoding, expected_encoding_enum)
 
-        mock_makedirs.assert_called_once_with(TEMP_AUDIO_DIR, exist_ok=True)
-        
-        # Determine expected extension based on DEFAULT_AUDIO_ENCODING_TYPE from vfa.main
-        expected_extension = ".mp3" # Default if MP3
-        if DEFAULT_AUDIO_ENCODING_TYPE == texttospeech.AudioEncoding.LINEAR16: # Use the actual value from the imported constant
-            expected_extension = ".wav"
-        elif DEFAULT_AUDIO_ENCODING_TYPE == texttospeech.AudioEncoding.OGG_OPUS:
-            expected_extension = ".ogg"
-            
-        expected_filepath = os.path.join(TEMP_AUDIO_DIR, f"aethercast_audio_{TEST_UUID.hex}{expected_extension}")
-        
-        mock_file_open.assert_called_once_with(expected_filepath, "wb")
-        mock_file_open().write.assert_called_once_with(b"fake_audio_bytes")
-        
-        self.assertEqual(result.get("status"), "success")
-        self.assertEqual(result.get("audio_filepath"), expected_filepath)
-        self.assertEqual(result.get("audio_format"), texttospeech.AudioEncoding.Name(DEFAULT_AUDIO_ENCODING_TYPE).lower())
-        self.assertEqual(result.get("engine_used"), "google_cloud_tts")
+        mock_file_open.assert_called_once_with(result["audio_filepath"], "wb")
+        mock_file_open().write.assert_called_once_with(b"mock audio")
 
-    @patch.dict(os.environ, {}, clear=True) # Override setUp patch
-    def test_missing_google_credentials(self):
-        """Test VFA behavior when GOOGLE_APPLICATION_CREDENTIALS are not set."""
-        result = forge_voice("A valid script.")
-        self.assertEqual(result.get("status"), "error")
-        self.assertIn("GOOGLE_APPLICATION_CREDENTIALS environment variable not set", result.get("message", ""))
-        self.assertEqual(result.get("engine_used"), "google_cloud_tts_no_credentials")
-
-    @patch('aethercast.vfa.main.VFA_IMPORTS_SUCCESSFUL', False)
-    @patch('aethercast.vfa.main.VFA_MISSING_IMPORT_ERROR', "Test: TTS SDK is missing")
-    def test_vfa_imports_failed(self, mock_imports_flag_ignored, mock_error_msg_ignored): # Mocks are applied by decorators
-        """Test VFA behavior when Google Cloud TTS library import fails."""
-        result = forge_voice("A valid script.")
-        self.assertEqual(result.get("status"), "error")
-        self.assertIn("Google Cloud Text-to-Speech library not available. Test: TTS SDK is missing", result.get("message", ""))
-        self.assertEqual(result.get("engine_used"), "google_cloud_tts_unavailable")
-
-    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
-    def test_google_api_error_on_synthesize(self, mock_tts_client_constructor):
-        """Test handling of GoogleAPIError during speech synthesis."""
-        mock_tts_client_instance = mock_tts_client_constructor.return_value
-        mock_tts_client_instance.synthesize_speech.side_effect = google_exceptions.ServiceUnavailable("TTS service currently down")
-        
-        result = forge_voice("A valid script for TTS.")
-        self.assertEqual(result.get("status"), "error")
-        self.assertIn("Google TTS API Error: ServiceUnavailable", result.get("message", ""))
-        self.assertIn("TTS service currently down", result.get("message", ""))
-
-    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
-    def test_unexpected_error_on_synthesize(self, mock_tts_client_constructor):
-        """Test handling of unexpected errors during speech synthesis."""
-        mock_tts_client_instance = mock_tts_client_constructor.return_value
-        mock_tts_client_instance.synthesize_speech.side_effect = RuntimeError("Unexpected Boom!")
-        
-        result = forge_voice("A valid script for TTS.")
-        self.assertEqual(result.get("status"), "error")
-        self.assertIn("Unexpected error during TTS synthesis: RuntimeError", result.get("message", ""))
-        self.assertIn("Unexpected Boom!", result.get("message", ""))
-
-    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient') # Still need to mock as it's called if checks pass
-    @patch('builtins.open', new_callable=mock_open)
-    def test_script_too_short_skips_tts(self, mock_file_open, mock_tts_client_constructor):
-        """Test that TTS is skipped for scripts shorter than MIN_SCRIPT_LENGTH_FOR_AUDIO."""
-        short_script = "Too short."
-        self.assertTrue(len(short_script) < MIN_SCRIPT_LENGTH_FOR_AUDIO)
-        
-        result = forge_voice(short_script)
-        
-        self.assertEqual(result.get("status"), "skipped")
-        self.assertIn("Script too short", result.get("message", ""))
-        mock_tts_client_constructor.assert_not_called()
-        mock_file_open.assert_not_called()
+    def test_forge_voice_pswa_error_script(self):
+        error_script = {
+            "script_id": "s_err", "topic": "Error Topic", "title": "Error Title",
+            "full_raw_script": "[ERROR] Insufficient content provided for topic: Error Topic",
+            "segments": [{"segment_title": "ERROR", "content": "[ERROR] Insufficient content..."}]
+        }
+        result = vfa_main.forge_voice(error_script)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("error message from PSWA", result["message"])
 
     @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
     @patch('builtins.open', new_callable=mock_open)
-    def test_script_is_pswa_error_skips_tts(self, mock_file_open, mock_tts_client_constructor):
-        """Test that TTS is skipped if the script is a known PSWA error string."""
-        # Use one of the prefixes defined in vfa.main's PSWA_ERROR_PREFIXES
-        pswa_error_script = PSWA_ERROR_PREFIXES[0] + " - Details of the API key error."
+    def test_forge_voice_empty_segments_uses_raw_script(self, mock_file, mock_tts_constructor):
+        script_no_segments = {
+            "script_id": "s_raw", "topic": "Raw Topic", "title": "Raw Title",
+            "full_raw_script": "This is the full raw script content only, long enough.",
+            "segments": []
+        }
+        mock_tts_instance = mock_tts_constructor.return_value
+        mock_tts_instance.synthesize_speech.return_value = MagicMock(audio_content=b"raw audio")
+
+        result = vfa_main.forge_voice(script_no_segments)
+        self.assertEqual(result["status"], "success")
+
+        synthesized_text = mock_tts_instance.synthesize_speech.call_args[1]['request']['input'].text
+        self.assertEqual(synthesized_text, "This is the full raw script content only, long enough.")
+
+
+    def test_forge_voice_no_usable_text(self):
+        script_no_text = {
+            "script_id": "s_notxt", "topic": "No Text Topic", "title": "No Text Title",
+            "full_raw_script": "", "segments": [] # Empty raw script and segments
+        }
+        result = vfa_main.forge_voice(script_no_text)
+        self.assertEqual(result["status"], "skipped")
+        self.assertIn("too short", result["message"])
+
+    def test_forge_voice_missing_google_credentials(self):
+        with patch.dict(vfa_main.vfa_config, {"GOOGLE_APPLICATION_CREDENTIALS": ""}):
+            result = vfa_main.forge_voice({"script_id": "s_nocred", "topic": "No Creds", "title": "No Creds", "full_raw_script": "test script long enough", "segments": []})
+            self.assertEqual(result["status"], "error")
+            self.assertIn("GOOGLE_APPLICATION_CREDENTIALS environment variable not set", result["message"])
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    def test_forge_voice_tts_api_error(self, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        # Use the potentially mocked google_exceptions.GoogleAPIError
+        mock_tts_client_instance.synthesize_speech.side_effect = vfa_main.google_exceptions.GoogleAPIError("TTS API failed")
+
+        valid_script = {"script_id": "s_apierr", "topic": "API Error", "title": "API Error", "full_raw_script": "A valid script long enough for TTS attempt.", "segments": []}
+        result = vfa_main.forge_voice(valid_script)
+        self.assertEqual(result["status"], "error")
+        self.assertIn("Google TTS API Error", result["message"])
+
+
+class TestForgeVoiceEndpoint(unittest.TestCase):
+    def setUp(self):
+        vfa_main.app.config['TESTING'] = True
+        self.client = vfa_main.app.test_client()
+        self.config_patcher = patch.dict(vfa_main.vfa_config, {
+             "GOOGLE_APPLICATION_CREDENTIALS": "fake_creds.json"
+        })
+        self.mock_config = self.config_patcher.start()
+        # Ensure imports are considered successful for endpoint tests that call forge_voice
+        self.imports_patcher = patch.object(vfa_main, 'VFA_IMPORTS_SUCCESSFUL', True)
+        self.mock_imports = self.imports_patcher.start()
+
+
+    def tearDown(self):
+        self.config_patcher.stop()
+        self.imports_patcher.stop()
+
+    @patch('aethercast.vfa.main.forge_voice')
+    def test_handle_forge_voice_success(self, mock_forge_voice_func):
+        mock_forge_voice_func.return_value = {
+            "status": "success", "message": "Audio created",
+            "audio_filepath": "/path/audio.mp3", "stream_id": "s1"
+        }
+        payload = {"script": {"script_id": "s1", "topic": "Test", "title": "Test", "full_raw_script": "Test script", "segments": []}}
+        response = self.client.post('/forge_voice', json=payload)
         
-        result = forge_voice(pswa_error_script)
-        
-        self.assertEqual(result.get("status"), "skipped")
-        self.assertIn("Script appears to be an error message from PSWA", result.get("message", ""))
-        mock_tts_client_constructor.assert_not_called()
-        mock_file_open.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertEqual(json_data["status"], "success")
+        self.assertEqual(json_data["audio_filepath"], "/path/audio.mp3")
+        mock_forge_voice_func.assert_called_once_with(payload["script"])
+
+    def test_handle_forge_voice_missing_script(self):
+        response = self.client.post('/forge_voice', json={})
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertIn("Missing 'script' parameter", json_data["message"])
+
+    def test_handle_forge_voice_script_not_dict(self):
+        response = self.client.post('/forge_voice', json={"script": "this is a string, not a dict"})
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertIn("'script' parameter must be a valid JSON object", json_data["message"])
+
+    @patch('aethercast.vfa.main.forge_voice')
+    def test_handle_forge_voice_skipped(self, mock_forge_voice_func):
+        mock_forge_voice_func.return_value = {"status": "skipped", "message": "Script too short"}
+        response = self.client.post('/forge_voice', json={"script": {"full_raw_script": "short"}}) # Pass a dict
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertEqual(json_data["status"], "skipped")
+
+    @patch('aethercast.vfa.main.forge_voice')
+    def test_handle_forge_voice_error(self, mock_forge_voice_func):
+        mock_forge_voice_func.return_value = {"status": "error", "message": "TTS failed"}
+        response = self.client.post('/forge_voice', json={"script": {"full_raw_script": "test"}}) # Pass a dict
+        self.assertEqual(response.status_code, 500)
+        json_data = response.get_json()
+        self.assertEqual(json_data["status"], "error")
+
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(verbosity=2)

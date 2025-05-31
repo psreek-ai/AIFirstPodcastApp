@@ -1,55 +1,78 @@
 # Aethercast Frontend (FEND)
 
-This directory contains a very basic HTML, CSS, and JavaScript frontend to interact with the Aethercast backend services (CPOA, and indirectly, ASF).
+## Purpose
 
-## Features:
+The Aethercast Frontend provides a web-based user interface for interacting with the Aethercast system. It allows users to:
+-   View suggested podcast snippets.
+-   Initiate the generation of full podcast episodes based on chosen topics or snippets.
+-   Receive status updates on podcast generation.
+-   Play back generated podcast audio, either through direct file links or real-time streaming via WebSockets and MediaSource Extensions (MSE).
 
-1.  **Snippet Display:**
-    *   Fetches a list of podcast snippets from the CPOA (`GET /api/v1/snippets`) on page load.
-    *   Displays these snippets, typically showing title and summary.
-2.  **Podcast Generation Request:**
-    *   Each snippet has a "Listen" or "Generate Podcast" button.
-    *   Clicking this button sends a request to CPOA (`POST /api/v1/podcasts/generate`) using the snippet's associated data (e.g., `topic` derived from snippet, or `snippet_id`).
-3.  **Task Status Polling:**
-    *   After requesting podcast generation, the UI polls CPOA's task status endpoint (`GET /api/v1/tasks/<task_id>`) to check the progress.
-4.  **WebSocket Connection to ASF:**
-    *   Once CPOA signals that the podcast is ready for streaming (by providing `audio_stream_url_for_client` and `stream_id` via the task status endpoint), the frontend:
-        *   Establishes a WebSocket connection to the Audio Stream Feeder (ASF) using the provided URL.
-        *   Sends a `join_stream` message to ASF with the `stream_id`.
-5.  **Simulated Audio Streaming:**
-    *   Listens for messages from ASF over the WebSocket.
-    *   Displays received messages (simulated audio chunks and control messages) in the UI or console.
-    *   No actual audio playback is implemented in this version.
-6.  **Status Updates:** Provides feedback to the user about ongoing processes (e.g., "Fetching snippets...", "Generating podcast...", "Connecting to stream...", "Streaming chunk...").
+It is a single-page application (SPA) built with HTML, CSS, and vanilla JavaScript.
 
-## Files:
+## Key Functionalities (`app.js`)
 
-*   `index.html`: The main HTML structure.
-*   `style.css`: Basic CSS for styling.
-*   `app.js`: JavaScript for API communication, WebSocket handling, and UI updates.
+The core client-side logic resides in `aethercast/fend/app.js`.
 
-## How to Run:
+1.  **Snippet Handling:**
+    *   **Fetch Snippets:** On page load and via a "Refresh Snippets" button, it makes a `GET` request to the API Gateway's `/api/v1/snippets` endpoint.
+    *   **Display Snippets:** Dynamically renders received snippets (title, summary) in the `#snippet-list-container`.
+    *   **Trigger Podcast from Snippet:** Each snippet card has a "Generate Podcast from this Snippet" button. Clicking this button takes the snippet's title (or a relevant topic identifier) and uses it to initiate a full podcast generation task.
 
-1.  Ensure all backend services are running:
-    *   CPOA (Central Podcast Orchestrator Agent)
-    *   TDA (Topic Discovery Agent) - if CPOA is configured to use it for snippet generation.
-    *   SCA (Snippet Craft Agent) - if CPOA is configured to use it.
-    *   WCHA (Web Content Harvester Agent) - if CPOA is configured to use it.
-    *   PSWA (Podcast Script Weaver Agent) - if CPOA is configured to use it.
-    *   VFA (Voice Forge Agent) - if CPOA is configured to use it.
-    *   ASF (Audio Stream Feeder)
-2.  Open `index.html` in a web browser that supports modern JavaScript and WebSockets.
+2.  **Podcast Generation (from Topic Input or Snippet):**
+    *   **User Input:** Allows users to enter a topic directly into an input field (`#topic-input`).
+    *   **API Call:** When generation is triggered (either from direct input or a snippet button), it makes a `POST` request to the API Gateway's `/api/v1/podcasts` endpoint with the topic: `{"topic": "your_topic_string"}`.
+    *   **Status Display:** Updates the UI (`#status-messages` or a dedicated status area) with messages like "Generating podcast for '{topic}'... Please wait."
 
-## CPOA Endpoints Used:
+3.  **Podcast Playback & Streaming:**
+    *   **Response Handling:** When the `/api/v1/podcasts` POST request completes, the frontend inspects the response from the API Gateway.
+    *   **Direct Playback (Fallback):** If the API response includes a direct `audio_url` (and no WebSocket streaming information), it sets the `src` of the main `<audio id="audio-player">` element to this URL for playback.
+    *   **WebSocket/MSE Streaming (Primary):**
+        *   If the API response includes an `asf_websocket_url` (base URL for ASF) and a `stream_id` (from `final_audio_details`), the frontend initiates a WebSocket connection to the AudioStreamFeeder (ASF).
+        *   A new `<audio id="audio-player-mse">` element is used for MSE-based playback.
+        *   **Connection:** Connects to the ASF namespace (e.g., `ws://asf_host:port/api/v1/podcasts/stream`).
+        *   **Joining Stream:** Sends a `join_stream` event with the `stream_id` to ASF.
+        *   **MediaSource Extensions (MSE):**
+            *   A `MediaSource` object is created and attached to `audio-player-mse`.
+            *   On the `sourceopen` event, a `SourceBuffer` is added (typically for `'audio/mpeg'` if MP3s are streamed).
+        *   **Receiving Audio:** Listens for `audio_chunk` events from ASF. Received binary `ArrayBuffer` data is queued.
+        *   **Appending Chunks:** An `audioQueue` and an `appendNextChunk()` mechanism manage appending audio data from the queue to the `sourceBuffer`, respecting `sourceBuffer.updating` status.
+        *   **Stream Control:** Listens for `audio_control` messages from ASF (`start_of_stream`, `end_of_stream`). When `end_of_stream` is received and all chunks are appended, `mediaSource.endOfStream()` is called.
+        *   **Error Handling:** Listens for WebSocket `error`, `connect_error`, `disconnect`, and ASF `stream_error` events to update UI and clean up.
+        *   **Status Updates:** A dedicated `<div id="streaming-status">` displays messages related to the streaming process (e.g., "Connecting...", "Buffering...", "Stream ended.").
+        *   `cleanupMSE()` function ensures resources are reset when a stream ends or errors out.
 
-*   `GET /api/v1/snippets` (CPOA should be configured to generate one on demand for this to work as designed in CPOA's current version)
-*   `POST /api/v1/podcasts/generate`
-*   `GET /api/v1/tasks/<task_id>`
+## HTML Structure (`index.html`)
 
-## ASF WebSocket Interaction:
+The `app.js` script relies on specific element IDs being present in `index.html`:
 
-*   Connects to the WebSocket URL provided by CPOA (which VFA constructs, e.g., `ws://localhost:5005/api/v1/podcasts/stream`).
-*   Sends `join_stream` event with `{'stream_id': '...'}`.
-*   Receives `stream_status`, `audio_control`, and `text_chunk` events. (Note: ASF `main.py` was built to handle a namespaced connection, so the client-side JS will need to reflect that, e.g. `io('/api/v1/podcasts/stream')`)
+-   `#topic-input`: Text input for users to enter a podcast topic.
+-   `#generate-btn`: Button to trigger podcast generation from the text input.
+-   `#status-messages`: General area for displaying status messages from various operations.
+-   `#podcast-display`: Container for the main audio player and generation details (for direct playback or when streaming finishes).
+-   `#podcast-topic-title`: To display the topic of the currently playing/generated podcast.
+-   `#audio-player`: The standard HTML5 audio element, primarily used for direct `audio_url` playback.
+-   `#generation-details-log`: A `<pre>` tag to show raw JSON details from API responses.
+-   `#podcast-snippets-section`: Main container for displaying snippets.
+-   `#snippet-list-container`: Where individual snippet cards are dynamically added.
+-   `#snippet-status-message`: For messages related to loading snippets (e.g., "Loading...", "No snippets...").
+-   `#refresh-snippets-btn`: Button to manually refresh the list of snippets.
+-   **New/Assumed for Streaming:**
+    -   `<audio id="audio-player-mse" controls></audio>`: A dedicated audio element for playback via MediaSource Extensions.
+    -   `<div id="streaming-status"></div>`: A div to show real-time status messages related to audio streaming (e.g., "Connecting to stream...", "Buffering...", "Stream ended.").
 
-This is a simplified frontend for demonstration and testing of the backend pipeline.
+## Dependencies
+
+-   **Socket.IO Client Library:** The frontend relies on the Socket.IO client JavaScript library being available. This is typically served automatically by Flask-SocketIO (ASF) at `/socket.io/socket.io.js` when a client connects from a page served by a Flask app integrated with Flask-SocketIO. If ASF is on a different domain or the library is not served automatically, it needs to be included manually in `index.html`:
+    ```html
+    <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+    ```
+    (Using a CDN or a self-hosted version). The current ASF setup implies it serves the client library.
+-   No other external JavaScript frameworks are used; it's plain vanilla JavaScript.
+
+## How to Run
+
+The frontend is a set of static files (HTML, CSS, JS) and is served by the API Gateway.
+1.  Ensure the API Gateway service is running.
+2.  Navigate your browser to the root URL of the API Gateway (e.g., `http://localhost:5001/`). The `index.html` page should load.
+The `app.js` script will then automatically attempt to fetch snippets and set up event listeners.
