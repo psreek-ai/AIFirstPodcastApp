@@ -1,5 +1,6 @@
 import logging
 import os
+from flask import Flask, request, jsonify
 
 # --- Attempt to import OpenAI library ---
 try:
@@ -23,11 +24,18 @@ except ImportError as e:
         openai.error.OpenAIError = OpenAIErrorPlaceholder
 
 
+# --- Flask App Setup ---
+app = Flask(__name__)
+
 # --- Logging Configuration ---
 # Ensure logger name is distinct if other modules also configure root logger
-logger = logging.getLogger(__name__) # Use module-specific logger
-if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
+# Use Flask's logger if available and not the root logger to avoid duplicate messages when running with Flask.
+if app.logger and app.logger.name != 'root':
+    logger = app.logger
+else:
+    logger = logging.getLogger(__name__) # Use module-specific logger
+    if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
 
 
 def weave_script(content: str, topic: str) -> str:
@@ -107,46 +115,105 @@ If the provided content is sparse or insufficient to generate a full script as d
         logger.error(f"[PSWA_LLM_LOGIC] {error_msg}", exc_info=True)
         return error_msg
 
+# --- Flask Endpoint ---
+@app.route('/weave_script', methods=['POST'])
+def handle_weave_script():
+    logger.info("[PSWA_FLASK_ENDPOINT] Received request for /weave_script")
+    data = request.get_json()
+
+    if not data:
+        logger.error("[PSWA_FLASK_ENDPOINT] No JSON payload received.")
+        return jsonify({"error": "No JSON payload received"}), 400
+
+    content = data.get('content')
+    topic = data.get('topic')
+
+    if not content or not topic:
+        missing_params = []
+        if not content:
+            missing_params.append('content')
+        if not topic:
+            missing_params.append('topic')
+        logger.error(f"[PSWA_FLASK_ENDPOINT] Missing parameters: {', '.join(missing_params)}")
+        return jsonify({"error": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+
+    logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script with topic: '{topic}'")
+    script_or_error = weave_script(content, topic)
+
+    # Error Handling based on known error prefixes from weave_script
+    error_prefixes_500 = [
+        "OpenAI library not available",
+        "Error: OPENAI_API_KEY",
+        "OpenAI API Error:",
+        "An unexpected error occurred" # General LLM call error
+    ]
+    error_prefix_400 = "[ERROR] Insufficient content"
+
+    for prefix in error_prefixes_500:
+        if script_or_error.startswith(prefix):
+            logger.error(f"[PSWA_FLASK_ENDPOINT] weave_script returned 500-type error: {script_or_error}")
+            return jsonify({"error": script_or_error}), 500
+
+    if script_or_error.startswith(error_prefix_400):
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] weave_script returned 400-type error: {script_or_error}")
+        return jsonify({"error": script_or_error}), 400
+
+    logger.info("[PSWA_FLASK_ENDPOINT] Successfully generated script.")
+    return jsonify({"script_text": script_or_error})
+
 
 if __name__ == "__main__":
-    print("\n--- PSWA LLM Test ---")
-    sample_topic = "The Impact of AI on Daily Life"
-    sample_content = (
-        "Artificial intelligence is increasingly prevalent. From voice assistants like Siri and Alexa "
-        "to recommendation algorithms on Netflix and Spotify, AI shapes our interactions with technology. "
-        "It's also making inroads in healthcare for diagnostics and in transportation with self-driving car development."
-    )
-    print(f"Attempting to weave script for topic: '{sample_topic}'")
+    # The original CLI test logic can be kept for direct script testing if needed,
+    # but the primary execution mode will now be the Flask app.
 
-    # Check for import success
-    if not PSWA_IMPORTS_SUCCESSFUL:
-         print(f"Cannot run weave_script: OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}")
-    else:
-        # Check for API key to give user context if it will run
-        if os.getenv("OPENAI_API_KEY"):
-            print("OPENAI_API_KEY found, will attempt real API call.")
-        else:
-            print("OPENAI_API_KEY not found or empty. Expecting error message from weave_script.")
+    # Start Flask app
+    # Consider environment variables for host, port, debug for more flexibility
+    host = os.getenv("PSWA_HOST", "0.0.0.0")
+    port = int(os.getenv("PSWA_PORT", 5004))
+    debug_mode = os.getenv("PSWA_DEBUG", "True").lower() == "true"
+
+    print(f"\n--- PSWA LLM Service starting on {host}:{port} (Debug: {debug_mode}) ---")
+    app.run(host=host, port=port, debug=debug_mode)
+
+    # Original CLI test (can be commented out or removed if Flask is the sole interface)
+    # print("\n--- PSWA LLM Test (CLI - for direct script testing) ---")
+    # sample_topic = "The Impact of AI on Daily Life"
+    # sample_content = (
+    #     "Artificial intelligence is increasingly prevalent. From voice assistants like Siri and Alexa "
+    #     "to recommendation algorithms on Netflix and Spotify, AI shapes our interactions with technology. "
+    #     "It's also making inroads in healthcare for diagnostics and in transportation with self-driving car development."
+    # )
+    # print(f"Attempting to weave script for topic: '{sample_topic}'")
+
+    # # Check for import success
+    # if not PSWA_IMPORTS_SUCCESSFUL:
+    #      print(f"Cannot run weave_script: OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}")
+    # else:
+    #     # Check for API key to give user context if it will run
+    #     if os.getenv("OPENAI_API_KEY"):
+    #         print("OPENAI_API_KEY found, will attempt real API call.")
+    #     else:
+    #         print("OPENAI_API_KEY not found or empty. Expecting error message from weave_script.")
         
-        generated_script = weave_script(sample_content, sample_topic)
-        print("\nGenerated Script or Error Message:")
-        print(generated_script)
+    #     generated_script = weave_script(sample_content, sample_topic)
+    #     print("\nGenerated Script or Error Message:")
+    #     print(generated_script)
     
-    # Test with empty content to see if LLM follows instruction
-    print("\n--- PSWA LLM Test (Empty Content) ---")
-    sample_topic_empty_content = "The Mysteries of the Deep Sea"
-    sample_content_empty = "" # Or very minimal like "Not much is known."
+    # # Test with empty content to see if LLM follows instruction
+    # print("\n--- PSWA LLM Test (Empty Content) ---")
+    # sample_topic_empty_content = "The Mysteries of the Deep Sea"
+    # sample_content_empty = "" # Or very minimal like "Not much is known."
     
-    print(f"Attempting to weave script for topic: '{sample_topic_empty_content}' with empty content.")
-    if not PSWA_IMPORTS_SUCCESSFUL:
-         print(f"Cannot run weave_script: OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}")
-    else:
-        if os.getenv("OPENAI_API_KEY"):
-            print("OPENAI_API_KEY found, will attempt real API call.")
-        else:
-            print("OPENAI_API_KEY not found or empty. Expecting error message from weave_script.")
-        generated_script_empty = weave_script(sample_content_empty, sample_topic_empty_content)
-        print("\nGenerated Script or Error Message (for empty content):")
-        print(generated_script_empty)
+    # print(f"Attempting to weave script for topic: '{sample_topic_empty_content}' with empty content.")
+    # if not PSWA_IMPORTS_SUCCESSFUL:
+    #      print(f"Cannot run weave_script: OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}")
+    # else:
+    #     if os.getenv("OPENAI_API_KEY"):
+    #         print("OPENAI_API_KEY found, will attempt real API call.")
+    #     else:
+    #         print("OPENAI_API_KEY not found or empty. Expecting error message from weave_script.")
+    #     generated_script_empty = weave_script(sample_content_empty, sample_topic_empty_content)
+    #     print("\nGenerated Script or Error Message (for empty content):")
+    #     print(generated_script_empty)
         
-    print("\n--- End PSWA LLM Test ---")
+    # print("\n--- End PSWA LLM Test (CLI) ---")

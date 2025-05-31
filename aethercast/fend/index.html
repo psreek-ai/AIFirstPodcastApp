@@ -13,8 +13,17 @@
         </header>
 
         <main>
+            <section id="podcast-snippets-section" class="hidden">
+                <h2>Fresh Podcast Snippets</h2>
+                <div id="snippet-list-container">
+                    <!-- Snippets will be loaded here by app.js -->
+                </div>
+                <p id="snippet-status-message" class="status-messages status-info">Loading snippets...</p>
+                <!-- Re-using status-messages class for consistency, but could be specific -->
+            </section>
+
             <section class="input-section">
-                <h2>Create Your Podcast</h2>
+                <h2>Create Full Podcast</h2>
                 <label for="topic-input">Enter Topic:</label>
                 <input type="text" id="topic-input" name="topic" placeholder="e.g., The Future of AI">
                 <button id="generate-btn">Generate Podcast</button>
@@ -25,7 +34,7 @@
                 <div id="status-messages">
                     <p>Please enter a topic and click 'Generate Podcast' to begin.</p>
                 </div>
-                <div id="podcast-display" class="hidden">
+                <div id="podcast-display" class="hidden"> <!-- This is for the full podcast, ensure it's hidden initially -->
                     <h3 id="podcast-topic-title"></h3>
                     <audio id="audio-player" controls src=""></audio>
                     <div class="podcast-metadata-display">

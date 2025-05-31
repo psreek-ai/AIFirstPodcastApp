@@ -1,87 +1,78 @@
 import logging
 import sys
 import os
-import json # Ensure this is present
-import sqlite3 # Add this
-from datetime import datetime # Add this
-import uuid # Add this
-from typing import Optional, Dict, Any, List # Add this
+import json
+import sqlite3
+from datetime import datetime
+import uuid
+from typing import Optional, Dict, Any, List
+import requests # Added for service calls
 
-# Ensure the 'aethercast' directory (which is one level up from 'cpoa', 'wcha', etc.)
-# is in the Python path. This allows for imports like 'from aethercast.wcha.main import ...'
-# when this script might be run from the repo root or from within the cpoa directory.
-# Get the directory of the current script (aethercast/cpoa/main.py)
+# Ensure the 'aethercast' directory is in the Python path.
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
-# Get the parent directory (aethercast/cpoa)
 parent_dir = os.path.dirname(current_script_dir)
-# Get the grandparent directory (aethercast) - this is what we want for package resolution
-# Actually, we need the parent of 'aethercast' directory to be in sys.path
-# if 'aethercast' itself is the top-level package.
-# If script is run from repo root, 'aethercast' is already findable.
-# If script is run from aethercast/cpoa, then '..' (parent_dir) is 'aethercast',
-# and '../..' (grandparent_dir) is the repo root.
-# Let's add the repo root to sys.path.
-repo_root_dir = os.path.dirname(parent_dir) 
+repo_root_dir = os.path.dirname(parent_dir)
 if repo_root_dir not in sys.path:
     sys.path.insert(0, repo_root_dir)
 
-# Now the imports should work assuming the simple agent files exist
-try:
-    from aethercast.wcha.main import get_content_for_topic # Changed import
-    from aethercast.pswa.main import weave_script
-    from aethercast.vfa.main import forge_voice
-    # TODO: Later, consider importing actual error indicators from agent modules if they define them
-    # from aethercast.wcha.main import WCHA_ERROR_INDICATORS as WCHA_ERRORS_FROM_MODULE
-    CPOA_IMPORTS_SUCCESSFUL = True
-    CPOA_MISSING_IMPORT_ERROR = None
-except ImportError as e:
-    CPOA_IMPORTS_SUCCESSFUL = False
-    CPOA_MISSING_IMPORT_ERROR = f"CPOA critical import error: {e}. One or more agent modules (WCHA, PSWA, VFA) are missing or have issues."
-    # Define placeholder functions if imports fail, so CPOA can still be 'loaded' by API Gateway
-    def get_content_for_topic(topic: str, max_sources: int = 3) -> str:
-        return f"Error: WCHA module not loaded. Cannot get content for topic '{topic}'."
-    def weave_script(content: str, topic: str) -> str:
-        return "Error: PSWA module not loaded. Cannot weave script."
-    def forge_voice(script: str, output_filename_prefix: str = "podcast_audio") -> Dict[str, Any]:
-        return {"status": "error", "message": "Error: VFA module not loaded. Cannot forge voice.", "audio_filepath": None}
+# --- Service URLs ---
+PSWA_SERVICE_URL = os.getenv("PSWA_SERVICE_URL", "http://localhost:5004/weave_script")
+VFA_SERVICE_URL = os.getenv("VFA_SERVICE_URL", "http://localhost:5005/forge_voice")
+ASF_NOTIFICATION_URL = os.getenv("ASF_NOTIFICATION_URL", "http://localhost:5006/asf/internal/notify_new_audio")
+ASF_WEBSOCKET_BASE_URL = os.getenv("ASF_WEBSOCKET_BASE_URL", "ws://localhost:5006/api/v1/podcasts/stream")
+SCA_SERVICE_URL = os.getenv("SCA_SERVICE_URL", "http://localhost:5002/craft_snippet")
 
-# Global Error Indicator Constants (Fallbacks/Defaults)
-# These are used if not overridden by actual imports from agent modules
+# Try to import WCHA. PSWA and VFA are now services.
+try:
+    from aethercast.wcha.main import get_content_for_topic
+    WCHA_IMPORT_SUCCESSFUL = True
+    WCHA_MISSING_IMPORT_ERROR = None
+except ImportError as e:
+    WCHA_IMPORT_SUCCESSFUL = False
+    WCHA_MISSING_IMPORT_ERROR = f"CPOA: WCHA module import error: {e}. WCHA functionality will be unavailable."
+    # Define placeholder function for WCHA if import fails
+    def get_content_for_topic(topic: str, max_sources: int = 3) -> str: # Placeholder
+        return f"Error: WCHA module not loaded. Cannot get content for topic '{topic}'."
+
+# CPOA_IMPORTS_SUCCESSFUL now only depends on WCHA for this module's direct operation.
+# If WCHA was also a service, this would be True unless requests was missing.
+CPOA_IMPORTS_SUCCESSFUL = WCHA_IMPORT_SUCCESSFUL
+CPOA_MISSING_IMPORT_ERROR = WCHA_MISSING_IMPORT_ERROR
+
+
+# Global Error Indicator Constants
 WCHA_ERROR_INDICATORS = (
-    "Error: WCHA module not loaded", 
-    "WCHA Error: Necessary web scraping libraries not installed.", 
-    "Error during web search", 
-    "WCHA: No search results", 
+    "Error: WCHA module not loaded",
+    "WCHA Error: Necessary web scraping libraries not installed.",
+    "Error during web search",
+    "WCHA: No search results",
     "WCHA: Failed to harvest usable content",
-    "Error fetching URL", # From old harvest_from_url
-    "Failed to fetch URL", # From old harvest_from_url
-    "No paragraph text found", # From old harvest_from_url
-    "Content at URL", # From old harvest_from_url
-    "Cannot 'harvest_from_url'", # From old harvest_from_url
-    "No pre-defined content found" # From old harvest_content
+    "Error fetching URL",
+    "Failed to fetch URL",
+    "No paragraph text found",
+    "Content at URL",
+    "Cannot 'harvest_from_url'",
+    "No pre-defined content found"
 )
-PSWA_ERROR_PREFIXES = (
-    "Error: PSWA module not loaded", 
-    "OpenAI library not available", 
-    "Error: OPENAI_API_KEY", 
-    "OpenAI API Error:", 
-    "[ERROR] Insufficient content", 
-    "An unexpected error occurred during LLM call"
+# PSWA errors are now primarily handled by HTTP status codes from its service.
+# This list can be kept as a fallback for checking 200 OK responses with error messages in payload.
+PSWA_PAYLOAD_ERROR_PREFIXES = (
+    "OpenAI library not available", # Should ideally be a 500 from PSWA service
+    "Error: OPENAI_API_KEY",        # Should ideally be a 500 from PSWA service
+    "OpenAI API Error:",            # Should ideally be a 500 from PSWA service
+    "[ERROR] Insufficient content", # Should ideally be a 400 from PSWA service
+    "An unexpected error occurred"  # Should ideally be a 500 from PSWA service
 )
-# VFA errors are typically handled by its dictionary output's 'status' and 'message' keys.
+# VFA errors are handled by its service's JSON response structure ('status' and 'message' keys).
 
 # --- Logging Configuration ---
-# BasicConfig should be called only once. If other modules also call it,
-# it might lead to unexpected behavior. For simplicity here, we assume
-# CPOA is the primary entry point for this specific execution flow.
-# Use a module-specific logger to avoid conflicts if other modules also configure root logger
 logger = logging.getLogger(__name__)
-if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
+if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(message)s')
 
-# TOPIC_TO_URL_MAP has been removed as WCHA's get_content_for_topic will use web search.
+# TOPIC_TO_URL_MAP has been removed.
 
-def get_timestamp() -> str:
+def get_timestamp() -> str: # This function seems unused in the provided snippet, consider removing if not used elsewhere.
     return datetime.utcnow().isoformat() + "Z"
 
 def _update_task_status_in_db(db_path: str, task_id: str, new_status: str, error_msg: Optional[str] = None) -> None:
@@ -116,12 +107,13 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
     """
     orchestration_log: List[Dict[str, Any]] = []
     # Initialize vfa_result_dict with a 'not_run' status. This will be updated if VFA is reached.
-    vfa_result_dict: Dict[str, Any] = {"status": "not_run", "message": "VFA not reached.", "audio_filepath": None}
+    vfa_result_dict: Dict[str, Any] = {"status": "not_run", "message": "VFA not reached.", "audio_filepath": None, "stream_id": None}
     current_orchestration_stage: str = "initialization"
     # final_cpoa_status and final_error_message will be determined by the outcome of the steps.
     # Initialize them here to ensure they are always defined before the finally block.
-    final_cpoa_status: str = "pending" 
+    final_cpoa_status: str = "pending"
     final_error_message: Optional[str] = None
+    asf_notification_status_message: Optional[str] = None # For ASF notification outcome
 
     def log_step(message: str, data: Optional[Dict[str, Any]] = None) -> None:
         timestamp = datetime.now().isoformat()
@@ -172,96 +164,268 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
 
             current_orchestration_stage = "processing_pswa"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
-            
-            log_step("Calling PSWA (weave_script with LLM)...", data={"content_length": len(wcha_output), "topic": topic})
-            # Assuming weave_script is defined and imported
-            pswa_output = weave_script(content=wcha_output, topic=topic)
-            log_step("PSWA finished.", data={"output_length": len(pswa_output)})
-            
-            # Check PSWA_ERROR_PREFIXES (ensure this constant is defined in CPOA)
-            if not pswa_output or any(str(pswa_output).startswith(prefix) for prefix in PSWA_ERROR_PREFIXES):
-                final_error_message = str(pswa_output) if pswa_output else "PSWA returned no script or an error string."
-                log_step(f"PSWA indicated failure: {final_error_message}", data={"pswa_output": pswa_output})
+
+            log_step("Calling PSWA Service (weave_script)...", data={"url": PSWA_SERVICE_URL, "topic": topic, "content_length": len(wcha_output)})
+            try:
+                pswa_payload = {"content": wcha_output, "topic": topic}
+                # Increased timeout for LLM, ensure PSWA service can handle it.
+                response = requests.post(PSWA_SERVICE_URL, json=pswa_payload, timeout=180)
+                response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+                pswa_response_json = response.json()
+                pswa_output = pswa_response_json.get("script_text")
+
+                # Handle cases where PSWA service returns 200 but an error in its payload (e.g. OpenAI key issue)
+                # The PSWA service itself should ideally return a non-200 status for this, but as a fallback:
+                if response.status_code == 200 and pswa_response_json.get("error"):
+                    final_error_message = f"PSWA service returned 200 OK but with an error in payload: {pswa_response_json.get('error')}"
+                    log_step(final_error_message, data=pswa_response_json)
+                    final_cpoa_status = "failed" # Or completed_with_errors
+                    raise Exception(f"PSWA logical error: {final_error_message}")
+
+                if not pswa_output: # If no "script_text" and no "error" in a 200 OK response.
+                    final_error_message = "PSWA service returned success status but no script_text or error in payload."
+                    log_step(f"PSWA service call issue: {final_error_message}", data=pswa_response_json)
+                    final_cpoa_status = "failed"
+                    raise Exception(f"PSWA service failure: {final_error_message}")
+
+                # Fallback: Check payload content for known error strings if service doesn't use JSON error field well
+                if any(str(pswa_output).startswith(prefix) for prefix in PSWA_PAYLOAD_ERROR_PREFIXES):
+                    final_error_message = str(pswa_output)
+                    log_step(f"PSWA service returned 200 OK but script content indicates error: {final_error_message}", data={"pswa_output_preview": pswa_output[:200]})
+                    final_cpoa_status = "failed"
+                    raise Exception(f"PSWA logical error in content: {final_error_message}")
+
+                log_step("PSWA Service finished successfully.", data={"output_length": len(pswa_output)})
+
+            except requests.exceptions.HTTPError as e_http:
+                # Attempt to get error message from PSWA service response if available
+                pswa_err_payload = {}
+                if e_http.response is not None:
+                    try:
+                        pswa_err_payload = e_http.response.json()
+                    except json.JSONDecodeError:
+                        pswa_err_payload = {"raw_response": e_http.response.text[:500]} # Avoid overly long raw responses
+
+                error_detail = pswa_err_payload.get("error", str(e_http))
+                final_error_message = f"PSWA service call failed (HTTP error {e_http.response.status_code if e_http.response is not None else 'N/A'}): {error_detail}"
+                log_step(f"PSWA service HTTP error: {final_error_message}", data={"error_payload": pswa_err_payload, "original_exception": str(e_http)})
                 final_cpoa_status = "failed"
-                raise Exception(f"PSWA critical failure: {final_error_message}")
+                raise Exception(final_error_message) # Re-raise to be caught by outer try-except
+            except requests.exceptions.RequestException as e_req: # Covers network, timeout, etc.
+                final_error_message = f"PSWA service call failed (network/request error): {type(e_req).__name__} - {str(e_req)}"
+                log_step(f"PSWA service request exception: {final_error_message}", data={"error": str(e_req)})
+                final_cpoa_status = "failed"
+                raise Exception(final_error_message)
+            except json.JSONDecodeError as e_json: # If PSWA returns non-JSON on success status (unlikely)
+                final_error_message = f"PSWA service response was not valid JSON despite success status: {str(e_json)}"
+                log_step(f"PSWA service JSON decode error: {final_error_message}", data={"response_text": response.text[:500] if 'response' in locals() else "N/A"})
+                final_cpoa_status = "failed"
+                raise Exception(final_error_message)
+
 
             current_orchestration_stage = "processing_vfa"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
-            
-            log_step("Calling VFA (forge_voice with TTS)...", data={"script_length": len(pswa_output)})
-            # Assuming forge_voice is defined and imported
-            vfa_result_dict = forge_voice(script=pswa_output)
-            log_step("VFA finished.", data=vfa_result_dict)
 
+            log_step("Calling VFA Service (forge_voice)...", data={"url": VFA_SERVICE_URL, "script_length": len(pswa_output)})
+            try:
+                vfa_payload = {"script": pswa_output}
+                response = requests.post(VFA_SERVICE_URL, json=vfa_payload, timeout=90) # TTS can also take time
+                response.raise_for_status()
+                vfa_result_dict = response.json() # VFA service returns the dict directly
+                log_step("VFA Service finished.", data=vfa_result_dict)
+
+            except requests.exceptions.HTTPError as e_http_vfa:
+                vfa_err_payload = {}
+                if e_http_vfa.response is not None:
+                    try:
+                        vfa_err_payload = e_http_vfa.response.json()
+                    except json.JSONDecodeError:
+                         vfa_err_payload = {"raw_response": e_http_vfa.response.text[:500]}
+                error_detail_vfa = vfa_err_payload.get("message", str(e_http_vfa)) # VFA uses "message" in its error JSON
+                final_error_message = f"VFA service call failed (HTTP error {e_http_vfa.response.status_code if e_http_vfa.response is not None else 'N/A'}): {error_detail_vfa}"
+                log_step(f"VFA service HTTP error: {final_error_message}", data={"error_payload": vfa_err_payload, "original_exception": str(e_http_vfa)})
+                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
+                final_cpoa_status = "failed"
+                raise Exception(final_error_message)
+            except requests.exceptions.RequestException as e_req_vfa:
+                final_error_message = f"VFA service call failed (network/request error): {type(e_req_vfa).__name__} - {str(e_req_vfa)}"
+                log_step(f"VFA service request exception: {final_error_message}", data={"error": str(e_req_vfa)})
+                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
+                final_cpoa_status = "failed"
+                raise Exception(final_error_message)
+            except json.JSONDecodeError as e_json_vfa: # If VFA returns non-JSON on success (should not happen)
+                final_error_message = f"VFA service response was not valid JSON despite success status: {str(e_json_vfa)}"
+                log_step(f"VFA service JSON decode error: {final_error_message}", data={"response_text": response.text[:500] if 'response' in locals() else "N/A"})
+                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
+                final_cpoa_status = "failed"
+                raise Exception(final_error_message)
+
+            # Process VFA result (already a dictionary)
             vfa_status = vfa_result_dict.get("status")
             if vfa_status == "success":
                 final_cpoa_status = "completed"
-                final_error_message = None # Clear any previous non-critical error
+                final_error_message = None # Clear error if VFA succeeded
+
+                # Attempt to notify ASF
+                audio_filepath = vfa_result_dict.get("audio_filepath")
+                stream_id = vfa_result_dict.get("stream_id")
+
+                if audio_filepath and stream_id:
+                    current_orchestration_stage = "notifying_asf"
+                    log_step("Notifying ASF about new audio...", data={"url": ASF_NOTIFICATION_URL, "stream_id": stream_id, "filepath": audio_filepath})
+                    try:
+                        asf_payload = {"stream_id": stream_id, "filepath": audio_filepath}
+                        asf_response = requests.post(ASF_NOTIFICATION_URL, json=asf_payload, timeout=10)
+                        asf_response.raise_for_status()
+                        asf_notification_status_message = f"ASF notified successfully for stream {stream_id}."
+                        log_step(asf_notification_status_message, data=asf_response.json())
+                    except requests.exceptions.HTTPError as e_asf_http:
+                        asf_error_payload = {}
+                        if e_asf_http.response is not None:
+                            try:
+                                asf_error_payload = e_asf_http.response.json()
+                            except json.JSONDecodeError:
+                                asf_error_payload = {"raw_response": e_asf_http.response.text[:200]}
+                        asf_notification_status_message = (
+                            f"ASF notification failed (HTTP error {e_asf_http.response.status_code if e_asf_http.response is not None else 'N/A'}): "
+                            f"{asf_error_payload.get('error', str(e_asf_http))}"
+                        )
+                        log_step(asf_notification_status_message, data={"error_payload": asf_error_payload, "original_exception": str(e_asf_http)})
+                        # Do not change final_cpoa_status to "failed" here. This is a notification error.
+                        if final_error_message: # Append to existing error message if any
+                            final_error_message += f"; {asf_notification_status_message}"
+                        else:
+                            final_error_message = asf_notification_status_message
+                        if final_cpoa_status == "completed": # If primary task was fine, now it has warnings.
+                            final_cpoa_status = "completed_with_warnings"
+
+                    except requests.exceptions.RequestException as e_asf_req:
+                        asf_notification_status_message = f"ASF notification failed (network/request error): {type(e_asf_req).__name__} - {str(e_asf_req)}"
+                        log_step(asf_notification_status_message, data={"error": str(e_asf_req)})
+                        if final_error_message:
+                            final_error_message += f"; {asf_notification_status_message}"
+                        else:
+                            final_error_message = asf_notification_status_message
+                        if final_cpoa_status == "completed":
+                            final_cpoa_status = "completed_with_warnings"
+                else:
+                    asf_notification_status_message = "ASF notification skipped: audio_filepath or stream_id missing from VFA success response."
+                    log_step(asf_notification_status_message, data=vfa_result_dict)
+                    if final_error_message:
+                        final_error_message += f"; {asf_notification_status_message}"
+                    else:
+                        final_error_message = asf_notification_status_message
+                    if final_cpoa_status == "completed": # This indicates an issue with VFA's response despite "success"
+                            final_cpoa_status = "completed_with_warnings"
+
+
             elif vfa_status == "skipped":
                 final_cpoa_status = "completed_with_warnings"
                 final_error_message = vfa_result_dict.get("message", "VFA skipped audio generation.")
-            elif vfa_status == "error": 
+            elif vfa_status == "error":
                 final_cpoa_status = "completed_with_errors" 
                 final_error_message = vfa_result_dict.get("message", "VFA reported an internal error.")
-            else: # Unknown status from VFA or VFA indicated a more critical failure
+            else:
                 final_cpoa_status = "failed"
-                final_error_message = f"VFA returned an unknown or failure status: '{vfa_status}'. Details: {vfa_result_dict.get('message')}"
-                log_step(f"VFA failure: {final_error_message}", data=vfa_result_dict)
-                # For an unknown/critical VFA failure, we might also want to raise an exception if it means subsequent steps are impossible
-                # For now, setting status to "failed" and logging is the primary path.
+                final_error_message = f"VFA service returned an unknown status: '{vfa_status}'. Details: {vfa_result_dict.get('message')}"
+                log_step(f"VFA unknown status: {final_error_message}", data=vfa_result_dict)
 
-        except Exception as e:
-            # This block catches exceptions from agent calls that were not handled by prefix checks (if they raise),
-            # or exceptions raised by CPOA itself (like the WCHA/PSWA critical failures above).
-            logger.error(f"CPOA: Critical error during orchestration for task {task_id} (at stage '{current_orchestration_stage}'): {type(e).__name__} - {e}", exc_info=True)
-            if not final_error_message: # Preserve specific error if already set by a prefix check + raise
-                final_error_message = f"Critical orchestration error at {current_orchestration_stage} stage: {type(e).__name__} - {str(e)}"
-            log_step(f"Critical orchestration error: {final_error_message}")
-            final_cpoa_status = "failed" # Ensure status is 'failed'
+        except Exception as e: # Outer exception handler
+            # This block catches exceptions from WCHA, or re-raised exceptions from PSWA/VFA service calls.
+            logger.error(f"CPOA: Orchestration failed for task {task_id} at stage '{current_orchestration_stage}': {type(e).__name__} - {e}", exc_info=True)
+            # final_error_message should have been set by the specific exception handling block that raised/re-raised.
+            # If it's an unexpected exception from WCHA or CPOA logic itself, it might not be set yet.
+            if not final_error_message:
+                final_error_message = f"Orchestration error at {current_orchestration_stage}: {type(e).__name__} - {str(e)}"
+            log_step(f"Orchestration critical error: {final_error_message}")
+            final_cpoa_status = "failed"
             
-            # Ensure vfa_result_dict reflects error if exception happened before or during VFA call
-            if current_orchestration_stage != "processing_vfa" or vfa_result_dict.get('status') == 'not_run':
+            # Ensure vfa_result_dict reflects error if exception happened before or during VFA call and not caught by VFA specific try-except
+            if vfa_result_dict.get('status') == 'not_run' or (current_orchestration_stage != "processing_vfa" and vfa_result_dict.get('status') != 'error'):
                  vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
     
     # This final DB update happens regardless of CPOA_IMPORTS_SUCCESSFUL outcome or try/except block.
-    # It ensures the DB reflects the final_cpoa_status determined by the logic above.
     _update_task_status_in_db(db_path, task_id, final_cpoa_status, error_msg=final_error_message)
     log_step(f"Orchestration ended with overall status: {final_cpoa_status}.")
 
     # The CPOA result dictionary, which will be used by the API Gateway thread
     # to do the *final* update to the cpoa_details column in the database.
+
+    # Ensure vfa_result_dict (which is final_audio_details) contains stream_id if available
+    stream_id_for_url = vfa_result_dict.get("stream_id")
+    asf_ws_url = None
+    if stream_id_for_url:
+        # The client will use this base URL and then send a 'join_stream' message with the stream_id.
+        # So, we just provide the base ASF WebSocket URL.
+        asf_ws_url = ASF_WEBSOCKET_BASE_URL
+        # If ASF expected stream_id in query param: asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={stream_id_for_url}"
+
     cpoa_final_result = {
         "task_id": task_id,
         "topic": topic,
-        "status": final_cpoa_status, 
-        "error_message": final_error_message,
-        "final_audio_details": vfa_result_dict, 
+        "status": final_cpoa_status,
+        "error_message": final_error_message, # This might now include ASF notification issues
+        "asf_notification_status": asf_notification_status_message, # Specific status for ASF notification
+        "asf_websocket_url": asf_ws_url, # New field for client consumption
+        "final_audio_details": vfa_result_dict, # This contains the stream_id from VFA
         "orchestration_log": orchestration_log
     }
+    # The API Gateway will use asf_websocket_url and final_audio_details.stream_id for client responses.
     return cpoa_final_result
 
-def pretty_print_orchestration_result(result: dict):
-        return {
-            "topic": topic, "status": status, "final_audio_details": None,
-            "orchestration_log": orchestration_log, "error_message": f"VFA failed: {str(e)}"
-        }
+def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
+    """
+    Orchestrates snippet generation by calling the SnippetCraftAgent (SCA) service.
+    """
+    function_name = "orchestrate_snippet_generation"
+    logger.info(f"CPOA: {function_name} called for topic_info: {topic_info.get('title_suggestion', 'N/A')}")
 
-    # Determine final overall status if not already set to failed or completed_with_warnings
-    if status == "in_progress": # Only change if no intermediate failures/warnings set it
-        status = "completed"
-        
-    log_step(f"Orchestration finished with status: '{status}' for topic: '{topic}'.")
+    topic_id = topic_info.get("topic_id")
+    if not topic_id:
+        topic_id = f"topic_adhoc_{uuid.uuid4().hex[:6]}"
+        logger.warning(f"CPOA: {function_name} - topic_id missing from input, generated adhoc topic_id: {topic_id}")
     
-    final_result = {
-        "topic": topic,
-        "status": status,
-        "final_audio_details": vfa_result_dict,
-        "orchestration_log": orchestration_log
-    }
-    if status == "failed" and "error_message" not in final_result: # Ensure error message exists if failed
-        final_result["error_message"] = "An unspecified error occurred during orchestration."
+    content_brief = topic_info.get("title_suggestion") # Using title_suggestion as the content_brief
+    if not content_brief:
+        logger.error(f"CPOA: {function_name} - 'title_suggestion' (for content_brief) missing from topic_info for topic_id: {topic_id}.")
+        return {"error": "SCA_REQUEST_INVALID", "details": "Missing title_suggestion for content_brief."}
 
-    return final_result
+    sca_payload = {
+        "topic_id": topic_id,
+        "content_brief": content_brief,
+        "topic_info": topic_info # Pass the whole topic_info dict as it might contain other useful fields for SCA
+    }
+
+    logger.info(f"CPOA: {function_name} - Calling SCA Service for topic_id {topic_id}...")
+    try:
+        response = requests.post(SCA_SERVICE_URL, json=sca_payload, timeout=60)
+        response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+
+        snippet_data = response.json()
+        logger.info(f"CPOA: {function_name} - SCA Service call successful for topic_id {topic_id}. Snippet data received.")
+        # snippet_data should be a dict like {"topic_id": ..., "snippet_text": ..., "keywords": [...], ...}
+        return snippet_data
+
+    except requests.exceptions.HTTPError as e_http:
+        error_details = str(e_http)
+        if e_http.response is not None:
+            try:
+                error_payload = e_http.response.json()
+                error_details = error_payload.get("detail", error_details) if isinstance(error_payload, dict) else error_details
+            except json.JSONDecodeError:
+                error_details = e_http.response.text[:200] # First 200 chars of raw response
+        logger.error(f"CPOA: {function_name} - SCA service call failed for topic_id {topic_id} (HTTP error): {error_details}", exc_info=True)
+        return {"error": "SCA_CALL_FAILED", "details": f"HTTP error: {error_details}"}
+    except requests.exceptions.RequestException as e_req: # Covers network, timeout, etc.
+        logger.error(f"CPOA: {function_name} - SCA service call failed for topic_id {topic_id} (network/request error): {str(e_req)}", exc_info=True)
+        return {"error": "SCA_CALL_FAILED", "details": f"Network/request error: {str(e_req)}"}
+    except json.JSONDecodeError as e_json:
+        logger.error(f"CPOA: {function_name} - SCA service response was not valid JSON for topic_id {topic_id}: {str(e_json)}", exc_info=True)
+        return {"error": "SCA_RESPONSE_INVALID", "details": f"Invalid JSON response: {str(e_json)}"}
+    except Exception as e:
+        logger.error(f"CPOA: {function_name} - Unexpected error during SCA call for topic_id {topic_id}: {str(e)}", exc_info=True)
+        return {"error": "SCA_CALL_UNEXPECTED_ERROR", "details": str(e)}
+
 
 def pretty_print_orchestration_result(result: dict):
     """Helper to pretty print the orchestration result, parsing log data."""
@@ -291,45 +455,112 @@ def pretty_print_orchestration_result(result: dict):
 if __name__ == "__main__":
     print("--- CPOA: Testing Enhanced Podcast Orchestration ---")
     
-    # Example 1: Topic in TOPIC_TO_URL_MAP (e.g., "ai in healthcare")
-    # This should attempt live fetching.
-    # Ensure 'requests' and 'bs4' are installed if you want this to succeed with live data.
-    # pip install requests beautifulsoup4
-    topic_live_fetch = "ai in healthcare"
-    print(f"\nInitiating orchestration for TOPIC IN URL_MAP: '{topic_live_fetch}'")
-    result_live = orchestrate_podcast_generation(topic=topic_live_fetch)
-    print(f"\n--- Result for '{topic_live_fetch}' ---")
-    pretty_print_orchestration_result(result_live)
-
-    # Example 2: Topic NOT in TOPIC_TO_URL_MAP, but IS in WCHA's SIMULATED_WEB_CONTENT
-    # For this, let's assume "space exploration" is NOT in TOPIC_TO_URL_MAP for this test
-    # but IS in SIMULATED_WEB_CONTENT.
-    # (Current TOPIC_TO_URL_MAP has "space exploration", so let's use a different one or modify map for test)
-    # Let's add a mock-only topic to WCHA's SIMULATED_WEB_CONTENT for this test.
-    # This would typically be done by editing WCHA's main.py, but for here, imagine it exists:
-    # SIMULATED_WEB_CONTENT["quantum computing"] = "Quantum computers use qubits..."
-    topic_mock_only = "quantum computing" # Assuming this is NOT in TOPIC_TO_URL_MAP
-                                          # but you've ensured it's in WCHA's mock data.
-                                          # If not, it will fallback to "No pre-defined content"
-    print(f"\nInitiating orchestration for MOCK-ONLY TOPIC: '{topic_mock_only}'")
-    result_mock_only = orchestrate_podcast_generation(topic=topic_mock_only)
-    print(f"\n--- Result for '{topic_mock_only}' ---")
-    pretty_print_orchestration_result(result_mock_only)
-
-
-    # Example 3: Topic in neither URL_MAP nor WCHA's SIMULATED_WEB_CONTENT
-    topic_not_found = "underwater basket weaving"
-    print(f"\nInitiating orchestration for UNKNOWN TOPIC: '{topic_not_found}'")
-    result_not_found = orchestrate_podcast_generation(topic=topic_not_found)
-    print(f"\n--- Result for '{topic_not_found}' ---")
-    pretty_print_orchestration_result(result_not_found)
+    # The main function for testing will require PSWA and VFA services to be running.
+    # For local testing, you would run pswa/main.py and vfa/main.py in separate terminals.
     
-    # Example 4: Topic that might fail live fetching (e.g., bad URL in map)
-    # To test this, temporarily add a bad URL to TOPIC_TO_URL_MAP for a specific topic
-    # For instance: TOPIC_TO_URL_MAP["bad url test"] = "http://thissitedoesnotexistatallforsure.xyz"
-    # Then call orchestrate_podcast_generation("bad url test")
-    # This will demonstrate the fallback to harvest_content.
-    # For now, we rely on the "ai in healthcare" example which might sometimes fail (network etc.)
-    # or be blocked, naturally testing the fallback.
+    # Mock DB path for testing if no real DB is set up for this standalone test.
+    mock_db_path = os.path.join(os.getcwd(), "cpoa_test_orchestration.db") # Use current dir for test DB
+    # Create a dummy podcasts table if it doesn't exist for the mock_db_path
+    try:
+        conn = sqlite3.connect(mock_db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS podcasts (
+                podcast_id TEXT PRIMARY KEY,
+                topic TEXT,
+                status TEXT,
+                created_timestamp TEXT,
+                last_updated_timestamp TEXT,
+                error_message TEXT,
+                cpoa_details TEXT,
+                audio_filepath TEXT
+            )
+        """)
+        conn.commit()
+        logger.info(f"Mock database '{mock_db_path}' initialized for testing.")
+    except sqlite3.Error as e:
+        logger.error(f"Error creating mock DB table: {e}")
+    finally:
+        if conn:
+            conn.close()
 
-    print("\n--- CPOA enhanced orchestration testing complete ---")
+    sample_topic_1 = "AI in Healthcare"
+    sample_task_id_1 = "task_" + uuid.uuid4().hex
+    print(f"\nTest 1: Orchestrating for topic '{sample_topic_1}' (Task ID: {sample_task_id_1})")
+    try:
+        conn = sqlite3.connect(mock_db_path)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO podcasts (podcast_id, topic, status, created_timestamp) VALUES (?, ?, ?, ?)",
+                       (sample_task_id_1, sample_topic_1, "pending", datetime.now().isoformat()))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error inserting mock task {sample_task_id_1}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    result1 = orchestrate_podcast_generation(topic=sample_topic_1, task_id=sample_task_id_1, db_path=mock_db_path)
+    print(f"\n--- Result for '{sample_topic_1}' ---")
+    pretty_print_orchestration_result(result1)
+
+    sample_topic_2 = "The Future of Space Travel"
+    sample_task_id_2 = "task_" + uuid.uuid4().hex
+    print(f"\nTest 2: Orchestrating for topic '{sample_topic_2}' (Task ID: {sample_task_id_2})")
+    try:
+        conn = sqlite3.connect(mock_db_path)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO podcasts (podcast_id, topic, status, created_timestamp) VALUES (?, ?, ?, ?)",
+                       (sample_task_id_2, sample_topic_2, "pending", datetime.now().isoformat()))
+        conn.commit()
+    except sqlite3.Error as e:
+        logger.error(f"Error inserting mock task {sample_task_id_2}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    result2 = orchestrate_podcast_generation(topic=sample_topic_2, task_id=sample_task_id_2, db_path=mock_db_path)
+    print(f"\n--- Result for '{sample_topic_2}' ---")
+    pretty_print_orchestration_result(result2)
+
+    # You might want to keep the mock_db_path for inspection after tests, or remove it.
+    # try:
+    #     os.remove(mock_db_path)
+    #     logger.info(f"Cleaned up mock database: {mock_db_path}")
+    # except OSError as e:
+    #     logger.error(f"Error removing mock database {mock_db_path}: {e}")
+
+    print("\n--- CPOA orchestration testing with service calls complete ---")
+    print(f"NOTE: Ensure PSWA (URL: {PSWA_SERVICE_URL}), VFA (URL: {VFA_SERVICE_URL}), ASF (Notification URL: {ASF_NOTIFICATION_URL}), and SCA (URL: {SCA_SERVICE_URL}) services are running for these tests to fully succeed.")
+    print(f"Mock database used: {mock_db_path}")
+
+    print("\n--- CPOA: Testing Snippet Generation ---")
+    sample_topic_info_for_snippet = {
+        "topic_id": "topic_snippet_test_001",
+        "title_suggestion": "The Future of Renewable Energy",
+        "summary": "A brief look into advancements in solar, wind, and other renewable energy sources.",
+        "keywords": ["renewable energy", "solar power", "wind energy", "sustainability"]
+    }
+    snippet_result = orchestrate_snippet_generation(sample_topic_info_for_snippet)
+    print("\n--- Result for Snippet Generation ---")
+    # Using pretty_print_orchestration_result for consistency, though it's a simple dict here
+    pretty_print_orchestration_result(snippet_result)
+
+    sample_topic_info_no_id = {
+        "title_suggestion": "Exploring Mars: The Next Frontier",
+        "summary": "What challenges and opportunities await humans on the Red Planet?",
+        "keywords": ["mars exploration", "space travel", "colonization", "nasa"]
+    }
+    snippet_result_no_id = orchestrate_snippet_generation(sample_topic_info_no_id)
+    print("\n--- Result for Snippet Generation (No Topic ID initially) ---")
+    pretty_print_orchestration_result(snippet_result_no_id)
+
+    sample_topic_info_no_brief = {
+        "topic_id": "topic_snippet_test_002",
+        "summary": "This will fail due to missing title_suggestion for content_brief.",
+        "keywords": ["error case", "missing field"]
+    }
+    snippet_result_no_brief = orchestrate_snippet_generation(sample_topic_info_no_brief)
+    print("\n--- Result for Snippet Generation (Missing Content Brief) ---")
+    pretty_print_orchestration_result(snippet_result_no_brief)
+
+    print("\n--- CPOA All Tests Complete ---")
