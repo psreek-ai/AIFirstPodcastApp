@@ -7,10 +7,13 @@ The Central Podcast Orchestrator Agent (CPOA) is the core component responsible 
 Key responsibilities include:
 
 -   **Workflow Management:** Orchestrating multi-step workflows involving other agents:
-    -   **Full Podcast Generation:** Coordinates with WebContentHarvesterAgent (WCHA), PodcastScriptWeaverAgent (PSWA), and VoiceForgeAgent (VFA). It also notifies the AudioStreamFeeder (ASF) when new audio is ready.
-    -   **Snippet Generation:** Coordinates with SnippetCraftAgent (SCA) (which might internally use a TopicDiscoveryAgent or similar logic).
--   **Task State Management:** Updates the status of podcast generation tasks in a shared database. The API Gateway initiates tasks, and CPOA updates their progress.
--   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF).
+    -   **Full Podcast Generation:** Coordinates with WebContentHarvesterAgent (WCHA), PodcastScriptWeaverAgent (PSWA), and VoiceForgeAgent (VFA).
+        -   Receives a structured JSON script from PSWA, which it then forwards to VFA.
+        -   Accepts optional voice parameters (e.g., voice name, language, speaking rate, pitch) from the caller (API Gateway) and forwards them to VFA.
+        -   It also notifies the AudioStreamFeeder (ASF) when new audio is ready.
+    -   **Snippet Generation:** Coordinates with SnippetCraftAgent (SCA) (which might internally use a TopicDiscoveryAgent or similar logic). After SCA generates a snippet, CPOA saves this snippet to the shared `topics_snippets` database (using the `CPOA_DATABASE_PATH` configuration).
+-   **Task State Management:** Updates the status of podcast generation tasks in a shared database (specifically, the `podcasts` table). The API Gateway initiates tasks, and CPOA updates their progress.
+-   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF). For VFA, this includes the structured script from PSWA and any optional voice parameters.
 -   **Error Handling and Resilience:** Implements retry mechanisms for service calls and manages failures within the orchestration process, providing detailed error feedback.
 
 CPOA itself is not a directly exposed service with its own API endpoints for external clients. Instead, it's a Python module whose functions are called by the API Gateway.
@@ -35,8 +38,8 @@ Then, edit the `.env` file with your desired settings. The following variables a
     -   *Default:* `ws://localhost:5006/api/v1/podcasts/stream`
 -   `SCA_SERVICE_URL`: URL of the SnippetCraftAgent.
     -   *Default:* `http://localhost:5002/craft_snippet`
--   `CPOA_DATABASE_PATH`: Path to the SQLite database file used for storing podcast task information. This **must** be the same path used by the API Gateway.
-    -   *Default:* `cpoa_orchestration_tasks.db` (Note: The default name might differ from the API Gateway's default `aethercast_podcasts.db`. Ensure they match in a deployment.)
+-   `CPOA_DATABASE_PATH`: Path to the shared SQLite database file. This **must** be the same path used by the API Gateway and TDA. CPOA uses this database to update podcast task statuses in the `podcasts` table and to save generated snippets into the `topics_snippets` table.
+    -   *Default:* `cpoa_orchestration_tasks.db` (Note: The default name set in `os.getenv` might differ from the API Gateway's default `aethercast_podcasts.db`. Ensure the actual environment variable in `.env` or the deployment environment points to the correct shared database, e.g., `../api_gateway/aethercast_podcasts.db`.)
 -   `CPOA_SERVICE_RETRY_COUNT`: Number of times to retry failed HTTP requests to downstream services.
     -   *Default:* `3`
 -   `CPOA_SERVICE_RETRY_BACKOFF_FACTOR`: Base factor for exponential backoff between retries (in seconds).
@@ -72,9 +75,21 @@ For formal unit tests, see the files in the `aethercast/cpoa/tests/` directory. 
 python -m unittest discover aethercast/cpoa/tests
 ```
 
-## Database Interaction
+## Database Interaction & Output Structure
 
 -   CPOA expects the API Gateway to create an initial record for a podcast task in the shared database.
--   CPOA's `orchestrate_podcast_generation` function receives a `task_id` (which is the `podcast_id`) and `db_path` from the API Gateway.
+-   CPOA's `orchestrate_podcast_generation` function receives a `task_id` (which is the `podcast_id`), `db_path`, and optional `voice_params_input` from the API Gateway.
 -   During its operation, CPOA updates the `cpoa_status`, `cpoa_error_message`, and `last_updated_timestamp` fields of the existing record in the `podcasts` table using its internal `_update_task_status_in_db` function.
--   The final dictionary returned by `orchestrate_podcast_generation` provides comprehensive details that the API Gateway uses for its final update to the podcast record.
+-   The final dictionary returned by `orchestrate_podcast_generation` provides comprehensive details for the API Gateway. This includes:
+    -   `task_id`, `topic`
+    -   `status`: The final CPOA status (e.g., "completed", "failed_vfa_error").
+    -   `error_message`: Any final error message.
+    -   `asf_notification_status`: Status of the notification sent to ASF.
+    -   `asf_websocket_url`: The WebSocket URL for clients to connect to ASF for this podcast.
+    -   `final_audio_details`: A dictionary containing details from VFA's response, including:
+        -   `audio_filepath`: Path to the generated audio file.
+        -   `stream_id`: The stream ID for ASF.
+        -   `tts_settings_used`: A dictionary of the actual TTS settings (voice name, language, rate, pitch, encoding) that VFA used for synthesis. This is passed through from VFA's response.
+    -   `orchestration_log`: A detailed log of the orchestration steps.
+-   The `script` CPOA receives from PSWA and sends to VFA is a structured JSON object.
+```

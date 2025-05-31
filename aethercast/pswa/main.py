@@ -16,32 +16,38 @@ def load_pswa_configuration():
     pswa_config['PSWA_LLM_MODEL'] = os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo")
     pswa_config['PSWA_LLM_TEMPERATURE'] = float(os.getenv("PSWA_LLM_TEMPERATURE", "0.7"))
     pswa_config['PSWA_LLM_MAX_TOKENS'] = int(os.getenv("PSWA_LLM_MAX_TOKENS", "1500"))
+    pswa_config['PSWA_LLM_JSON_MODE'] = os.getenv("PSWA_LLM_JSON_MODE", "true").lower() == 'true' # Added
 
-    default_system_message = "You are a podcast scriptwriter tasked with creating well-structured podcast scripts."
-    pswa_config['PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE'] = os.getenv("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", default_system_message)
+    default_system_message_json = """You are a podcast scriptwriter. Your output MUST be a single, valid JSON object.
+Do not include any text outside of this JSON object, not even markdown tags like ```json.
+The JSON object should conform to the following schema:
+{
+  "title": "string (The main title of the podcast)",
+  "intro": "string (The introductory part of the podcast script, 2-3 sentences)",
+  "segments": [
+    {
+      "segment_title": "string (Title of this segment, e.g., 'Segment 1: The Core Idea')",
+      "content": "string (Content of this segment, several sentences or paragraphs)"
+    }
+  ],
+  "outro": "string (The concluding part of the podcast script, 2-3 sentences)"
+}
+Ensure all script content is engaging and based on the provided topic and source content.
+There should be at least an intro, one segment, and an outro.
+If the provided source content is insufficient to generate a meaningful script with at least one segment,
+return a JSON object with an error field:
+{
+  "error": "Insufficient content",
+  "message": "The provided content was not sufficient to generate a full podcast script for the topic: [topic_name_here]."
+}"""
+    pswa_config['PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE'] = os.getenv("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", default_system_message_json)
 
-    default_user_template = """You are an expert podcast scriptwriter. Your goal is to create an engaging and informative podcast script based on the provided topic and content.
-
-Topic: "{topic}"
-
-Provided Content:
+    default_user_template_json = """Generate a podcast script for topic '{topic}' using the following content:
 ---
 {content}
 ---
-
-Please structure your script as follows, using the exact formatting cues:
-[TITLE] Your Podcast Title Here
-[INTRO] A brief introduction to the topic and what the podcast will cover.
-[SEGMENT_1_TITLE] Title for the first main segment.
-[SEGMENT_1_CONTENT] Detailed content for the first segment, derived from the provided content.
-(You can add more segments like [SEGMENT_2_TITLE], [SEGMENT_2_CONTENT] if the content warrants it, typically 1-2 main segments are enough for a short podcast unless content is very rich.)
-[OUTRO] A concluding summary and call to action or final thought.
-
-Ensure the tone is informative yet engaging for a general audience.
-The script should be well-organized and flow naturally.
-Only output the script itself, with no additional commentary before or after.
-If the provided content is sparse or insufficient to generate a full script as described, please indicate this by starting the script with: "[ERROR] Insufficient content provided to generate a full podcast script for the topic: {topic}" and do not generate the rest of the script structure."""
-    pswa_config['PSWA_DEFAULT_PROMPT_USER_TEMPLATE'] = os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE", default_user_template)
+Remember, your entire response must be a single JSON object conforming to the schema provided in the system message."""
+    pswa_config['PSWA_DEFAULT_PROMPT_USER_TEMPLATE'] = os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE", default_user_template_json)
 
     pswa_config['PSWA_HOST'] = os.getenv("PSWA_HOST", "0.0.0.0")
     pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
@@ -52,9 +58,10 @@ If the provided content is sparse or insufficient to generate a full script as d
         if "API_KEY" in key and value:
             logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
         elif key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
-            logger.info(f"  {key}: Loaded (length: {len(value)})") # Log length for long strings
+            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{value[:50].replace('\n', ' ')}...')")
         else:
             logger.info(f"  {key}: {value}")
+    logger.info(f"  PSWA_LLM_JSON_MODE: {pswa_config['PSWA_LLM_JSON_MODE']}") # Added logging for new mode
     logger.info("--- End PSWA Configuration ---")
 
     if not pswa_config['OPENAI_API_KEY']:
@@ -119,133 +126,142 @@ def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
     parsed_script = {
         "script_id": script_id,
         "topic": topic,
-        "title": f"Podcast on {topic}", # Default title
-        "full_raw_script": raw_script_text,
+        "title": f"Podcast on {topic}",
+        "full_raw_script": raw_script_text, # Store the original LLM output
         "segments": [],
-        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo") # Get from config
+        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo")
     }
 
-    # Check for critical LLM-reported error first
-    if raw_script_text.startswith("[ERROR] Insufficient content"):
-        logger.warning(f"[PSWA_PARSING] LLM indicated insufficient content for topic '{topic}'.")
-        # No specific segments, title might not be relevant.
-        # The full_raw_script already contains the error.
-        # The endpoint will handle returning this as an error to CPOA.
-        # For structured output, we can reflect this.
+    # Attempt to parse as JSON first
+    try:
+        llm_json_data = json.loads(raw_script_text)
+        logger.info(f"[PSWA_PARSING] Successfully parsed LLM output as JSON for topic '{topic}'.")
+
+        # Check for LLM-reported error within the JSON
+        if "error" in llm_json_data and llm_json_data["error"] == "Insufficient content":
+            logger.warning(f"[PSWA_PARSING] LLM returned 'Insufficient content' error in JSON for topic '{topic}'.")
+            parsed_script["title"] = llm_json_data.get("message", f"Error: Insufficient Content for {topic}")
+            parsed_script["segments"] = [{"segment_title": "ERROR", "content": llm_json_data.get("message", raw_script_text)}]
+            return parsed_script
+
+        # Validate and map JSON fields to our structure
+        parsed_script["title"] = llm_json_data.get("title", f"Podcast on {topic}")
+
+        # Intro
+        intro_content = llm_json_data.get("intro")
+        if intro_content is not None: # Allow empty string for intro
+             parsed_script["segments"].append({"segment_title": "INTRO", "content": str(intro_content)})
+        else:
+            logger.warning(f"[PSWA_PARSING] JSON from LLM missing 'intro' for topic '{topic}'.")
+
+
+        # Segments
+        llm_segments = llm_json_data.get("segments", [])
+        if isinstance(llm_segments, list):
+            for seg in llm_segments:
+                if isinstance(seg, dict) and "segment_title" in seg and "content" in seg:
+                    parsed_script["segments"].append({
+                        "segment_title": str(seg["segment_title"]),
+                        "content": str(seg["content"])
+                    })
+                else:
+                    logger.warning(f"[PSWA_PARSING] Invalid segment structure in JSON from LLM for topic '{topic}': {seg}")
+        else:
+            logger.warning(f"[PSWA_PARSING] JSON from LLM 'segments' is not a list for topic '{topic}'.")
+
+        # Outro
+        outro_content = llm_json_data.get("outro")
+        if outro_content is not None: # Allow empty string for outro
+            parsed_script["segments"].append({"segment_title": "OUTRO", "content": str(outro_content)})
+        else:
+            logger.warning(f"[PSWA_PARSING] JSON from LLM missing 'outro' for topic '{topic}'.")
+
+        if not parsed_script["segments"]: # If after all this, segments are empty
+             logger.warning(f"[PSWA_PARSING] No valid segments (intro, content segments, outro) found in JSON for topic '{topic}'.")
+             # This might be an issue, could lead to an empty podcast.
+
+        return parsed_script
+
+    except json.JSONDecodeError:
+        logger.warning(f"[PSWA_PARSING] LLM output was not valid JSON for topic '{topic}'. Raw output preview: '{raw_script_text[:200]}...' Attempting fallback tag-based parsing.")
+        # Fallback to tag-based parsing (existing logic)
+        # The existing tag-based parser is already here, so we just let the code flow into it.
+        # Reset title to default as it might have been partially set by failed JSON attempt.
+        parsed_script["title"] = f"Podcast on {topic}" # Reset for tag parser
+        parsed_script["segments"] = [] # Reset for tag parser
+
+    # Fallback Tag-based parsing (adapted from previous version)
+    if raw_script_text.startswith("[ERROR] Insufficient content"): # Check again for fallback
+        logger.warning(f"[PSWA_PARSING_FALLBACK] LLM indicated insufficient content for topic '{topic}'.")
         parsed_script["title"] = f"Error: Insufficient Content for {topic}"
-        parsed_script["segments"].append({
-            "segment_title": "ERROR",
-            "content": raw_script_text
-        })
-        return parsed_script # Return early with error reflected in structure
-
-    # Regex to find all tagged sections. Dotall for multiline content.
-    # Order of tags in this regex matters for segment ordering if not strictly sequential.
-    # This regex finds a tag, then captures everything until the next tag or end of string.
-    # It's a bit greedy, so we process sequentially.
-
-    # Define tags we expect, including optional segment numbers
-    # This version tries to capture specific known tags and then generic segments.
-    # It's more robust to capture all [TAG] Content patterns and then map them.
-
-    # Simpler approach: Split by lines and process lines that are tags
-    # and lines that are content.
-
-    # Let's use a regex to find all [TAG_NAME] occurrences and the text that follows them.
-    # This regex captures the tag name (e.g., TITLE, INTRO, SEGMENT_1_TITLE)
-    # and the content until the next tag or end of string.
-
-    # Revised parsing strategy:
-    # 1. Extract [TITLE]Value
-    # 2. Then process the rest for [TAG]Content pairs sequentially.
+        parsed_script["segments"].append({"segment_title": "ERROR", "content": raw_script_text})
+        return parsed_script
 
     title_match = re.search(r"\[TITLE\](.*?)\n", raw_script_text, re.IGNORECASE)
     if title_match:
         parsed_script["title"] = title_match.group(1).strip()
 
-    # Find all other tags and their content.
-    # This regex looks for a tag like [ANY_TAG_NAME_HERE] and captures the tag name and the content following it.
-    # The content is captured non-greedily (.*?) until a lookahead assertion finds the next tag or end of string.
-    pattern = re.compile(r"\[([A-Z0-9_]+)\](.*?)(?=\n\[[A-Z0-9_]+\]|\Z)", re.IGNORECASE | re.DOTALL)
-
-    # We skip [TITLE] as it's handled separately for the main title.
-    # For segments, we need to pair up _TITLE and _CONTENT.
-
-    current_segment_title = None
-
-    # More direct parsing based on known tags in sequence:
-    tag_sequence = ["INTRO", "SEGMENT_1_TITLE", "SEGMENT_1_CONTENT",
-                    "SEGMENT_2_TITLE", "SEGMENT_2_CONTENT", # Optional
-                    "SEGMENT_3_TITLE", "SEGMENT_3_CONTENT", # Optional
-                    "OUTRO"]
-
-    # Simple split-based parser, less reliant on complex regex for flow
     lines = raw_script_text.splitlines()
     current_tag_content = []
     active_tag = None
 
     for line in lines:
         line = line.strip()
-        # Check if line is a tag
         match = re.fullmatch(r"\[([A-Z0-9_]+)\]", line, re.IGNORECASE)
         if match:
-            if active_tag and current_tag_content: # Save previous tag's content
-                if active_tag.upper() == "TITLE" and not parsed_script["title"]: # If title wasn't caught by initial regex
+            if active_tag and current_tag_content:
+                # Special handling for title if it wasn't caught by initial regex and is default
+                if active_tag.upper() == "TITLE" and parsed_script["title"] == f"Podcast on {topic}":
                     parsed_script["title"] = "\n".join(current_tag_content).strip()
                 else:
                     parsed_script["segments"].append({
                         "segment_title": active_tag,
                         "content": "\n".join(current_tag_content).strip()
                     })
-            active_tag = match.group(1).upper() # Normalize tag name
+            active_tag = match.group(1).upper()
             current_tag_content = []
-            if active_tag == "TITLE" and parsed_script["title"] == f"Podcast on {topic}":
-                # If we already have a title from the initial regex, this [TITLE] tag in body is ignored
-                # or could be treated as a segment if needed. For now, main title is prioritized.
-                pass
+            # Avoid re-processing TITLE if already extracted by initial regex search
+            if active_tag == "TITLE" and parsed_script["title"] != f"Podcast on {topic}":
+                active_tag = None # Effectively ignore this [TITLE] content as main title is already set
         elif active_tag:
             current_tag_content.append(line)
 
-    # Add the last captured segment
-    if active_tag and current_tag_content:
-         if active_tag.upper() == "TITLE" and parsed_script["title"] == f"Podcast on {topic}":
+    if active_tag and current_tag_content: # Add the last segment
+        if active_tag.upper() == "TITLE" and parsed_script["title"] == f"Podcast on {topic}":
              parsed_script["title"] = "\n".join(current_tag_content).strip()
-         else:
-            parsed_script["segments"].append({
-                "segment_title": active_tag,
-                "content": "\n".join(current_tag_content).strip()
-            })
+        else:
+            parsed_script["segments"].append({"segment_title": active_tag, "content": "\n".join(current_tag_content).strip()})
 
-    # Post-process to pair up SEGMENT_X_TITLE and SEGMENT_X_CONTENT
     processed_segments = []
     i = 0
-    while i < len(parsed_script["segments"]):
-        segment = parsed_script["segments"][i]
-        title = segment["segment_title"]
-        content = segment["content"]
+    temp_segments_for_processing = parsed_script["segments"] # Use the segments populated by tag parser
+    parsed_script["segments"] = [] # Clear it to repopulate with processed ones
 
-        if title.endswith("_TITLE") and (i + 1 < len(parsed_script["segments"])):
-            next_segment = parsed_script["segments"][i+1]
-            if next_segment["segment_title"] == title.replace("_TITLE", "_CONTENT"):
+    while i < len(temp_segments_for_processing):
+        segment = temp_segments_for_processing[i]
+        title_tag = segment["segment_title"]
+        text_content = segment["content"]
+
+        if title_tag.endswith("_TITLE") and (i + 1 < len(temp_segments_for_processing)):
+            next_segment = temp_segments_for_processing[i+1]
+            if next_segment["segment_title"] == title_tag.replace("_TITLE", "_CONTENT"):
                 processed_segments.append({
-                    "segment_title": content, # The content of _TITLE tag is the actual title string
+                    "segment_title": text_content,
                     "content": next_segment["content"]
                 })
-                i += 1 # Skip next segment as it's consumed
-            else: # Title without matching content, treat as simple segment
-                processed_segments.append({"segment_title": title, "content": content})
-        elif title in ["INTRO", "OUTRO"]:
-             processed_segments.append({"segment_title": title, "content": content})
-        elif not title.endswith("_CONTENT"): # Other non-content tags, or content for a title already processed
-            processed_segments.append({"segment_title": title, "content": content})
+                i += 1
+            else:
+                processed_segments.append({"segment_title": title_tag, "content": text_content})
+        elif title_tag in ["INTRO", "OUTRO"]:
+             processed_segments.append({"segment_title": title_tag, "content": text_content})
+        elif not title_tag.endswith("_CONTENT"):
+            processed_segments.append({"segment_title": title_tag, "content": text_content})
         i += 1
     parsed_script["segments"] = processed_segments
 
-    # Basic validation: Ensure essential parts are present
-    if not parsed_script["title"] or not any(s["segment_title"] == "INTRO" for s in parsed_script["segments"]):
-        logger.warning(f"[PSWA_PARSING] Critical tags ([TITLE] or [INTRO]) missing or failed to parse for topic '{topic}'. LLM Output: '{raw_script_text[:200]}...'")
-        # Decide if this is a critical parsing failure. For now, we'll return what we have.
-        # Could add an error flag to parsed_script here.
+    if (not parsed_script["title"] or parsed_script["title"] == f"Podcast on {topic}") and \
+       not any(s["segment_title"] == "INTRO" for s in parsed_script["segments"]):
+        logger.warning(f"[PSWA_PARSING_FALLBACK] Critical tags missing after fallback for topic '{topic}'. Output: '{raw_script_text[:200]}...'")
 
     return parsed_script
 
@@ -284,34 +300,40 @@ def weave_script(content: str, topic: str) -> dict: # Return type changed to dic
     llm_model = pswa_config.get('PSWA_LLM_MODEL')
     temperature = pswa_config.get('PSWA_LLM_TEMPERATURE')
     max_tokens = pswa_config.get('PSWA_LLM_MAX_TOKENS')
+    use_json_mode = pswa_config.get('PSWA_LLM_JSON_MODE', False) # Get from config
 
-    logger.info(f"[PSWA_LLM_LOGIC] Sending request to OpenAI API. Model: {llm_model}, Temp: {temperature}, MaxTokens: {max_tokens}")
+    openai_call_params = {
+        "model": llm_model,
+        "messages": [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": user_prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens
+    }
+
+    if use_json_mode:
+        # Basic check for models known to support JSON mode.
+        # More sophisticated checks or library version checks might be needed for robustness.
+        if "1106" in llm_model or "gpt-4" in llm_model or "turbo" in llm_model or "gpt-3.5-turbo-0125" in llm_model:
+            openai_call_params["response_format"] = {"type": "json_object"}
+            logger.info(f"[PSWA_LLM_LOGIC] Attempting to use JSON mode with OpenAI model {llm_model}.")
+        else:
+            logger.warning(f"[PSWA_LLM_LOGIC] PSWA_LLM_JSON_MODE is true, but model {llm_model} might not explicitly support it via API flag. Will rely on prompt for JSON structure.")
+            # If not explicitly setting json_object, the prompt is crucial.
+
+    logger.info(f"[PSWA_LLM_LOGIC] Sending request to OpenAI API. Params: {json.dumps(openai_call_params)}") # Log the actual params being sent
     raw_script_text = None
-    llm_model_used = llm_model # Default to configured model
+    llm_model_used = llm_model
 
     try:
-        response = openai.ChatCompletion.create(
-            model=llm_model,
-            messages=[
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=temperature,
-            max_tokens=max_tokens
-        )
+        response = openai.ChatCompletion.create(**openai_call_params)
         raw_script_text = response.choices[0].message['content'].strip()
-        llm_model_used = response.model # Get actual model used from response
+        llm_model_used = response.model
         logger.info(f"[PSWA_LLM_LOGIC] Successfully received script from OpenAI API (model: {llm_model_used}). Length: {len(raw_script_text)}")
 
-        # Check for LLM-indicated error before parsing
-        if raw_script_text.startswith("[ERROR] Insufficient content"):
-            logger.warning(f"[PSWA_LLM_LOGIC] LLM indicated insufficient content for topic '{current_topic}'.")
-            # This will be handled by the endpoint to return a 400 type error to CPOA.
-            # The structured parser will also reflect this.
-            # Pass it to the parser to get a consistent structure.
-
         parsed_script = parse_llm_script_output(raw_script_text, current_topic)
-        parsed_script["llm_model_used"] = llm_model_used # Ensure this is updated
+        parsed_script["llm_model_used"] = llm_model_used
         return parsed_script
 
     except openai.error.OpenAIError as e:

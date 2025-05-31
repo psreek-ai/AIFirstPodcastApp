@@ -22,7 +22,7 @@ The core client-side logic resides in `aethercast/fend/app.js`.
 2.  **Podcast Generation (from Topic Input or Snippet):**
     *   **User Input:** Allows users to enter a topic directly into an input field (`#topic-input`).
     *   **API Call:** When generation is triggered (either from direct input or a snippet button), it makes a `POST` request to the API Gateway's `/api/v1/podcasts` endpoint with the topic: `{"topic": "your_topic_string"}`.
-    *   **Status Display:** Updates the UI (`#status-messages` or a dedicated status area) with messages like "Generating podcast for '{topic}'... Please wait."
+    *   **Status Display:** Instead of a single 'Generating...' message, the UI now displays a sequence of simulated progress updates in a dedicated area (`#generation-progress-display`). These messages (e.g., 'Discovering content...', 'Crafting script...', 'Synthesizing audio...') provide a perception of progress while waiting for the actual API response. The final status from the API call then replaces these simulated messages, shown in `#status-messages`.
 
 3.  **Podcast Playback & Streaming:**
     *   **Response Handling:** When the `/api/v1/podcasts` POST request completes, the frontend inspects the response from the API Gateway.
@@ -38,7 +38,9 @@ The core client-side logic resides in `aethercast/fend/app.js`.
         *   **Receiving Audio:** Listens for `audio_chunk` events from ASF. Received binary `ArrayBuffer` data is queued.
         *   **Appending Chunks:** An `audioQueue` and an `appendNextChunk()` mechanism manage appending audio data from the queue to the `sourceBuffer`, respecting `sourceBuffer.updating` status.
         *   **Stream Control:** Listens for `audio_control` messages from ASF (`start_of_stream`, `end_of_stream`). When `end_of_stream` is received and all chunks are appended, `mediaSource.endOfStream()` is called.
-        *   **Error Handling:** Listens for WebSocket `error`, `connect_error`, `disconnect`, and ASF `stream_error` events to update UI and clean up.
+        *   **Buffering Indicator:** Displays buffering status messages (e.g., 'Buffering audio...', 'Buffer ready...') in `#streaming-status` based on the audio queue and buffer state.
+        *   **Error Handling:** Listens for WebSocket `error`, `connect_error`, `disconnect`, ASF `stream_error`, `MediaSource` errors, `SourceBuffer` errors, and `audio` element errors. On critical errors, it displays user-friendly messages in `#streaming-status`, attempts to clean up MSE resources, and may show a 'Retry Stream' button.
+        *   **Retry Mechanism:** A 'Retry Stream' button (`#retry-stream-btn`) is shown if a WebSocket connection fails or a critical MSE error occurs, allowing the user to attempt reconnecting and restarting the stream.
         *   **Status Updates:** A dedicated `<div id="streaming-status">` displays messages related to the streaming process (e.g., "Connecting...", "Buffering...", "Stream ended.").
         *   `cleanupMSE()` function ensures resources are reset when a stream ends or errors out.
 
@@ -57,9 +59,10 @@ The `app.js` script relies on specific element IDs being present in `index.html`
 -   `#snippet-list-container`: Where individual snippet cards are dynamically added.
 -   `#snippet-status-message`: For messages related to loading snippets (e.g., "Loading...", "No snippets...").
 -   `#refresh-snippets-btn`: Button to manually refresh the list of snippets.
--   **New/Assumed for Streaming:**
+    -   `<div id="generation-progress-display">`: A div to show the sequence of simulated progress messages during podcast generation.
     -   `<audio id="audio-player-mse" controls></audio>`: A dedicated audio element for playback via MediaSource Extensions.
     -   `<div id="streaming-status"></div>`: A div to show real-time status messages related to audio streaming (e.g., "Connecting to stream...", "Buffering...", "Stream ended.").
+    -   `<button id="retry-stream-btn">`: Button (initially hidden) that allows users to retry audio streaming if it fails.
 
 ## Dependencies
 

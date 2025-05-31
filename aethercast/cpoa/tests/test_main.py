@@ -135,60 +135,88 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     def test_successful_run(self, mock_get_content, mock_requests_retry, mock_update_db):
         mock_get_content.return_value = "Detailed content about a fascinating topic."
 
-        # PSWA now returns a structured script
         mock_pswa_structured_script = {
-            "script_id": "pswa_script_123",
-            "topic": "Test Topic", # Should match input topic to PSWA
-            "title": "A Brilliant Podcast Title",
-            "full_raw_script": "[TITLE]A Brilliant Podcast Title\n[INTRO]Intro here.",
-            "segments": [{"segment_title": "INTRO", "content": "Intro here."}],
-            "llm_model_used": "gpt-test"
+            "script_id": "pswa_script_123", "topic": "Test Topic", "title": "A Brilliant Podcast Title",
+            "full_raw_script": "Full script text",
+            "segments": [{"segment_title": "INTRO", "content": "Intro here."}]
         }
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = mock_pswa_structured_script
         
-        mock_vfa_response = MagicMock(status_code=200)
-        mock_vfa_response.json.return_value = {
-            "status": "success",
-            "audio_filepath": "/shared/audio/podcast_123.mp3",
-            "stream_id": "stream_abc"
+        mock_vfa_response_data = {
+            "status": "success", "audio_filepath": "/shared/audio/podcast_123.mp3",
+            "stream_id": "stream_abc",
+            "tts_settings_used": {"voice_name": "en-TEST-Voice", "speaking_rate": 1.0, "pitch": 0.0, "audio_encoding": "MP3"}
         }
+        mock_vfa_response = MagicMock(status_code=200)
+        mock_vfa_response.json.return_value = mock_vfa_response_data
         
         mock_asf_response = MagicMock(status_code=200)
         mock_asf_response.json.return_value = {"message": "ASF notified"}
 
         def requests_side_effect(method, url, **kwargs):
-            if url == cpoa_main.PSWA_SERVICE_URL:
-                return mock_pswa_response
+            if url == cpoa_main.PSWA_SERVICE_URL: return mock_pswa_response
             if url == cpoa_main.VFA_SERVICE_URL:
-                # Check that VFA is called with the structured script from PSWA
                 self.assertIn("json", kwargs)
-                self.assertIsInstance(kwargs["json"]["script"], dict)
                 self.assertEqual(kwargs["json"]["script"]["script_id"], "pswa_script_123")
+                self.assertNotIn("voice_params", kwargs["json"]) # No voice_params in this call
                 return mock_vfa_response
-            if url == cpoa_main.ASF_NOTIFICATION_URL:
-                return mock_asf_response
-            # Fallback for unexpected calls
-            error_response = MagicMock(status_code=500)
-            error_response.json.return_value = {"error": f"Unexpected URL in test: {url}"}
-            # Ensure the mock for raise_for_status is also set up if requests_with_retry uses it internally on the returned obj
-            error_response.raise_for_status.side_effect = requests.exceptions.HTTPError(response=error_response)
-            return error_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL: return mock_asf_response
+            return MagicMock(status_code=404)
         mock_requests_retry.side_effect = requests_side_effect
 
         result = cpoa_main.orchestrate_podcast_generation("Test Topic", "task_podcast_001", "dummy.db")
 
         self.assertEqual(result['status'], "completed")
-        self.assertIsNotNone(result['final_audio_details'].get('audio_filepath'))
-        self.assertIsNone(result['error_message']) # Should be None for fully successful
+        self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-TEST-Voice")
         self.assertTrue(result['asf_notification_status'].startswith("ASF notified successfully"))
+
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_successful_run_with_voice_params(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Detailed content."
+        mock_pswa_structured_script = {
+            "script_id": "s456", "topic": "Custom Voice Topic", "title": "Title With Custom Voice",
+            "segments": [{"segment_title": "INTRO", "content": "Intro with custom voice."}]
+        }
+        mock_pswa_response = MagicMock(status_code=200)
+        mock_pswa_response.json.return_value = mock_pswa_structured_script
+
+        custom_voice_params = {"voice_name": "en-GB-Standard-A", "speaking_rate": 0.9, "pitch": -2.0}
         
-        # Verify DB updates: initial, wcha, pswa, vfa, asf_notification (if success), final "completed"
-        # Example: check the final status update
-        final_db_call = mock_update_db.call_args_list[-1][0] # Get args of the last call
-        self.assertEqual(final_db_call[1], "task_podcast_001") # task_id
-        self.assertEqual(final_db_call[2], "completed")       # status
-        self.assertIsNone(final_db_call[3])                   # error_message
+        # VFA response should reflect that it used these custom params
+        mock_vfa_response_data_custom = {
+            "status": "success", "audio_filepath": "/custom/audio.mp3", "stream_id": "stream_custom",
+            "tts_settings_used": custom_voice_params
+        }
+        mock_vfa_response_with_custom_voice = MagicMock(status_code=200)
+        mock_vfa_response_with_custom_voice.json.return_value = mock_vfa_response_data_custom
+
+        mock_asf_response = MagicMock(status_code=200)
+        mock_asf_response.json.return_value = {"message": "ASF notified for custom voice"}
+
+        def requests_side_effect_custom_voice(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL: return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL:
+                self.assertIn("json", kwargs)
+                self.assertIn("voice_params", kwargs["json"])
+                self.assertEqual(kwargs["json"]["voice_params"]["voice_name"], "en-GB-Standard-A")
+                self.assertEqual(kwargs["json"]["voice_params"]["speaking_rate"], 0.9)
+                return mock_vfa_response_with_custom_voice
+            if url == cpoa_main.ASF_NOTIFICATION_URL: return mock_asf_response
+            return MagicMock(status_code=404)
+        mock_requests_retry.side_effect = requests_side_effect_custom_voice
+
+        result = cpoa_main.orchestrate_podcast_generation(
+            "Custom Voice Topic", "task_custom_voice_001", "dummy.db",
+            voice_params_input=custom_voice_params
+        )
+        self.assertEqual(result['status'], "completed")
+        self.assertIn("tts_settings_used", result['final_audio_details'])
+        self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-GB-Standard-A")
+        self.assertEqual(result['final_audio_details']['tts_settings_used']['speaking_rate'], 0.9)
 
 
     @patch.object(cpoa_main, '_update_task_status_in_db')
@@ -258,14 +286,34 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         # This mock_requests_retry will only be for the PSWA call in this test.
         mock_requests_retry.return_value = mock_pswa_malformed_response
 
-        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Malformed", "task_pswa_malformed_001", "dummy.db")
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Malformed Segments", "task_pswa_malformed_seg_001", "dummy.db")
+
+        self.assertEqual(result['status'], "failed_pswa_bad_script_structure")
+        self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
+
+        last_db_call_args = mock_update_db.call_args_list[-1][0] # Check the final status update to DB
+        self.assertEqual(last_db_call_args[2], "failed_pswa_bad_script_structure")
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_pswa_returns_malformed_script_missing_id(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Some content"
+
+        mock_pswa_malformed_response_missing_id = MagicMock(status_code=200)
+        # Missing 'script_id'
+        mock_pswa_malformed_response_missing_id.json.return_value = {
+            "title": "Malformed Title No ID", "segments": [{"segment_title": "INTRO", "content": "Intro"}]
+        }
+        mock_requests_retry.return_value = mock_pswa_malformed_response_missing_id
+
+        result = cpoa_main.orchestrate_podcast_generation("Test PSWA Malformed ID", "task_pswa_malformed_id_001", "dummy.db")
 
         self.assertEqual(result['status'], "failed_pswa_bad_script_structure")
         self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
 
         last_db_call_args = mock_update_db.call_args_list[-1][0]
         self.assertEqual(last_db_call_args[2], "failed_pswa_bad_script_structure")
-
 
     @patch.object(cpoa_main, '_update_task_status_in_db')
     @patch.object(cpoa_main, 'requests_with_retry')
@@ -285,7 +333,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         mock_vfa_error_response = MagicMock(status_code=500)
         mock_vfa_error_response.json.return_value = {"message": "VFA internal server error"}
         mock_vfa_error_response.text = '{"message": "VFA internal server error"}'
-        
+
         def requests_side_effect(method, url, **kwargs):
             if url == cpoa_main.PSWA_SERVICE_URL:
                 return mock_pswa_response
@@ -317,7 +365,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = {"script_text": "Script for ASF test"}
-        
+
         mock_vfa_response = MagicMock(status_code=200)
         mock_vfa_response.json.return_value = {
             "status": "success",

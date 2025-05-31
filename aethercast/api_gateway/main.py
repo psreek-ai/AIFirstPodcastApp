@@ -4,7 +4,7 @@ from dotenv import load_dotenv # Added
 from flask import Flask, jsonify, request, send_file, send_from_directory # Added send_from_directory
 import uuid 
 import sqlite3
-from datetime import datetime # Added
+from datetime import datetime, timedelta # Added timedelta
 import json # Added
 import requests # Added for TDA calls
 
@@ -46,9 +46,32 @@ CREATE TABLE IF NOT EXISTS podcasts (
     task_created_timestamp TEXT NOT NULL,
     last_updated_timestamp TEXT,
     -- Full CPOA log/details
-    cpoa_full_orchestration_log TEXT
+    cpoa_full_orchestration_log TEXT,
+    -- Voice parameters used for TTS
+    tts_settings_used TEXT
+);
+
+CREATE TABLE IF NOT EXISTS topics_snippets (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL CHECK(type IN ('topic', 'snippet')),
+    title TEXT NOT NULL,
+    summary TEXT,
+    keywords TEXT,
+    source_url TEXT,
+    source_name TEXT,
+    original_topic_details TEXT,
+    llm_model_used_for_snippet TEXT,
+    cover_art_prompt TEXT,
+    generation_timestamp TEXT NOT NULL,
+    last_accessed_timestamp TEXT,
+    relevance_score REAL
 );
 """
+
+# --- API Gateway Specific Configurations ---
+API_GW_SNIPPET_CACHE_SIZE = int(os.getenv("API_GW_SNIPPET_CACHE_SIZE", "10"))
+API_GW_SNIPPET_CACHE_MAX_AGE_HOURS = int(os.getenv("API_GW_SNIPPET_CACHE_MAX_AGE_HOURS", "24"))
+
 
 # --- Database Helper Functions ---
 def get_db_connection():
@@ -64,12 +87,23 @@ def init_db():
         # Check if the table exists and if it has the old 'audio_filepath' column to suggest deletion for dev
         cursor.execute("PRAGMA table_info(podcasts)")
         columns = [col[1] for col in cursor.fetchall()]
-        if "audio_filepath" in columns and "final_audio_filepath" not in columns :
-             app.logger.warning("Old 'podcasts' table schema detected. For development, please delete the database file 'aethercast_podcasts.db' to apply the new schema. This is a destructive operation for dev only.")
+        if "audio_filepath" in columns and "final_audio_filepath" not in columns : # A simple check for old schema
+             app.logger.warning("Old 'podcasts' table schema detected (missing 'final_audio_filepath' or 'tts_settings_used'). For development, please delete the database file 'aethercast_podcasts.db' to apply the new schema. This is a destructive operation for dev only.")
+        elif "tts_settings_used" not in columns: # Check specifically for the new column from this subtask
+            app.logger.warning("The 'podcasts' table is missing the 'tts_settings_used' column. Consider DB deletion for schema update in dev.")
+
+        # Check for the existence of the new topics_snippets table.
+        # The `IF NOT EXISTS` in its DDL handles initial creation.
+        # This log is mainly for awareness during development if the schema *within* topics_snippets needs future changes.
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='topics_snippets';")
+        if not cursor.fetchone():
+            app.logger.info("Table 'topics_snippets' not found. It will be created as per DB_SCHEMA_SQL.")
+        else:
+            app.logger.info("Table 'topics_snippets' already exists. Schema definition will ensure it's up-to-date if structure changed and `IF NOT EXISTS` is used appropriately in DDL for new elements.")
 
         cursor.executescript(DB_SCHEMA_SQL) # Use executescript for multi-statement SQL
         conn.commit()
-        app.logger.info("Database initialized successfully with the new schema.")
+        app.logger.info("Database initialization processed. 'podcasts' and 'topics_snippets' tables ensured.")
     except sqlite3.Error as e:
         # Use app.logger if available, otherwise print
         log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
@@ -133,8 +167,9 @@ with app.app_context():
     app.logger.info("--- API Gateway Configuration ---")
     app.logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}")
     app.logger.info(f"DATABASE_FILE: {DATABASE_FILE}")
-    # FEND_DIR is derived, but we can log its final value
-    app.logger.info(f"FEND_DIR: {FEND_DIR}")
+    app.logger.info(f"FEND_DIR: {FEND_DIR}") # FEND_DIR is derived below, but logged here after app context is up.
+    app.logger.info(f"API_GW_SNIPPET_CACHE_SIZE: {API_GW_SNIPPET_CACHE_SIZE}")
+    app.logger.info(f"API_GW_SNIPPET_CACHE_MAX_AGE_HOURS: {API_GW_SNIPPET_CACHE_MAX_AGE_HOURS}")
     app.logger.info("--- End API Gateway Configuration ---")
 
 # --- Frontend Directory Path ---
@@ -194,22 +229,98 @@ def get_dynamic_snippets():
         app.logger.error("CPOA snippet generation function not loaded. Cannot process snippet generation.")
         return jsonify({"error": "Service Unavailable", "message": f"Core snippet orchestration module not loaded. Import error: {CPOA_IMPORT_ERROR_MESSAGE}"}), 503
 
-    # Call TDA to get topics
+    # --- Try fetching from DB cache first ---
+    conn = None
+    cached_snippets = []
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Calculate the oldest acceptable generation timestamp
+        # Using datetime directly without strptime for ISO format
+        max_age_dt = datetime.utcnow() - timedelta(hours=API_GW_SNIPPET_CACHE_MAX_AGE_HOURS)
+        oldest_acceptable_timestamp = max_age_dt.isoformat()
+
+        app.logger.info(f"Fetching snippets from DB, limit: {API_GW_SNIPPET_CACHE_SIZE}, newer than: {oldest_acceptable_timestamp}")
+        cursor.execute(
+            """
+            SELECT * FROM topics_snippets
+            WHERE type = 'snippet' AND generation_timestamp >= ?
+            ORDER BY generation_timestamp DESC
+            LIMIT ?
+            """,
+            (oldest_acceptable_timestamp, API_GW_SNIPPET_CACHE_SIZE)
+        )
+        rows = cursor.fetchall()
+
+        current_time_iso = datetime.now().isoformat()
+        snippet_ids_to_update_access_time = []
+
+        for row in rows:
+            snippet_dict = dict(row) # Convert sqlite3.Row to dict
+            # Deserialize JSON fields
+            if snippet_dict.get("keywords"):
+                try:
+                    snippet_dict["keywords"] = json.loads(snippet_dict["keywords"])
+                except json.JSONDecodeError:
+                    app.logger.warning(f"Failed to decode keywords JSON for snippet {snippet_dict['id']}: {snippet_dict['keywords']}")
+                    snippet_dict["keywords"] = [] # Default to empty list on error
+
+            if snippet_dict.get("original_topic_details"):
+                try:
+                    snippet_dict["original_topic_details"] = json.loads(snippet_dict["original_topic_details"])
+                except json.JSONDecodeError:
+                    app.logger.warning(f"Failed to decode original_topic_details JSON for snippet {snippet_dict['id']}: {snippet_dict['original_topic_details']}")
+                    snippet_dict["original_topic_details"] = None # Default to None
+
+            cached_snippets.append(snippet_dict)
+            snippet_ids_to_update_access_time.append(snippet_dict["id"])
+
+        if snippet_ids_to_update_access_time:
+            # Batch update last_accessed_timestamp
+            # Ensure each ID is a tuple for executemany
+            update_params = [(current_time_iso, snippet_id) for snippet_id in snippet_ids_to_update_access_time]
+            cursor.executemany(
+                "UPDATE topics_snippets SET last_accessed_timestamp = ? WHERE id = ?",
+                update_params
+            )
+            conn.commit()
+            app.logger.info(f"Updated last_accessed_timestamp for {len(snippet_ids_to_update_access_time)} cached snippets.")
+
+    except sqlite3.Error as e_sql:
+        app.logger.error(f"Database error while fetching/updating cached snippets: {e_sql}", exc_info=True)
+        # Do not fail the request here; proceed to generate new snippets.
+    except Exception as e_gen_cache: # Catch other potential errors during cache read
+        app.logger.error(f"Unexpected error during snippet cache retrieval: {e_gen_cache}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+    # Cache decision logic: Use cached snippets if we have a reasonable number.
+    # Heuristic: if we have at least half the desired cache size.
+    if len(cached_snippets) >= API_GW_SNIPPET_CACHE_SIZE / 2:
+        app.logger.info(f"Serving {len(cached_snippets)} snippets from DB cache.")
+        return jsonify({"snippets": cached_snippets, "source": "cache"}), 200
+    else:
+        app.logger.info(f"Cache miss or insufficient fresh snippets ({len(cached_snippets)} found). Proceeding to generate new snippets.")
+
+    # --- Fallback to TDA/CPOA if cache is insufficient ---
     topics_from_tda = []
     try:
         app.logger.info(f"Calling TDA service at {TDA_SERVICE_URL} to discover topics.")
-        tda_payload = {"limit": request.args.get('limit', 5, type=int)} # Allow limit override via query param
+        tda_payload = {"limit": request.args.get('limit', 5, type=int)}
         tda_response = requests.post(TDA_SERVICE_URL, json=tda_payload, timeout=30)
-        tda_response.raise_for_status() # Check for HTTP errors
-
+        tda_response.raise_for_status()
         tda_data = tda_response.json()
-        topics_from_tda = tda_data.get("topics", []) # Assuming TDA returns {"topics": [...]}
+        # TDA now returns "topics" directly in the root of the JSON response as per recent updates.
+        # Before it was {"discovered_topics": [...]}, now it's {"topics": [...] }
+        topics_from_tda = tda_data.get("topics", tda_data.get("discovered_topics", []))
+
 
         if not topics_from_tda:
             app.logger.warning("TDA service returned no topics.")
-            return jsonify({"message": "No topics available from TDA to generate snippets.", "snippets": []}), 200
-
-        app.logger.info(f"Received {len(topics_from_tda)} topics from TDA.")
+            return jsonify({"message": "No topics available from TDA to generate new snippets.", "snippets": []}), 200
+        app.logger.info(f"Received {len(topics_from_tda)} topics from TDA for new snippet generation.")
 
     except requests.exceptions.HTTPError as e_http:
         error_details = str(e_http)
@@ -227,46 +338,45 @@ def get_dynamic_snippets():
     except json.JSONDecodeError as e_json:
         app.logger.error(f"TDA service response was not valid JSON: {e_json}", exc_info=True)
         return jsonify({"error": "Internal Server Error", "message": "Invalid response from Topic Discovery Agent."}), 500
-    except Exception as e_gen: # Catch-all for other unexpected TDA call errors
+    except Exception as e_gen:
         app.logger.error(f"Unexpected error calling TDA service: {e_gen}", exc_info=True)
         return jsonify({"error": "Internal Server Error", "message": f"An unexpected error occurred while fetching topics: {e_gen}"}), 500
 
     generated_snippets = []
     for topic_obj in topics_from_tda:
-        # Adapt TDA's TopicObject to CPOA's expected topic_info structure if needed.
-        # Assuming TDA's TopicObject fields are directly usable or CPOA can handle them.
-        # Specifically, CPOA's orchestrate_snippet_generation expects 'topic_id' and 'title_suggestion'.
-        # Let's assume TDA provides 'id' and 'title'.
+        topic_id_val = topic_obj.get("id") or topic_obj.get("topic_id")
+        title_sug_val = topic_obj.get("title") or topic_obj.get("title_suggestion")
+
         topic_info_for_cpoa = {
-            "topic_id": topic_obj.get("id") or topic_obj.get("topic_id"), # Adapt based on TDA's actual output
-            "title_suggestion": topic_obj.get("title") or topic_obj.get("title_suggestion"), # Adapt
+            "topic_id": topic_id_val,
+            "title_suggestion": title_sug_val,
             "summary": topic_obj.get("summary"),
-            "keywords": topic_obj.get("keywords", [])
-            # Pass other fields from topic_obj if they exist and SCA might use them
+            "keywords": topic_obj.get("keywords", []),
+            # Pass the full original TDA topic object to CPOA, so it can store it in DB for snippets
+            "original_topic_details_from_tda": topic_obj
         }
-        # Ensure essential fields for CPOA are present
         if not topic_info_for_cpoa["title_suggestion"]:
             app.logger.warning(f"Skipping snippet generation for topic from TDA due to missing title: {topic_obj}")
             continue
 
-        app.logger.info(f"Requesting snippet generation from CPOA for topic: {topic_info_for_cpoa.get('title_suggestion')}")
+        app.logger.info(f"Requesting snippet generation from CPOA for topic: {title_sug_val}")
         try:
+            # CPOA's orchestrate_snippet_generation will now save to DB itself.
             snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_cpoa)
             if snippet_result and "error" not in snippet_result:
                 generated_snippets.append(snippet_result)
-                app.logger.info(f"Snippet generated successfully for topic: {topic_info_for_cpoa.get('title_suggestion')}")
+                app.logger.info(f"Snippet generated successfully by CPOA for topic: {title_sug_val}")
             else:
-                app.logger.error(f"Snippet generation failed for topic '{topic_info_for_cpoa.get('title_suggestion')}': {snippet_result.get('details', 'Unknown CPOA error')}")
+                app.logger.error(f"Snippet generation by CPOA failed for topic '{title_sug_val}': {snippet_result.get('details', 'Unknown CPOA error')}")
         except Exception as e_cpoa_snip:
-            app.logger.error(f"Unexpected error calling CPOA orchestrate_snippet_generation for topic '{topic_info_for_cpoa.get('title_suggestion')}': {e_cpoa_snip}", exc_info=True)
-            # Continue to next topic
+            app.logger.error(f"Unexpected error calling CPOA orchestrate_snippet_generation for topic '{title_sug_val}': {e_cpoa_snip}", exc_info=True)
 
     if not generated_snippets:
-        app.logger.info("No snippets were successfully generated for the discovered topics.")
-        return jsonify({"message": "No snippets generated for the available topics.", "snippets": []}), 200
+        app.logger.info("No snippets were successfully generated by CPOA for the discovered topics.")
+        return jsonify({"message": "No new snippets generated for the available topics.", "snippets": []}), 200
 
-    app.logger.info(f"Successfully generated {len(generated_snippets)} snippets.")
-    return jsonify({"snippets": generated_snippets}), 200
+    app.logger.info(f"Successfully generated {len(generated_snippets)} new snippets via TDA/CPOA.")
+    return jsonify({"snippets": generated_snippets, "source": "generation"}), 200
 
 
 # --- Podcast Generation Endpoint ---
@@ -278,11 +388,16 @@ def create_podcast_generation_task():
         app.logger.warning("Bad request to /api/v1/podcasts: Missing or empty 'topic'.")
         return jsonify({"error": "Bad Request", "message": "Missing or empty 'topic' in request body."}), 400
     
-    topic = data['topic'] # This is just a string for now.
-                         # Consider if this should be a more structured topic_info object in the future.
-    app.logger.info(f"Received podcast generation request for topic string: '{topic}'")
+    topic = data['topic']
+    voice_params_from_request = data.get('voice_params') # Optional
 
-    if not cpoa_podcast_func_imported: # Check specific function import
+    if voice_params_from_request is not None and not isinstance(voice_params_from_request, dict):
+        app.logger.warning("Bad request to /api/v1/podcasts: 'voice_params' was provided but not as a valid JSON object.")
+        return jsonify({"error": "Bad Request", "message": "'voice_params' must be a valid JSON object if provided."}), 400
+
+    app.logger.info(f"Received podcast generation request for topic string: '{topic}'. Voice params: {voice_params_from_request}")
+
+    if not cpoa_podcast_func_imported:
         app.logger.error("CPOA podcast generation function not loaded. Cannot process podcast generation.")
         return jsonify({"error": "Service Unavailable", "message": f"Core podcast orchestration module (podcast func) not loaded. Import error: {CPOA_IMPORT_ERROR_MESSAGE}"}), 503
 
@@ -299,13 +414,13 @@ def create_podcast_generation_task():
             cursor.execute(
                 """
                 INSERT INTO podcasts
-                (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp)
-                VALUES (?, ?, ?, ?, ?)
+                (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp, tts_settings_used)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (podcast_id, topic, "pending_api_gateway", task_created_timestamp, task_created_timestamp)
+                (podcast_id, topic, "pending_api_gateway", task_created_timestamp, task_created_timestamp, json.dumps(voice_params_from_request) if voice_params_from_request else None)
             )
             conn.commit()
-            app.logger.info(f"Initial record for podcast_id {podcast_id} created with topic '{topic}'.")
+            app.logger.info(f"Initial record for podcast_id {podcast_id} created with topic '{topic}'. Voice params (if any) stored.")
         except sqlite3.Error as e:
             app.logger.error(f"Database error creating initial record for topic '{topic}', podcast_id {podcast_id}: {e}", exc_info=True)
             return jsonify({"error": "Database Error", "message": "Failed to create initial podcast task record."}), 500
@@ -313,21 +428,14 @@ def create_podcast_generation_task():
             if conn:
                 conn.close()
 
-        # Call CPOA (assuming CPOA's orchestrate_podcast_generation is adapted to take task_id and db_path)
-        # For now, this part of CPOA's signature change is assumed.
-        # CPOA will update the status and error messages directly in the DB.
-        app.logger.info(f"Invoking CPOA orchestrate_podcast_generation for topic: '{topic}', task_id: {podcast_id}")
+        app.logger.info(f"Invoking CPOA orchestrate_podcast_generation for topic: '{topic}', task_id: {podcast_id}, voice_params: {voice_params_from_request}")
 
-        # *** This is a temporary adaptation. CPOA's orchestrate_podcast_generation needs to be updated
-        # *** to accept task_id and db_path, and to perform its own DB updates for status.
-        # *** For now, we'll call the existing CPOA function and then do a final update.
-        # *** The 'db_path=db_path_for_cpoa' part of the call below will only work once CPOA is updated.
-        # cpoa_result = orchestrate_podcast_generation(topic=topic, task_id=podcast_id, db_path=db_path_for_cpoa)
-
-        # TEMPORARY: Call existing CPOA and then update based on its full result.
-        # Once CPOA is updated, it will handle its own status updates.
-        # The API Gateway would then only fetch the final status or specific details if needed.
-        cpoa_result = orchestrate_podcast_generation(topic=topic, task_id=podcast_id, db_path=db_path_for_cpoa) # Pass task_id and db_path
+        cpoa_result = orchestrate_podcast_generation(
+            topic=topic,
+            task_id=podcast_id,
+            db_path=db_path_for_cpoa,
+            voice_params_input=voice_params_from_request
+        )
         app.logger.info(f"CPOA returned for task_id '{podcast_id}'. Status: {cpoa_result.get('status')}")
 
         # Extract details from CPOA result for final update
@@ -339,6 +447,11 @@ def create_podcast_generation_task():
         final_asf_websocket_url = cpoa_result.get("asf_websocket_url")
         final_asf_notification_status = cpoa_result.get("asf_notification_status")
         cpoa_log_json = json.dumps(cpoa_result.get("orchestration_log", []))
+
+        # Get tts_settings_used from CPOA's result (from final_audio_details)
+        tts_settings_used_dict = final_audio_details.get("tts_settings_used", {})
+        tts_settings_used_json = json.dumps(tts_settings_used_dict) if tts_settings_used_dict else None
+
         last_updated_ts = datetime.now().isoformat()
 
         conn_update = None
@@ -350,12 +463,12 @@ def create_podcast_generation_task():
                 UPDATE podcasts
                 SET cpoa_status = ?, cpoa_error_message = ?, final_audio_filepath = ?,
                     stream_id = ?, asf_websocket_url = ?, asf_notification_status = ?,
-                    cpoa_full_orchestration_log = ?, last_updated_timestamp = ?
+                    cpoa_full_orchestration_log = ?, tts_settings_used = ?, last_updated_timestamp = ?
                 WHERE podcast_id = ?
                 """,
                 (final_cpoa_status, final_cpoa_error_message, final_audio_filepath,
                  final_stream_id, final_asf_websocket_url, final_asf_notification_status,
-                 cpoa_log_json, last_updated_ts, podcast_id)
+                 cpoa_log_json, tts_settings_used_json, last_updated_ts, podcast_id)
             )
             conn_update.commit()
             app.logger.info(f"Final details for podcast {podcast_id} updated in DB.")
@@ -505,12 +618,12 @@ def get_podcast_details(podcast_id: str):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        # Fetch all new columns
+        # Fetch all new columns, including tts_settings_used
         cursor.execute(
             """SELECT podcast_id, topic, cpoa_status, cpoa_error_message,
                       final_audio_filepath, stream_id, asf_websocket_url,
                       asf_notification_status, task_created_timestamp,
-                      last_updated_timestamp, cpoa_full_orchestration_log
+                      last_updated_timestamp, cpoa_full_orchestration_log, tts_settings_used
                FROM podcasts WHERE podcast_id = ?""", (podcast_id,))
         row = cursor.fetchone()
 
@@ -521,7 +634,16 @@ def get_podcast_details(podcast_id: str):
                     orchestration_log_data = json.loads(row["cpoa_full_orchestration_log"])
                 except json.JSONDecodeError as e:
                     app.logger.error(f"Error parsing cpoa_full_orchestration_log JSON for podcast {podcast_id}: {e}")
-                    orchestration_log_data = [{"error": "Failed to parse orchestration log"}]
+                    orchestration_log_data = [{"error": "Failed to parse orchestration log"}] # Provide error in log field
+
+            tts_settings_data = None
+            if row["tts_settings_used"]: # This field might be NULL if not set during creation/update
+                try:
+                    tts_settings_data = json.loads(row["tts_settings_used"])
+                except json.JSONDecodeError as e:
+                    app.logger.error(f"Error parsing tts_settings_used JSON for podcast {podcast_id}: {e}")
+                    tts_settings_data = {"error": "Failed to parse TTS settings"}
+
 
             response_data = {
                 "podcast_id": row["podcast_id"],
@@ -529,13 +651,14 @@ def get_podcast_details(podcast_id: str):
                 "status": row["cpoa_status"],
                 "error_message": row["cpoa_error_message"],
                 "audio_url": f"/api/v1/podcasts/{row['podcast_id']}/audio.mp3" if row["final_audio_filepath"] else None,
-                "final_audio_filepath": row["final_audio_filepath"], # For client info, might be removed from public response later
+                "final_audio_filepath": row["final_audio_filepath"],
                 "stream_id": row["stream_id"],
                 "asf_websocket_url": row["asf_websocket_url"],
                 "asf_notification_status": row["asf_notification_status"],
                 "task_created_timestamp": row["task_created_timestamp"],
                 "last_updated_timestamp": row["last_updated_timestamp"],
-                "orchestration_log": orchestration_log_data
+                "orchestration_log": orchestration_log_data,
+                "tts_settings_used": tts_settings_data
             }
             app.logger.info(f"Returning details for podcast {podcast_id}.")
             return jsonify(response_data), 200
@@ -622,3 +745,5 @@ if __name__ == '__main__':
     print(f" - ASF at {os.getenv('ASF_WEBSOCKET_BASE_URL', 'ws://localhost:5006/api/v1/podcasts/stream')} and its notification endpoint")
 
     app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=True)
+
+[end of aethercast/api_gateway/main.py]

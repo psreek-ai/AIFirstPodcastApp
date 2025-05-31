@@ -12,10 +12,12 @@ Key Responsibilities:
     *   The prompt guides the LLM to generate a script with specific structural cues (e.g., `[TITLE]`, `[INTRO]`, `[SEGMENT_X_TITLE]`, `[SEGMENT_X_CONTENT]`, `[OUTRO]`) and to indicate errors like insufficient content.
 3.  **LLM Interaction:**
     *   Calls an OpenAI-compatible LLM service using the configured API key, model, temperature, and max tokens.
+    *   When `PSWA_LLM_JSON_MODE` is enabled and a compatible model is used, PSWA instructs the LLM to return its output directly as a JSON string.
     *   Handles API errors from the LLM service.
 4.  **Script Parsing & Structuring:**
-    *   Parses the raw text output from the LLM.
-    *   Identifies and extracts sections based on the predefined tags (e.g., `[TITLE]`, `[INTRO]`).
+    *   If JSON output is requested and successfully received, it's parsed directly.
+    *   If JSON output fails or is disabled, PSWA falls back to parsing a text-based response from the LLM using predefined tags (e.g., `[TITLE]`, `[INTRO]`).
+    *   Identifies and extracts sections based on the chosen parsing method.
     *   Constructs a structured JSON object representing the podcast script, including a `script_id`, `topic`, `title`, the `full_raw_script` from the LLM, a list of `segments` (each with `segment_title` and `content`), and the `llm_model_used`.
 5.  **Output:** Returns the structured script JSON object to the CPOA.
 
@@ -37,10 +39,12 @@ Then, edit the `.env` file. The following variables are used:
     -   *Default:* `0.7`
 -   `PSWA_LLM_MAX_TOKENS`: Maximum number of tokens to generate in the LLM response.
     -   *Default:* `1500`
--   `PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE`: The system message to set the context for the LLM.
-    -   *Default:* `"You are a podcast scriptwriter tasked with creating well-structured podcast scripts."`
--   `PSWA_DEFAULT_PROMPT_USER_TEMPLATE`: The template for the user message sent to the LLM. It uses `{topic}` and `{content}` placeholders. The default template guides the LLM to produce specific tags like `[TITLE]`, `[INTRO]`, etc.
-    -   *Default:* (A multi-line template string, see `.env.example` for the full content)
+-   `PSWA_LLM_JSON_MODE`: Set to `true` to explicitly request JSON output from compatible LLMs. If `false`, or if the model doesn't support the JSON mode flag, PSWA will rely on tag-based parsing from the LLM's text response. The system and user prompts should be adjusted accordingly based on this mode.
+    -   *Default:* `true` (as per current `.env.example`)
+-   `PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE`: The system message to set the context for the LLM. The default example is designed for JSON output mode.
+    -   *Default:* `"You are a podcast scriptwriter tasked with creating well-structured podcast scripts."` (Note: The actual default in `.env.example` is more JSON specific and should be referenced by users).
+-   `PSWA_DEFAULT_PROMPT_USER_TEMPLATE`: The template for the user message sent to the LLM. It uses `{topic}` and `{content}` placeholders. The default template guides the LLM to produce specific tags like `[TITLE]`, `[INTRO]`, etc. The default example is designed for JSON output mode.
+    -   *Default:* (A multi-line template string, see `.env.example` for the full content, which is JSON specific)
 -   `PSWA_HOST`: Host for the Flask development server.
     -   *Default:* `0.0.0.0`
 -   `PSWA_PORT`: Port for the Flask development server.
@@ -110,13 +114,18 @@ flask run --host=0.0.0.0 --port=5004
         }
         ```
     -   **400 Bad Request (Insufficient Content Indicated by LLM):**
-        If the LLM returns the specific error string defined in the prompt template (e.g., `[ERROR] Insufficient content...`).
+        If the LLM (in JSON mode) returns the specific error JSON.
         ```json
         {
-            "error": "[ERROR] Insufficient content provided to generate a full podcast script for the topic: The Future of Artificial Intelligence",
-            "details": "LLM indicated content was insufficient."
+            "error": "PSWA_INSUFFICIENT_CONTENT_FROM_LLM",
+            "message": "LLM indicated content was insufficient for topic: The Future of Artificial Intelligence",
+            "llm_response": {
+                "error": "Insufficient content",
+                "message": "The provided content was not sufficient for topic: The Future of Artificial Intelligence"
+            }
         }
         ```
+        If not in JSON mode, a tag-based error like `[ERROR] Insufficient content...` would be parsed and result in a structured error segment.
     -   **500 Internal Server Error (LLM API Error):**
         ```json
         {
@@ -125,11 +134,11 @@ flask run --host=0.0.0.0 --port=5004
         }
         ```
     -   **500 Internal Server Error (Script Parsing Failure):**
-        If the LLM output is successfully received but cannot be parsed into the expected structure (e.g., missing critical tags like `[TITLE]` or `[INTRO]`).
+        If JSON mode is enabled, this error occurs if the LLM output is not valid JSON *and* the subsequent fallback to tag-based parsing also fails to find essential script structure. If JSON mode is disabled, it means tag-based parsing failed.
         ```json
         {
             "error": "PSWA_SCRIPT_PARSING_FAILURE",
-            "message": "Failed to parse essential script structure from LLM output.",
+            "message": "Failed to parse LLM output as JSON and also failed tag-based fallback.",
             "raw_output_preview": "..." // Preview of the raw LLM output
         }
         ```

@@ -38,13 +38,20 @@ class TestWeaveScriptLogic(unittest.TestCase):
         # Mock configurations - these will be active for each test
         self.mock_pswa_config = {
             "OPENAI_API_KEY": "fake_api_key",
-            "PSWA_LLM_MODEL": "gpt-test-model",
+            "PSWA_LLM_MODEL": "gpt-3.5-turbo-1106", # A model that supports JSON mode
             "PSWA_LLM_TEMPERATURE": 0.5,
             "PSWA_LLM_MAX_TOKENS": 1000,
-            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System message for tests.",
-            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "Topic: {topic}\nContent: {content}\n\n[TITLE]Default Test Title\n[INTRO]Default Intro\n[SEGMENT_1_TITLE]Seg1 Title\n[SEGMENT_1_CONTENT]Seg1 Content\n[OUTRO]Default Outro"
+            "PSWA_LLM_JSON_MODE": True, # Enable JSON mode for most tests here
+            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": pswa_main.pswa_config.get("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE"), # Use actual default
+            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": pswa_main.pswa_config.get("PSWA_DEFAULT_PROMPT_USER_TEMPLATE")   # Use actual default
         }
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config)
+        # Ensure the main pswa_config is updated with these test-specific values
+        # self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
+        # A safer way if pswa_config is already populated by load_pswa_configuration at module import:
+        temp_config = pswa_main.pswa_config.copy()
+        temp_config.update(self.mock_pswa_config)
+        self.config_patcher = patch.dict(pswa_main.pswa_config, temp_config, clear=True)
+
         self.mock_config = self.config_patcher.start()
 
         self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
@@ -55,15 +62,142 @@ class TestWeaveScriptLogic(unittest.TestCase):
         self.imports_patcher.stop()
 
     @patch('openai.ChatCompletion.create')
-    def test_weave_script_success(self, mock_openai_create):
-        mock_llm_response_content = """[TITLE]AI in Education
-[INTRO]Welcome to a discussion on how AI is reshaping education.
-[SEGMENT_1_TITLE]Personalized Learning
-[SEGMENT_1_CONTENT]AI algorithms analyze student performance to offer tailored learning paths. This helps address individual needs effectively.
-[OUTRO]AI holds immense potential to revolutionize teaching and learning. Join us next time!"""
+    def test_weave_script_success_json_mode(self, mock_openai_create):
+        # Simulate LLM returning a valid JSON string
+        llm_output_json_str = json.dumps({
+            "title": "AI in Education (JSON)",
+            "intro": "Welcome to a JSON discussion on AI in education.",
+            "segments": [
+                {"segment_title": "Personalized Learning (JSON)", "content": "AI offers tailored JSON learning paths."},
+                {"segment_title": "Future Trends (JSON)", "content": "JSON-based AI tutors are emerging."}
+            ],
+            "outro": "JSON AI will reshape learning. Thanks!"
+        })
         
         mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=mock_llm_response_content))],
+            choices=[MagicMock(message=MagicMock(content=llm_output_json_str))],
+            model="gpt-3.5-turbo-1106-from-api"
+        )
+
+        result = pswa_main.weave_script("Some harvested content", "AI in Education via JSON")
+
+        mock_openai_create.assert_called_once()
+        call_kwargs = mock_openai_create.call_args.kwargs
+        self.assertEqual(call_kwargs.get("response_format"), {"type": "json_object"})
+
+
+        self.assertNotIn("error", result)
+        self.assertEqual(result["topic"], "AI in Education via JSON")
+        self.assertEqual(result["title"], "AI in Education (JSON)")
+        self.assertEqual(result["llm_model_used"], "gpt-3.5-turbo-1106-from-api")
+        self.assertEqual(result["full_raw_script"], llm_output_json_str) # Raw script is the JSON string
+
+        self.assertEqual(len(result["segments"]), 4) # Intro, Seg1, Seg2, Outro
+        self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
+        self.assertEqual(result["segments"][0]["content"], "Welcome to a JSON discussion on AI in education.")
+        self.assertEqual(result["segments"][1]["segment_title"], "Personalized Learning (JSON)")
+        self.assertEqual(result["segments"][1]["content"], "AI offers tailored JSON learning paths.")
+        self.assertEqual(result["segments"][3]["segment_title"], "OUTRO")
+
+
+    @patch('openai.ChatCompletion.create')
+    def test_weave_script_success_fallback_parsing(self, mock_openai_create):
+        # Test fallback to tag-based parsing if JSON mode is off or LLM fails to produce JSON
+        with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
+            mock_llm_response_content = """[TITLE]AI in Education (Tag Fallback)
+[INTRO]Tag-based intro.
+[SEGMENT_1_TITLE]Segment One (Tag)
+[SEGMENT_1_CONTENT]Content for segment one via tags.
+[OUTRO]Tag-based outro."""
+
+            mock_openai_create.return_value = MagicMock(
+                choices=[MagicMock(message=MagicMock(content=mock_llm_response_content))],
+                model="gpt-test-model-fallback"
+            )
+
+            result = pswa_main.weave_script("Some content", "AI Education Fallback")
+
+            mock_openai_create.assert_called_once()
+            call_kwargs = mock_openai_create.call_args.kwargs
+            self.assertNotIn("response_format", call_kwargs) # JSON mode should not be requested
+
+            self.assertNotIn("error", result)
+            self.assertEqual(result["title"], "AI in Education (Tag Fallback)")
+            self.assertEqual(len(result["segments"]), 3) # Intro, Seg1, Outro
+            self.assertEqual(result["segments"][0]["content"], "Tag-based intro.")
+            self.assertEqual(result["segments"][1]["segment_title"], "Segment One (Tag)")
+            self.assertEqual(result["segments"][2]["segment_title"], "OUTRO")
+
+    @patch('openai.ChatCompletion.create')
+    def test_weave_script_invalid_json_fallback_to_tags(self, mock_openai_create):
+        # LLM returns non-JSON string even when JSON mode might have been requested
+        invalid_json_but_valid_tags = "[TITLE]Title from Tags\n[INTRO]Intro from Tags\nThis is not JSON."
+        mock_openai_create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content=invalid_json_but_valid_tags))],
+            model="gpt-test-model-invalid-json"
+        )
+
+        # Keep PSWA_LLM_JSON_MODE True to simulate LLM ignoring the format request
+        with patch.object(pswa_main.logger, 'warning') as mock_logger_warning:
+            result = pswa_main.weave_script("Content", "Invalid JSON Test")
+
+            self.assertNotIn("error", result)
+            self.assertEqual(result["title"], "Title from Tags")
+            self.assertEqual(result["segments"][0]["content"], "Intro from Tags")
+            self.assertTrue(any("LLM output was not valid JSON" in call_args[0][0] for call_args in mock_logger_warning.call_args_list))
+
+    @patch('openai.ChatCompletion.create')
+    def test_weave_script_critical_failure_unparsable_output_json_mode(self, mock_openai_create):
+        # Test LLM returning completely unparsable output (neither JSON nor tags) when JSON mode is on
+        unparsable_gibberish = "This is complete gibberish, not JSON, and not tags."
+        mock_openai_create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content=unparsable_gibberish))],
+            model="gpt-test-model-gibberish"
+        )
+
+        # Ensure JSON mode is on
+        self.assertTrue(pswa_main.pswa_config["PSWA_LLM_JSON_MODE"])
+
+        with patch.object(pswa_main.logger, 'error') as mock_logger_error:
+            result = pswa_main.weave_script("Content", "Unparsable Test")
+
+            self.assertIn("error", result, "Result should indicate an error for unparsable output.")
+            self.assertEqual(result["error"], "PSWA_SCRIPT_PARSING_FAILURE")
+            self.assertIn("Failed to parse LLM output as JSON and also failed tag-based fallback", result["details"])
+
+            # Check that an error was logged about the parsing failure
+            self.assertTrue(any("Failed to parse LLM output as JSON" in call_args[0][0] for call_args in mock_logger_error.call_args_list))
+
+    @patch('openai.ChatCompletion.create')
+    def test_weave_script_json_insufficient_content(self, mock_openai_create):
+        llm_error_json_str = json.dumps({
+            "error": "Insufficient content",
+            "message": "The provided content was not sufficient for topic: Too Brief"
+        })
+        mock_openai_create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content=llm_error_json_str))],
+            model="gpt-test-model"
+        )
+        result = pswa_main.weave_script("Too little", "Too Brief")
+        self.assertEqual(result["segments"][0]["segment_title"], "ERROR")
+        self.assertIn("not sufficient for topic: Too Brief", result["segments"][0]["content"])
+        self.assertTrue(result["title"].startswith("Error: Insufficient Content"))
+
+
+    @patch('openai.ChatCompletion.create') # Keep this patch for consistency even if not used in this specific test path
+    def test_weave_script_success(self, mock_openai_create): # Original success test, now defaults to JSON mode
+        # This test implicitly tests JSON mode if self.mock_pswa_config["PSWA_LLM_JSON_MODE"] is True
+        llm_output_json_str = json.dumps({
+            "title": "AI in Education",
+            "intro": "Welcome to a discussion on how AI is reshaping education.",
+            "segments": [
+                {"segment_title": "Personalized Learning", "content": "AI algorithms analyze student performance to offer tailored learning paths. This helps address individual needs effectively."}
+            ],
+            "outro": "AI holds immense potential to revolutionize teaching and learning. Join us next time!"
+        })
+
+        mock_openai_create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content=llm_output_json_str))],
             model="gpt-test-model-from-api"
         )
 
@@ -73,9 +207,10 @@ class TestWeaveScriptLogic(unittest.TestCase):
         self.assertEqual(result["topic"], "AI in Education")
         self.assertEqual(result["title"], "AI in Education")
         self.assertEqual(result["llm_model_used"], "gpt-test-model-from-api")
-        self.assertEqual(result["full_raw_script"], mock_llm_response_content)
+        # full_raw_script should be the JSON string itself now
+        self.assertEqual(result["full_raw_script"], llm_output_json_str)
         
-        self.assertEqual(len(result["segments"]), 3)
+        self.assertEqual(len(result["segments"]), 3) # Intro, Seg1, Outro
         self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
         self.assertEqual(result["segments"][0]["content"], "Welcome to a discussion on how AI is reshaping education.")
         self.assertEqual(result["segments"][1]["segment_title"], "Personalized Learning")
@@ -100,65 +235,104 @@ class TestWeaveScriptLogic(unittest.TestCase):
             self.assertEqual(result["error"], "PSWA_CONFIG_ERROR_API_KEY")
 
     @patch('openai.ChatCompletion.create')
-    def test_weave_script_insufficient_content_from_llm(self, mock_openai_create):
-        error_message_from_llm = "[ERROR] Insufficient content provided to generate a full podcast script for the topic: Sparse Topic"
-        mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=error_message_from_llm))],
-            model="gpt-test-model"
-        )
-        result = pswa_main.weave_script("Too little content", "Sparse Topic")
-        
-        self.assertNotIn("error", result, "weave_script should parse the LLM's error message, not raise its own error key for insufficient content.")
-        self.assertEqual(result["segments"][0]["segment_title"], "ERROR")
-        self.assertEqual(result["segments"][0]["content"], error_message_from_llm)
-        self.assertEqual(result["full_raw_script"], error_message_from_llm)
-        self.assertTrue(result["title"].startswith("Error: Insufficient Content"))
+    def test_weave_script_insufficient_content_from_llm_tag_mode(self, mock_openai_create):
+        # Test the tag-based insufficient content error when JSON mode is off
+        with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
+            error_message_from_llm = "[ERROR] Insufficient content provided to generate a full podcast script for the topic: Sparse Topic"
+            mock_openai_create.return_value = MagicMock(
+                choices=[MagicMock(message=MagicMock(content=error_message_from_llm))],
+                model="gpt-test-model"
+            )
+            result = pswa_main.weave_script("Too little content", "Sparse Topic")
+
+            self.assertNotIn("error", result, "weave_script should parse the LLM's error message, not raise its own error key for insufficient content.")
+            self.assertEqual(result["segments"][0]["segment_title"], "ERROR")
+            self.assertEqual(result["segments"][0]["content"], error_message_from_llm)
+            self.assertEqual(result["full_raw_script"], error_message_from_llm)
+            self.assertTrue(result["title"].startswith("Error: Insufficient Content"))
 
 
     @patch('openai.ChatCompletion.create')
-    def test_script_parsing_variations(self, mock_openai_create):
-        # Test case 1: Only Title and Intro
-        script_1 = "[TITLE]Minimalist Podcast\n[INTRO]Just an intro here."
-        mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_1))])
-        result_1 = pswa_main.weave_script("content", "topic1")
-        self.assertEqual(result_1["title"], "Minimalist Podcast")
-        self.assertEqual(len(result_1["segments"]), 1)
-        self.assertEqual(result_1["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(result_1["segments"][0]["content"], "Just an intro here.")
+    def test_script_parsing_variations_tag_mode(self, mock_openai_create):
+        # Test tag parsing variations specifically when JSON mode is off
+        with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
+            # Test case 1: Only Title and Intro
+            script_1 = "[TITLE]Minimalist Podcast (Tag)\n[INTRO]Just an intro here (Tag)."
+            mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_1))])
+            result_1 = pswa_main.weave_script("content", "topic1_tag")
+            self.assertEqual(result_1["title"], "Minimalist Podcast (Tag)")
+            self.assertEqual(len(result_1["segments"]), 1)
+            self.assertEqual(result_1["segments"][0]["segment_title"], "INTRO")
+            self.assertEqual(result_1["segments"][0]["content"], "Just an intro here (Tag).")
 
-        # Test case 2: Missing Title tag, but other tags present
-        script_2 = "[INTRO]An intro without a title tag first.\n[OUTRO]And an outro."
-        mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_2))])
-        result_2 = pswa_main.weave_script("content", "topic2")
-        self.assertTrue(result_2["title"].startswith("Podcast on topic2"))
-        self.assertEqual(len(result_2["segments"]), 2)
-        self.assertEqual(result_2["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(result_2["segments"][1]["segment_title"], "OUTRO")
-
-        # Test case 3: Segment title without content tag immediately after
-        script_3 = "[TITLE]Segment Anomaly\n[INTRO]Intro here.\n[SEGMENT_1_TITLE]Title for Segment 1\n[SEGMENT_2_TITLE]Another Title, No Content for Seg1"
-        mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_3))])
-        result_3 = pswa_main.weave_script("content", "topic3")
-        # The parser should handle the content of [SEGMENT_1_TITLE] as the title for that segment.
-        # Since there's no [SEGMENT_1_CONTENT], its content will be empty.
-        self.assertEqual(result_3["segments"][1]["segment_title"], "Title for Segment 1")
-        self.assertEqual(result_3["segments"][1]["content"], "")
-        self.assertEqual(result_3["segments"][2]["segment_title"], "SEGMENT_2_TITLE")
-        self.assertEqual(result_3["segments"][2]["content"], "Another Title, No Content for Seg1")
+            # Test case 2: Missing Title tag, but other tags present
+            script_2 = "[INTRO]An intro without a title tag first (Tag).\n[OUTRO]And an outro (Tag)."
+            mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_2))])
+            result_2 = pswa_main.weave_script("content", "topic2_tag")
+            self.assertTrue(result_2["title"].startswith("Podcast on topic2_tag"))
+            self.assertEqual(len(result_2["segments"]), 2)
+            self.assertEqual(result_2["segments"][0]["segment_title"], "INTRO")
+            self.assertEqual(result_2["segments"][1]["segment_title"], "OUTRO")
 
 
 class TestParseLlmScriptOutput(unittest.TestCase):
-    # Test the parser directly
+    # Test the parser directly. This class primarily tests the TAG-BASED parser.
+    # JSON parsing is simpler (json.loads) and its failure modes are tested within weave_script tests.
     def setUp(self):
         # The parser uses pswa_config for default model, so mock it.
+        # For these tag-based tests, PSWA_LLM_JSON_MODE should be False or not strictly relevant
+        # as we are testing the direct tag parser.
+        self.mock_pswa_config = {
+            "PSWA_LLM_MODEL": "parser-test-model",
+            "PSWA_LLM_JSON_MODE": False
+        }
+        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
+        self.mock_config = self.config_patcher.start()
+
+        # Mock imports_patcher if pswa_main.parse_llm_script_output relies on it (it shouldn't directly)
+        # For safety, keeping it if other utility functions called by parser might use it.
+        self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
+        self.mock_imports = self.imports_patcher.start()
+
+    def tearDown(self):
+        self.config_patcher.stop()
+        self.imports_patcher.stop()
+
+    # The test_weave_script_success and other weave_script tests from the original TestParseLlmScriptOutput
+    # seem redundant if TestWeaveScriptLogic is comprehensive.
+    # I'll keep the direct parser tests for the tag-based parser.
+    # Removing the redundant weave_script tests from this class.
+
+    # @patch('openai.ChatCompletion.create')
+    # def test_weave_script_success(self, mock_openai_create):
+    # ... (removed) ...
+
+    # @patch('openai.ChatCompletion.create')
+    # def test_weave_script_openai_api_error(self, mock_openai_create):
+    # ... (removed) ...
+
+    # def test_weave_script_missing_api_key(self):
+    # ... (removed) ...
+
+    # @patch('openai.ChatCompletion.create')
+    # def test_weave_script_insufficient_content_from_llm(self, mock_openai_create):
+    # ... (removed) ...
+
+    # @patch('openai.ChatCompletion.create')
+    # def test_script_parsing_variations(self, mock_openai_create):
+    # ... (removed) ...
+
+# Renaming this class to be more specific about testing the tag-based parser.
+class TestTagBasedParseLlmScriptOutput(unittest.TestCase):
+    def setUp(self):
+        # For these tag-based tests, PSWA_LLM_JSON_MODE is not relevant for the parser itself.
         self.mock_pswa_config = {"PSWA_LLM_MODEL": "parser-test-model"}
         self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config)
         self.mock_config = self.config_patcher.start()
 
     def tearDown(self):
         self.config_patcher.stop()
-
-    def test_parse_perfect_script(self):
+    def test_parse_perfect_script(self): # Testing TAG-BASED parser
         raw_script = """[TITLE]Perfect Podcast Title
 [INTRO]This is the introduction. It has multiple lines.
 Welcome!
@@ -169,9 +343,10 @@ More content for segment 1.
 [SEGMENT_2_CONTENT]Content for the second segment.
 [OUTRO]This is the outro.
 Thanks for listening!"""
+        # Note: parse_llm_script_output is the tag-based parser.
         parsed = pswa_main.parse_llm_script_output(raw_script, "Perfect Topic")
         self.assertEqual(parsed["title"], "Perfect Podcast Title")
-        self.assertEqual(len(parsed["segments"]), 4) # Intro, Seg1, Seg2, Outro
+        self.assertEqual(len(parsed["segments"]), 4)
         self.assertEqual(parsed["segments"][0]["segment_title"], "INTRO")
         self.assertEqual(parsed["segments"][0]["content"], "This is the introduction. It has multiple lines.\nWelcome!")
         self.assertEqual(parsed["segments"][1]["segment_title"], "First Segment Title")
@@ -181,7 +356,7 @@ Thanks for listening!"""
         self.assertEqual(parsed["segments"][3]["segment_title"], "OUTRO")
         self.assertEqual(parsed["segments"][3]["content"], "This is the outro.\nThanks for listening!")
 
-    def test_parse_minimal_script(self):
+    def test_parse_minimal_script(self): # Testing TAG-BASED parser
         raw_script = "[TITLE]Minimal\n[INTRO]Just intro.\n[OUTRO]Just outro."
         parsed = pswa_main.parse_llm_script_output(raw_script, "Minimal Topic")
         self.assertEqual(parsed["title"], "Minimal")
@@ -191,14 +366,14 @@ Thanks for listening!"""
         self.assertEqual(parsed["segments"][1]["segment_title"], "OUTRO")
         self.assertEqual(parsed["segments"][1]["content"], "Just outro.")
 
-    def test_parse_missing_optional_tags(self):
+    def test_parse_missing_optional_tags(self): # Testing TAG-BASED parser
         raw_script = "[TITLE]No Segments\n[INTRO]Only intro and outro here.\n[OUTRO]Bye."
         parsed = pswa_main.parse_llm_script_output(raw_script, "No Segments Topic")
         self.assertEqual(parsed["title"], "No Segments")
-        self.assertEqual(len(parsed["segments"]), 2) # Intro, Outro
+        self.assertEqual(len(parsed["segments"]), 2)
         self.assertEqual(parsed["segments"][0]["content"], "Only intro and outro here.")
 
-    def test_parse_extra_whitespace_and_newlines(self):
+    def test_parse_extra_whitespace_and_newlines(self): # Testing TAG-BASED parser
         raw_script = """  [TITLE]   Spaced Out Title
 
 [INTRO]
@@ -213,7 +388,7 @@ Thanks for listening!"""
         self.assertEqual(parsed["segments"][0]["content"], "Intro with spaces.")
         self.assertEqual(parsed["segments"][1]["segment_title"], "OUTRO")
         self.assertEqual(parsed["segments"][1]["content"], "Outro also spaced.")
-        
+
     def test_parse_segment_title_no_content(self):
         raw_script = "[TITLE]Seg Title No Content\n[INTRO]Intro.\n[SEGMENT_1_TITLE]Title Only\n[OUTRO]End."
         parsed = pswa_main.parse_llm_script_output(raw_script, "Seg Title No Content")
@@ -267,13 +442,14 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
         self.mock_pswa_config = {
             "OPENAI_API_KEY": "fake_api_key_for_endpoint",
             "PSWA_LLM_MODEL": "gpt-endpoint-model",
-            # Ensure all keys used by weave_script are present if they are accessed via pswa_config.get
             "PSWA_LLM_TEMPERATURE": 0.7,
             "PSWA_LLM_MAX_TOKENS": 1500,
-            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System msg",
-            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User: {topic} - {content}"
+            "PSWA_LLM_JSON_MODE": True, # For endpoint tests, assume JSON mode is generally active
+            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System msg for endpoint",
+            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User: {topic} - {content} (endpoint)"
         }
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config)
+        # Use clear=True to ensure only these values are in pswa_config for this test class
+        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
         self.mock_config = self.config_patcher.start()
 
         self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
@@ -292,11 +468,11 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
             "llm_model_used": "gpt-endpoint-model"
         }
         mock_weave_script_func.return_value = mock_structured_script
-        
+
         response = self.client.post('/weave_script', json={'content': 'Some content', 'topic': 'Test Topic'})
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
-        
+
         self.assertEqual(json_data["script_id"], "pswa_script_test123")
         self.assertEqual(json_data["title"], "Great Test Podcast")
 
@@ -326,7 +502,7 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
     @patch('aethercast.pswa.main.weave_script')
     def test_handle_weave_script_llm_api_error(self, mock_weave_script_func):
         mock_weave_script_func.return_value = {"error": "PSWA_OPENAI_API_ERROR", "details": "OpenAI down"}
-        
+
         response = self.client.post('/weave_script', json={'content': 'content', 'topic': 'topic'})
         self.assertEqual(response.status_code, 500)
         json_data = response.get_json()

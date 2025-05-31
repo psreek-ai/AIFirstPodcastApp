@@ -160,9 +160,10 @@ def _update_task_status_in_db(db_path: str, task_id: str, new_cpoa_status: str, 
         if conn:
             conn.close()
 
-def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Dict[str, Any]:
+def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice_params_input: Optional[dict] = None) -> Dict[str, Any]:
     """
-    Orchestrates the podcast generation by calling WCHA, PSWA, and VFA in sequence.
+    Orchestrates the podcast generation by calling WCHA, PSWA, and VFA in sequence,
+    optionally using provided voice parameters for VFA.
     Uses web search via WCHA's get_content_for_topic.
     Updates task status in a database.
     """
@@ -180,224 +181,254 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
     retry_count = CPOA_SERVICE_RETRY_COUNT
     backoff_factor = CPOA_SERVICE_RETRY_BACKOFF_FACTOR
 
-    def log_step(message: str, data: Optional[Dict[str, Any]] = None) -> None:
+    def log_step(message: str, data: Optional[Dict[str, Any]] = None, is_error_payload: bool = False) -> None:
         timestamp = datetime.now().isoformat()
-        log_entry: Dict[str, Any] = {"timestamp": timestamp, "message": message}
-        log_data_str = "N/A"
+        # current_orchestration_stage is available in the outer function's scope
+        log_entry: Dict[str, Any] = {"timestamp": timestamp, "stage": current_orchestration_stage, "message": message}
+
+        log_data_str_for_preview = "N/A"
+
         if data is not None:
+            # Store the actual dictionary for structured_data if it's not an error payload meant only for preview
+            if not is_error_payload:
+                 log_entry["structured_data"] = data
+
+            # Create string representation for data_preview
             try:
-                log_data_str = json.dumps(data) 
+                # For error payloads or complex data, ensure sensitive info is handled if necessary before full dump
+                log_data_str_for_preview = json.dumps(data)
             except TypeError: 
                 try:
-                    log_data_str = str(data)
+                    log_data_str_for_preview = str(data) # Fallback to string representation
                 except Exception:
-                    log_data_str = "Data could not be serialized or converted to string"
+                    log_data_str_for_preview = "Data could not be serialized or converted to string for preview"
         
-        preview_limit = 500  # To prevent excessively long log lines
-        log_entry["data_preview"] = log_data_str[:preview_limit] + "..." if len(log_data_str) > preview_limit else log_data_str
+        preview_limit = 250  # Keep preview concise
+        log_entry["data_preview"] = log_data_str_for_preview[:preview_limit] + "..." if len(log_data_str_for_preview) > preview_limit else log_data_str_for_preview
         
         orchestration_log.append(log_entry)
         # Also log to the main CPOA logger for real-time visibility if needed
-        logger.info(f"Task {task_id} @ {current_orchestration_stage}: {message} - Data Preview: {log_entry['data_preview']}")
+        logger.info(f"Task {task_id} @ {current_orchestration_stage}: {message} - Preview: {log_entry['data_preview']}")
+
+    # Log initial parameters
+    log_step("Orchestration process started.", data={"task_id": task_id, "topic": topic, "db_path": db_path, "voice_params_input": voice_params_input})
 
     # Check for import issues first
-    if not WCHA_IMPORT_SUCCESSFUL: # Changed from CPOA_IMPORTS_SUCCESSFUL for clarity if WCHA is the only direct import concern
+    if not WCHA_IMPORT_SUCCESSFUL:
         current_orchestration_stage = "initialization_failure"
         critical_error_msg = str(WCHA_MISSING_IMPORT_ERROR if WCHA_MISSING_IMPORT_ERROR else "WCHA module import error not specified.")
-        log_step(f"CPOA critical failure: WCHA module import error. {critical_error_msg}")
-        final_cpoa_status = "failed_wcha_module_error" # Specific status
+        log_step(f"CPOA critical failure: WCHA module import error.", data={"error_message": critical_error_msg})
+        final_cpoa_status = "failed_wcha_module_error"
         final_error_message = critical_error_msg
-        # The _update_task_status_in_db will be called in the 'finally' block
     
-    else: # Proceed with orchestration only if imports were successful
+    else: # Proceed with orchestration
         try:
-            log_step(f"Orchestration started for topic: '{topic}'")
-            current_orchestration_stage = "wcha_content_retrieval" # More specific stage
+            current_orchestration_stage = "wcha_content_retrieval"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
 
             log_step("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
-            wcha_output = get_content_for_topic(topic=topic) 
-            log_step("WCHA finished.", data={"output_length": len(wcha_output)})
+            wcha_output = get_content_for_topic(topic=topic)
+
+            wcha_data_log = {"output_length": len(wcha_output)}
+            if any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
+                 wcha_data_log["wcha_error_content"] = wcha_output # Capture full error if it's an error string
+            log_step("WCHA finished.", data=wcha_data_log)
+
 
             if not wcha_output or any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
                 final_error_message = str(wcha_output) if wcha_output else "WCHA returned no content or an error string."
-                log_step(f"WCHA content retrieval failure: {final_error_message}", data={"wcha_output": wcha_output})
-                final_cpoa_status = "failed_wcha_content_harvest" # Specific status
+                log_step(f"WCHA content retrieval failure.", data={"error_message": final_error_message, "wcha_output_preview": wcha_output[:100]}, is_error_payload=True)
+                final_cpoa_status = "failed_wcha_content_harvest"
                 raise Exception(f"WCHA critical failure: {final_error_message}")
 
-            current_orchestration_stage = "pswa_script_generation" # More specific stage
+            current_orchestration_stage = "pswa_script_generation"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
 
-            log_step("Calling PSWA Service (weave_script)...", data={"url": PSWA_SERVICE_URL, "topic": topic, "content_length": len(wcha_output)})
+            log_step("Calling PSWA Service (weave_script)...",
+                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output)})
             try:
                 pswa_payload = {"content": wcha_output, "topic": topic}
                 response = requests_with_retry("post", PSWA_SERVICE_URL,
                                                max_retries=retry_count, backoff_factor=backoff_factor,
-                                               json=pswa_payload, timeout=180) # Increased timeout for LLM
-                # response.raise_for_status() is handled by requests_with_retry
+                                               json=pswa_payload, timeout=180)
 
-                # PSWA now returns a structured script object.
-                # A 200 OK from PSWA (ensured by requests_with_retry) means a valid structured script.
-                # If PSWA had an internal error (like parsing LLM output or insufficient content),
-                # it should have returned a non-200 code, which requests_with_retry would raise as HTTPError.
                 structured_script_from_pswa = response.json()
-                log_step("PSWA Service finished successfully. Received structured script.",
-                         data={"script_id": structured_script_from_pswa.get("script_id"),
-                               "title": structured_script_from_pswa.get("title")})
+                pswa_success_data = {
+                    "script_id": structured_script_from_pswa.get("script_id"),
+                    "title": structured_script_from_pswa.get("title"),
+                    "segment_count": len(structured_script_from_pswa.get("segments", []))
+                }
+                log_step("PSWA Service finished successfully.", data=pswa_success_data)
 
-                # Validate essential parts of the structured script from PSWA
                 if not isinstance(structured_script_from_pswa, dict) or \
-                   not structured_script_from_pswa.get("script_id") or \
-                   not structured_script_from_pswa.get("title") or \
-                   not isinstance(structured_script_from_pswa.get("segments"), list): # Segments should be a list (can be empty)
-                    final_error_message = "PSWA service returned invalid or malformed structured script (missing script_id, title, or segments list)."
-                    log_step(final_error_message, data=structured_script_from_pswa)
+                   not pswa_success_data["script_id"] or \
+                   not pswa_success_data["title"] or \
+                   not isinstance(structured_script_from_pswa.get("segments"), list):
+                    final_error_message = "PSWA service returned invalid or malformed structured script."
+                    log_step(final_error_message, data={"received_script_preview": structured_script_from_pswa}, is_error_payload=True)
                     final_cpoa_status = "failed_pswa_bad_script_structure"
                     raise Exception(f"PSWA critical failure: {final_error_message}")
 
-                # VFA has been updated to expect this structured_script_from_pswa dictionary
-                # in the 'script' field of its payload.
-
-            except requests.exceptions.RequestException as e_req: # Includes HTTPError from requests_with_retry if max retries failed for 5xx or non-retryable 4xx
-                pswa_err_payload_str = "N/A"
-                status_code_str = "N/A"
+            except requests.exceptions.RequestException as e_req:
+                err_payload_str = "N/A"
+                status_code = "N/A"
                 if hasattr(e_req, 'response') and e_req.response is not None:
-                    status_code_str = str(e_req.response.status_code)
+                    status_code = str(e_req.response.status_code)
                     try:
-                        pswa_err_payload_str = json.dumps(e_req.response.json())
+                        err_payload_str = json.dumps(e_req.response.json())
                     except json.JSONDecodeError:
-                        pswa_err_payload_str = e_req.response.text[:500]
+                        err_payload_str = e_req.response.text[:200] # Use a smaller preview for error payloads in log
 
-                final_error_message = f"PSWA service call failed after retries (HTTP status: {status_code_str}, type: {type(e_req).__name__}): {str(e_req)}. Response payload: {pswa_err_payload_str}"
-                log_step(f"PSWA service request exception after retries: {final_error_message}", data={"error": str(e_req), "response_payload": pswa_err_payload_str})
-                final_cpoa_status = "failed_pswa_request_exception" # Specific status
-                raise Exception(final_error_message) # Re-raise to be caught by outer try-except
-            except json.JSONDecodeError as e_json: # If PSWA returns non-JSON on success status (unlikely if service is well-behaved)
-                final_error_message = f"PSWA service response was not valid JSON despite success status: {str(e_json)}"
-                log_step(f"PSWA service JSON decode error: {final_error_message}", data={"response_text": response.text[:500] if 'response' in locals() and response is not None else "N/A"})
-                final_cpoa_status = "failed_pswa_json_decode" # Specific status
+                final_error_message = f"PSWA service call failed (HTTP status: {status_code}, type: {type(e_req).__name__}): {str(e_req)}."
+                log_step(f"PSWA service request exception.", data={"error_message": final_error_message, "response_payload_preview": err_payload_str}, is_error_payload=True)
+                final_cpoa_status = "failed_pswa_request_exception"
+                raise Exception(final_error_message)
+            except json.JSONDecodeError as e_json:
+                final_error_message = f"PSWA service response was not valid JSON: {str(e_json)}"
+                log_step(f"PSWA service JSON decode error.", data={"error_message": final_error_message, "response_text_preview": response.text[:200] if 'response' in locals() and response is not None else "N/A"}, is_error_payload=True)
+                final_cpoa_status = "failed_pswa_json_decode"
                 raise Exception(final_error_message)
 
-            current_orchestration_stage = "vfa_audio_generation" # More specific stage
+            current_orchestration_stage = "vfa_audio_generation"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
 
-            log_step("Calling VFA Service (forge_voice)...",
-                     data={"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id")})
+            vfa_call_data = {"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title")}
+            if voice_params_input: # Masking sensitive parts if any, though voice params usually aren't.
+                vfa_call_data["voice_params_input"] = voice_params_input # Or a masked version if needed
+
+            log_step("Calling VFA Service (forge_voice)...", data=vfa_call_data)
             try:
-                # VFA expects the entire structured script from PSWA in its "script" field
                 vfa_payload = {"script": structured_script_from_pswa}
+                if voice_params_input:
+                    vfa_payload["voice_params"] = voice_params_input
+
                 response = requests_with_retry("post", VFA_SERVICE_URL,
                                                max_retries=retry_count, backoff_factor=backoff_factor,
                                                json=vfa_payload, timeout=90)
-                vfa_result_dict = response.json() # VFA service returns the dict directly
-                log_step("VFA Service finished.", data=vfa_result_dict)
+                vfa_result_dict = response.json()
+                vfa_success_data = {
+                    "status": vfa_result_dict.get("status"),
+                    "audio_filepath": vfa_result_dict.get("audio_filepath"),
+                    "stream_id": vfa_result_dict.get("stream_id"),
+                    "tts_settings_used": vfa_result_dict.get("tts_settings_used")
+                }
+                log_step("VFA Service finished.", data=vfa_success_data)
 
-            except requests.exceptions.RequestException as e_req_vfa: # Includes HTTPError
-                vfa_err_payload_str = "N/A"
-                status_code_str = "N/A"
+            except requests.exceptions.RequestException as e_req_vfa:
+                err_payload_str = "N/A"
+                status_code = "N/A"
                 if hasattr(e_req_vfa, 'response') and e_req_vfa.response is not None:
-                    status_code_str = str(e_req_vfa.response.status_code)
+                    status_code = str(e_req_vfa.response.status_code)
                     try:
-                        vfa_err_payload_str = json.dumps(e_req_vfa.response.json().get("message", e_req_vfa.response.json()))
+                        err_payload_str = json.dumps(e_req_vfa.response.json().get("message", e_req_vfa.response.json()))
                     except json.JSONDecodeError:
-                         vfa_err_payload_str = e_req_vfa.response.text[:500]
+                         err_payload_str = e_req_vfa.response.text[:200]
 
-                final_error_message = f"VFA service call failed after retries (HTTP status: {status_code_str}, type: {type(e_req_vfa).__name__}): {str(e_req_vfa)}. Response payload: {vfa_err_payload_str}"
-                log_step(f"VFA service request exception after retries: {final_error_message}", data={"error": str(e_req_vfa), "response_payload": vfa_err_payload_str})
-                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None} # Ensure vfa_result_dict is updated
-                final_cpoa_status = "failed_vfa_request_exception" # Specific status
+                final_error_message = f"VFA service call failed (HTTP status: {status_code}, type: {type(e_req_vfa).__name__}): {str(e_req_vfa)}."
+                log_step(f"VFA service request exception.", data={"error_message": final_error_message, "response_payload_preview": err_payload_str}, is_error_payload=True)
+                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
+                final_cpoa_status = "failed_vfa_request_exception"
                 raise Exception(final_error_message)
-            except json.JSONDecodeError as e_json_vfa: # If VFA returns non-JSON on success
-                final_error_message = f"VFA service response was not valid JSON despite success status: {str(e_json_vfa)}"
-                log_step(f"VFA service JSON decode error: {final_error_message}", data={"response_text": response.text[:500] if 'response' in locals() and response is not None else "N/A"})
-                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None} # Ensure vfa_result_dict is updated
-                final_cpoa_status = "failed_vfa_json_decode" # Specific status
+            except json.JSONDecodeError as e_json_vfa:
+                final_error_message = f"VFA service response was not valid JSON: {str(e_json_vfa)}"
+                log_step(f"VFA service JSON decode error.", data={"error_message": final_error_message, "response_text_preview": response.text[:200] if 'response' in locals() and response is not None else "N/A"}, is_error_payload=True)
+                vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None}
+                final_cpoa_status = "failed_vfa_json_decode"
                 raise Exception(final_error_message)
 
             vfa_status = vfa_result_dict.get("status")
             if vfa_status == "success":
-                final_cpoa_status = "completed" # Base success status
-                final_error_message = None # Clear previous step errors if VFA succeeded
+                final_cpoa_status = "completed"
+                final_error_message = None
 
                 audio_filepath = vfa_result_dict.get("audio_filepath")
                 stream_id = vfa_result_dict.get("stream_id")
 
                 if audio_filepath and stream_id:
-                    current_orchestration_stage = "asf_notification" # More specific stage
-                    log_step("Notifying ASF about new audio...", data={"url": ASF_NOTIFICATION_URL, "stream_id": stream_id, "filepath": audio_filepath})
+                    current_orchestration_stage = "asf_notification"
+                    asf_call_data = {"url": ASF_NOTIFICATION_URL, "stream_id": stream_id, "filepath": audio_filepath}
+                    log_step("Notifying ASF about new audio...", data=asf_call_data)
                     try:
                         asf_payload = {"stream_id": stream_id, "filepath": audio_filepath}
                         asf_response = requests_with_retry("post", ASF_NOTIFICATION_URL,
                                                            max_retries=retry_count, backoff_factor=backoff_factor,
                                                            json=asf_payload, timeout=10)
                         asf_notification_status_message = f"ASF notified successfully for stream {stream_id}."
-                        log_step(asf_notification_status_message, data=asf_response.json())
-                        # final_cpoa_status remains "completed"
-                    except requests.exceptions.RequestException as e_asf_req: # Includes HTTPError
-                        asf_err_payload_str = "N/A"
-                        status_code_str = "N/A"
+                        log_step(asf_notification_status_message, data={"response_status": asf_response.status_code, "response_payload_preview": asf_response.json() if asf_response.content else None})
+
+                    except requests.exceptions.RequestException as e_asf_req:
+                        err_payload_str = "N/A"
+                        status_code = "N/A"
                         if hasattr(e_asf_req, 'response') and e_asf_req.response is not None:
-                            status_code_str = str(e_asf_req.response.status_code)
+                            status_code = str(e_asf_req.response.status_code)
                             try:
-                                asf_err_payload_str = json.dumps(e_asf_req.response.json().get("error", e_asf_req.response.json()))
+                                err_payload_str = json.dumps(e_asf_req.response.json().get("error", e_asf_req.response.json()))
                             except json.JSONDecodeError:
-                                asf_err_payload_str = e_asf_req.response.text[:200]
+                                err_payload_str = e_asf_req.response.text[:200]
 
                         asf_notification_status_message = (
-                            f"ASF notification failed after retries (HTTP status: {status_code_str}, type: {type(e_asf_req).__name__}): {str(e_asf_req)}. Response: {asf_err_payload_str}"
+                            f"ASF notification failed (HTTP status: {status_code}, type: {type(e_asf_req).__name__}): {str(e_asf_req)}."
                         )
-                        log_step(asf_notification_status_message, data={"error": str(e_asf_req), "response_payload": asf_err_payload_str})
-                        final_error_message = asf_notification_status_message # Store this as the primary error if main task was ok
-                        final_cpoa_status = "completed_with_asf_notification_failure" # Specific status
-                    except json.JSONDecodeError as e_asf_json: # Should not happen if ASF is well-behaved
+                        log_step(asf_notification_status_message, data={"error_message": str(e_asf_req), "response_payload_preview": err_payload_str}, is_error_payload=True)
+                        final_error_message = asf_notification_status_message
+                        final_cpoa_status = "completed_with_asf_notification_failure"
+                    except json.JSONDecodeError as e_asf_json:
                         asf_notification_status_message = f"ASF notification response was not valid JSON: {str(e_asf_json)}"
-                        log_step(asf_notification_status_message, data={"response_text": asf_response.text[:500] if 'asf_response' in locals() and asf_response is not None else "N/A"})
+                        log_step(asf_notification_status_message, data={"response_text_preview": asf_response.text[:200] if 'asf_response' in locals() and asf_response is not None else "N/A"}, is_error_payload=True)
                         final_error_message = asf_notification_status_message
                         final_cpoa_status = "completed_with_asf_notification_failure_json_decode"
-                else: # audio_filepath or stream_id missing from VFA success response
+                else:
                     asf_notification_status_message = "ASF notification skipped: audio_filepath or stream_id missing from VFA success response."
-                    log_step(asf_notification_status_message, data=vfa_result_dict)
+                    log_step(asf_notification_status_message, data={"vfa_result": vfa_result_dict}, is_error_payload=True) # Log as error/warning
                     final_error_message = asf_notification_status_message
-                    final_cpoa_status = "completed_with_vfa_data_missing" # More specific status
+                    final_cpoa_status = "completed_with_vfa_data_missing"
 
             elif vfa_status == "skipped":
-                final_cpoa_status = "completed_with_vfa_skipped" # Specific status
+                final_cpoa_status = "completed_with_vfa_skipped"
                 final_error_message = vfa_result_dict.get("message", "VFA skipped audio generation.")
-            elif vfa_status == "error": # VFA itself reported an error in its JSON response
-                final_cpoa_status = "failed_vfa_reported_error" # Specific status
+                log_step(f"VFA skipped audio generation.", data={"vfa_result": vfa_result_dict})
+            elif vfa_status == "error":
+                final_cpoa_status = "failed_vfa_reported_error"
                 final_error_message = vfa_result_dict.get("message", "VFA reported an internal error.")
-            else: # Unknown status from VFA
-                final_cpoa_status = "failed_vfa_unknown_status" # Specific status
+                log_step(f"VFA reported an internal error.", data={"vfa_result": vfa_result_dict}, is_error_payload=True)
+            else:
+                final_cpoa_status = "failed_vfa_unknown_status"
                 final_error_message = f"VFA service returned an unknown status: '{vfa_status}'. Details: {vfa_result_dict.get('message')}"
-                log_step(f"VFA unknown status: {final_error_message}", data=vfa_result_dict)
+                log_step(f"VFA unknown status.", data={"vfa_result": vfa_result_dict}, is_error_payload=True)
 
-        except Exception as e: # Outer exception handler for WCHA, PSWA, VFA stages
-            logger.error(f"CPOA: Orchestration failed for task {task_id} at stage '{current_orchestration_stage}': {type(e).__name__} - {e}", exc_info=True)
-            if not final_error_message: # Ensure an error message is set
-                final_error_message = f"Orchestration error at {current_orchestration_stage}: {type(e).__name__} - {str(e)}"
-
-            # Update status based on stage if not already a specific failure status
-            if final_cpoa_status == "pending" or not final_cpoa_status.startswith("failed_"):
-                if current_orchestration_stage == "wcha_content_retrieval":
-                    final_cpoa_status = "failed_wcha_exception"
-                elif current_orchestration_stage == "pswa_script_generation":
-                    final_cpoa_status = "failed_pswa_exception"
-                elif current_orchestration_stage == "vfa_audio_generation":
-                    final_cpoa_status = "failed_vfa_exception"
-                else:
-                    final_cpoa_status = "failed_unknown_stage_exception"
-            log_step(f"Orchestration critical error: {final_error_message}")
+        except Exception as e:
+            logger.error(f"CPOA: Orchestration failed for task {task_id} at stage '{current_orchestration_stage}': {type(e).__name__} - {str(e)}", exc_info=True) # Keep exc_info for main logger
             
+            # Set final_error_message if not already specifically set by a caught exception block
+            if not final_error_message:
+                final_error_message = f"Orchestration error at stage {current_orchestration_stage}: {type(e).__name__} - {str(e)}"
+
+            # Update final_cpoa_status based on stage if not already a specific failure status
+            if final_cpoa_status == "pending" or not final_cpoa_status.startswith("failed_") and not final_cpoa_status.startswith("completed_with_"):
+                stage_error_map = {
+                    "wcha_content_retrieval": "failed_wcha_exception",
+                    "pswa_script_generation": "failed_pswa_exception",
+                    "vfa_audio_generation": "failed_vfa_exception",
+                    "asf_notification": "failed_asf_notification_exception" # Should be caught by ASF block, but as fallback
+                }
+                final_cpoa_status = stage_error_map.get(current_orchestration_stage, "failed_unknown_stage_exception")
+
+            log_step(f"Orchestration ended with critical error.", data={"error_message": final_error_message, "exception_type": type(e).__name__}, is_error_payload=True)
+
             # Ensure vfa_result_dict reflects error if exception occurred before or during VFA, and not caught by VFA specific try-except
             if vfa_result_dict.get('status') == 'not_run' and current_orchestration_stage != "vfa_audio_generation":
                  vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None, "stream_id": None}
-            elif current_orchestration_stage == "vfa_audio_generation" and vfa_result_dict.get('status') != 'error': # If in VFA stage but no specific VFA error caught
+            elif current_orchestration_stage == "vfa_audio_generation" and vfa_result_dict.get('status') != 'error':
                  vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None, "stream_id": None}
 
-    # This final DB update by CPOA sets its final assessment of cpoa_status and cpoa_error_message.
-    # The API Gateway will then do one more update for fields like final_audio_filepath, etc.
+    # Final DB update for CPOA's status
     _update_task_status_in_db(db_path, task_id, final_cpoa_status, error_msg=final_error_message)
-    log_step(f"Orchestration ended with CPOA's final status: {final_cpoa_status}. Error (if any): {final_error_message}")
+
+    # Final log entry summarizing the outcome
+    log_step(f"Orchestration process ended.",
+             data={"final_cpoa_status": final_cpoa_status,
+                   "final_error_message_preview": final_error_message[:200] if final_error_message else None, # Preview for log
+                   "asf_notification_outcome": asf_notification_status_message})
 
     # Ensure vfa_result_dict (which is final_audio_details) contains stream_id if available
     stream_id_for_url = vfa_result_dict.get("stream_id")
@@ -419,7 +450,67 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
         "orchestration_log": orchestration_log
     }
     # The API Gateway will use this returned dict to perform its own final update on the podcast record.
+    # Ensure tts_settings_used from VFA's response is part of final_audio_details in cpoa_final_result
+    if "tts_settings_used" not in vfa_result_dict : # Ensure key exists even on VFA failure/skip for consistency
+         vfa_result_dict["tts_settings_used"] = voice_params_input if voice_params_input else None # Default to input if VFA didn't provide
+
+
     return cpoa_final_result
+
+
+# --- Snippet DB Interaction ---
+def _save_snippet_to_db(snippet_object: dict, db_path: str):
+    """Saves a single snippet object to the topics_snippets table."""
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        keywords_json = json.dumps(snippet_object.get("keywords", []))
+        # original_topic_details might be complex; ensure it's stored as JSON string
+        original_topic_details_json = json.dumps(snippet_object.get("original_topic_details_from_tda")) \
+            if snippet_object.get("original_topic_details_from_tda") else None
+
+        current_ts = datetime.now().isoformat()
+
+        # Relevance score for snippets might not be directly applicable or could be defaulted
+        relevance_score = snippet_object.get("relevance_score", 0.5) # Default if not present
+
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO topics_snippets (
+                id, type, title, summary, keywords,
+                source_url, source_name, original_topic_details,
+                llm_model_used_for_snippet, cover_art_prompt,
+                generation_timestamp, last_accessed_timestamp, relevance_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snippet_object.get("snippet_id"),
+                'snippet', # type
+                snippet_object.get("title"),
+                snippet_object.get("summary"), # Using summary for snippet's main text content
+                keywords_json,
+                None, # source_url (can be null for snippets, or link to original topic if available)
+                None, # source_name (can be null for snippets)
+                original_topic_details_json,
+                snippet_object.get("llm_model_used"),
+                snippet_object.get("cover_art_prompt"),
+                snippet_object.get("generation_timestamp", current_ts),
+                current_ts, # last_accessed_timestamp
+                relevance_score
+            )
+        )
+        conn.commit()
+        logger.info(f"Saved/Replaced snippet {snippet_object.get('snippet_id')} to DB: {snippet_object.get('title')}")
+    except sqlite3.Error as e:
+        logger.error(f"Database error saving snippet {snippet_object.get('snippet_id')}: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error saving snippet {snippet_object.get('snippet_id')} to DB: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
 
 def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
     """
@@ -450,13 +541,20 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
                                        max_retries=CPOA_SERVICE_RETRY_COUNT,
                                        backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
                                        json=sca_payload, timeout=60)
-        # response.raise_for_status() # Handled by requests_with_retry
 
-        snippet_data = response.json()
-        logger.info(f"CPOA: {function_name} - SCA Service call successful for topic_id {topic_id}. Snippet data received.")
+        snippet_data = response.json() # This is the SnippetDataObject from SCA
+        logger.info(f"CPOA: {function_name} - SCA Service call successful for topic_id {topic_id}. Snippet data received: {snippet_data.get('snippet_id')}")
+
+        # Save the generated snippet to the database
+        db_path = CPOA_DATABASE_PATH # Use configured DB path
+        if not db_path:
+            logger.error(f"CPOA: {function_name} - CPOA_DATABASE_PATH not configured. Cannot save snippet to DB.")
+        else:
+            _save_snippet_to_db(snippet_data, db_path)
+
         return snippet_data
 
-    except requests.exceptions.RequestException as e_req: # Includes HTTPError from requests_with_retry
+    except requests.exceptions.RequestException as e_req:
         sca_err_payload_str = "N/A"
         status_code_str = "N/A"
         if hasattr(e_req, 'response') and e_req.response is not None:

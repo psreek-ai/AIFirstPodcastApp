@@ -51,16 +51,19 @@ except ImportError:
 
 class TestForgeVoiceLogic(unittest.TestCase):
     def setUp(self):
-        self.maxDiff = None # Show full diff on assertion failure
+        self.maxDiff = None
         self.mock_vfa_config = {
             "GOOGLE_APPLICATION_CREDENTIALS": "fake_creds.json",
             "VFA_SHARED_AUDIO_DIR": "/tmp/vfa_test_audio",
-            "VFA_TTS_VOICE_NAME": "en-TEST-Voice",
-            "VFA_TTS_LANG_CODE": "en-TEST",
+            "VFA_TTS_VOICE_NAME": "en-US-Standard-A", # Default voice
+            "VFA_TTS_LANG_CODE": "en-US",             # Default lang
             "VFA_TTS_AUDIO_ENCODING_STR": "MP3",
             "VFA_MIN_SCRIPT_LENGTH": 10,
+            "VFA_TTS_DEFAULT_SPEAKING_RATE": 1.0,     # Added default
+            "VFA_TTS_DEFAULT_PITCH": 0.0              # Added default
         }
-        self.config_patcher = patch.dict(vfa_main.vfa_config, self.mock_vfa_config)
+        # Use clear=True with patch.dict if vfa_config might already exist from module import
+        self.config_patcher = patch.dict(vfa_main.vfa_config, self.mock_vfa_config, clear=True)
         self.mock_config = self.config_patcher.start()
 
         self.makedirs_patcher = patch('os.makedirs')
@@ -115,16 +118,71 @@ class TestForgeVoiceLogic(unittest.TestCase):
         mock_tts_client_instance.synthesize_speech.assert_called_once()
         call_args = mock_tts_client_instance.synthesize_speech.call_args[1]['request']
         self.assertEqual(call_args['input'].text, expected_text_for_tts)
-        self.assertEqual(call_args['voice'].language_code, "en-TEST")
-        self.assertEqual(call_args['voice'].name, "en-TEST-Voice")
+        self.assertEqual(call_args['voice'].language_code, self.mock_vfa_config["VFA_TTS_LANG_CODE"])
+        self.assertEqual(call_args['voice'].name, self.mock_vfa_config["VFA_TTS_VOICE_NAME"])
+        self.assertEqual(call_args['audio_config'].speaking_rate, self.mock_vfa_config["VFA_TTS_DEFAULT_SPEAKING_RATE"])
+        self.assertEqual(call_args['audio_config'].pitch, self.mock_vfa_config["VFA_TTS_DEFAULT_PITCH"])
         
-        # Depending on whether texttospeech is real or mocked, the enum value might differ
-        # For safety, compare against the value fetched from the (mocked) map
         expected_encoding_enum = vfa_main.google_audio_encoding_map["MP3"]
         self.assertEqual(call_args['audio_config'].audio_encoding, expected_encoding_enum)
 
         mock_file_open.assert_called_once_with(result["audio_filepath"], "wb")
         mock_file_open().write.assert_called_once_with(b"mock audio")
+        self.assertIsNotNone(result.get("tts_settings_used"))
+        self.assertEqual(result["tts_settings_used"]["voice_name"], self.mock_vfa_config["VFA_TTS_VOICE_NAME"])
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_with_custom_voice_params(self, mock_file_open, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"custom audio")
+
+        structured_script = {
+            "script_id": "s_custom", "topic": "Custom Voice", "title": "Custom Voice Test",
+            "segments": [{"segment_title": "INTRO", "content": "Testing custom voice parameters."}]
+        }
+        custom_voice_params = {
+            "voice_name": "en-GB-Wavenet-F",
+            "language_code": "en-GB",
+            "speaking_rate": 1.2,
+            "pitch": -2.5
+        }
+        result = vfa_main.forge_voice(structured_script, voice_params_input=custom_voice_params)
+
+        self.assertEqual(result["status"], "success")
+        self.assertIsNotNone(result["tts_settings_used"])
+        self.assertEqual(result["tts_settings_used"]["voice_name"], "en-GB-Wavenet-F")
+        self.assertEqual(result["tts_settings_used"]["language_code"], "en-GB")
+        self.assertEqual(result["tts_settings_used"]["speaking_rate"], 1.2)
+        self.assertEqual(result["tts_settings_used"]["pitch"], -2.5) # Clamped to -2.0 by logic in forge_voice if out of range
+
+        mock_tts_client_instance.synthesize_speech.assert_called_once()
+        call_args = mock_tts_client_instance.synthesize_speech.call_args[1]['request']
+        self.assertEqual(call_args['voice'].name, "en-GB-Wavenet-F")
+        self.assertEqual(call_args['voice'].language_code, "en-GB")
+        self.assertEqual(call_args['audio_config'].speaking_rate, 1.2)
+        self.assertEqual(call_args['audio_config'].pitch, -2.5) # Check if clamping logic is tested separately if needed
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_with_partial_voice_params(self, mock_file_open, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"partial audio")
+        structured_script = {"segments": [{"content": "Test partial params"}]}
+        partial_voice_params = {"speaking_rate": 0.9}
+
+        result = vfa_main.forge_voice(structured_script, voice_params_input=partial_voice_params)
+
+        self.assertEqual(result["status"], "success")
+        used_settings = result["tts_settings_used"]
+        self.assertEqual(used_settings["speaking_rate"], 0.9)
+        self.assertEqual(used_settings["voice_name"], self.mock_vfa_config["VFA_TTS_VOICE_NAME"]) # Default
+        self.assertEqual(used_settings["pitch"], self.mock_vfa_config["VFA_TTS_DEFAULT_PITCH"])   # Default
+
+        call_args = mock_tts_client_instance.synthesize_speech.call_args[1]['request']
+        self.assertEqual(call_args['audio_config'].speaking_rate, 0.9)
+        self.assertEqual(call_args['voice'].name, self.mock_vfa_config["VFA_TTS_VOICE_NAME"])
+
 
     def test_forge_voice_pswa_error_script(self):
         error_script = {
@@ -202,16 +260,21 @@ class TestForgeVoiceEndpoint(unittest.TestCase):
     def test_handle_forge_voice_success(self, mock_forge_voice_func):
         mock_forge_voice_func.return_value = {
             "status": "success", "message": "Audio created",
-            "audio_filepath": "/path/audio.mp3", "stream_id": "s1"
+            "audio_filepath": "/path/audio.mp3", "stream_id": "s1",
+            "tts_settings_used": {"voice_name": "default"} # ensure this key exists
         }
-        payload = {"script": {"script_id": "s1", "topic": "Test", "title": "Test", "full_raw_script": "Test script", "segments": []}}
+        payload = {
+            "script": {"script_id": "s1", "topic": "Test", "title": "Test", "full_raw_script": "Test script", "segments": []},
+            "voice_params": {"voice_name": "custom-voice"} # Test sending voice_params
+        }
         response = self.client.post('/forge_voice', json=payload)
         
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
         self.assertEqual(json_data["status"], "success")
         self.assertEqual(json_data["audio_filepath"], "/path/audio.mp3")
-        mock_forge_voice_func.assert_called_once_with(payload["script"])
+        # Check that voice_params are passed through
+        mock_forge_voice_func.assert_called_once_with(payload["script"], voice_params_input=payload["voice_params"])
 
     def test_handle_forge_voice_missing_script(self):
         response = self.client.post('/forge_voice', json={})

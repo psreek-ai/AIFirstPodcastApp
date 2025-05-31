@@ -19,10 +19,15 @@ tda_config = {
     "TDA_NEWS_DEFAULT_KEYWORDS": os.getenv("TDA_NEWS_DEFAULT_KEYWORDS", "AI,technology,science").split(','),
     "TDA_NEWS_DEFAULT_LANGUAGE": os.getenv("TDA_NEWS_DEFAULT_LANGUAGE", "en"),
     "USE_REAL_NEWS_API": os.getenv("USE_REAL_NEWS_API", "False").lower() == "true",
-    "TDA_NEWS_PAGE_SIZE": int(os.getenv("TDA_NEWS_PAGE_SIZE", "25")), # Added
-    "TDA_NEWS_REQUEST_TIMEOUT": int(os.getenv("TDA_NEWS_REQUEST_TIMEOUT", "15")), # Added
-    "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"), # Added
+    "TDA_NEWS_PAGE_SIZE": int(os.getenv("TDA_NEWS_PAGE_SIZE", "25")),
+    "TDA_NEWS_REQUEST_TIMEOUT": int(os.getenv("TDA_NEWS_REQUEST_TIMEOUT", "15")),
+    "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"),
+    "TDA_DATABASE_PATH": os.getenv("TDA_DATABASE_PATH", "../api_gateway/aethercast_podcasts.db") # Added, assuming relative path for dev
 }
+
+# --- Additional Imports ---
+import sqlite3
+from datetime import datetime
 
 # --- Configuration & Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -56,14 +61,69 @@ app = flask.Flask(__name__)
 # --- Placeholder Data Sources ---
 # Simulates data fetched from various news APIs, RSS feeds, etc.
 
+# --- Database Interaction for Topics ---
+def _save_topic_to_db(topic_object: dict, db_path: str):
+    """Saves a single topic object to the topics_snippets table."""
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Map TopicObject fields to topics_snippets table columns
+        # Ensure keywords is stored as a JSON string
+        keywords_json = json.dumps(topic_object.get("keywords", []))
+
+        # Extract source_url and source_name safely
+        potential_sources = topic_object.get("potential_sources", [])
+        source_url = potential_sources[0].get("url") if potential_sources and isinstance(potential_sources, list) and len(potential_sources) > 0 and isinstance(potential_sources[0], dict) else None
+        source_name = potential_sources[0].get("source_name") if potential_sources and isinstance(potential_sources, list) and len(potential_sources) > 0 and isinstance(potential_sources[0], dict) else None
+
+        current_ts = datetime.now().isoformat()
+
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO topics_snippets (
+                id, type, title, summary, keywords,
+                source_url, source_name, original_topic_details,
+                llm_model_used_for_snippet, cover_art_prompt,
+                generation_timestamp, last_accessed_timestamp, relevance_score
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                topic_object.get("topic_id"),
+                'topic', # type
+                topic_object.get("title_suggestion"),
+                topic_object.get("summary"),
+                keywords_json,
+                source_url,
+                source_name,
+                None, # original_topic_details (N/A for topics from TDA)
+                None, # llm_model_used_for_snippet (N/A for topics)
+                None, # cover_art_prompt (N/A for topics)
+                topic_object.get("publication_date", current_ts), # generation_timestamp (use publication if available)
+                current_ts, # last_accessed_timestamp (set to now on creation/update)
+                topic_object.get("relevance_score")
+            )
+        )
+        conn.commit()
+        logging.info(f"Saved/Replaced topic {topic_object.get('topic_id')} to DB: {topic_object.get('title_suggestion')}")
+    except sqlite3.Error as e:
+        logging.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}")
+    except Exception as e: # Catch any other unexpected error during DB interaction
+        logging.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
 def call_real_news_api(keywords: list[str] = None, categories: list[str] = None, language: str = None, country: str = None) -> list[dict]:
     """
-    Calls the NewsAPI.org to fetch articles, parses the response, and transforms articles into TopicObjects.
-    Returns a list of TopicObject dictionaries or an empty list if an error occurs.
+    Calls the NewsAPI.org to fetch articles, parses them, transforms into TopicObjects,
+    saves them to the database, and returns the list of TopicObjects.
     """
-    global tda_config, generate_topic_id # Ensure access to global tda_config and generate_topic_id
-    if not tda_config["TDA_NEWS_API_KEY"]:
-        logging.error("call_real_news_api: Missing TDA_NEWS_API_KEY. Cannot make request.")
+    if not tda_config.get("USE_REAL_NEWS_API"): # Should be checked by caller, but good safeguard
+        return []
+    if not tda_config.get("TDA_NEWS_API_KEY"):
+        logging.error("call_real_news_api: TDA_NEWS_API_KEY not configured. Cannot make request.")
         return []
 
     base_url = tda_config["TDA_NEWS_API_BASE_URL"]
@@ -114,52 +174,52 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
             return []
 
         articles = response_json.get("articles", [])
+        db_path = tda_config.get("TDA_DATABASE_PATH")
+        if not db_path:
+            logging.error("TDA_DATABASE_PATH not configured. Cannot save topics to DB.")
         
         for article in articles:
             title = article.get('title')
-            if not title or title == "[Removed]": # Skip articles with no title or removed content
+            if not title or title == "[Removed]":
                 continue
 
             description = article.get('description')
-            content = article.get('content') # NewsAPI often truncates content, description might be better
+            content = article.get('content')
             summary_text = description if description else content if content else "No summary available."
-            # Remove incomplete sentence artifacts like "[+1234 chars]"
             if summary_text.endswith(" chars]") and summary_text[-10:].startswith("[+"):
                 summary_text = summary_text[:summary_text.rfind("[+")].strip()
-            if not summary_text: # If still empty
+            if not summary_text:
                 summary_text = "Content details not available."
-
 
             article_url = article.get('url')
             source_name = article.get('source', {}).get('name', 'Unknown Source')
             published_at = article.get('publishedAt')
-
-            # Use the original list of keywords that formed the query for this TopicObject
-            # This ensures the keywords reflect the search intent.
             topic_keywords = query_keywords_list
 
             topic_object = {
-                "topic_id": generate_topic_id(),
-                "source_feed_name": "news_api_org", # More specific
-                "title_suggestion": title,
+                "topic_id": generate_topic_id(), # This will be 'id' in DB
+                "source_feed_name": "news_api_org",
+                "title_suggestion": title, # This will be 'title' in DB
                 "summary": summary_text,
                 "keywords": topic_keywords,
                 "potential_sources": [{
-                    "url": article_url,
-                    "title": title, # Source title is the article title itself
-                    "source_name": source_name # e.g., "CNN", "BBC News"
+                    "url": article_url, # This will be 'source_url' in DB
+                    "title": title,
+                    "source_name": source_name # This will be 'source_name' in DB
                 }],
-                "relevance_score": round(random.uniform(0.6, 0.9), 2), # More varied default relevance
-                "publication_date": published_at,
-                "category_suggestion": "News" # Default, can be enhanced later
+                "relevance_score": round(random.uniform(0.6, 0.9), 2),
+                "publication_date": published_at, # This will be 'generation_timestamp' in DB
+                "category_suggestion": "News"
             }
             topic_objects.append(topic_object)
+            if db_path: # Save to DB if path is configured
+                _save_topic_to_db(topic_object, db_path)
         
-        logging.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI.")
+        logging.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI. Saved to DB: {bool(db_path)}")
         return topic_objects
 
     except requests.exceptions.JSONDecodeError as json_err:
-        logging.error(f"Failed to decode JSON from NewsAPI: {json_err}. Response text: {response.text if 'response' in locals() else 'N/A'}")
+        logging.error(f"Failed to decode JSON from NewsAPI: {json_err}. Response text: {response.text if 'response' in locals() and response else 'N/A'}")
         return []
     except requests.exceptions.HTTPError as http_err:
         logging.error(f"HTTP error occurred: {http_err} - {http_err.response.text if http_err.response else 'No response text'}")
@@ -243,6 +303,9 @@ def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
     """
     identified_topics = []
     all_articles = []
+    db_path = tda_config.get("TDA_DATABASE_PATH")
+    if not db_path:
+        logging.warning("TDA_DATABASE_PATH not configured. Simulated topics will not be saved to DB.")
 
     logging.info(f"[TDA_LOGIC] Scanning simulated data sources. Query: '{query}', Limit: {limit}")
 
@@ -253,27 +316,32 @@ def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
                 "url": article["url"],
                 "source_name": data_source["source_name"],
                 "keywords": article.get("keywords", []),
-                "publish_date": article.get("publish_date", "")
+                "publish_date": article.get("publish_date", datetime.now().isoformat()) # Ensure a date
             })
 
-    # Score and select topics
     for article in all_articles:
         relevance = calculate_relevance_score(article, query)
+        # Combine query keywords with article keywords if query exists
+        combined_keywords = list(set(article.get("keywords", []) + ([kw.strip() for kw in query.split(',')] if query else [])))
+
         topic_object = {
             "topic_id": generate_topic_id(),
             "title_suggestion": article["title"],
             "summary": generate_summary_from_title(article["title"]),
-            "keywords": article.get("keywords", []) + [kw.strip() for kw in query.split()] if query else article.get("keywords", []),
+            "keywords": combined_keywords,
             "potential_sources": [{"url": article["url"], "title": article["title"], "source_name": article["source_name"]}],
             "relevance_score": relevance,
-            "category_suggestion": "General" # Placeholder, could be derived from keywords
+            "publication_date": article.get("publish_date"),
+            "category_suggestion": "General"
         }
         identified_topics.append(topic_object)
+        if db_path: # Save to DB if path is configured
+            _save_topic_to_db(topic_object, db_path)
 
-    # Sort by relevance score (descending) and return top 'limit'
+
     identified_topics.sort(key=lambda x: x["relevance_score"], reverse=True)
     
-    logging.info(f"[TDA_LOGIC] Identified {len(identified_topics)} potential topics. Returning top {min(limit, len(identified_topics))}.")
+    logging.info(f"[TDA_LOGIC] Identified {len(identified_topics)} potential topics. Saved to DB: {bool(db_path)}. Returning top {min(limit, len(identified_topics))}.")
     return identified_topics[:limit]
 
 # --- API Endpoint ---

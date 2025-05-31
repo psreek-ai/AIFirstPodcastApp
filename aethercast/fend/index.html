@@ -34,9 +34,21 @@
                 <div id="status-messages">
                     <p>Please enter a topic and click 'Generate Podcast' to begin.</p>
                 </div>
-                <div id="podcast-display" class="hidden"> <!-- This is for the full podcast, ensure it's hidden initially -->
+                <!-- Area for generation progress simulation -->
+                <div id="generation-progress-display" class="status-messages status-info" style="display:none;"></div>
+
+                <div id="podcast-display" class="hidden"> <!-- This is for the full podcast -->
                     <h3 id="podcast-topic-title"></h3>
+
+                    <!-- Main audio player for direct URL file -->
                     <audio id="audio-player" controls src=""></audio>
+
+                    <!-- MSE audio player for streaming, initially hidden -->
+                    <audio id="audio-player-mse" controls class="hidden"></audio>
+
+                    <div id="streaming-status" class="status-messages status-info" style="display:none;"></div>
+                    <button id="retry-stream-btn" style="display:none; margin-top: 10px;">Retry Stream</button>
+
                     <div class="podcast-metadata-display">
                         <h4>Generation Details:</h4>
                         <pre id="generation-details-log"></pre> 

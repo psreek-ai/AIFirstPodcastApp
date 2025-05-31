@@ -13,6 +13,7 @@ Key Responsibilities:
     *   Processes fetched articles (or simulated data) to extract key information.
     *   Transforms these articles into a structured `TopicObject` format, including a generated `topic_id`, title suggestion, summary, keywords, potential sources, relevance score, publication date, and category suggestion.
 3.  **Output:** Provides a list of these `TopicObject` dictionaries to the calling service, typically the API Gateway or CPOA.
+4.  **Database Interaction:** Saves all successfully identified `TopicObject`s to a shared database (`topics_snippets` table, using the `TDA_DATABASE_PATH` configuration), making them available for other services (e.g., for snippet caching by the API Gateway).
 
 ## Configuration
 
@@ -42,6 +43,8 @@ Then, edit the `.env` file. The following variables are used:
     -   *Default:* `15`
 -   `TDA_NEWS_USER_AGENT`: User-Agent string for HTTP requests made by TDA.
     -   *Default:* `AethercastTopicDiscovery/0.1`
+-   `TDA_DATABASE_PATH`: Path to the shared SQLite database file (e.g., `../api_gateway/aethercast_podcasts.db`). This **must** be the same path used by the API Gateway and CPOA for the `topics_snippets` table.
+    -   *Default (in code):* `../api_gateway/aethercast_podcasts.db`
 
 **Flask Application Parameters:**
 The following are standard Flask environment variables used by `main.py` if you run it directly:
