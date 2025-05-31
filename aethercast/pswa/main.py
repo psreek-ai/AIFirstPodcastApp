@@ -53,6 +53,12 @@ Remember, your entire response must be a single JSON object conforming to the sc
     pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
     pswa_config['PSWA_DEBUG'] = os.getenv("PSWA_DEBUG", "True").lower() == "true"
 
+    # Script Caching Configuration
+    pswa_config['PSWA_DATABASE_PATH'] = os.getenv("PSWA_DATABASE_PATH", "../api_gateway/aethercast_podcasts.db")
+    pswa_config['PSWA_SCRIPT_CACHE_ENABLED'] = os.getenv("PSWA_SCRIPT_CACHE_ENABLED", "True").lower() == 'true'
+    pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'] = int(os.getenv("PSWA_SCRIPT_CACHE_MAX_AGE_HOURS", "720")) # 30 days
+    pswa_config['PSWA_TEST_MODE_ENABLED'] = os.getenv("PSWA_TEST_MODE_ENABLED", "False").lower() == 'true' # Added Test Mode
+
     logger.info("--- PSWA Configuration ---")
     for key, value in pswa_config.items():
         if "API_KEY" in key and value:
@@ -106,15 +112,129 @@ else:
     # Ensure load_pswa_configuration is called after logger is configured if it uses logger.
     # If logger was just configured, and pswa_config is empty, reload.
     if not pswa_config: # Check if it's empty
-        load_pswa_configuration() # Call it if it wasn't called or completed due to logger
+        load_pswa_configuration()
 
-# Ensure configuration is loaded at startup if not already by the above check
-if not pswa_config:
+if not pswa_config: # Ensure configuration is loaded at startup
     load_pswa_configuration()
 
+import uuid
+import re
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta # Added timedelta for cache age
+import json # Already imported if used by logger, but good to ensure for DB operations
 
-import uuid # For script_id
-import re # For parsing
+# --- Database Helper Functions for Script Caching ---
+def _get_db_connection(db_path: str):
+    """Establishes a SQLite database connection."""
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    except sqlite3.Error as e:
+        logger.error(f"[PSWA_CACHE_DB] Error connecting to database at {db_path}: {e}")
+        raise # Re-raise to be handled by caller, or return None if preferred to not halt all operations
+
+def _calculate_content_hash(topic: str, content: str) -> str:
+    """Calculates a SHA256 hash for the given topic and content."""
+    # Normalize: lowercase and strip whitespace
+    normalized_topic = topic.lower().strip()
+    # Use a summary of content to avoid hashing very large strings, e.g., first 1000 chars
+    normalized_content_summary = content.lower().strip()[:1000]
+
+    input_string = f"topic:{normalized_topic}|content_summary:{normalized_content_summary}"
+    return hashlib.sha256(input_string.encode('utf-8')).hexdigest()
+
+def _get_cached_script(db_path: str, topic_hash: str, max_age_hours: int) -> Optional[dict]:
+    """Retrieves a script from cache if it exists and is not stale."""
+    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        return None
+
+    logger.info(f"[PSWA_CACHE_DB] Attempting to fetch script from cache for hash: {topic_hash}")
+    conn = None
+    try:
+        conn = _get_db_connection(db_path)
+        cursor = conn.cursor()
+
+        cutoff_timestamp = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
+
+        cursor.execute(
+            "SELECT script_id, structured_script_json, llm_model_used, generation_timestamp FROM generated_scripts WHERE topic_hash = ? AND generation_timestamp >= ?",
+            (topic_hash, cutoff_timestamp)
+        )
+        row = cursor.fetchone()
+
+        if row:
+            logger.info(f"[PSWA_CACHE_DB] Cache hit for hash {topic_hash}. Script ID: {row['script_id']}")
+            structured_script = json.loads(row['structured_script_json'])
+
+            # Update last_accessed_timestamp (best effort)
+            try:
+                cursor.execute("UPDATE generated_scripts SET last_accessed_timestamp = ? WHERE script_id = ?",
+                               (datetime.utcnow().isoformat(), row['script_id']))
+                conn.commit()
+            except sqlite3.Error as e_update:
+                logger.warning(f"[PSWA_CACHE_DB] Failed to update last_accessed_timestamp for script {row['script_id']}: {e_update}")
+
+            # Add source field for clarity if it's not already part of the stored script
+            if 'source' not in structured_script:
+                 structured_script['source'] = "cache"
+            structured_script['script_id'] = row['script_id'] # Ensure script_id from DB is used
+            structured_script['llm_model_used'] = row['llm_model_used'] # Ensure model from DB is used
+            structured_script['generation_timestamp_from_cache'] = row['generation_timestamp'] # For context
+            return structured_script
+        else:
+            logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash} (max_age_hours: {max_age_hours})")
+            return None
+    except sqlite3.Error as e:
+        logger.error(f"[PSWA_CACHE_DB] Database error getting cached script for hash {topic_hash}: {e}")
+        return None # On DB error, proceed as if cache miss
+    except json.JSONDecodeError as e_json:
+        logger.error(f"[PSWA_CACHE_DB] Error decoding cached script JSON for hash {topic_hash}: {e_json}. Treating as cache miss.")
+        # Optionally, consider deleting the malformed cache entry here.
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+def _save_script_to_cache(db_path: str, script_id: str, topic_hash: str, structured_script: dict, llm_model_used: str):
+    """Saves a generated script to the cache."""
+    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        return
+
+    logger.info(f"[PSWA_CACHE_DB] Saving script {script_id} to cache with hash: {topic_hash}")
+    conn = None
+    try:
+        # Ensure the script itself doesn't have the temporary 'source' field before saving
+        script_to_save = structured_script.copy()
+        if 'source' in script_to_save : del script_to_save['source']
+        if 'generation_timestamp_from_cache' in script_to_save: del script_to_save['generation_timestamp_from_cache']
+
+        structured_script_json = json.dumps(script_to_save)
+        generation_timestamp = datetime.utcnow().isoformat()
+
+        conn = _get_db_connection(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO generated_scripts
+            (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, generation_timestamp)
+        )
+        conn.commit()
+        logger.info(f"[PSWA_CACHE_DB] Successfully saved script {script_id} to cache.")
+    except sqlite3.Error as e:
+        logger.error(f"[PSWA_CACHE_DB] Database error saving script {script_id} to cache: {e}")
+    except json.JSONEncodeError as e_json:
+        logger.error(f"[PSWA_CACHE_DB] Error encoding script {script_id} to JSON for cache: {e_json}")
+    except Exception as e_unexp: # Catch any other unexpected error
+        logger.error(f"[PSWA_CACHE_DB] Unexpected error saving script {script_id} to cache: {e_unexp}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
 
 def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
     """
@@ -269,21 +389,67 @@ def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
 def weave_script(content: str, topic: str) -> dict: # Return type changed to dict
     """
     Generates a podcast script using the configured LLM and parses it into a structured dict.
+    Implements caching logic to avoid redundant LLM calls.
     Returns a dictionary, which will include an 'error' key if something went wrong,
-    or the structured script data on success.
+    or the structured script data on success (with a 'source' field indicating 'cache' or 'generation').
     """
-    logger.info(f"[PSWA_LLM_LOGIC] weave_script called with topic: '{topic}'")
+    logger.info(f"[PSWA_MAIN_LOGIC] weave_script called for topic: '{topic}'")
+
+    if pswa_config.get('PSWA_TEST_MODE_ENABLED'):
+        logger.info(f"[PSWA_MAIN_LOGIC] Test mode enabled. Returning predefined script for topic '{topic}'.")
+        script_id = f"pswa_script_testmode_{uuid.uuid4().hex[:6]}"
+        dummy_segments = [
+            {"segment_title": "INTRO", "content": f"This is a test mode intro for {topic}."},
+            {"segment_title": "Segment 1: Test Details", "content": "Content of segment 1 for test mode."},
+            {"segment_title": "OUTRO", "content": "This concludes the test mode script."}
+        ]
+        dummy_script = {
+            "script_id": script_id,
+            "topic": topic,
+            "title": f"Test Mode: {topic}",
+            "segments": dummy_segments,
+            "full_raw_script": json.dumps({ # Simulating what a JSON response from LLM might look like
+                "title": f"Test Mode: {topic}",
+                "intro": dummy_segments[0]["content"],
+                "segments": [{"segment_title": s["segment_title"], "content": s["content"]} for s in dummy_segments[1:-1]], # Exclude intro/outro for this part
+                "outro": dummy_segments[-1]["content"]
+            }),
+            "llm_model_used": "test-mode-model",
+            "source": "test_mode"
+        }
+        return dummy_script
+
+    # Calculate hash for caching
+    topic_hash = _calculate_content_hash(topic, content)
+    logger.info(f"[PSWA_MAIN_LOGIC] Topic hash for caching: {topic_hash}")
+
+    # Cache lookup if enabled
+    if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        cached_script = _get_cached_script(
+            pswa_config['PSWA_DATABASE_PATH'],
+            topic_hash,
+            pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS']
+        )
+        if cached_script:
+            logger.info(f"[PSWA_MAIN_LOGIC] Returning cached script for topic '{topic}', hash {topic_hash}")
+            # Ensure 'source' field is set, default to 'cache' if not present from DB (older entries)
+            if 'source' not in cached_script:
+                cached_script['source'] = "cache"
+            return cached_script
+
+    # Proceed with LLM generation if no cache hit or caching disabled
+    logger.info(f"[PSWA_MAIN_LOGIC] No suitable cache entry found or caching disabled for topic '{topic}'. Proceeding with LLM generation.")
 
     if not PSWA_IMPORTS_SUCCESSFUL:
-        error_msg = f"OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}"
-        logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
-        return {"error": "PSWA_IMPORT_ERROR", "details": error_msg}
+        error_msg = f"OpenAI library not available. Import error: {PSWA_MISSING_IMPORT_ERROR}"
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
+        return {"error": "PSWA_IMPORT_ERROR", "details": error_msg, "source": "error"}
 
     api_key = pswa_config.get("OPENAI_API_KEY")
     if not api_key:
         error_msg = "Error: OPENAI_API_KEY is not configured."
-        logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
-        return {"error": "PSWA_CONFIG_ERROR_API_KEY", "details": error_msg}
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
+        return {"error": "PSWA_CONFIG_ERROR_API_KEY", "details": error_msg, "source": "error"}
     openai.api_key = api_key
 
     current_topic = topic if topic else "an interesting subject"
@@ -293,7 +459,7 @@ def weave_script(content: str, topic: str) -> dict: # Return type changed to dic
     try:
         user_prompt = user_prompt_template.format(topic=current_topic, content=current_content)
     except KeyError as e:
-        logger.error(f"[PSWA_LLM_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt structure.")
+        logger.error(f"[PSWA_MAIN_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt structure.")
         user_prompt = f"Topic: {current_topic}\nContent: {current_content}\n\nPlease generate a podcast script with [TITLE], [INTRO], [SEGMENT_1_TITLE], [SEGMENT_1_CONTENT], and [OUTRO]."
 
     system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE')
@@ -317,12 +483,11 @@ def weave_script(content: str, topic: str) -> dict: # Return type changed to dic
         # More sophisticated checks or library version checks might be needed for robustness.
         if "1106" in llm_model or "gpt-4" in llm_model or "turbo" in llm_model or "gpt-3.5-turbo-0125" in llm_model:
             openai_call_params["response_format"] = {"type": "json_object"}
-            logger.info(f"[PSWA_LLM_LOGIC] Attempting to use JSON mode with OpenAI model {llm_model}.")
+            logger.info(f"[PSWA_MAIN_LOGIC] Attempting to use JSON mode with OpenAI model {llm_model}.")
         else:
-            logger.warning(f"[PSWA_LLM_LOGIC] PSWA_LLM_JSON_MODE is true, but model {llm_model} might not explicitly support it via API flag. Will rely on prompt for JSON structure.")
-            # If not explicitly setting json_object, the prompt is crucial.
+            logger.warning(f"[PSWA_MAIN_LOGIC] PSWA_LLM_JSON_MODE is true, but model {llm_model} might not explicitly support it via API flag. Will rely on prompt for JSON structure.")
 
-    logger.info(f"[PSWA_LLM_LOGIC] Sending request to OpenAI API. Params: {json.dumps(openai_call_params)}") # Log the actual params being sent
+    logger.info(f"[PSWA_MAIN_LOGIC] Sending request to OpenAI API. Params: {json.dumps(openai_call_params)}")
     raw_script_text = None
     llm_model_used = llm_model
 
@@ -330,20 +495,31 @@ def weave_script(content: str, topic: str) -> dict: # Return type changed to dic
         response = openai.ChatCompletion.create(**openai_call_params)
         raw_script_text = response.choices[0].message['content'].strip()
         llm_model_used = response.model
-        logger.info(f"[PSWA_LLM_LOGIC] Successfully received script from OpenAI API (model: {llm_model_used}). Length: {len(raw_script_text)}")
+        logger.info(f"[PSWA_MAIN_LOGIC] Successfully received script from OpenAI API (model: {llm_model_used}). Length: {len(raw_script_text)}")
 
-        parsed_script = parse_llm_script_output(raw_script_text, current_topic)
+        parsed_script = parse_llm_script_output(raw_script_text, current_topic) # This populates script_id
         parsed_script["llm_model_used"] = llm_model_used
+        parsed_script["source"] = "generation"
+
+        # Save to cache if enabled and parsing was successful (not an error structure)
+        if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED') and not (parsed_script.get("segments") and parsed_script["segments"][0]["segment_title"] == "ERROR"):
+            _save_script_to_cache(
+                pswa_config['PSWA_DATABASE_PATH'],
+                parsed_script["script_id"], # Use the ID generated by parse_llm_script_output
+                topic_hash,
+                parsed_script, # Pass the full structured script
+                llm_model_used
+            )
         return parsed_script
 
     except openai.error.OpenAIError as e:
         error_msg = f"OpenAI API Error: {type(e).__name__} - {str(e)}"
-        logger.error(f"[PSWA_LLM_LOGIC] {error_msg}")
-        return {"error": "PSWA_OPENAI_API_ERROR", "details": error_msg, "raw_script_text_if_any": raw_script_text}
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
+        return {"error": "PSWA_OPENAI_API_ERROR", "details": error_msg, "raw_script_text_if_any": raw_script_text, "source": "error"}
     except Exception as e:
         error_msg = f"An unexpected error occurred during LLM call: {type(e).__name__} - {str(e)}"
-        logger.error(f"[PSWA_LLM_LOGIC] {error_msg}", exc_info=True)
-        return {"error": "PSWA_UNEXPECTED_LLM_ERROR", "details": error_msg, "raw_script_text_if_any": raw_script_text}
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}", exc_info=True)
+        return {"error": "PSWA_UNEXPECTED_LLM_ERROR", "details": error_msg, "raw_script_text_if_any": raw_script_text, "source": "error"}
 
 # --- Flask Endpoint ---
 @app.route('/weave_script', methods=['POST'])

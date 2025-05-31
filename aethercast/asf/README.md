@@ -43,6 +43,8 @@ Then, edit the `.env` file. Key variables include:
     -   *Default:* `5006`
 -   `ASF_DEBUG_MODE`: Enables or disables Flask debug mode (and SocketIO debug features).
     -   *Default:* `True`
+-   `ASF_UI_UPDATES_NAMESPACE`: The Socket.IO namespace dedicated to UI status updates.
+    -   *Default:* `/ui_updates`
 
 ## Dependencies
 

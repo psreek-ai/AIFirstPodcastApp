@@ -22,6 +22,16 @@
                 <!-- Re-using status-messages class for consistency, but could be specific -->
             </section>
 
+            <section id="topic-exploration-section">
+                <h2>Explore New Topics</h2>
+                <input type="text" id="explore-keywords-input" placeholder="Enter keywords to explore...">
+                <button id="explore-keywords-btn">Explore Keywords</button>
+                <div id="explored-topics-status" class="status-messages status-info" style="display:none;"></div>
+                <div id="explored-topics-container">
+                    <!-- Explored snippets/topics will be loaded here -->
+                </div>
+            </section>
+
             <section class="input-section">
                 <h2>Create Full Podcast</h2>
                 <label for="topic-input">Enter Topic:</label>
@@ -60,6 +70,22 @@
         <footer>
             <p>&copy; 2024 Aethercast AI. All rights reserved.</p>
         </footer>
+    </div>
+
+    <!-- Diagnostics Modal -->
+    <div id="diagnostics-modal" class="modal" style="display:none;">
+        <div class="modal-content">
+            <span class.close-btn" id="diagnostics-modal-close-btn">&times;</span>
+            <h2>Podcast Generation Diagnostics</h2>
+            <p><strong>Podcast ID:</strong> <span id="diag-podcast-id"></span></p>
+            <p><strong>Topic:</strong> <span id="diag-topic"></span></p>
+            <p><strong>Overall Status:</strong> <span id="diag-overall-status"></span></p>
+            <p><strong>Final Error Message:</strong> <span id="diag-final-error">N/A</span></p>
+            <h3>Orchestration Log:</h3>
+            <div id="diag-orchestration-log-container" style="max-height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; background: #f9f9f9; font-family: monospace; font-size: 0.9em;">
+                <!-- Log entries will be populated here -->
+            </div>
+        </div>
     </div>
 
     <script src="app.js"></script>

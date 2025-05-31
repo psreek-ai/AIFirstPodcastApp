@@ -136,9 +136,13 @@ flask run --host=0.0.0.0 --port=5001
                 "language_code": "en-GB",
                 "speaking_rate": 0.9,
                 "pitch": -1.5
-            }
+            },
+            "client_id": "your_unique_client_session_id_here" // Optional: For real-time UI updates
         }
         ```
+        -   `topic` (string, required): The main topic for the podcast.
+        -   `voice_params` (object, optional): Parameters to customize the voice synthesis (see VFA documentation for details).
+        -   `client_id` (string, optional): A unique identifier for the client session. If provided, CPOA will attempt to send real-time progress updates via ASF to this client.
     -   **Success Response (201 Created - if CPOA completes successfully with audio):**
         ```json
         {

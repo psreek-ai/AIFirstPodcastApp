@@ -1,0 +1,118 @@
+version: '3.8'
+
+volumes:
+  aethercast_db_data:
+  aethercast_audio_data:
+
+services:
+  api_gateway:
+    build:
+      context: . # Build context is the project root
+      dockerfile: ./aethercast/api_gateway/Dockerfile
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./aethercast:/app/aethercast # For live code changes in dev
+      - aethercast_db_data:/app/database # Named volume for DB
+    env_file:
+      - common.env # Shared environment variables
+      - ./aethercast/api_gateway/.env # Service-specific vars
+    # depends_on: # Example, can be added if strict startup order is needed
+      # - tda
+      # - cpoa (though cpoa is part of api_gateway image)
+
+  tda:
+    build:
+      context: .
+      dockerfile: ./aethercast/tda/Dockerfile
+    ports:
+      - "5000:5000" # Assuming TDA runs on 5000
+    volumes:
+      - ./aethercast:/app/aethercast
+      - aethercast_db_data:/app/database
+    env_file:
+      - common.env
+      - ./aethercast/tda/.env
+
+  sca:
+    build:
+      context: .
+      dockerfile: ./aethercast/sca/Dockerfile
+    ports:
+      - "5002:5002" # Assuming SCA runs on 5002
+    volumes:
+      - ./aethercast:/app/aethercast
+      # SCA might need DB access if it writes directly, or if it reads topics/snippets
+      # For now, assuming it doesn't directly write to the shared DB discussed for PSWA/TDA/API-GW
+      # If it does, add:
+      # - aethercast_db_data:/app/database
+    env_file:
+      - common.env
+      - ./aethercast/sca/.env
+
+  pswa:
+    build:
+      context: .
+      dockerfile: ./aethercast/pswa/Dockerfile
+    ports:
+      - "5004:5004" # Assuming PSWA runs on 5004
+    volumes:
+      - ./aethercast:/app/aethercast
+      - aethercast_db_data:/app/database # For script caching
+    env_file:
+      - common.env
+      - ./aethercast/pswa/.env
+
+  vfa:
+    build:
+      context: .
+      dockerfile: ./aethercast/vfa/Dockerfile
+    ports:
+      - "5005:5005" # Assuming VFA runs on 5005
+    volumes:
+      - ./aethercast:/app/aethercast
+      - aethercast_audio_data:/srv/aethercast/generated_audio # Shared volume for audio files
+    env_file:
+      - common.env
+      - ./aethercast/vfa/.env
+
+  asf:
+    build:
+      context: .
+      dockerfile: ./aethercast/asf/Dockerfile
+    ports:
+      - "5006:5006" # Assuming ASF runs on 5006
+    volumes:
+      - ./aethercast:/app/aethercast
+      - aethercast_audio_data:/srv/aethercast/generated_audio # ASF needs to read audio files
+    env_file:
+      - common.env
+      - ./aethercast/asf/.env
+
+# Note on .env files for services:
+# Each service's .env file (e.g., aethercast/api_gateway/.env) will need to be updated.
+# It should source common.env variables and then define its specific ones.
+# Example for aethercast/api_gateway/.env:
+#   DATABASE_FILE=${DATABASE_FILE_PATH_CONTAINER}
+#   TDA_SERVICE_URL=http://tda:5000/discover_topics
+#   # ... other API_GW specific vars
+#
+# Example for aethercast/pswa/.env:
+#   PSWA_DATABASE_PATH=${DATABASE_FILE_PATH_CONTAINER}
+#   OPENAI_API_KEY=your_real_key_or_leave_blank_for_no_external_calls_if_test_mode_is_on
+#   PSWA_TEST_MODE_ENABLED=True # Enable test mode for integration tests
+#
+# Example for aethercast/vfa/.env:
+#   VFA_SHARED_AUDIO_DIR=${SHARED_AUDIO_DIR_CONTAINER}
+#   VFA_TEST_MODE_ENABLED=True # Enable test mode
+#
+# These service-specific .env files are NOT created by this tool automatically.
+# They need to be present or created manually by the user, often by copying from their .env.example
+# and then adjusting for the Docker Compose environment (using service names for URLs, container paths).
+# The common.env provides the container paths, which are then referenced in the service .env files.
+#
+# The Dockerfiles copy the *entire* ./aethercast directory into /app/aethercast.
+# This means the Python code should use imports like 'from aethercast.module.file import ...'
+# and the PYTHONPATH=/app should make this work.
+# The CMD ["python", "aethercast/service_dir/main.py"] should also work with this structure.
+# The build context for each service is set to '.' (project root) to allow Dockerfiles to COPY ./aethercast.

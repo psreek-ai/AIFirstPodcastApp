@@ -66,6 +66,16 @@ CREATE TABLE IF NOT EXISTS topics_snippets (
     last_accessed_timestamp TEXT,
     relevance_score REAL
 );
+
+CREATE TABLE IF NOT EXISTS generated_scripts (
+    script_id TEXT PRIMARY KEY,
+    topic_hash TEXT NOT NULL UNIQUE, -- Hash of topic + input content summary/key elements
+    structured_script_json TEXT NOT NULL,
+    generation_timestamp TEXT NOT NULL,
+    llm_model_used TEXT,
+    last_accessed_timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
 """
 
 # --- API Gateway Specific Configurations ---
@@ -99,11 +109,24 @@ def init_db():
         if not cursor.fetchone():
             app.logger.info("Table 'topics_snippets' not found. It will be created as per DB_SCHEMA_SQL.")
         else:
-            app.logger.info("Table 'topics_snippets' already exists. Schema definition will ensure it's up-to-date if structure changed and `IF NOT EXISTS` is used appropriately in DDL for new elements.")
+            app.logger.info("Table 'topics_snippets' already exists.")
+
+        # Check for generated_scripts table
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='generated_scripts';")
+        if not cursor.fetchone():
+            app.logger.info("Table 'generated_scripts' not found. It will be created as per DB_SCHEMA_SQL.")
+        else:
+            app.logger.info("Table 'generated_scripts' already exists.")
+            # Check for index (less critical to log, but good for completeness if debugging)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_topic_hash';")
+            if not cursor.fetchone():
+                 app.logger.info("Index 'idx_topic_hash' for 'generated_scripts' not found. It will be created.")
+            else:
+                 app.logger.info("Index 'idx_topic_hash' for 'generated_scripts' already exists.")
 
         cursor.executescript(DB_SCHEMA_SQL) # Use executescript for multi-statement SQL
         conn.commit()
-        app.logger.info("Database initialization processed. 'podcasts' and 'topics_snippets' tables ensured.")
+        app.logger.info("Database initialization processed. 'podcasts', 'topics_snippets', and 'generated_scripts' tables (and indexes) ensured.")
     except sqlite3.Error as e:
         # Use app.logger if available, otherwise print
         log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
@@ -114,41 +137,49 @@ def init_db():
 
 
 # --- Attempt CPOA Import ---
+# Define placeholders that raise ImportError if called, indicating the real function wasn't imported.
+def _cpoa_placeholder_podcast(*args, **kwargs): raise ImportError("CPOA's orchestrate_podcast_generation function is not available due to import failure.")
+def _cpoa_placeholder_snippet(*args, **kwargs): raise ImportError("CPOA's orchestrate_snippet_generation function is not available due to import failure.")
+def _cpoa_placeholder_explore(*args, **kwargs): raise ImportError("CPOA's orchestrate_topic_exploration function is not available due to import failure.")
+
+# Initialize with placeholders
+orchestrate_podcast_generation = _cpoa_placeholder_podcast
+orchestrate_snippet_generation = _cpoa_placeholder_snippet
+orchestrate_topic_exploration = _cpoa_placeholder_explore
+
 cpoa_podcast_func_imported = False
 cpoa_snippet_func_imported = False
-CPOA_IMPORT_ERROR_MESSAGE = ""
+cpoa_exploration_func_imported = False
+CPOA_OVERALL_IMPORT_ERROR_MESSAGE = [] # Store multiple error messages if needed
+
+_pre_init_logger = print # Fallback logger before Flask app context is ready
+
 try:
-    from aethercast.cpoa.main import orchestrate_podcast_generation, orchestrate_snippet_generation
+    from aethercast.cpoa.main import orchestrate_podcast_generation as opg_real
+    orchestrate_podcast_generation = opg_real
     cpoa_podcast_func_imported = True
-    cpoa_snippet_func_imported = True
+    _pre_init_logger("Successfully imported CPOA.orchestrate_podcast_generation.")
 except ImportError as e:
-    CPOA_IMPORT_ERROR_MESSAGE = str(e)
-    # Try importing individually if combined fails, to see which one is the issue
-    if not cpoa_podcast_func_imported:
-        try:
-            from aethercast.cpoa.main import orchestrate_podcast_generation
-            cpoa_podcast_func_imported = True
-        except ImportError as e_pod:
-            CPOA_IMPORT_ERROR_MESSAGE += f" orchestrate_podcast_generation: {e_pod};"
-            log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print # Ensure logger for this context
-            log_func(f"Error importing CPOA orchestrate_podcast_generation: {e_pod}")
-            def orchestrate_podcast_generation(*args, **kwargs): # Placeholder
-                raise ImportError(f"CPOA's orchestrate_podcast_generation could not be imported: {CPOA_IMPORT_ERROR_MESSAGE}")
+    CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_podcast_generation: {e}")
 
-    if not cpoa_snippet_func_imported:
-        try:
-            from aethercast.cpoa.main import orchestrate_snippet_generation
-            cpoa_snippet_func_imported = True
-        except ImportError as e_snip:
-            CPOA_IMPORT_ERROR_MESSAGE += f" orchestrate_snippet_generation: {e_snip};"
-            log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print # Ensure logger for this context
-            log_func(f"Error importing CPOA orchestrate_snippet_generation: {e_snip}")
-            def orchestrate_snippet_generation(*args, **kwargs): # Placeholder
-                raise ImportError(f"CPOA's orchestrate_snippet_generation could not be imported: {CPOA_IMPORT_ERROR_MESSAGE}")
+try:
+    from aethercast.cpoa.main import orchestrate_snippet_generation as osg_real
+    orchestrate_snippet_generation = osg_real
+    cpoa_snippet_func_imported = True
+    _pre_init_logger("Successfully imported CPOA.orchestrate_snippet_generation.")
+except ImportError as e:
+    CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_snippet_generation: {e}")
 
-    if not cpoa_podcast_func_imported or not cpoa_snippet_func_imported:
-         log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
-         log_func(f"Overall CPOA import status: podcast_func={cpoa_podcast_func_imported}, snippet_func={cpoa_snippet_func_imported}. Errors: {CPOA_IMPORT_ERROR_MESSAGE}")
+try:
+    from aethercast.cpoa.main import orchestrate_topic_exploration as ote_real
+    orchestrate_topic_exploration = ote_real
+    cpoa_exploration_func_imported = True
+    _pre_init_logger("Successfully imported CPOA.orchestrate_topic_exploration.")
+except ImportError as e:
+    CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_topic_exploration: {e}")
+
+if CPOA_OVERALL_IMPORT_ERROR_MESSAGE:
+    _pre_init_logger(f"CPOA Module Import Errors: {'; '.join(CPOA_OVERALL_IMPORT_ERROR_MESSAGE)}")
 
 
 # --- Flask App Initialization ---
@@ -200,8 +231,9 @@ def serve_script():
 # --- Health Check Endpoint ---
 @app.route('/health', methods=['GET'])
 def health_check():
-    podcast_func_status = "successfully imported" if cpoa_podcast_func_imported else f"failed to import ({CPOA_IMPORT_ERROR_MESSAGE})"
-    snippet_func_status = "successfully imported" if cpoa_snippet_func_imported else f"failed to import ({CPOA_IMPORT_ERROR_MESSAGE})"
+    podcast_func_status = "successfully imported" if cpoa_podcast_func_imported else f"failed to import ({'; '.join(CPOA_OVERALL_IMPORT_ERROR_MESSAGE)})"
+    snippet_func_status = "successfully imported" if cpoa_snippet_func_imported else f"failed to import ({'; '.join(CPOA_OVERALL_IMPORT_ERROR_MESSAGE)})"
+    exploration_func_status = "successfully imported" if cpoa_exploration_func_imported else f"failed to import ({'; '.join(CPOA_OVERALL_IMPORT_ERROR_MESSAGE)})" # Added
     db_status_message = "Database connection successful."
     try:
         conn = get_db_connection()
@@ -213,11 +245,13 @@ def health_check():
 
     return jsonify({
         "status": "API Gateway is healthy",
-        "cpoa_podcast_function_status": podcast_func_status,
-        "cpoa_snippet_function_status": snippet_func_status,
-        "cpoa_podcast_func_imported": cpoa_podcast_func_imported,
-        "cpoa_snippet_func_imported": cpoa_snippet_func_imported,
-        "database_status": db_status_message
+        "cpoa_functions_import_status": {
+            "orchestrate_podcast_generation": {"imported": cpoa_podcast_func_imported, "status": podcast_func_status},
+            "orchestrate_snippet_generation": {"imported": cpoa_snippet_func_imported, "status": snippet_func_status},
+            "orchestrate_topic_exploration": {"imported": cpoa_exploration_func_imported, "status": exploration_func_status} # Added
+        },
+        "database_status": db_status_message,
+        "cpoa_import_error_details": CPOA_OVERALL_IMPORT_ERROR_MESSAGE if CPOA_OVERALL_IMPORT_ERROR_MESSAGE else "None"
     }), 200
 
 # --- Snippets Endpoint ---
@@ -378,6 +412,55 @@ def get_dynamic_snippets():
     app.logger.info(f"Successfully generated {len(generated_snippets)} new snippets via TDA/CPOA.")
     return jsonify({"snippets": generated_snippets, "source": "generation"}), 200
 
+# --- Topic Exploration Endpoint ---
+@app.route('/api/v1/topics/explore', methods=['POST'])
+def explore_topic():
+    app.logger.info("Request received for /api/v1/topics/explore")
+    data = request.get_json()
+
+    if not data:
+        app.logger.warning("Bad request to /api/v1/topics/explore: No JSON payload.")
+        return jsonify({"error": "Bad Request", "message": "Missing JSON payload."}), 400
+
+    current_topic_id = data.get('current_topic_id')
+    keywords = data.get('keywords')
+    depth_mode = data.get('depth', 'deeper') # Default to 'deeper'
+
+    if not current_topic_id and not keywords:
+        app.logger.warning("Bad request to /api/v1/topics/explore: Missing 'current_topic_id' or 'keywords'.")
+        return jsonify({"error": "Bad Request", "message": "Either 'current_topic_id' or 'keywords' must be provided."}), 400
+
+    # Ensure CPOA has the new exploration function imported
+    # Check if the specific CPOA function for exploration is available
+    if not cpoa_exploration_func_imported:
+        app.logger.error(f"CPOA's orchestrate_topic_exploration function is not available due to import error(s): {CPOA_OVERALL_IMPORT_ERROR_MESSAGE}")
+        return jsonify({"error": "Service Unavailable", "message": "Core topic exploration module is not available."}), 503
+
+    try:
+        app.logger.info(f"Calling CPOA to explore topic. Topic ID: {current_topic_id}, Keywords: {keywords}, Depth: {depth_mode}")
+
+        # Call the (potentially placeholder or real) orchestrate_topic_exploration function
+        exploration_results = orchestrate_topic_exploration(
+            current_topic_id=current_topic_id,
+            keywords=keywords,
+            depth_mode=depth_mode
+            # client_id is not passed here, as this is an internal generation loop,
+            # not directly tied to a single client's immediate podcast request UI.
+        )
+
+        app.logger.info(f"CPOA returned {len(exploration_results)} items for topic exploration.")
+        return jsonify({"explored_topics_or_snippets": exploration_results}), 200
+
+    except ValueError as ve: # Catch specific errors raised by CPOA for bad inputs not caught by initial check
+        app.logger.error(f"ValueError during topic exploration: {ve}")
+        return jsonify({"error": "Bad Request", "message": str(ve)}), 400
+    except ImportError as ie: # If the dynamic import above failed (should be caught by initial check ideally)
+        app.logger.error(f"CPOA function 'orchestrate_topic_exploration' unavailable: {ie}")
+        return jsonify({"error": "Service Unavailable", "message": "Core topic exploration module is not available."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error during topic exploration: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred during topic exploration."}), 500
+
 
 # --- Podcast Generation Endpoint ---
 @app.route('/api/v1/podcasts', methods=['POST'])
@@ -390,12 +473,18 @@ def create_podcast_generation_task():
     
     topic = data['topic']
     voice_params_from_request = data.get('voice_params') # Optional
+    client_id_from_request = data.get('client_id') # Optional client_id for UI updates
 
     if voice_params_from_request is not None and not isinstance(voice_params_from_request, dict):
         app.logger.warning("Bad request to /api/v1/podcasts: 'voice_params' was provided but not as a valid JSON object.")
         return jsonify({"error": "Bad Request", "message": "'voice_params' must be a valid JSON object if provided."}), 400
 
-    app.logger.info(f"Received podcast generation request for topic string: '{topic}'. Voice params: {voice_params_from_request}")
+    if client_id_from_request is not None and not isinstance(client_id_from_request, str):
+        app.logger.warning("Bad request to /api/v1/podcasts: 'client_id' was provided but not as a string.")
+        return jsonify({"error": "Bad Request", "message": "'client_id' must be a string if provided."}), 400
+
+
+    app.logger.info(f"Received podcast generation request for topic string: '{topic}'. Voice params: {voice_params_from_request}. Client ID: {client_id_from_request}")
 
     if not cpoa_podcast_func_imported:
         app.logger.error("CPOA podcast generation function not loaded. Cannot process podcast generation.")
@@ -428,14 +517,19 @@ def create_podcast_generation_task():
             if conn:
                 conn.close()
 
-        app.logger.info(f"Invoking CPOA orchestrate_podcast_generation for topic: '{topic}', task_id: {podcast_id}, voice_params: {voice_params_from_request}")
+        app.logger.info(f"Invoking CPOA orchestrate_podcast_generation for topic: '{topic}', task_id: {podcast_id}, voice_params: {voice_params_from_request}, client_id: {client_id_from_request}")
 
-        cpoa_result = orchestrate_podcast_generation(
-            topic=topic,
-            task_id=podcast_id,
-            db_path=db_path_for_cpoa,
-            voice_params_input=voice_params_from_request
-        )
+        # Pass client_id to CPOA if available
+        cpoa_kwargs = {
+            "topic": topic,
+            "task_id": podcast_id,
+            "db_path": db_path_for_cpoa,
+            "voice_params_input": voice_params_from_request
+        }
+        if client_id_from_request:
+            cpoa_kwargs["client_id"] = client_id_from_request
+
+        cpoa_result = orchestrate_podcast_generation(**cpoa_kwargs)
         app.logger.info(f"CPOA returned for task_id '{podcast_id}'. Status: {cpoa_result.get('status')}")
 
         # Extract details from CPOA result for final update

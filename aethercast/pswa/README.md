@@ -19,7 +19,12 @@ Key Responsibilities:
     *   If JSON output fails or is disabled, PSWA falls back to parsing a text-based response from the LLM using predefined tags (e.g., `[TITLE]`, `[INTRO]`).
     *   Identifies and extracts sections based on the chosen parsing method.
     *   Constructs a structured JSON object representing the podcast script, including a `script_id`, `topic`, `title`, the `full_raw_script` from the LLM, a list of `segments` (each with `segment_title` and `content`), and the `llm_model_used`.
-5.  **Output:** Returns the structured script JSON object to the CPOA.
+5.  **Output:** Returns the structured script JSON object to the CPOA. This object includes a `source` field indicating if the script was from `"generation"` (newly created by LLM) or `"cache"`.
+6.  **Script Caching (Optional):**
+    *   If enabled via configuration, PSWA calculates a hash based on the input `topic` and `content`.
+    *   It checks a shared database table (`generated_scripts`) for a recent, matching script.
+    *   If a fresh cached script is found, it's returned, bypassing the LLM call.
+    *   Newly generated scripts are saved to this cache if caching is enabled.
 
 ## Configuration
 
@@ -51,6 +56,12 @@ Then, edit the `.env` file. The following variables are used:
     -   *Default:* `5004`
 -   `PSWA_DEBUG`: Enables/disables Flask debug mode.
     -   *Default:* `True`
+-   `PSWA_DATABASE_PATH`: Path to the shared SQLite database (e.g., `../api_gateway/aethercast_podcasts.db`). **Required** if script caching (`PSWA_SCRIPT_CACHE_ENABLED`) is enabled. This database must be the same one used by the API Gateway to ensure access to the `generated_scripts` table.
+    -   *Default (in code):* `../api_gateway/aethercast_podcasts.db`
+-   `PSWA_SCRIPT_CACHE_ENABLED`: Set to `true` to enable script caching, `false` to disable.
+    -   *Default (in code):* `true`
+-   `PSWA_SCRIPT_CACHE_MAX_AGE_HOURS`: Maximum age (in hours) for a cached script to be considered fresh and usable.
+    -   *Default (in code):* `720` (which is 30 days)
 
 ## Dependencies
 
@@ -103,7 +114,9 @@ flask run --host=0.0.0.0 --port=5004
             {"segment_title": "The Current State", "content": "Currently, AI is impacting various sectors..."},
             {"segment_title": "OUTRO", "content": "Join us next time as we delve deeper..."}
         ],
-        "llm_model_used": "gpt-3.5-turbo"
+        "llm_model_used": "gpt-3.5-turbo",
+        "source": "generation"
+        // "source" will be "cache" if a valid cached script was found and used.
     }
     ```
 -   **Error Response Examples (JSON):**

@@ -56,6 +56,7 @@ def load_vfa_configuration():
     # Added new default voice parameters
     vfa_config['VFA_TTS_DEFAULT_SPEAKING_RATE'] = float(os.getenv("VFA_TTS_DEFAULT_SPEAKING_RATE", "1.0"))
     vfa_config['VFA_TTS_DEFAULT_PITCH'] = float(os.getenv("VFA_TTS_DEFAULT_PITCH", "0.0"))
+    vfa_config['VFA_TEST_MODE_ENABLED'] = os.getenv("VFA_TEST_MODE_ENABLED", "False").lower() == 'true' # Added Test Mode
 
     vfa_config['VFA_HOST'] = os.getenv("VFA_HOST", "0.0.0.0")
     vfa_config['VFA_PORT'] = int(os.getenv("VFA_PORT", 5005))
@@ -120,9 +121,52 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
     Returns a dictionary with audio generation details, including a stream_id, or error information.
     """
     stream_id = f"strm_{uuid.uuid4().hex}"
-    text_to_synthesize = ""
-    original_topic = "Unknown Topic"
+    original_topic = script_input.get("topic", "Unknown Topic") if isinstance(script_input, dict) else "Unknown Topic (from non-dict input)"
     voice_params_input = voice_params_input or {}
+
+    # Determine TTS parameters early for potential use in test mode response
+    used_tts_settings = {
+        "voice_name": voice_params_input.get("voice_name", vfa_config.get('VFA_TTS_VOICE_NAME')),
+        "language_code": voice_params_input.get("language_code", vfa_config.get('VFA_TTS_LANG_CODE')),
+        "speaking_rate": voice_params_input.get("speaking_rate", vfa_config.get('VFA_TTS_DEFAULT_SPEAKING_RATE')),
+        "pitch": voice_params_input.get("pitch", vfa_config.get('VFA_TTS_DEFAULT_PITCH')),
+        "audio_encoding": vfa_config.get('VFA_TTS_AUDIO_ENCODING_STR')
+    }
+
+    if vfa_config.get('VFA_TEST_MODE_ENABLED'):
+        logger.info(f"[VFA_MAIN_LOGIC] Test mode enabled. Simulating audio generation for stream {stream_id}, topic '{original_topic}'.")
+        shared_audio_dir = vfa_config.get('VFA_SHARED_AUDIO_DIR')
+        os.makedirs(shared_audio_dir, exist_ok=True)
+
+        # Create a small dummy MP3 file (very basic - not a valid MP3 header but enough for file existence)
+        file_extension = f".{used_tts_settings['audio_encoding'].lower()}" if used_tts_settings['audio_encoding'] else ".mp3"
+        dummy_filename = f"aethercast_audio_testmode_{stream_id}_{uuid.uuid4().hex[:6]}{file_extension}"
+        dummy_filepath = os.path.join(shared_audio_dir, dummy_filename)
+
+        try:
+            with open(dummy_filepath, "wb") as f:
+                f.write(b"ID3\x03\x00\x00\x00\x00\x0fThis is a test MP3 file.") # Minimal dummy MP3 like content
+            logger.info(f"[VFA_MAIN_LOGIC] Test mode: Created dummy audio file at {dummy_filepath}")
+            return {
+                "status": "success",
+                "message": "Audio successfully synthesized (TEST MODE - dummy file).",
+                "audio_filepath": dummy_filepath,
+                "stream_id": stream_id,
+                "audio_format": used_tts_settings['audio_encoding'].lower(),
+                "script_char_count": len(str(script_input)), # Approximate length
+                "engine_used": "test_mode_tts",
+                "tts_settings_used": used_tts_settings
+            }
+        except IOError as e:
+            logger.error(f"[VFA_MAIN_LOGIC] Test mode: Failed to create dummy audio file: {e}")
+            return {
+                "status": "error", "message": f"Test mode failed to create dummy file: {e}",
+                "audio_filepath": None, "stream_id": stream_id,
+                "script_char_count": 0, "engine_used": "test_mode_tts_error",
+                "tts_settings_used": used_tts_settings
+            }
+
+    text_to_synthesize = ""
 
     if not isinstance(script_input, dict):
         logger.warning(f"[VFA_TTS_LOGIC] Stream {stream_id}: Received script_input is not a dictionary. Input type: {type(script_input)}")
@@ -167,14 +211,6 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
     script_char_count = len(text_to_synthesize)
     logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}. Topic: '{original_topic}'. Effective script char count for TTS: {script_char_count}")
 
-    # Determine TTS parameters, merging inputs with defaults from config
-    used_tts_settings = {
-        "voice_name": voice_params_input.get("voice_name", vfa_config.get('VFA_TTS_VOICE_NAME')),
-        "language_code": voice_params_input.get("language_code", vfa_config.get('VFA_TTS_LANG_CODE')),
-        "speaking_rate": voice_params_input.get("speaking_rate", vfa_config.get('VFA_TTS_DEFAULT_SPEAKING_RATE')),
-        "pitch": voice_params_input.get("pitch", vfa_config.get('VFA_TTS_DEFAULT_PITCH')),
-        "audio_encoding": vfa_config.get('VFA_TTS_AUDIO_ENCODING_STR')
-    }
 
     shared_audio_dir = vfa_config.get('VFA_SHARED_AUDIO_DIR')
     min_script_length = vfa_config.get('VFA_MIN_SCRIPT_LENGTH')

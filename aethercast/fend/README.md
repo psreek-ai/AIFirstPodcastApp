@@ -44,6 +44,23 @@ The core client-side logic resides in `aethercast/fend/app.js`.
         *   **Status Updates:** A dedicated `<div id="streaming-status">` displays messages related to the streaming process (e.g., "Connecting...", "Buffering...", "Stream ended.").
         *   `cleanupMSE()` function ensures resources are reset when a stream ends or errors out.
 
+4.  **Topic Exploration:**
+    *   **Triggering Exploration:** Users can explore topics in two ways:
+        *   Clicking an "Explore Related" button (`.explore-related-btn`) dynamically added to each snippet card. This uses the snippet's associated topic ID (`data-topic-id`).
+        *   Entering keywords into a dedicated input field (`#explore-keywords-input`) and clicking an "Explore Keywords" button (`#explore-keywords-btn`).
+    *   **API Call:** Both methods trigger `triggerTopicExploration(payload)`, which makes a `POST` request to the API Gateway's `/api/v1/topics/explore` endpoint. The payload contains either `current_topic_id` or `keywords`, and a `depth` mode (currently "deeper").
+    *   **Displaying Results:** New snippets returned by the API are rendered in the `#explored-topics-container` using a reusable `renderSnippetCard` function. Each new explored snippet card also includes "Generate Podcast" and "Explore Related" buttons, allowing for further interaction.
+    *   **Status Updates:** Loading states and errors during the exploration process are displayed in `#explored-topics-status`.
+
+5.  **Advanced Error Diagnostics:**
+    *   **Triggering Diagnostics:** After a podcast generation attempt (whether successful or failed), if a `podcast_id` is available from the API response, a "View Diagnostics" button (`.view-diagnostics-btn`) is dynamically added to the status display area.
+    *   **Modal Display:** Clicking this button opens a modal window (`#diagnostics-modal`) overlaying the page.
+    *   **Fetching Details:** The modal fetches detailed information for the specific podcast task by making a `GET` request to the API Gateway's `/api/v1/podcasts/<podcast_id>` endpoint.
+    *   **Information Displayed:** The modal presents:
+        *   Key information: Podcast ID, Topic, Overall Status, and Final Error Message (if any).
+        *   A formatted, scrollable view of CPOA's `orchestration_log`. Each log entry shows its timestamp, stage, message, and any `data_preview` or `structured_data` associated with it (formatted as JSON). This allows for detailed inspection of the generation process.
+    *   **Interactivity:** The modal can be closed by clicking an "X" button (`#diagnostics-modal-close-btn`) or by clicking outside the main modal content area.
+
 ## HTML Structure (`index.html`)
 
 The `app.js` script relies on specific element IDs being present in `index.html`:
@@ -61,8 +78,18 @@ The `app.js` script relies on specific element IDs being present in `index.html`
 -   `#refresh-snippets-btn`: Button to manually refresh the list of snippets.
     -   `<div id="generation-progress-display">`: A div to show the sequence of simulated progress messages during podcast generation.
     -   `<audio id="audio-player-mse" controls></audio>`: A dedicated audio element for playback via MediaSource Extensions.
-    -   `<div id="streaming-status"></div>`: A div to show real-time status messages related to audio streaming (e.g., "Connecting to stream...", "Buffering...", "Stream ended.").
+    -   `<div id="streaming-status"></div>`: A div to show real-time status messages related to audio streaming.
     -   `<button id="retry-stream-btn">`: Button (initially hidden) that allows users to retry audio streaming if it fails.
+    -   `#explore-keywords-input`: Text input for users to enter keywords for topic exploration.
+    -   `#explore-keywords-btn`: Button to trigger exploration based on keywords.
+    -   `#explored-topics-container`: Div where snippets resulting from topic exploration are displayed.
+    -   `#explored-topics-status`: Div for displaying status messages related to the topic exploration process.
+    -   `.explore-related-btn`: Class for "Explore Related" buttons dynamically added to snippet cards.
+    -   `#diagnostics-modal`: The main container for the diagnostics modal (initially hidden).
+    -   `#diagnostics-modal-close-btn`: The close button ('&times;') for the modal.
+    -   `#diag-podcast-id`, `#diag-topic`, `#diag-overall-status`, `#diag-final-error`: Spans within the modal to display basic info of the diagnosed podcast.
+    -   `#diag-orchestration-log-container`: A div within the modal to display the formatted orchestration log entries.
+    -   `.view-diagnostics-btn`: Class for "View Diagnostics" buttons dynamically added after a podcast generation attempt.
 
 ## Dependencies
 

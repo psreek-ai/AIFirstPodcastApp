@@ -49,6 +49,12 @@ class TestAPIGateway(unittest.TestCase):
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='topics_snippets';")
                 if cursor.fetchone() is None:
                     raise AssertionError("topics_snippets table was not created in :memory: database.")
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='generated_scripts';")
+                if cursor.fetchone() is None:
+                    raise AssertionError("generated_scripts table was not created in :memory: database.")
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_topic_hash';")
+                if cursor.fetchone() is None:
+                    raise AssertionError("idx_topic_hash index on generated_scripts was not created.")
             finally:
                 if conn: conn.close()
 
@@ -65,7 +71,8 @@ class TestAPIGateway(unittest.TestCase):
             conn = api_gw_main.get_db_connection()
             cursor = conn.cursor()
             cursor.execute("DELETE FROM podcasts;")
-            cursor.execute("DELETE FROM topics_snippets;") # Clear topics_snippets table as well
+            cursor.execute("DELETE FROM topics_snippets;")
+            cursor.execute("DELETE FROM generated_scripts;") # Clear generated_scripts table as well
             conn.commit()
             conn.close()
 
@@ -159,7 +166,7 @@ class TestAPIGateway(unittest.TestCase):
         mock_orchestrate_podcast_func.return_value = mock_cpoa_result
 
         response = self.client.post('/api/v1/podcasts', json={'topic': 'Test CPOA Internal Fail'})
-        
+
         self.assertEqual(response.status_code, 200)
         json_data = response.get_json()
         generated_podcast_id = json_data['podcast_id']
@@ -475,12 +482,12 @@ class TestAPIGateway(unittest.TestCase):
         
         with open(temp_audio_path_for_db, "wb") as f:
             f.write(b"dummy audio data")
-        
+
         response = self.client.get(f'/api/v1/podcasts/{dummy_data["podcast_id"]}/audio.mp3')
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.mimetype, 'audio/mpeg')
         self.assertEqual(response.data, b"dummy audio data")
-        
+
         os.remove(temp_audio_path_for_db)
 
     def test_serve_podcast_audio_not_found_db(self):
@@ -495,6 +502,84 @@ class TestAPIGateway(unittest.TestCase):
         self.assertEqual(response.status_code, 404)
         json_data = response.get_json()
         self.assertIn("Audio file missing", json_data["message"])
+
+    # --- Tests for /api/v1/topics/explore ---
+    @patch('aethercast.api_gateway.main.orchestrate_topic_exploration')
+    def test_explore_topic_with_topic_id_success(self, mock_orchestrate_explore):
+        mock_cpoa_response = [{"snippet_id": "exp_snip_1", "title": "Explored Snippet 1"}]
+        mock_orchestrate_explore.return_value = mock_cpoa_response
+
+        payload = {"current_topic_id": "topic_abc", "depth": "deeper"}
+        response = self.client.post('/api/v1/topics/explore', json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertEqual(json_data["explored_topics_or_snippets"], mock_cpoa_response)
+        mock_orchestrate_explore.assert_called_once_with(
+            current_topic_id="topic_abc",
+            keywords=None,
+            depth_mode="deeper"
+        )
+
+    @patch('aethercast.api_gateway.main.orchestrate_topic_exploration')
+    def test_explore_topic_with_keywords_success(self, mock_orchestrate_explore):
+        mock_cpoa_response = [{"snippet_id": "exp_snip_2", "title": "Keyword Snippet"}]
+        mock_orchestrate_explore.return_value = mock_cpoa_response
+
+        payload = {"keywords": ["ai", "ethics"], "depth": "broader"}
+        response = self.client.post('/api/v1/topics/explore', json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertEqual(json_data["explored_topics_or_snippets"], mock_cpoa_response)
+        mock_orchestrate_explore.assert_called_once_with(
+            current_topic_id=None,
+            keywords=["ai", "ethics"],
+            depth_mode="broader"
+        )
+
+    def test_explore_topic_missing_identifier(self):
+        payload = {"depth": "deeper"} # Missing both current_topic_id and keywords
+        response = self.client.post('/api/v1/topics/explore', json=payload)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertIn("Either 'current_topic_id' or 'keywords' must be provided", json_data["message"])
+
+    @patch('aethercast.api_gateway.main.orchestrate_topic_exploration')
+    def test_explore_topic_cpoa_raises_value_error(self, mock_orchestrate_explore):
+        mock_orchestrate_explore.side_effect = ValueError("Test CPOA ValueError for exploration")
+
+        payload = {"keywords": ["test"], "depth": "deeper"}
+        response = self.client.post('/api/v1/topics/explore', json=payload)
+
+        self.assertEqual(response.status_code, 400) # Assuming ValueError from CPOA maps to 400
+        json_data = response.get_json()
+        self.assertIn("Test CPOA ValueError for exploration", json_data["message"])
+
+    @patch('aethercast.api_gateway.main.orchestrate_topic_exploration')
+    def test_explore_topic_cpoa_raises_import_error(self, mock_orchestrate_explore):
+        # This simulates if orchestrate_topic_exploration was the placeholder due to import error
+        mock_orchestrate_explore.side_effect = ImportError("CPOA's orchestrate_topic_exploration not imported.")
+
+        # Ensure the import flag is also False for this test scenario
+        with patch.object(api_gw_main, 'cpoa_exploration_func_imported', False):
+            payload = {"keywords": ["test"], "depth": "deeper"}
+            response = self.client.post('/api/v1/topics/explore', json=payload)
+
+            self.assertEqual(response.status_code, 503)
+            json_data = response.get_json()
+            self.assertIn("Core topic exploration module is not available", json_data["message"])
+
+    @patch('aethercast.api_gateway.main.orchestrate_topic_exploration')
+    def test_explore_topic_cpoa_returns_empty_list(self, mock_orchestrate_explore):
+        mock_orchestrate_explore.return_value = []
+
+        payload = {"keywords": ["rare topic"], "depth": "deeper"}
+        response = self.client.post('/api/v1/topics/explore', json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertEqual(json_data["explored_topics_or_snippets"], [])
 
 
 if __name__ == '__main__':

@@ -19,10 +19,10 @@ if not hasattr(pswa_main, 'openai') or not hasattr(pswa_main.openai, 'error'):
     # Define placeholder if main module's import failed and didn't set up a dummy
     class OpenAIErrorPlaceholder(Exception): pass
     class DummyOpenAIError: OpenAIError = OpenAIErrorPlaceholder
-    if 'openai' not in sys.modules: # if openai module itself is not in sys.modules
-        openai = MagicMock() # general MagicMock for openai
+    if 'openai' not in sys.modules:
+        openai = MagicMock()
         openai.error = DummyOpenAIError()
-    else: # if openai is imported but error attribute is missing
+    else:
         import openai
         if not hasattr(openai, 'error'):
             openai.error = DummyOpenAIError()
@@ -31,27 +31,62 @@ if not hasattr(pswa_main, 'openai') or not hasattr(pswa_main.openai, 'error'):
 else:
     import openai
 
+# For mocking datetime
+from datetime import datetime, timedelta
+
+
+class TestCalculateContentHash(unittest.TestCase):
+    def test_hash_consistency(self):
+        hash1 = pswa_main._calculate_content_hash("Topic A", "Content for topic A, first 1000 chars.")
+        hash2 = pswa_main._calculate_content_hash("Topic A", "Content for topic A, first 1000 chars.")
+        self.assertEqual(hash1, hash2)
+
+    def test_hash_case_insensitivity(self):
+        hash1 = pswa_main._calculate_content_hash("Topic B", "Some Content.")
+        hash2 = pswa_main._calculate_content_hash("topic b", "some content.")
+        self.assertEqual(hash1, hash2)
+
+    def test_hash_content_truncation(self):
+        base_content = "c" * 1000
+        extended_content = base_content + "extra content that should not affect hash"
+        hash1 = pswa_main._calculate_content_hash("Topic C", base_content)
+        hash2 = pswa_main._calculate_content_hash("Topic C", extended_content)
+        self.assertEqual(hash1, hash2)
+
+        # Ensure that if the first 1000 chars change, the hash changes
+        different_base_content = "d" * 1000
+        hash3 = pswa_main._calculate_content_hash("Topic C", different_base_content)
+        self.assertNotEqual(hash1, hash3)
+
+    def test_hash_topic_sensitivity(self):
+        hash1 = pswa_main._calculate_content_hash("Topic D1", "Common Content")
+        hash2 = pswa_main._calculate_content_hash("Topic D2", "Common Content")
+        self.assertNotEqual(hash1, hash2)
+
 
 class TestWeaveScriptLogic(unittest.TestCase):
 
     def setUp(self):
+        self.maxDiff = None # Show full diff on assertion failure
         # Mock configurations - these will be active for each test
-        self.mock_pswa_config = {
+        self.mock_pswa_config_defaults = {
             "OPENAI_API_KEY": "fake_api_key",
-            "PSWA_LLM_MODEL": "gpt-3.5-turbo-1106", # A model that supports JSON mode
+            "PSWA_LLM_MODEL": "gpt-3.5-turbo-1106",
             "PSWA_LLM_TEMPERATURE": 0.5,
             "PSWA_LLM_MAX_TOKENS": 1000,
-            "PSWA_LLM_JSON_MODE": True, # Enable JSON mode for most tests here
-            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": pswa_main.pswa_config.get("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE"), # Use actual default
-            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": pswa_main.pswa_config.get("PSWA_DEFAULT_PROMPT_USER_TEMPLATE")   # Use actual default
+            "PSWA_LLM_JSON_MODE": True,
+            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System prompt for JSON",
+            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User prompt for JSON: {topic} - {content}",
+            "PSWA_DATABASE_PATH": ":memory:", # Use in-memory DB for caching tests by default
+            "PSWA_SCRIPT_CACHE_ENABLED": True,
+            "PSWA_SCRIPT_CACHE_MAX_AGE_HOURS": 720 # 30 days
         }
-        # Ensure the main pswa_config is updated with these test-specific values
-        # self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
-        # A safer way if pswa_config is already populated by load_pswa_configuration at module import:
-        temp_config = pswa_main.pswa_config.copy()
-        temp_config.update(self.mock_pswa_config)
-        self.config_patcher = patch.dict(pswa_main.pswa_config, temp_config, clear=True)
 
+        # Use a copy for modification in tests to avoid altering the class default dict
+        self.current_test_config = self.mock_pswa_config_defaults.copy()
+
+        # Patch pswa_main.pswa_config directly. This is simpler if pswa_config is a global dict.
+        self.config_patcher = patch.dict(pswa_main.pswa_config, self.current_test_config)
         self.mock_config = self.config_patcher.start()
 
         self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
@@ -90,9 +125,10 @@ class TestWeaveScriptLogic(unittest.TestCase):
         self.assertEqual(result["topic"], "AI in Education via JSON")
         self.assertEqual(result["title"], "AI in Education (JSON)")
         self.assertEqual(result["llm_model_used"], "gpt-3.5-turbo-1106-from-api")
-        self.assertEqual(result["full_raw_script"], llm_output_json_str) # Raw script is the JSON string
+        self.assertEqual(result["full_raw_script"], llm_output_json_str)
+        self.assertEqual(result.get("source"), "generation") # Should indicate it was generated
 
-        self.assertEqual(len(result["segments"]), 4) # Intro, Seg1, Seg2, Outro
+        self.assertEqual(len(result["segments"]), 4)
         self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
         self.assertEqual(result["segments"][0]["content"], "Welcome to a JSON discussion on AI in education.")
         self.assertEqual(result["segments"][1]["segment_title"], "Personalized Learning (JSON)")
@@ -119,11 +155,12 @@ class TestWeaveScriptLogic(unittest.TestCase):
 
             mock_openai_create.assert_called_once()
             call_kwargs = mock_openai_create.call_args.kwargs
-            self.assertNotIn("response_format", call_kwargs) # JSON mode should not be requested
+            self.assertNotIn("response_format", call_kwargs)
 
             self.assertNotIn("error", result)
             self.assertEqual(result["title"], "AI in Education (Tag Fallback)")
-            self.assertEqual(len(result["segments"]), 3) # Intro, Seg1, Outro
+            self.assertEqual(result.get("source"), "generation")
+            self.assertEqual(len(result["segments"]), 3)
             self.assertEqual(result["segments"][0]["content"], "Tag-based intro.")
             self.assertEqual(result["segments"][1]["segment_title"], "Segment One (Tag)")
             self.assertEqual(result["segments"][2]["segment_title"], "OUTRO")
@@ -144,28 +181,26 @@ class TestWeaveScriptLogic(unittest.TestCase):
             self.assertNotIn("error", result)
             self.assertEqual(result["title"], "Title from Tags")
             self.assertEqual(result["segments"][0]["content"], "Intro from Tags")
+            self.assertEqual(result.get("source"), "generation") # Fallback is still a form of generation
             self.assertTrue(any("LLM output was not valid JSON" in call_args[0][0] for call_args in mock_logger_warning.call_args_list))
 
     @patch('openai.ChatCompletion.create')
     def test_weave_script_critical_failure_unparsable_output_json_mode(self, mock_openai_create):
-        # Test LLM returning completely unparsable output (neither JSON nor tags) when JSON mode is on
         unparsable_gibberish = "This is complete gibberish, not JSON, and not tags."
         mock_openai_create.return_value = MagicMock(
             choices=[MagicMock(message=MagicMock(content=unparsable_gibberish))],
             model="gpt-test-model-gibberish"
         )
 
-        # Ensure JSON mode is on
-        self.assertTrue(pswa_main.pswa_config["PSWA_LLM_JSON_MODE"])
+        self.assertTrue(pswa_main.pswa_config["PSWA_LLM_JSON_MODE"]) # Ensure JSON mode is on for this test variant
 
         with patch.object(pswa_main.logger, 'error') as mock_logger_error:
             result = pswa_main.weave_script("Content", "Unparsable Test")
 
-            self.assertIn("error", result, "Result should indicate an error for unparsable output.")
+            self.assertIn("error", result)
             self.assertEqual(result["error"], "PSWA_SCRIPT_PARSING_FAILURE")
+            self.assertEqual(result.get("source"), "error")
             self.assertIn("Failed to parse LLM output as JSON and also failed tag-based fallback", result["details"])
-
-            # Check that an error was logged about the parsing failure
             self.assertTrue(any("Failed to parse LLM output as JSON" in call_args[0][0] for call_args in mock_logger_error.call_args_list))
 
     @patch('openai.ChatCompletion.create')
@@ -182,35 +217,39 @@ class TestWeaveScriptLogic(unittest.TestCase):
         self.assertEqual(result["segments"][0]["segment_title"], "ERROR")
         self.assertIn("not sufficient for topic: Too Brief", result["segments"][0]["content"])
         self.assertTrue(result["title"].startswith("Error: Insufficient Content"))
+        self.assertEqual(result.get("source"), "generation") # LLM generated an error message, counts as generation
 
-
-    @patch('openai.ChatCompletion.create') # Keep this patch for consistency even if not used in this specific test path
-    def test_weave_script_success(self, mock_openai_create): # Original success test, now defaults to JSON mode
-        # This test implicitly tests JSON mode if self.mock_pswa_config["PSWA_LLM_JSON_MODE"] is True
+    @patch('openai.ChatCompletion.create')
+    def test_weave_script_success_no_cache_involvement(self, mock_openai_create):
+        # This test is similar to test_weave_script_success_json_mode but explicitly for when cache is not hit
+        # and to ensure 'source: generation' is added.
         llm_output_json_str = json.dumps({
             "title": "AI in Education",
             "intro": "Welcome to a discussion on how AI is reshaping education.",
-            "segments": [
-                {"segment_title": "Personalized Learning", "content": "AI algorithms analyze student performance to offer tailored learning paths. This helps address individual needs effectively."}
-            ],
-            "outro": "AI holds immense potential to revolutionize teaching and learning. Join us next time!"
+            "segments": [{"segment_title": "Personalized Learning", "content": "AI algorithms analyze."}],
+            "outro": "Join us next time!"
         })
-
         mock_openai_create.return_value = MagicMock(
             choices=[MagicMock(message=MagicMock(content=llm_output_json_str))],
             model="gpt-test-model-from-api"
         )
+        # Ensure caching is enabled for this test to check save path, but mock _get_cached_script to return None
+        pswa_main.pswa_config['PSWA_SCRIPT_CACHE_ENABLED'] = True
+        with patch.object(pswa_main, '_get_cached_script', return_value=None) as mock_get_cache, \
+             patch.object(pswa_main, '_save_script_to_cache') as mock_save_cache:
 
-        result = pswa_main.weave_script("Some harvested content", "AI in Education")
+            result = pswa_main.weave_script("Some harvested content", "AI in Education")
 
-        self.assertNotIn("error", result)
-        self.assertEqual(result["topic"], "AI in Education")
-        self.assertEqual(result["title"], "AI in Education")
-        self.assertEqual(result["llm_model_used"], "gpt-test-model-from-api")
-        # full_raw_script should be the JSON string itself now
-        self.assertEqual(result["full_raw_script"], llm_output_json_str)
+            self.assertNotIn("error", result)
+            self.assertEqual(result["topic"], "AI in Education")
+            self.assertEqual(result["title"], "AI in Education")
+            self.assertEqual(result["llm_model_used"], "gpt-test-model-from-api")
+            self.assertEqual(result["full_raw_script"], llm_output_json_str)
+            self.assertEqual(result.get("source"), "generation")
+            mock_get_cache.assert_called_once()
+            mock_save_cache.assert_called_once()
         
-        self.assertEqual(len(result["segments"]), 3) # Intro, Seg1, Outro
+        self.assertEqual(len(result["segments"]), 3)
         self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
         self.assertEqual(result["segments"][0]["content"], "Welcome to a discussion on how AI is reshaping education.")
         self.assertEqual(result["segments"][1]["segment_title"], "Personalized Learning")

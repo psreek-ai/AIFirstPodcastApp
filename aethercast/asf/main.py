@@ -24,6 +24,7 @@ def load_asf_configuration():
     asf_config['ASF_CORS_ALLOWED_ORIGINS'] = os.getenv('ASF_CORS_ALLOWED_ORIGINS', '*')
     asf_config['ASF_CHUNK_SIZE'] = int(os.getenv('ASF_CHUNK_SIZE', '4096'))
     asf_config['ASF_STREAM_SLEEP_INTERVAL'] = float(os.getenv('ASF_STREAM_SLEEP_INTERVAL', '0.01'))
+    asf_config['ASF_UI_UPDATES_NAMESPACE'] = os.getenv('ASF_UI_UPDATES_NAMESPACE', '/ui_updates') # Added
 
     asf_config['ASF_HOST'] = os.getenv("ASF_HOST", '0.0.0.0')
     asf_config['ASF_PORT'] = int(os.getenv("ASF_PORT", 5006))
@@ -57,6 +58,8 @@ app = flask.Flask(__name__)
 app.config['SECRET_KEY'] = asf_config['ASF_SECRET_KEY']
 socketio = SocketIO(app, cors_allowed_origins=asf_config['ASF_CORS_ALLOWED_ORIGINS'])
 
+# Define namespace after config is loaded
+ASF_UI_UPDATES_NAMESPACE = None # Will be set in main block or after load_asf_configuration if called there
 
 # --- Global Data Structures ---
 stream_id_to_filepath_map = {} # Stores mapping from stream_id to audio file path
@@ -188,7 +191,75 @@ def notify_new_audio():
     return jsonify({"message": "Notification received successfully", "stream_id": stream_id}), 200
 
 
+# --- UI Update Namespace Handlers ---
+@socketio.on('connect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE) # Use lambda to access config post-init
+def handle_ui_connect():
+    logger.info(f"ASF: Client {request.sid} connected to UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
+    emit('ui_connection_ack', {'message': f'Connected to ASF UI updates on namespace {ASF_UI_UPDATES_NAMESPACE}.'})
+
+@socketio.on('disconnect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE)
+def handle_ui_disconnect():
+    logger.info(f"ASF: Client {request.sid} disconnected from UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
+    # Rooms are left automatically by Flask-SocketIO on disconnect from namespace
+
+@socketio.on('subscribe_to_ui_updates', namespace=lambda: ASF_UI_UPDATES_NAMESPACE)
+def handle_subscribe_ui_updates(data):
+    client_id = data.get('client_id')
+    if not client_id:
+        logger.warning(f"ASF: Client {request.sid} attempted to subscribe to UI updates without a client_id.")
+        emit('ui_error', {'message': 'client_id is required for UI update subscription.'})
+        return
+
+    join_room(client_id) # Use client_id as the room name
+    logger.info(f"ASF: Client {request.sid} (client_id: {client_id}) subscribed to UI updates in room '{client_id}' on namespace {ASF_UI_UPDATES_NAMESPACE}.")
+    emit('subscribed_ui_updates', {'status': 'success', 'client_id': client_id, 'subscribed_to_room': client_id})
+
+
+# --- Internal HTTP Endpoint for CPOA to send UI updates ---
+@app.route('/asf/internal/send_ui_update', methods=['POST'])
+def send_ui_update():
+    """
+    Internal endpoint for CPOA to send UI updates to specific clients.
+    Expects JSON: {"client_id": "...", "event_name": "...", "data": {...}}
+    """
+    payload = request.get_json()
+    if not payload:
+        logger.error("ASF_SEND_UI: Received empty payload for /send_ui_update")
+        return jsonify({"error": "No JSON payload received"}), 400
+
+    client_id = payload.get('client_id')
+    event_name = payload.get('event_name')
+    event_data = payload.get('data')
+
+    if not all([client_id, event_name, event_data is not None]): # event_data can be an empty dict
+        missing_params = [p for p, v in {"client_id": client_id, "event_name": event_name, "data": event_data}.items() if v is None] # Check for None specifically for data if it can be empty dict
+        if event_data is None and "data" not in missing_params : missing_params.append("data")
+
+        logger.error(f"ASF_SEND_UI: Missing parameters in /send_ui_update: {', '.join(missing_params)}. Payload: {payload}")
+        return jsonify({"error": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+
+    if not ASF_UI_UPDATES_NAMESPACE: # Ensure namespace is loaded
+        logger.error("ASF_SEND_UI: ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message.")
+        return jsonify({"error": "ASF server configuration error for UI namespace."}), 500
+
+    try:
+        logger.info(f"ASF_SEND_UI: Emitting '{event_name}' to client_id (room) '{client_id}' in namespace '{ASF_UI_UPDATES_NAMESPACE}' with data: {event_data}")
+        socketio.emit(event_name, event_data, room=client_id, namespace=ASF_UI_UPDATES_NAMESPACE)
+        return jsonify({"status": "success", "message": "UI update sent to client."}), 200
+    except Exception as e:
+        logger.error(f"ASF_SEND_UI: Failed to emit SocketIO event for client_id '{client_id}': {e}", exc_info=True)
+        return jsonify({"error": "Failed to send UI update via SocketIO.", "details": str(e)}), 500
+
+
 if __name__ == '__main__':
+    # Set the namespace globally after config is loaded and before app runs
+    ASF_UI_UPDATES_NAMESPACE = asf_config.get('ASF_UI_UPDATES_NAMESPACE')
+    if not ASF_UI_UPDATES_NAMESPACE:
+        logger.error("ASF_UI_UPDATES_NAMESPACE is not defined in config. UI updates will not work.")
+        # Optionally exit or raise error if this is critical for startup
+    else:
+        logger.info(f"ASF UI Updates Namespace configured to: {ASF_UI_UPDATES_NAMESPACE}")
+
     asf_host = asf_config.get('ASF_HOST')
     asf_port = asf_config.get('ASF_PORT')
     asf_debug_mode = asf_config.get('ASF_DEBUG_MODE')

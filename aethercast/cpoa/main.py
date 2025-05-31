@@ -26,24 +26,38 @@ ASF_NOTIFICATION_URL = os.getenv("ASF_NOTIFICATION_URL", "http://localhost:5006/
 ASF_WEBSOCKET_BASE_URL = os.getenv("ASF_WEBSOCKET_BASE_URL", "ws://localhost:5006/api/v1/podcasts/stream")
 SCA_SERVICE_URL = os.getenv("SCA_SERVICE_URL", "http://localhost:5002/craft_snippet")
 CPOA_DATABASE_PATH = os.getenv("CPOA_DATABASE_PATH", "cpoa_orchestration_tasks.db")
-CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3")) # Added
-CPOA_SERVICE_RETRY_BACKOFF_FACTOR = float(os.getenv("CPOA_SERVICE_RETRY_BACKOFF_FACTOR", "0.5")) # Added
+CPOA_ASF_SEND_UI_UPDATE_URL = os.getenv("CPOA_ASF_SEND_UI_UPDATE_URL", "http://localhost:5006/asf/internal/send_ui_update") # Added
+CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3"))
+CPOA_SERVICE_RETRY_BACKOFF_FACTOR = float(os.getenv("CPOA_SERVICE_RETRY_BACKOFF_FACTOR", "0.5"))
+
+# Moved TDA_SERVICE_URL to be loaded in load_cpoa_configuration
 
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(message)s')
 
+# Load CPOA configurations (this will now include TDA_SERVICE_URL)
+# Ensure this is called early, but after logger basicConfig if logger is used within.
+# Note: Global `pswa_config` style might be better if config is only loaded once.
+# For now, assuming this structure from existing file.
+# It seems CPOA_ASF_SEND_UI_UPDATE_URL etc. are module-level globals set from os.getenv directly.
+# To be consistent, TDA_SERVICE_URL should also be a module-level global for now.
+TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
+
+
 # Log loaded configuration
 logger.info("--- CPOA Configuration ---")
+logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}")
 logger.info(f"PSWA_SERVICE_URL: {PSWA_SERVICE_URL}")
 logger.info(f"VFA_SERVICE_URL: {VFA_SERVICE_URL}")
 logger.info(f"ASF_NOTIFICATION_URL: {ASF_NOTIFICATION_URL}")
 logger.info(f"ASF_WEBSOCKET_BASE_URL: {ASF_WEBSOCKET_BASE_URL}")
 logger.info(f"SCA_SERVICE_URL: {SCA_SERVICE_URL}")
 logger.info(f"CPOA_DATABASE_PATH: {CPOA_DATABASE_PATH}")
-logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}") # Added
-logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}") # Added
+logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}") # Added
+logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}")
+logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}")
 logger.info("--- End CPOA Configuration ---")
 
 
@@ -160,7 +174,47 @@ def _update_task_status_in_db(db_path: str, task_id: str, new_cpoa_status: str, 
         if conn:
             conn.close()
 
-def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice_params_input: Optional[dict] = None) -> Dict[str, Any]:
+# --- Helper function to send UI updates to ASF ---
+def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, Any]):
+    """
+    Sends a UI update message to ASF's internal endpoint.
+    This is a non-critical operation; failures are logged but do not halt orchestration.
+    """
+    if not client_id:
+        logger.info("No client_id provided, skipping UI update.")
+        return
+
+    if not CPOA_ASF_SEND_UI_UPDATE_URL:
+        logger.warning("CPOA_ASF_SEND_UI_UPDATE_URL not configured. Cannot send UI update.")
+        return
+
+    payload = {
+        "client_id": client_id,
+        "event_name": event_name,
+        "data": data
+    }
+    try:
+        # Using requests_with_retry for this internal call, but with very few retries.
+        # Timeout should be short as it's an internal call.
+        response = requests_with_retry(
+            "post",
+            CPOA_ASF_SEND_UI_UPDATE_URL,
+            max_retries=1, # Low retry for internal, quick calls
+            backoff_factor=0.1, # Short backoff
+            json=payload,
+            timeout=5 # Short timeout
+        )
+        if response.status_code == 200:
+            logger.info(f"Successfully sent UI update '{event_name}' for client_id '{client_id}'. Data: {data}")
+        else:
+            logger.warning(f"Failed to send UI update '{event_name}' for client_id '{client_id}'. ASF responded with {response.status_code}: {response.text}")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error sending UI update '{event_name}' for client_id '{client_id}' to ASF: {e}")
+    except Exception as e_unexp: # Catch any other unexpected error
+        logger.error(f"Unexpected error in _send_ui_update for client_id '{client_id}': {e_unexp}", exc_info=True)
+
+
+def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice_params_input: Optional[dict] = None, client_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Orchestrates the podcast generation by calling WCHA, PSWA, and VFA in sequence,
     optionally using provided voice parameters for VFA.
@@ -211,13 +265,14 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
         logger.info(f"Task {task_id} @ {current_orchestration_stage}: {message} - Preview: {log_entry['data_preview']}")
 
     # Log initial parameters
-    log_step("Orchestration process started.", data={"task_id": task_id, "topic": topic, "db_path": db_path, "voice_params_input": voice_params_input})
+    log_step("Orchestration process started.", data={"task_id": task_id, "topic": topic, "db_path": db_path, "voice_params_input": voice_params_input, "client_id": client_id})
 
     # Check for import issues first
     if not WCHA_IMPORT_SUCCESSFUL:
         current_orchestration_stage = "initialization_failure"
         critical_error_msg = str(WCHA_MISSING_IMPORT_ERROR if WCHA_MISSING_IMPORT_ERROR else "WCHA module import error not specified.")
         log_step(f"CPOA critical failure: WCHA module import error.", data={"error_message": critical_error_msg})
+        _send_ui_update(client_id, "task_error", {"message": critical_error_msg, "stage": current_orchestration_stage})
         final_cpoa_status = "failed_wcha_module_error"
         final_error_message = critical_error_msg
     
@@ -225,7 +280,7 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
         try:
             current_orchestration_stage = "wcha_content_retrieval"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
-
+            _send_ui_update(client_id, "generation_status", {"message": "Fetching and processing web content...", "stage": current_orchestration_stage})
             log_step("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
             wcha_output = get_content_for_topic(topic=topic)
 
@@ -243,7 +298,7 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
 
             current_orchestration_stage = "pswa_script_generation"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
-
+            _send_ui_update(client_id, "generation_status", {"message": "Crafting podcast script with AI...", "stage": current_orchestration_stage})
             log_step("Calling PSWA Service (weave_script)...",
                      data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output)})
             try:
@@ -291,10 +346,10 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
 
             current_orchestration_stage = "vfa_audio_generation"
             _update_task_status_in_db(db_path, task_id, current_orchestration_stage, error_msg=None)
-
+            _send_ui_update(client_id, "generation_status", {"message": "Synthesizing audio...", "stage": current_orchestration_stage})
             vfa_call_data = {"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title")}
-            if voice_params_input: # Masking sensitive parts if any, though voice params usually aren't.
-                vfa_call_data["voice_params_input"] = voice_params_input # Or a masked version if needed
+            if voice_params_input:
+                vfa_call_data["voice_params_input"] = voice_params_input
 
             log_step("Calling VFA Service (forge_voice)...", data=vfa_call_data)
             try:
@@ -346,6 +401,7 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
 
                 if audio_filepath and stream_id:
                     current_orchestration_stage = "asf_notification"
+                    _send_ui_update(client_id, "generation_status", {"message": "Preparing audio stream...", "stage": current_orchestration_stage})
                     asf_call_data = {"url": ASF_NOTIFICATION_URL, "stream_id": stream_id, "filepath": audio_filepath}
                     log_step("Notifying ASF about new audio...", data=asf_call_data)
                     try:
@@ -414,6 +470,7 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
                 final_cpoa_status = stage_error_map.get(current_orchestration_stage, "failed_unknown_stage_exception")
 
             log_step(f"Orchestration ended with critical error.", data={"error_message": final_error_message, "exception_type": type(e).__name__}, is_error_payload=True)
+            _send_ui_update(client_id, "task_error", {"message": final_error_message, "stage": current_orchestration_stage})
 
             # Ensure vfa_result_dict reflects error if exception occurred before or during VFA, and not caught by VFA specific try-except
             if vfa_result_dict.get('status') == 'not_run' and current_orchestration_stage != "vfa_audio_generation":
@@ -427,8 +484,15 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str, voice
     # Final log entry summarizing the outcome
     log_step(f"Orchestration process ended.",
              data={"final_cpoa_status": final_cpoa_status,
-                   "final_error_message_preview": final_error_message[:200] if final_error_message else None, # Preview for log
+                   "final_error_message_preview": final_error_message[:200] if final_error_message else None,
                    "asf_notification_outcome": asf_notification_status_message})
+
+    # Send final UI update on overall success or specific handled failures
+    if final_cpoa_status.startswith("failed_") or final_cpoa_status.startswith("completed_with_"):
+        if not final_cpoa_status.endswith("_exception"): # Avoid sending generic exception message if already sent by outer try-except
+            _send_ui_update(client_id, "task_error", {"message": final_error_message or f"Task ended with status: {final_cpoa_status}", "final_status": final_cpoa_status})
+    elif final_cpoa_status == "completed":
+         _send_ui_update(client_id, "generation_status", {"message": "Podcast generation complete!", "final_status": final_cpoa_status, "is_terminal": True})
 
     # Ensure vfa_result_dict (which is final_audio_details) contains stream_id if available
     stream_id_for_url = vfa_result_dict.get("stream_id")
@@ -507,6 +571,34 @@ def _save_snippet_to_db(snippet_object: dict, db_path: str):
         logger.error(f"Database error saving snippet {snippet_object.get('snippet_id')}: {e}")
     except Exception as e:
         logger.error(f"Unexpected error saving snippet {snippet_object.get('snippet_id')} to DB: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+# --- Topic Exploration DB Helper ---
+def _get_topic_details_from_db(db_path: str, topic_id: str) -> Optional[Dict[str, Any]]:
+    """Fetches details for a specific topic_id from the topics_snippets table."""
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM topics_snippets WHERE id = ? AND type = 'topic'", (topic_id,))
+        row = cursor.fetchone()
+        if row:
+            topic_details = dict(row)
+            # Deserialize keywords if stored as JSON string
+            if isinstance(topic_details.get('keywords'), str):
+                try:
+                    topic_details['keywords'] = json.loads(topic_details['keywords'])
+                except json.JSONDecodeError:
+                    logger.warning(f"Failed to decode keywords JSON for topic {topic_id} from DB: {topic_details['keywords']}")
+                    topic_details['keywords'] = [] # Default to empty list on error
+            return topic_details
+        return None
+    except sqlite3.Error as e:
+        logger.error(f"Database error fetching topic {topic_id}: {e}")
+        return None
     finally:
         if conn:
             conn.close()
@@ -729,3 +821,127 @@ if __name__ == "__main__":
     pretty_print_orchestration_result(snippet_result_no_brief)
 
     print("\n--- CPOA All Tests Complete ---")
+
+
+# --- Topic Exploration Orchestration ---
+def orchestrate_topic_exploration(
+    current_topic_id: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    depth_mode: str = "deeper" # Depth mode currently illustrative, not deeply implemented
+) -> List[Dict[str, Any]]:
+    """
+    Orchestrates topic exploration by getting related topics from TDA
+    and then generating snippets for them via SCA.
+    """
+    logger.info(f"Starting topic exploration. Mode: {depth_mode}, Topic ID: {current_topic_id}, Keywords: {keywords}")
+    explored_snippets: List[Dict[str, Any]] = []
+
+    query_for_tda = None
+    original_topic_title = "original topic"
+
+    if current_topic_id:
+        if not CPOA_DATABASE_PATH:
+            logger.error("CPOA_DATABASE_PATH not configured. Cannot fetch topic details for exploration.")
+            # Depending on desired strictness, could raise error or return empty
+            return []
+
+        original_topic = _get_topic_details_from_db(CPOA_DATABASE_PATH, current_topic_id)
+        if original_topic:
+            original_topic_title = original_topic.get('title', current_topic_id)
+            # For "deeper", let's refine the query. Could be more sophisticated.
+            # Simple approach: use original keywords, or title if keywords are sparse.
+            # TDA's own logic might be better at handling "deeper" if it had such a mode.
+            # For now, we'll just re-query with existing keywords or title.
+            if original_topic.get('keywords') and isinstance(original_topic.get('keywords'), list) and len(original_topic['keywords']) > 0 :
+                 query_for_tda = " ".join(original_topic['keywords'])
+            if not query_for_tda: # Fallback to title if no keywords
+                 query_for_tda = original_topic_title
+            logger.info(f"Exploring based on existing topic '{original_topic_title}'. Using query for TDA: '{query_for_tda}'")
+        else:
+            logger.warning(f"Could not find details for current_topic_id: {current_topic_id}. Proceeding with keywords if available.")
+            # Fall through to use keywords if provided, otherwise error
+            if not keywords:
+                 logger.error(f"No details for topic_id {current_topic_id} and no keywords provided for exploration.")
+                 return []
+
+
+    if keywords: # If keywords are directly provided (or if topic_id lookup failed but keywords were also given)
+        direct_keywords_query = " ".join(keywords)
+        if query_for_tda and direct_keywords_query != query_for_tda : # If topic_id also yielded a query
+            # Simple strategy: prioritize direct keywords if they differ significantly, or combine.
+            # For now, let's say direct keywords override if they exist.
+            query_for_tda = direct_keywords_query
+            original_topic_title = f"keywords: {direct_keywords_query}" # Update context for logging
+            logger.info(f"Exploring based on provided keywords. Overriding/using query for TDA: '{query_for_tda}'")
+        elif not query_for_tda:
+            query_for_tda = direct_keywords_query
+            original_topic_title = f"keywords: {direct_keywords_query}"
+            logger.info(f"Exploring based on provided keywords. Using query for TDA: '{query_for_tda}'")
+
+
+    if not query_for_tda:
+        logger.error("No valid query could be constructed for TDA (neither topic_id yielded info nor keywords provided).")
+        raise ValueError("Cannot explore topic without a valid current_topic_id or keywords.")
+
+    # Call TDA Service
+    tda_topics = []
+    try:
+        logger.info(f"Calling TDA service for exploration. Query: '{query_for_tda}'")
+        # Example: Request fewer, more focused topics for "deeper" exploration.
+        tda_payload = {"query": query_for_tda, "limit": 3} # Adjust limit as needed
+
+        # Ensure TDA_SERVICE_URL is available
+        if not TDA_SERVICE_URL: # Accessing the global TDA_SERVICE_URL
+            logger.error("TDA_SERVICE_URL is not configured. Cannot perform topic exploration.")
+            return [] # Or raise an error
+
+        response = requests_with_retry("post", TDA_SERVICE_URL, # Using global TDA_SERVICE_URL
+                                       max_retries=CPOA_SERVICE_RETRY_COUNT,
+                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                       json=tda_payload, timeout=30)
+        tda_data = response.json()
+        # TDA returns list of topics under "discovered_topics" or "topics" key
+        tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", []))
+        logger.info(f"TDA returned {len(tda_topics)} topics for exploration based on '{original_topic_title}'.")
+
+    except requests.exceptions.RequestException as e_req:
+        logger.error(f"TDA service call failed during exploration: {e_req}")
+        return [] # Or re-raise as a CPOA internal error
+    except json.JSONDecodeError as e_json:
+        logger.error(f"TDA service response was not valid JSON during exploration: {e_json}")
+        return []
+
+    if not tda_topics:
+        logger.info(f"No further topics discovered by TDA for '{original_topic_title}'. Exploration ends.")
+        return []
+
+    # Generate snippets for these new/refined topics
+    for topic_obj in tda_topics:
+        # Adapt TDA's TopicObject to CPOA's expected topic_info structure for orchestrate_snippet_generation
+        # Main thing is that orchestrate_snippet_generation expects "title_suggestion"
+        # and a "topic_id" if available (TDA provides "topic_id" or "id").
+        topic_info_for_sca = {
+            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id"),
+            "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"),
+            "summary": topic_obj.get("summary"),
+            "keywords": topic_obj.get("keywords", []),
+            "original_topic_details_from_tda": topic_obj # Good to keep original TDA output if SCA needs more
+        }
+
+        if not topic_info_for_sca["title_suggestion"]:
+            logger.warning(f"Skipping snippet generation for explored topic due to missing title: {topic_obj}")
+            continue
+
+        logger.info(f"Generating exploration snippet for: {topic_info_for_sca['title_suggestion']}")
+        try:
+            # client_id is not passed here, as these are "background" generations for exploration results
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
+            if snippet_result and "error" not in snippet_result:
+                explored_snippets.append(snippet_result)
+            else:
+                logger.error(f"Snippet generation failed for explored topic '{topic_info_for_sca['title_suggestion']}': {snippet_result.get('details', 'Unknown error')}")
+        except Exception as e_snip:
+            logger.error(f"Unexpected error calling orchestrate_snippet_generation for explored topic '{topic_info_for_sca['title_suggestion']}': {e_snip}", exc_info=True)
+
+    logger.info(f"Topic exploration for '{original_topic_title}' yielded {len(explored_snippets)} new snippets.")
+    return explored_snippets

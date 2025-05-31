@@ -243,3 +243,77 @@ footer {
         font-size: 1em;
     }
 }
+
+/* Diagnostics Modal Styles */
+.modal {
+    position: fixed;
+    z-index: 1000; /* Ensure it's on top */
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto; /* Enable scroll if content is too long */
+    background-color: rgba(0,0,0,0.4); /* Black w/ opacity */
+}
+
+.modal-content {
+    background-color: #fefefe;
+    margin: 10% auto; /* 10% from the top and centered */
+    padding: 20px;
+    border: 1px solid #888;
+    width: 80%;
+    max-width: 700px; /* Max width */
+    position: relative;
+    border-radius: 8px;
+    box-shadow: 0 4px 8px 0 rgba(0,0,0,0.2),0 6px 20px 0 rgba(0,0,0,0.19);
+}
+
+.close-btn { /* Corrected class name from class.close-btn to .close-btn */
+    color: #aaa;
+    /* float: right; */ /* Avoid float for better positioning with absolute */
+    font-size: 28px;
+    font-weight: bold;
+    position: absolute;
+    top: 10px;
+    right: 20px;
+}
+
+.close-btn:hover,
+.close-btn:focus {
+    color: black;
+    text-decoration: none;
+    cursor: pointer;
+}
+
+#diag-orchestration-log-container {
+    max-height: 400px;
+    overflow-y: auto;
+    border: 1px solid #ccc;
+    padding: 10px;
+    background: #f9f9f9;
+    font-family: monospace; /* Ensure monospace for pre tags if not inherited */
+    font-size: 0.9em;     /* Ensure consistent font size */
+}
+
+#diag-orchestration-log-container pre {
+    white-space: pre-wrap;   /* CSS3 */
+    white-space: -moz-pre-wrap; /* Mozilla, since 1999 */
+    white-space: -pre-wrap;     /* Opera 4-6 */
+    white-space: -o-pre-wrap;   /* Opera 7 */
+    word-wrap: break-word;      /* Internet Explorer 5.5+ */
+    margin: 5px 0; /* Spacing for pre blocks */
+    padding: 5px;
+    background-color: #eee; /* Light background for pre blocks */
+    border-radius: 3px;
+}
+
+#diag-orchestration-log-container hr {
+    margin-top: 10px;
+    margin-bottom: 10px;
+    border: 0;
+    border-top: 1px solid #eee;
+}
+
+#diag-orchestration-log-container p {
+    margin: 5px 0;
+}
