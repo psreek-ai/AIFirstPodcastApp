@@ -1,241 +1,372 @@
 import unittest
-import json
+from unittest.mock import patch, MagicMock
 import os
-import uuid
-import sqlite3 # Added
-from datetime import datetime # Added
-from unittest import mock
-from unittest.mock import patch, Mock
+import sys
+import json
+import sqlite3 # For direct DB assertions
+from datetime import datetime # For timestamp comparisons
 
-# Ensure the 'aethercast' directory is in the Python path for absolute imports.
-# This allows tests to be run from the root directory or within the tests directory.
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-api_gateway_dir = os.path.dirname(current_script_dir)  # aethercast/api_gateway/
-aethercast_dir = os.path.dirname(api_gateway_dir)      # aethercast/
-project_root_dir = os.path.dirname(aethercast_dir)     # directory containing aethercast/
+# Adjust path to import API Gateway main module and CPOA (for mocking)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+api_gw_dir = os.path.dirname(current_dir)
+aethercast_dir = os.path.dirname(api_gw_dir)
+project_root_dir = os.path.dirname(aethercast_dir)
 
-if project_root_dir not in sys.path:
-    sys.path.insert(0, project_root_dir)
-
-# Import app and DB functions from the main module
-# We will patch DATABASE_FILE to use an in-memory DB for tests.
-from aethercast.api_gateway.main import app, init_db, get_db_connection, DATABASE_FILE
+sys.path.insert(0, project_root_dir) # project root
+sys.path.insert(0, aethercast_dir)   # aethercast directory
+sys.path.insert(0, api_gw_dir)       # api_gateway directory
 
 
-@patch('aethercast.api_gateway.main.DATABASE_FILE', ':memory:') # Patch DB to be in-memory for all tests in this class
-class TestApiEndpoints(unittest.TestCase):
+from aethercast.api_gateway import main as api_gw_main
+# We might need to mock cpoa.main if api_gateway.main imports it directly
+# from aethercast.cpoa import main as cpoa_main_module # Example if needed for patching
 
-    def setUp(self, mock_db_file_ignored): # mock_db_file_ignored is the mock object from class decorator
-        """Set up the test client and initialize the in-memory database."""
-        if hasattr(app, 'testing'):
-            app.testing = True
-        else:
-            app.config['TESTING'] = True
+# Store original DATABASE_FILE to restore after tests if it's not :memory:
+# This is good practice if tests might run in an environment where original value matters,
+# but for :memory: patching, it's mostly for completeness.
+ORIGINAL_DATABASE_FILE = api_gw_main.DATABASE_FILE
+
+class TestAPIGateway(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        api_gw_main.app.config['TESTING'] = True
+
+        # Patch DATABASE_FILE in api_gw_main to use :memory: for all tests in this class
+        cls.db_patcher = patch.object(api_gw_main, 'DATABASE_FILE', ":memory:")
+        cls.mock_db_file = cls.db_patcher.start()
+
+        # Initialize the in-memory database within the app context
+        with api_gw_main.app.app_context():
+            api_gw_main.init_db()
+            # Sanity check: ensure the table exists
+            conn = api_gw_main.get_db_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='podcasts';")
+                if cursor.fetchone() is None:
+                    raise AssertionError("Podcasts table was not created in :memory: database.")
+            finally:
+                if conn: conn.close()
+
+        cls.client = api_gw_main.app.test_client()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.db_patcher.stop()
+        # No need to delete :memory: database, it's ephemeral.
+
+    def setUp(self):
+        # Ensure a clean database state for each test method
+        with api_gw_main.app.app_context():
+            conn = api_gw_main.get_db_connection()
+            cursor = conn.cursor()
+            # Clear all data from tables - more robust than dropping if other tables exist
+            cursor.execute("DELETE FROM podcasts;")
+            # Add other tables here if necessary: e.g., cursor.execute("DELETE FROM snippets;")
+            conn.commit()
+            # init_db() might not be needed here if schema is already created by setUpClass
+            # and we are just clearing data. However, if tests could modify schema or if
+            # init_db has other setup logic, it might be useful.
+            # For now, assuming schema is stable after setUpClass.
+            conn.close()
+
+    def test_health_check(self):
+        response = self.client.get('/health')
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertEqual(json_data['status'], "API Gateway is healthy")
+        self.assertIn("cpoa_podcast_function_status", json_data)
+        self.assertIn("database_status", json_data)
+        self.assertIn("Database connection successful", json_data["database_status"])
+
+
+    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
+    def test_create_podcast_task_success(self, mock_orchestrate_podcast_func):
+        # This is the result CPOA's orchestrate_podcast_generation would return
+        mock_cpoa_result = {
+            "task_id": "will_be_overwritten_by_api_gw_uuid", # API GW generates its own podcast_id
+            "topic": "Test Success Topic", # This should match input to CPOA
+            "status": "completed",
+            "error_message": None,
+            "asf_notification_status": "ASF notified successfully.",
+            "asf_websocket_url": "ws://mockasf/stream/stream_mock_abc",
+            "final_audio_details": {
+                "status": "success", # VFA status
+                "audio_filepath": "/srv/aethercast/audio/mock_audio.mp3",
+                "stream_id": "stream_mock_abc"
+            },
+            "orchestration_log": [{"timestamp": "ts_now", "message": "All good from CPOA"}]
+        }
+        mock_orchestrate_podcast_func.return_value = mock_cpoa_result
+
+        post_response = self.client.post('/api/v1/podcasts', json={'topic': 'Test Success Topic'})
         
-        self.client = app.test_client()
+        self.assertEqual(post_response.status_code, 201)
+        json_data = post_response.get_json()
+        self.assertIn('podcast_id', json_data)
+        generated_podcast_id = json_data['podcast_id'] # Capture the generated ID
         
-        # Initialize the schema for the in-memory database
-        # init_db from main.py will use the patched DATABASE_FILE (':memory:')
-        with app.app_context(): # Ensure init_db runs within Flask app context if it uses app.logger
-            init_db()
+        self.assertEqual(json_data['topic'], 'Test Success Topic')
+        self.assertEqual(json_data['generation_status'], 'completed')
+        self.assertTrue(json_data['audio_url'].endswith(f'/audio.mp3'))
+        
+        # Verify CPOA was called correctly
+        # The podcast_id is generated by API GW *before* calling CPOA
+        mock_orchestrate_podcast_func.assert_called_once()
+        call_args = mock_orchestrate_podcast_func.call_args[1] # kwargs
+        self.assertEqual(call_args['topic'], 'Test Success Topic')
+        self.assertEqual(call_args['task_id'], generated_podcast_id)
+        self.assertEqual(call_args['db_path'], api_gw_main.DATABASE_FILE) # Check db_path
 
-    def _get_db_connection_for_test(self):
-        """Helper to get a connection to the in-memory test database."""
-        # This ensures we're connecting to the same :memory: db used by the app during the test.
-        # Since DATABASE_FILE is patched to ':memory:', get_db_connection from main will connect to it.
-        return get_db_connection()
+        # Verify data in DB
+        with api_gw_main.app.app_context():
+            conn = api_gw_main.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM podcasts WHERE podcast_id = ?", (generated_podcast_id,))
+            row = cursor.fetchone()
+            conn.close()
+        
+        self.assertIsNotNone(row, "Podcast record not found in DB.")
+        self.assertEqual(row['topic'], 'Test Success Topic')
+        self.assertEqual(row['cpoa_status'], 'completed') # This is updated by API GW from CPOA result
+        self.assertEqual(row['final_audio_filepath'], '/srv/aethercast/audio/mock_audio.mp3')
+        self.assertEqual(row['stream_id'], 'stream_mock_abc')
+        self.assertIsNotNone(row['cpoa_full_orchestration_log'])
+        log_content = json.loads(row['cpoa_full_orchestration_log'])
+        self.assertEqual(log_content[0]['message'], "All good from CPOA")
 
-    def _insert_podcast_to_db(self, podcast_id, audio_filepath, topic, cpoa_details_dict=None):
-        """Helper to insert a podcast record into the test DB."""
-        timestamp = datetime.now().isoformat()
-        cpoa_details_json = json.dumps(cpoa_details_dict or {"message": "test details"})
-        with self._get_db_connection_for_test() as conn:
-            conn.execute(
-                "INSERT INTO podcasts (podcast_id, audio_filepath, topic, generation_timestamp, cpoa_details) VALUES (?, ?, ?, ?, ?)",
-                (podcast_id, audio_filepath, topic, timestamp, cpoa_details_json)
+
+    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
+    def test_create_podcast_task_cpoa_reports_failure(self, mock_orchestrate_podcast_func):
+        mock_cpoa_result = {
+            "task_id": "some_id",
+            "topic": "Test CPOA Internal Fail",
+            "status": "failed_pswa_request_exception", # Example failure status from CPOA
+            "error_message": "PSWA service call failed after retries during CPOA run.",
+            "asf_notification_status": None,
+            "asf_websocket_url": None,
+            "final_audio_details": {"status": "not_run", "message": "PSWA failed, VFA not reached"},
+            "orchestration_log": [{"timestamp": "ts_now", "message": "PSWA failed in CPOA"}]
+        }
+        mock_orchestrate_podcast_func.return_value = mock_cpoa_result
+
+        response = self.client.post('/api/v1/podcasts', json={'topic': 'Test CPOA Internal Fail'})
+        
+        # API Gateway successfully handled the request and got a result from CPOA,
+        # even if CPOA itself reported an internal failure.
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        generated_podcast_id = json_data['podcast_id']
+
+        self.assertEqual(json_data['generation_status'], 'failed_pswa_request_exception')
+        self.assertIn("PSWA service call failed after retries during CPOA run.", json_data['message'])
+        self.assertIsNone(json_data.get('audio_url')) # No audio URL on CPOA failure
+
+        # Verify DB state
+        with api_gw_main.app.app_context():
+            conn = api_gw_main.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM podcasts WHERE podcast_id = ?", (generated_podcast_id,))
+            row = cursor.fetchone()
+            conn.close()
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row['cpoa_status'], 'failed_pswa_request_exception')
+        self.assertEqual(row['cpoa_error_message'], 'PSWA service call failed after retries during CPOA run.')
+        self.assertIsNone(row['final_audio_filepath'])
+
+
+    def test_create_podcast_task_missing_topic_payload(self):
+        response = self.client.post('/api/v1/podcasts', json={}) # Empty JSON
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertIn("Missing or empty 'topic'", json_data['message'])
+
+        response_no_topic_key = self.client.post('/api/v1/podcasts', json={'some_other_key': 'value'})
+        self.assertEqual(response_no_topic_key.status_code, 400)
+        json_data_no_topic_key = response_no_topic_key.get_json()
+        self.assertIn("Missing or empty 'topic'", json_data_no_topic_key['message'])
+
+        response_empty_topic_string = self.client.post('/api/v1/podcasts', json={'topic': ''})
+        self.assertEqual(response_empty_topic_string.status_code, 400)
+        json_data_empty_topic_string = response_empty_topic_string.get_json()
+        self.assertIn("Missing or empty 'topic'", json_data_empty_topic_string['message'])
+
+    def _insert_dummy_podcast(self, podcast_id, topic="Dummy Topic", cpoa_status="completed",
+                              final_audio_filepath="/test/audio.mp3", stream_id="stream123",
+                              asf_websocket_url="ws://test/ws", asf_notification_status="notified",
+                              log_message="Log message", error_message=None,
+                              task_created_ts=None):
+        ts = task_created_ts if task_created_ts else datetime.now().isoformat()
+        # Ensure log_data is a JSON string, as it would be stored from cpoa_result
+        log_data_list = [{"timestamp": ts, "message": log_message, "data_preview": "N/A"}] # Match CPOA log structure
+        log_data_str = json.dumps(log_data_list)
+
+        with api_gw_main.app.app_context():
+            conn = api_gw_main.get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO podcasts (podcast_id, topic, cpoa_status, cpoa_error_message,
+                                       final_audio_filepath, stream_id, asf_websocket_url,
+                                       asf_notification_status, task_created_timestamp,
+                                       last_updated_timestamp, cpoa_full_orchestration_log)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (podcast_id, topic, cpoa_status, error_message, final_audio_filepath, stream_id,
+                 asf_websocket_url, asf_notification_status, ts, ts, log_data_str)
             )
             conn.commit()
-    
-    def _get_podcast_from_db(self, podcast_id):
-        """Helper to retrieve a podcast record from the test DB."""
-        with self._get_db_connection_for_test() as conn:
-            cursor = conn.execute("SELECT * FROM podcasts WHERE podcast_id = ?", (podcast_id,))
-            return cursor.fetchone()
+            conn.close()
+        return {"podcast_id": podcast_id, "topic": topic, "cpoa_status": cpoa_status,
+                "final_audio_filepath": final_audio_filepath, "task_created_timestamp": ts,
+                "cpoa_full_orchestration_log_json_str": log_data_str, "stream_id": stream_id,
+                "asf_websocket_url": asf_websocket_url, "asf_notification_status": asf_notification_status,
+                "cpoa_error_message": error_message, "last_updated_timestamp": ts}
 
 
-    # --- Tests for POST /api/v1/podcasts ---
+    def test_get_podcast_details_success(self):
+        dummy_data = self._insert_dummy_podcast("pdcast_detail_001", topic="Detail Test Topic")
 
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
-    def test_create_podcast_success(self, mock_orchestrate_cpoa, mock_db_file_ignored=None): # mock_db_file_ignored for class decorator
-        """Test successful podcast creation (201 Created) and DB record."""
-        fake_filepath = "/tmp/fake_audio_success.mp3"
-        cpoa_return_value = {
-            "status": "completed",
-            "final_audio_details": {"audio_filepath": fake_filepath, "audio_format": "mp3", "script_char_count": 100, "engine_used": "google_cloud_tts"},
-            "orchestration_log": [{"message": "CPOA completed"}],
-            "topic": "test success topic" # CPOA result includes topic
-        }
-        mock_orchestrate_cpoa.return_value = cpoa_return_value
-        
-        test_topic_input = "test success topic"
-        response = self.client.post('/api/v1/podcasts', json={"topic": test_topic_input})
-        
-        self.assertEqual(response.status_code, 201)
-        data = response.get_json()
-        self.assertIn("podcast_id", data)
-        podcast_id_from_response = data["podcast_id"]
-        
-        self.assertEqual(data["topic"], test_topic_input)
-        self.assertEqual(data["generation_status"], "completed")
-        self.assertTrue(data["audio_url"].endswith(f"/{podcast_id_from_response}/audio.mp3"))
-        self.assertEqual(data["message"], "Podcast generated successfully and metadata saved.")
-        
-        # Verify database record
-        db_record = self._get_podcast_from_db(podcast_id_from_response)
-        self.assertIsNotNone(db_record)
-        self.assertEqual(db_record["podcast_id"], podcast_id_from_response)
-        self.assertEqual(db_record["audio_filepath"], fake_filepath)
-        self.assertEqual(db_record["topic"], test_topic_input)
-        self.assertIsNotNone(db_record["generation_timestamp"])
-        self.assertEqual(json.loads(db_record["cpoa_details"]), cpoa_return_value)
-        
-        mock_orchestrate_cpoa.assert_called_once_with(topic=test_topic_input)
-
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
-    def test_create_podcast_completed_with_warnings_no_filepath(self, mock_orchestrate_cpoa, mock_db_file_ignored=None):
-        """Test 200 OK when CPOA completes with warnings (no audio filepath), no DB record."""
-        mock_orchestrate_cpoa.return_value = {
-            "status": "completed_with_warnings",
-            "error_message": "VFA skipped audio generation",
-            "final_audio_details": {"audio_filepath": None, "status": "skipped"},
-            "orchestration_log": [{"message": "VFA skipped"}]
-        }
-        
-        response = self.client.post('/api/v1/podcasts', json={"topic": "test warning topic"})
-        
+        response = self.client.get(f'/api/v1/podcasts/{dummy_data["podcast_id"]}')
         self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-        self.assertNotIn("podcast_id", data)
-        self.assertEqual(data["message"], "VFA skipped audio generation")
-
-        # Verify no record in DB
-        with self._get_db_connection_for_test() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM podcasts").fetchone()[0]
-        self.assertEqual(count, 0)
-        mock_orchestrate_cpoa.assert_called_once_with(topic="test warning topic")
-
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
-    def test_create_podcast_cpoa_failed_status(self, mock_orchestrate_cpoa, mock_db_file_ignored=None):
-        """Test 500 when CPOA returns 'failed' status, no DB record."""
-        mock_orchestrate_cpoa.return_value = {"status": "failed", "error_message": "CPOA process failed"}
-        response = self.client.post('/api/v1/podcasts', json={"topic": "test cpoa fail topic"})
-        self.assertEqual(response.status_code, 500)
-        # Verify no record in DB
-        with self._get_db_connection_for_test() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM podcasts").fetchone()[0]
-        self.assertEqual(count, 0)
-
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
-    def test_create_podcast_cpoa_raises_exception(self, mock_orchestrate_cpoa, mock_db_file_ignored=None):
-        """Test 500 when CPOA call raises an exception, no DB record."""
-        mock_orchestrate_cpoa.side_effect = Exception("CPOA exploded")
-        response = self.client.post('/api/v1/podcasts', json={"topic": "test cpoa exception topic"})
-        self.assertEqual(response.status_code, 500)
-        # Verify no record in DB
-        with self._get_db_connection_for_test() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM podcasts").fetchone()[0]
-        self.assertEqual(count, 0)
-
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
-    def test_create_podcast_no_topic_bad_request(self, mock_orchestrate_cpoa, mock_db_file_ignored=None):
-        """Test 400 Bad Request when 'topic' is missing."""
-        response = self.client.post('/api/v1/podcasts', json={})
-        self.assertEqual(response.status_code, 400)
-        mock_orchestrate_cpoa.assert_not_called()
-
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation_imported', False)
-    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation') 
-    def test_create_podcast_cpoa_module_not_loaded(self, mock_cpoa_func, mock_import_flag, mock_db_file_ignored=None):
-        """Test 503 Service Unavailable if CPOA module isn't loaded."""
-        response = self.client.post('/api/v1/podcasts', json={"topic": "test cpoa import fail"})
-        self.assertEqual(response.status_code, 503)
-        mock_cpoa_func.assert_not_called()
-
-
-    # --- Tests for GET /api/v1/podcasts/<podcast_id>/audio.mp3 ---
-
-    @patch('aethercast.api_gateway.main.send_file')
-    @patch('aethercast.api_gateway.main.os.path.exists')
-    def test_get_audio_success(self, mock_os_path_exists, mock_send_file, mock_db_file_ignored=None):
-        """Test successful audio file retrieval from DB record."""
-        test_podcast_id = str(uuid.uuid4())
-        fake_filepath = f"/tmp/test_audio_{test_podcast_id}.mp3"
-        self._insert_podcast_to_db(test_podcast_id, fake_filepath, "test topic")
+        json_data = response.get_json()
         
-        mock_os_path_exists.return_value = True
-        mock_send_file.return_value = "dummy audio data" 
+        self.assertEqual(json_data['podcast_id'], dummy_data["podcast_id"])
+        self.assertEqual(json_data['topic'], "Detail Test Topic")
+        self.assertEqual(json_data['status'], dummy_data["cpoa_status"])
+        self.assertTrue(json_data['audio_url'].endswith('/audio.mp3'))
+        self.assertEqual(json_data['final_audio_filepath'], dummy_data["final_audio_filepath"])
+        self.assertEqual(json_data['stream_id'], dummy_data["stream_id"])
+        self.assertEqual(json_data['asf_websocket_url'], dummy_data["asf_websocket_url"])
+        self.assertEqual(json_data['asf_notification_status'], dummy_data["asf_notification_status"])
+        self.assertEqual(json_data['task_created_timestamp'], dummy_data["task_created_timestamp"])
+        self.assertEqual(json_data['last_updated_timestamp'], dummy_data["last_updated_timestamp"])
+        self.assertIsNone(json_data['error_message'])
         
-        response = self.client.get(f'/api/v1/podcasts/{test_podcast_id}/audio.mp3')
+        self.assertIsInstance(json_data['orchestration_log'], list)
+        self.assertEqual(json_data['orchestration_log'][0]['message'], "Log message")
+
+    def test_get_podcast_details_not_found(self):
+        response = self.client.get('/api/v1/podcasts/non_existent_id')
+        self.assertEqual(response.status_code, 404)
+        json_data = response.get_json()
+        self.assertEqual(json_data['error'], "Not Found")
+
+    def test_list_podcasts_success(self):
+        # Insert in a specific order for timestamp checking (older first)
+        self._insert_dummy_podcast("pdcast_list_001", topic="List Test 1", task_created_ts="2023-01-01T10:00:00Z")
+        self._insert_dummy_podcast("pdcast_list_002", topic="List Test 2", cpoa_status="failed_pswa", task_created_ts="2023-01-01T12:00:00Z")
         
+        response = self.client.get('/api/v1/podcasts?page=1&per_page=10')
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data.decode(), "dummy audio data")
-        mock_os_path_exists.assert_called_once_with(fake_filepath)
-        mock_send_file.assert_called_once_with(fake_filepath, mimetype='audio/mpeg')
+        json_data = response.get_json()
 
-    @patch('aethercast.api_gateway.main.send_file')
-    @patch('aethercast.api_gateway.main.os.path.exists')
-    def test_get_audio_podcast_id_not_in_db(self, mock_os_path_exists, mock_send_file, mock_db_file_ignored=None):
-        """Test 404 when podcast_id is not in the database."""
-        non_existent_uuid = str(uuid.uuid4())
-        response = self.client.get(f'/api/v1/podcasts/{non_existent_uuid}/audio.mp3')
+        self.assertEqual(json_data['page'], 1)
+        self.assertEqual(json_data['per_page'], 10)
+        self.assertEqual(json_data['total_podcasts'], 2)
+        self.assertEqual(json_data['total_pages'], 1)
+        self.assertEqual(len(json_data['podcasts']), 2)
+
+        self.assertEqual(json_data['podcasts'][0]['topic'], "List Test 2") # Most recent
+        self.assertEqual(json_data['podcasts'][0]['status'], "failed_pswa")
+        self.assertEqual(json_data['podcasts'][1]['topic'], "List Test 1")
+        self.assertEqual(json_data['podcasts'][1]['status'], "completed")
+
+    def test_list_podcasts_pagination(self):
+        for i in range(15): # Create 15 podcasts
+            # Create with slightly different timestamps to ensure order
+            ts = datetime(2023, 1, 1, 10, i, 0).isoformat() + "Z"
+            self._insert_dummy_podcast(f"pdcast_page_{i:02d}", topic=f"Page Test {i}", task_created_ts=ts)
         
+        response_p1 = self.client.get('/api/v1/podcasts?page=1&per_page=5')
+        json_data_p1 = response_p1.get_json()
+        self.assertEqual(len(json_data_p1['podcasts']), 5)
+        self.assertEqual(json_data_p1['page'], 1)
+        self.assertEqual(json_data_p1['per_page'], 5)
+        self.assertEqual(json_data_p1['total_podcasts'], 15)
+        self.assertEqual(json_data_p1['total_pages'], 3)
+        self.assertEqual(json_data_p1['podcasts'][0]['topic'], "Page Test 14") # Most recent (i=14)
+
+        response_p2 = self.client.get('/api/v1/podcasts?page=2&per_page=5')
+        json_data_p2 = response_p2.get_json()
+        self.assertEqual(len(json_data_p2['podcasts']), 5)
+        self.assertEqual(json_data_p2['page'], 2)
+        self.assertEqual(json_data_p2['podcasts'][0]['topic'], "Page Test 9") # Next set of 5
+
+    def test_list_podcasts_invalid_pagination_params(self):
+        response_bad_page = self.client.get('/api/v1/podcasts?page=abc&per_page=5')
+        self.assertEqual(response_bad_page.status_code, 400)
+        json_data_bad_page = response_bad_page.get_json()
+        self.assertIn("Invalid page or per_page parameters", json_data_bad_page['message'])
+
+        response_bad_per_page = self.client.get('/api/v1/podcasts?page=1&per_page=xyz')
+        self.assertEqual(response_bad_per_page.status_code, 400)
+
+    @patch('aethercast.api_gateway.main.requests.post')
+    @patch('aethercast.api_gateway.main.orchestrate_snippet_generation')
+    def test_get_snippets_success(self, mock_cpoa_orchestrate_snippet, mock_tda_requests_post):
+        # Mock TDA response
+        mock_tda_response = MagicMock()
+        mock_tda_response.ok = True
+        mock_tda_response.status_code = 200
+        mock_tda_response.json.return_value = {
+            "topics": [{"id": "tda_topic_1", "title": "TDA Topic 1", "summary": "Summary 1", "keywords": ["k1"]}]
+        }
+        mock_tda_requests_post.return_value = mock_tda_response
+
+        # Mock CPOA snippet generation response
+        mock_cpoa_orchestrate_snippet.return_value = {
+            "snippet_id": "cpoa_snip_1", "title": "CPOA Snippet Title 1",
+            "snippet_text": "Text 1", "keywords": ["k1", "cpoa_k"],
+            "topic_info": {"id": "tda_topic_1", "title": "TDA Topic 1"} # Ensure topic_info is present
+        }
+
+        response = self.client.get('/api/v1/snippets')
+        self.assertEqual(response.status_code, 200)
+        json_data = response.get_json()
+        self.assertIn("snippets", json_data)
+        self.assertEqual(len(json_data["snippets"]), 1)
+        self.assertEqual(json_data["snippets"][0]["title"], "CPOA Snippet Title 1")
+
+        mock_tda_requests_post.assert_called_once()
+        self.assertEqual(mock_tda_requests_post.call_args[0][0], api_gw_main.TDA_SERVICE_URL)
+
+        mock_cpoa_orchestrate_snippet.assert_called_once()
+        passed_topic_info = mock_cpoa_orchestrate_snippet.call_args[1]['topic_info']
+        self.assertEqual(passed_topic_info['topic_id'], "tda_topic_1")
+        self.assertEqual(passed_topic_info['title_suggestion'], "TDA Topic 1")
+
+
+    def test_serve_podcast_audio_success(self):
+        audio_filename = f"test_audio_{self._testMethodName}.mp3" # Unique name
+        # For testing, create the dummy file in a known, writable location like /tmp
+        temp_audio_path_for_db = f"/tmp/{audio_filename}"
+
+        dummy_data = self._insert_dummy_podcast("pdcast_audio_001", final_audio_filepath=temp_audio_path_for_db)
+        
+        with open(temp_audio_path_for_db, "wb") as f:
+            f.write(b"dummy audio data")
+        
+        response = self.client.get(f'/api/v1/podcasts/{dummy_data["podcast_id"]}/audio.mp3')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, 'audio/mpeg')
+        self.assertEqual(response.data, b"dummy audio data")
+        
+        os.remove(temp_audio_path_for_db)
+
+    def test_serve_podcast_audio_not_found_db(self):
+        response = self.client.get('/api/v1/podcasts/non_existent_audio_id/audio.mp3')
         self.assertEqual(response.status_code, 404)
-        data = response.get_json()
-        self.assertEqual(data["error"], "Not Found")
-        self.assertIn("Invalid or expired podcast_id", data["message"])
-        mock_os_path_exists.assert_not_called()
-        mock_send_file.assert_not_called()
+        json_data = response.get_json()
+        self.assertIn("Audio not found", json_data["message"])
 
-    @patch('aethercast.api_gateway.main.send_file')
-    @patch('aethercast.api_gateway.main.os.path.exists')
-    def test_get_audio_file_path_not_exist(self, mock_os_path_exists, mock_send_file, mock_db_file_ignored=None):
-        """Test 404 when audio file path (from DB) does not exist on disk."""
-        test_podcast_id = str(uuid.uuid4())
-        fake_filepath = f"/tmp/stale_audio_{test_podcast_id}.mp3"
-        self._insert_podcast_to_db(test_podcast_id, fake_filepath, "stale topic")
-        
-        mock_os_path_exists.return_value = False 
-        
-        response = self.client.get(f'/api/v1/podcasts/{test_podcast_id}/audio.mp3')
-        
+    def test_serve_podcast_audio_file_missing(self):
+        dummy_data = self._insert_dummy_podcast("pdcast_audio_missing_file", final_audio_filepath="/tmp/this_file_should_not_exist.mp3")
+        response = self.client.get(f'/api/v1/podcasts/{dummy_data["podcast_id"]}/audio.mp3')
         self.assertEqual(response.status_code, 404)
-        data = response.get_json()
-        self.assertEqual(data["error"], "Not Found")
-        self.assertIn("Audio file missing or no longer available", data["message"])
-        mock_os_path_exists.assert_called_once_with(fake_filepath)
-        mock_send_file.assert_not_called()
-        # Note: The main code does not delete the DB record if file is missing, so no need to check that.
+        json_data = response.get_json()
+        self.assertIn("Audio file missing", json_data["message"])
 
-
-    @patch('aethercast.api_gateway.main.send_file')
-    @patch('aethercast.api_gateway.main.os.path.exists')
-    def test_get_audio_send_file_raises_exception(self, mock_os_path_exists, mock_send_file, mock_db_file_ignored=None):
-        """Test 500 when send_file itself raises an exception."""
-        test_podcast_id = str(uuid.uuid4())
-        fake_filepath = f"/tmp/problematic_audio_{test_podcast_id}.mp3"
-        self._insert_podcast_to_db(test_podcast_id, fake_filepath, "problematic topic")
-        
-        mock_os_path_exists.return_value = True
-        mock_send_file.side_effect = Exception("Simulated error during send_file")
-        
-        response = self.client.get(f'/api/v1/podcasts/{test_podcast_id}/audio.mp3')
-        
-        self.assertEqual(response.status_code, 500)
-        data = response.get_json()
-        self.assertEqual(data["error"], "Internal Server Error")
-        self.assertIn("An error occurred while trying to serve the audio file", data["message"])
-        mock_os_path_exists.assert_called_once_with(fake_filepath)
-        mock_send_file.assert_called_once_with(fake_filepath, mimetype='audio/mpeg')
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(verbosity=2)

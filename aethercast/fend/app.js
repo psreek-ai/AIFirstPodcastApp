@@ -11,9 +11,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const generationDetailsLog = document.getElementById('generation-details-log');
 
     // New DOM Element References for Snippets
-    const podcastSnippetsSection = document.getElementById('podcast-snippets-section');
+    const podcastSnippetsSection = document.getElementById('podcast-snippets-section'); // Used as dynamic-content-container
     const snippetListContainer = document.getElementById('snippet-list-container');
-    const snippetStatusMessage = document.getElementById('snippet-status-message');
+    const snippetStatusMessage = document.getElementById('snippet-status-message'); // For snippet loading status
+    const refreshSnippetsBtn = document.getElementById('refresh-snippets-btn'); // Assumed to exist in HTML
+
+    // Container for displaying status of podcast generation from snippets
+    const podcastGenerationStatusDiv = document.getElementById('podcast-status-container'); // Assumed to exist, or reuse statusMessagesDiv
 
 
     let progressTimeouts = []; // To store timeout IDs for progress messages
@@ -55,25 +59,27 @@ document.addEventListener('DOMContentLoaded', () => {
         audioPlayer.src = '';
         podcastTopicTitle.textContent = '';
         generationDetailsLog.textContent = '';
-        updateStatus(`Initiating podcast generation for: "${topic}"...`, 'info');
+            updateStatus(`Initiating podcast generation for: "${topic}"...`, 'info'); // Main status line
 
-        // Clear any previous timeouts just in case
-        clearAllProgressTimeouts();
+            // Clear any previous timeouts and hide main podcast display area
+            clearAllProgressTimeouts();
+            podcastDisplayDiv.classList.add('hidden');
+            audioPlayer.src = '';
+            podcastTopicTitle.textContent = '';
+            generationDetailsLog.textContent = '';
 
-        // Simulated Progress Updates
-        progressTimeouts.push(setTimeout(() => {
-            updateStatus(`Gathering information for "${topic}"...`, 'generating');
-        }, 2000)); // 2 seconds
 
-        progressTimeouts.push(setTimeout(() => {
-            updateStatus(`Crafting script with AI for "${topic}"... This may take a moment.`, 'generating');
-        }, 5000)); // 5 seconds total
+        // API Call using fetch - This is for the main "Generate Podcast" button
+        // We will create a new function for snippet-triggered generation
+        // For now, let's keep this original function for the main button,
+        // but adapt its UI updates to be more generic or use a specific area.
 
-        progressTimeouts.push(setTimeout(() => {
-            updateStatus(`Synthesizing audio for "${topic}"... Almost there!`, 'generating');
-        }, 8000)); // 8 seconds total
+        // Simulate progress for the main generator button as before
+        progressTimeouts.push(setTimeout(() => updateStatus(`Main Generator: Gathering info for "${topic}"...`, 'generating'), 2000));
+        progressTimeouts.push(setTimeout(() => updateStatus(`Main Generator: Crafting script for "${topic}"...`, 'generating'), 5000));
+        progressTimeouts.push(setTimeout(() => updateStatus(`Main Generator: Synthesizing audio for "${topic}"...`, 'generating'), 8000));
 
-        // API Call using fetch
+        // The actual fetch call
         fetch('/api/v1/podcasts', {
             method: 'POST',
             headers: {
@@ -89,71 +95,119 @@ document.addEventListener('DOMContentLoaded', () => {
             clearAllProgressTimeouts();
             const { ok, status, data } = result;
 
+            clearAllProgressTimeouts(); // Clear timeouts related to the main generator
+
             if (!ok) {
-                // If response.ok was false, treat as an error from the start
                 const errorDetail = data.message || data.error || (status ? `Server error ${status}` : 'Unknown API error');
-                throw new Error(`API Error (${status}): ${errorDetail}`);
-            }
-            
-            // Handle successful or partially successful responses (200 OK or 201 Created)
-            // Based on API Gateway logic, 201 is for full success with audio.
-            // 200 can be for "completed_with_warnings" or "completed_with_errors" where no audio is served.
-            if (status === 201 && data.podcast_id && data.audio_url && data.generation_status === "completed") {
-                updateStatus(`Podcast "${data.topic || topic}" is ready!`, 'success');
-                podcastTopicTitle.textContent = data.topic || topic;
-                audioPlayer.src = data.audio_url; 
-                generationDetailsLog.textContent = JSON.stringify(data.details, null, 2);
-                podcastDisplayDiv.classList.remove('hidden');
-                audioPlayer.load(); 
-            } else if (status === 200 && (data.generation_status === "completed_with_warnings" || data.generation_status === "completed_with_errors" || (data.generation_status === "completed" && !data.audio_url))) {
-                const message = data.message || (data.details && data.details.error_message) || 'Podcast generation completed with issues, but no audio is available.';
-                updateStatus(`Generation issue: ${message}`, 'error'); // Use 'error' class for visibility, even for warnings
-                podcastTopicTitle.textContent = `Issue with: ${topic}`;
-                generationDetailsLog.textContent = JSON.stringify(data.details || data, null, 2);
-                podcastDisplayDiv.classList.remove('hidden');
-            } else {
-                // This case handles other 2xx responses that don't fit the above success/warning criteria,
-                // or if a 201/200 response is missing expected fields.
-                const message = data.message || (data.details && data.details.error_message) || 'Podcast generation finished with an unexpected status or missing data.';
-                updateStatus(`Generation issue: ${message}`, 'error');
-                podcastTopicTitle.textContent = `Issue with: ${topic}`;
+                updateStatus(`Main Generator API Error (${status}): ${errorDetail}`, 'error');
                 generationDetailsLog.textContent = JSON.stringify(data, null, 2);
-                podcastDisplayDiv.classList.remove('hidden');
+            } else {
+                if (status === 201 && data.podcast_id && data.audio_url && data.generation_status === "completed") {
+                    updateStatus(`Main Generator: Podcast "${data.topic || topic}" is ready!`, 'success');
+                    podcastTopicTitle.textContent = data.topic || topic;
+                    audioPlayer.src = data.audio_url;
+                    generationDetailsLog.textContent = JSON.stringify(data.details || data, null, 2);
+                    podcastDisplayDiv.classList.remove('hidden');
+                    audioPlayer.load();
+                } else { // Handle 200 OK with warnings/errors, or other unexpected 2xx
+                    const message = data.message || (data.details && data.details.error_message) || 'Podcast generation finished with an unexpected status or missing data.';
+                    updateStatus(`Main Generator Issue: ${message}`, 'error');
+                    podcastTopicTitle.textContent = `Issue with: ${topic}`;
+                    generationDetailsLog.textContent = JSON.stringify(data.details || data, null, 2);
+                    podcastDisplayDiv.classList.remove('hidden');
+                }
             }
         })
         .catch(error => {
             clearAllProgressTimeouts();
-            const errorMessage = error.message || (error.error ? `${error.error}: ${error.message}` : 'Network error or API unreachable.');
-            updateStatus(`API Request Failed: ${errorMessage}`, 'error');
-            podcastTopicTitle.textContent = "API Request Failed";
-            try {
-                // Attempt to stringify if it's an object (like from a JSON error response)
-                generationDetailsLog.textContent = (typeof error === 'object' && error !== null && Object.keys(error).length > 0) ? JSON.stringify(error, null, 2) : error.toString();
-            } catch (e) { 
-                generationDetailsLog.textContent = error.toString();
-            }
-            podcastDisplayDiv.classList.remove('hidden');
+            const errorMessage = error.message || 'Network error or API unreachable.';
+            updateStatus(`Main Generator API Request Failed: ${errorMessage}`, 'error');
+            generationDetailsLog.textContent = error.toString();
         })
         .finally(() => {
             generateBtn.disabled = false;
-            clearAllProgressTimeouts(); 
+            clearAllProgressTimeouts();
         });
     });
 
-    // Initial Status Message
-    updateStatus("Please enter a topic and click 'Generate Podcast' to begin.", "info");
+    // Function to display podcast generation status (can be called by snippet generation too)
+    function displayPodcastGenerationOutcome(topic, result, targetStatusDiv, targetPlayerDivId, targetTitleId, targetDetailsId) {
+        const { ok, status, data } = result;
+        const displayArea = document.getElementById(targetPlayerDivId); // e.g., 'podcast-display' or a new one for snippets
+        const titleEl = document.getElementById(targetTitleId);
+        const detailsEl = document.getElementById(targetDetailsId);
+        const audioEl = displayArea ? displayArea.querySelector('audio') : null;
 
-    // --- Snippet Fetching and Display Logic ---
+        targetStatusDiv.className = 'status-messages'; // Reset class
 
-    /**
-     * Fetches snippets from the API and displays them.
-     */
-    async function fetchAndDisplaySnippets() {
+        if (!ok) {
+            const errorDetail = data.message || data.error || (status ? `Server error ${status}` : 'Unknown API error');
+            targetStatusDiv.textContent = `Failed to start podcast generation for '${topic}'. Error: ${errorDetail}`;
+            targetStatusDiv.classList.add('status-error');
+            if (detailsEl) detailsEl.textContent = JSON.stringify(data, null, 2);
+            console.error("Error generating podcast:", data);
+        } else {
+            targetStatusDiv.textContent = `Podcast task for '${topic}' processed. Status: ${data.generation_status || status}.`;
+            targetStatusDiv.classList.add(data.audio_url && data.generation_status === "completed" ? 'status-success' : 'status-info');
+
+            if (titleEl) titleEl.textContent = topic;
+            if (detailsEl) detailsEl.textContent = JSON.stringify(data.details || data, null, 2);
+
+            if (data.audio_url) {
+                if (audioEl) {
+                    audioEl.src = data.audio_url;
+                    audioEl.load();
+                    if (displayArea) displayArea.classList.remove('hidden');
+                } else { // Create audio player if not found by ID (e.g. for dynamic snippet players)
+                    const newAudioPlayer = document.createElement('audio');
+                    newAudioPlayer.controls = true;
+                    newAudioPlayer.src = data.audio_url;
+                    targetStatusDiv.appendChild(document.createElement('br'));
+                    targetStatusDiv.appendChild(newAudioPlayer);
+                    newAudioPlayer.load();
+                }
+            } else {
+                 if (audioEl) audioEl.src = ''; // Clear src if no audio_url
+            }
+            if (data.message && data.generation_status !== "completed") { // Display CPOA error/warning if present
+                targetStatusDiv.textContent += ` Server message: ${data.message}`;
+            }
+            if (displayArea) displayArea.classList.remove('hidden'); // Show the display area
+        }
+        console.log("Podcast generation response:", data);
+    }
+
+
+    async function triggerPodcastGeneration(topic, statusDivId) {
+        const statusDiv = document.getElementById(statusDivId) || podcastGenerationStatusDiv || statusMessagesDiv; // Fallback status display
+        statusDiv.textContent = `Generating podcast for '${topic}'... Please wait.`;
+        statusDiv.className = 'status-messages status-generating';
+        if (statusDiv === podcastGenerationStatusDiv && podcastGenerationStatusDiv) podcastGenerationStatusDiv.classList.remove('hidden');
+
+
+        try {
+            const response = await fetch('/api/v1/podcasts', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ topic })
+            });
+            const responseOk = response.ok;
+            const data = await response.json();
+            // Use the main podcast display area for snippet-triggered generation for now
+            displayPodcastGenerationOutcome(topic, { ok: responseOk, status: response.status, data }, statusDiv, 'podcast-display', 'podcast-topic-title', 'generation-details-log');
+        } catch (error) {
+            console.error(`Error in triggerPodcastGeneration for topic "${topic}":`, error);
+            statusDiv.textContent = `Failed to start podcast generation for '${topic}'. Error: ${error.message || 'Network error or API unreachable.'}`;
+            statusDiv.className = 'status-messages status-error';
+        }
+    }
+
+    async function fetchSnippets() {
         snippetStatusMessage.textContent = 'Loading fresh snippets...';
-        snippetStatusMessage.className = 'status-messages status-info'; // Re-use styling
+        snippetStatusMessage.className = 'status-messages status-info';
         snippetStatusMessage.classList.remove('hidden');
-        snippetListContainer.innerHTML = ''; // Clear previous snippets
-        podcastSnippetsSection.classList.remove('hidden'); // Show section, hide if error/no snippets later
+        snippetListContainer.innerHTML = '';
+        podcastSnippetsSection.classList.remove('hidden');
 
         try {
             const response = await fetch('/api/v1/snippets');
@@ -164,66 +218,64 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await response.json();
 
             if (data.snippets && data.snippets.length > 0) {
-                snippetStatusMessage.classList.add('hidden'); // Hide status message
-                podcastSnippetsSection.classList.remove('hidden'); // Ensure section is visible
-
+                snippetStatusMessage.classList.add('hidden');
                 data.snippets.forEach(snippet => {
                     const snippetCard = document.createElement('div');
-                    snippetCard.className = 'snippet-card'; // For styling
+                    snippetCard.className = 'snippet-card';
 
-                    const title = document.createElement('h3');
-                    title.textContent = snippet.title || (snippet.topic_info && snippet.topic_info.title_suggestion) || 'Untitled Snippet';
+                    const titleEl = document.createElement('h3');
+                    titleEl.textContent = snippet.title || (snippet.topic_info && snippet.topic_info.title_suggestion) || 'Untitled Snippet';
 
-                    const textContent = document.createElement('p');
-                    textContent.className = 'snippet-text';
-                    textContent.textContent = snippet.snippet_text || 'No content available.';
+                    const summaryEl = document.createElement('p');
+                    summaryEl.textContent = snippet.summary || snippet.text_content || 'No content available.';
 
-                    const keywords = document.createElement('p');
-                    keywords.className = 'snippet-keywords';
-                    keywords.innerHTML = `<strong>Keywords:</strong> ${(snippet.keywords || []).join(', ') || 'N/A'}`;
+                    const generateBtnLocal = document.createElement('button');
+                    generateBtnLocal.textContent = 'Generate Podcast from this Snippet';
+                    generateBtnLocal.classList.add('generate-podcast-snippet-btn');
+                    const topicForGeneration = titleEl.textContent; // Use the displayed title as topic
+                    generateBtnLocal.dataset.topic = topicForGeneration; // Store topic in data attribute
 
-                    const generateFullBtn = document.createElement('button');
-                    generateFullBtn.textContent = 'Generate Full Podcast on this Topic';
-                    generateFullBtn.className = 'snippet-generate-full-btn';
-                    generateFullBtn.addEventListener('click', () => {
-                        const topicForFullPodcast = snippet.title || (snippet.topic_info && snippet.topic_info.title_suggestion) || snippet.topic_id;
-                        if (topicForFullPodcast) {
-                            topicInput.value = topicForFullPodcast;
-                            // Scroll to the main generation section and focus on input
-                            document.getElementById('topic-input').scrollIntoView({ behavior: 'smooth' });
-                            topicInput.focus();
-                            // Optionally, auto-click the generate button:
-                            // generateBtn.click();
-                            // For now, let user click it.
-                            updateStatus(`Topic "${topicForFullPodcast}" populated. Click "Generate Podcast" to proceed.`, "info");
-
-                        } else {
-                            updateStatus("Could not determine topic from snippet to generate full podcast.", "error");
-                        }
-                    });
-
-                    snippetCard.appendChild(title);
-                    snippetCard.appendChild(textContent);
-                    snippetCard.appendChild(keywords);
-                    snippetCard.appendChild(generateFullBtn);
+                    snippetCard.appendChild(titleEl);
+                    snippetCard.appendChild(summaryEl);
+                    snippetCard.appendChild(generateBtnLocal);
                     snippetListContainer.appendChild(snippetCard);
                 });
-
             } else {
-                snippetStatusMessage.textContent = 'No snippets available at the moment. Try again later!';
-                snippetStatusMessage.className = 'status-messages status-info'; // Or a specific class for "no snippets"
-                podcastSnippetsSection.classList.remove('hidden'); // Keep section visible to show the message
-                snippetListContainer.innerHTML = ''; // Ensure it's empty
+                snippetStatusMessage.textContent = 'No snippets available at the moment. Try refreshing!';
             }
         } catch (error) {
-            console.error('Error fetching or displaying snippets:', error);
+            console.error('Error fetching snippets:', error);
             snippetStatusMessage.textContent = `Error loading snippets: ${error.message}`;
             snippetStatusMessage.className = 'status-messages status-error';
-            podcastSnippetsSection.classList.remove('hidden'); // Keep section visible to show the error
-            snippetListContainer.innerHTML = ''; // Clear any partial content
         }
     }
 
-    // Call fetchAndDisplaySnippets on page load
-    fetchAndDisplaySnippets();
+    // Event listener for "Refresh Snippets" button
+    if (refreshSnippetsBtn) {
+        refreshSnippetsBtn.addEventListener('click', fetchSnippets);
+    } else {
+        console.warn("#refresh-snippets-btn not found in HTML.");
+    }
+
+    // Event delegation for "Generate Podcast" buttons on snippets
+    snippetListContainer.addEventListener('click', (event) => {
+        if (event.target && event.target.classList.contains('generate-podcast-snippet-btn')) {
+            const topic = event.target.dataset.topic;
+            if (topic) {
+                // Use a general status display area for snippet-triggered podcast generation for now
+                // Or create a dedicated one if preferred.
+                triggerPodcastGeneration(topic, 'status-messages');
+                 // Scroll to the main status/output area
+                document.getElementById('status-messages').scrollIntoView({ behavior: 'smooth' });
+            } else {
+                console.error("No topic found on snippet button.");
+                (document.getElementById('status-messages') || podcastGenerationStatusDiv).textContent = "Error: Could not determine topic from snippet button.";
+                (document.getElementById('status-messages') || podcastGenerationStatusDiv).className = 'status-messages status-error';
+            }
+        }
+    });
+
+    // Initial calls
+    updateStatus("Please enter a topic and click 'Generate Podcast' to begin, or explore snippets below.", "info");
+    fetchSnippets(); // Fetch snippets on page load
 });

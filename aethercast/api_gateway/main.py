@@ -33,10 +33,20 @@ DATABASE_FILE = os.getenv("DATABASE_FILE", "aethercast_podcasts.db") # Will be c
 DB_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS podcasts (
     podcast_id TEXT PRIMARY KEY,
-    audio_filepath TEXT NOT NULL,
     topic TEXT NOT NULL,
-    generation_timestamp TEXT NOT NULL,
-    cpoa_details TEXT 
+    -- Core CPOA status fields
+    cpoa_status TEXT,
+    cpoa_error_message TEXT,
+    -- Key details from successful generation
+    final_audio_filepath TEXT,
+    stream_id TEXT,
+    asf_websocket_url TEXT,
+    asf_notification_status TEXT,
+    -- Timestamps
+    task_created_timestamp TEXT NOT NULL,
+    last_updated_timestamp TEXT,
+    -- Full CPOA log/details
+    cpoa_full_orchestration_log TEXT
 );
 """
 
@@ -51,12 +61,18 @@ def init_db():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        # Check if the table exists and if it has the old 'audio_filepath' column to suggest deletion for dev
+        cursor.execute("PRAGMA table_info(podcasts)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "audio_filepath" in columns and "final_audio_filepath" not in columns :
+             app.logger.warning("Old 'podcasts' table schema detected. For development, please delete the database file 'aethercast_podcasts.db' to apply the new schema. This is a destructive operation for dev only.")
+
         cursor.executescript(DB_SCHEMA_SQL) # Use executescript for multi-statement SQL
         conn.commit()
-        app.logger.info("Database initialized successfully.") # Use app.logger if available
+        app.logger.info("Database initialized successfully with the new schema.")
     except sqlite3.Error as e:
         # Use app.logger if available, otherwise print
-        log_func = app.logger.error if hasattr(app, 'logger') else print
+        log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
         log_func(f"Database initialization error: {e}")
     finally:
         if conn:
@@ -271,103 +287,296 @@ def create_podcast_generation_task():
         return jsonify({"error": "Service Unavailable", "message": f"Core podcast orchestration module (podcast func) not loaded. Import error: {CPOA_IMPORT_ERROR_MESSAGE}"}), 503
 
     try:
-        # For full podcast generation, CPOA's orchestrate_podcast_generation currently expects a simple topic string.
-        # If it were to expect a topic_info object similar to snippet generation, this would need adjustment.
-        app.logger.info(f"Invoking CPOA orchestrate_podcast_generation for topic: '{topic}'")
-        cpoa_result = orchestrate_podcast_generation(topic=topic)
-        app.logger.info(f"CPOA returned for topic '{topic}'. Status: {cpoa_result.get('status')}")
-        
-        generation_status = cpoa_result.get("status")
-        final_audio_details = cpoa_result.get("final_audio_details", {}) 
-        audio_filepath = final_audio_details.get("audio_filepath") if final_audio_details else None
+        podcast_id = str(uuid.uuid4())
+        task_created_timestamp = datetime.now().isoformat()
+        db_path_for_cpoa = DATABASE_FILE # Use the configured DB file
 
-        if generation_status == "completed" and audio_filepath:
-            podcast_id = str(uuid.uuid4())
-            timestamp = datetime.now().isoformat()
-            cpoa_details_json = json.dumps(cpoa_result) # Store the whole CPOA result as JSON
+        # Initial record creation with "pending" status
+        conn = None
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO podcasts
+                (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (podcast_id, topic, "pending_api_gateway", task_created_timestamp, task_created_timestamp)
+            )
+            conn.commit()
+            app.logger.info(f"Initial record for podcast_id {podcast_id} created with topic '{topic}'.")
+        except sqlite3.Error as e:
+            app.logger.error(f"Database error creating initial record for topic '{topic}', podcast_id {podcast_id}: {e}", exc_info=True)
+            return jsonify({"error": "Database Error", "message": "Failed to create initial podcast task record."}), 500
+        finally:
+            if conn:
+                conn.close()
 
-            try:
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                cursor.execute(
-                    "INSERT INTO podcasts (podcast_id, audio_filepath, topic, generation_timestamp, cpoa_details) VALUES (?, ?, ?, ?, ?)",
-                    (podcast_id, audio_filepath, topic, timestamp, cpoa_details_json)
-                )
-                conn.commit()
-                app.logger.info(f"Podcast {podcast_id} metadata saved to DB for topic '{topic}'. File at: {audio_filepath}")
-            except sqlite3.Error as e:
-                app.logger.error(f"Database error saving podcast metadata for topic '{topic}': {e}", exc_info=True)
-                # CPOA ran, audio was generated, but DB save failed. This is a server-side issue.
-                return jsonify({"error": "Database Error", "message": "Failed to record podcast metadata after successful generation."}), 500
-            finally:
-                if conn:
-                    conn.close()
-            
-            response_data = {
+        # Call CPOA (assuming CPOA's orchestrate_podcast_generation is adapted to take task_id and db_path)
+        # For now, this part of CPOA's signature change is assumed.
+        # CPOA will update the status and error messages directly in the DB.
+        app.logger.info(f"Invoking CPOA orchestrate_podcast_generation for topic: '{topic}', task_id: {podcast_id}")
+
+        # *** This is a temporary adaptation. CPOA's orchestrate_podcast_generation needs to be updated
+        # *** to accept task_id and db_path, and to perform its own DB updates for status.
+        # *** For now, we'll call the existing CPOA function and then do a final update.
+        # *** The 'db_path=db_path_for_cpoa' part of the call below will only work once CPOA is updated.
+        # cpoa_result = orchestrate_podcast_generation(topic=topic, task_id=podcast_id, db_path=db_path_for_cpoa)
+
+        # TEMPORARY: Call existing CPOA and then update based on its full result.
+        # Once CPOA is updated, it will handle its own status updates.
+        # The API Gateway would then only fetch the final status or specific details if needed.
+        cpoa_result = orchestrate_podcast_generation(topic=topic, task_id=podcast_id, db_path=db_path_for_cpoa) # Pass task_id and db_path
+        app.logger.info(f"CPOA returned for task_id '{podcast_id}'. Status: {cpoa_result.get('status')}")
+
+        # Extract details from CPOA result for final update
+        final_cpoa_status = cpoa_result.get("status", "unknown_cpoa_status")
+        final_cpoa_error_message = cpoa_result.get("error_message")
+        final_audio_details = cpoa_result.get("final_audio_details", {})
+        final_audio_filepath = final_audio_details.get("audio_filepath")
+        final_stream_id = final_audio_details.get("stream_id")
+        final_asf_websocket_url = cpoa_result.get("asf_websocket_url")
+        final_asf_notification_status = cpoa_result.get("asf_notification_status")
+        cpoa_log_json = json.dumps(cpoa_result.get("orchestration_log", []))
+        last_updated_ts = datetime.now().isoformat()
+
+        conn_update = None
+        try:
+            conn_update = get_db_connection()
+            cursor_update = conn_update.cursor()
+            cursor_update.execute(
+                """
+                UPDATE podcasts
+                SET cpoa_status = ?, cpoa_error_message = ?, final_audio_filepath = ?,
+                    stream_id = ?, asf_websocket_url = ?, asf_notification_status = ?,
+                    cpoa_full_orchestration_log = ?, last_updated_timestamp = ?
+                WHERE podcast_id = ?
+                """,
+                (final_cpoa_status, final_cpoa_error_message, final_audio_filepath,
+                 final_stream_id, final_asf_websocket_url, final_asf_notification_status,
+                 cpoa_log_json, last_updated_ts, podcast_id)
+            )
+            conn_update.commit()
+            app.logger.info(f"Final details for podcast {podcast_id} updated in DB.")
+        except sqlite3.Error as e:
+            app.logger.error(f"Database error updating final details for podcast {podcast_id}: {e}", exc_info=True)
+            # Even if this update fails, the CPOA process ran. The response should reflect CPOA's outcome.
+            # The record will be in the DB from the initial insert, but might lack final details.
+        finally:
+            if conn_update:
+                conn_update.close()
+
+        # Construct response based on CPOA's outcome
+        if final_cpoa_status == "completed" and final_audio_filepath:
+            return jsonify({
                 "podcast_id": podcast_id,
                 "topic": topic,
-                "generation_status": generation_status,
+                "generation_status": final_cpoa_status,
                 "audio_url": f"/api/v1/podcasts/{podcast_id}/audio.mp3",
-                "message": "Podcast generated successfully and metadata saved.",
-                "details": cpoa_result 
-            }
-            return jsonify(response_data), 201 
-        
-        elif generation_status in ["completed_with_warnings", "completed_with_errors"] or \
-             (generation_status == "completed" and not audio_filepath):
-            log_message = (
-                f"Podcast generation for topic '{topic}' completed with issues (no audio or warnings/errors from VFA). "
-                f"Status: {generation_status}. Audio filepath: {audio_filepath}. "
-                f"CPOA details: {cpoa_result.get('error_message', 'No specific error message from CPOA.')}"
-            )
-            app.logger.warning(log_message)
-            response_data = {
+                "message": "Podcast generation task processed. Final status: completed.",
+                "details": cpoa_result # Return full CPOA result for now
+            }), 201 # 201 for successful creation and processing leading to resource
+        elif final_cpoa_status in ["completed_with_warnings", "completed_with_errors", "completed_with_asf_notification_failure"] or \
+             (final_cpoa_status == "completed" and not final_audio_filepath): # Completed but something is off
+            return jsonify({
+                "podcast_id": podcast_id, # Still provide podcast_id
                 "topic": topic,
-                "generation_status": generation_status,
-                "message": cpoa_result.get("error_message") or "Podcast generation completed but no usable audio was produced or an issue occurred.",
+                "generation_status": final_cpoa_status,
+                "message": final_cpoa_error_message or "Podcast generation task processed with warnings/issues.",
                 "details": cpoa_result
-            }
-            return jsonify(response_data), 200 
-        
-        else: # Covers CPOA "failed" status or other unexpected CPOA outcomes
-            app.logger.error(f"Podcast generation failed for topic '{topic}'. CPOA status: {generation_status}. CPOA details: {cpoa_result}")
-            response_data = {
+            }), 200 # 200 OK as the task was accepted and processed, but outcome has issues.
+        else: # Failed states from CPOA
+             return jsonify({
+                "podcast_id": podcast_id, # Still provide podcast_id
                 "topic": topic,
-                "generation_status": generation_status or "unknown_cpoa_failure",
-                "message": cpoa_result.get("error_message") or "Podcast generation failed at CPOA level.",
+                "generation_status": final_cpoa_status,
+                "message": final_cpoa_error_message or "Podcast generation failed.",
                 "details": cpoa_result
-            }
-            return jsonify(response_data), 500 
-            
-    except ImportError as ie: 
+            }), 200 # 200 OK because the API gateway handled the request, CPOA processed it (and failed)
+            # Alternative for hard failures: return 500 if CPOA reports a critical internal failure not due to user input.
+            # For now, 200 with error in payload seems fine as CPOA itself didn't crash.
+
+    except ImportError as ie: # CPOA module itself not found
         app.logger.error(f"CPOA function unavailable during request: {ie}")
+        # Update the initially created DB record to reflect this failure if possible
+        # This error happens before CPOA is called, so the 'pending_api_gateway' status is still relevant.
+        # We can update it to 'failed_cpoa_module_unavailable'.
+        conn_fail = None
+        try:
+            conn_fail = get_db_connection()
+            cursor_fail = conn_fail.cursor()
+            cursor_fail.execute("UPDATE podcasts SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ? WHERE podcast_id = ?",
+                                ("failed_cpoa_module_unavailable", str(ie), datetime.now().isoformat(), podcast_id if 'podcast_id' in locals() else "unknown_id"))
+            conn_fail.commit()
+        except Exception as db_e:
+            app.logger.error(f"DB error updating status for CPOA module import failure: {db_e}")
+        finally:
+            if conn_fail: conn_fail.close()
         return jsonify({"error": "Service Unavailable", "message": "Core podcast orchestration module is not available."}), 503
-    except Exception as e:
-        app.logger.error(f"Unexpected error during CPOA orchestration for topic '{topic}': {e}", exc_info=True)
-        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred during podcast generation."}), 500
+
+    except Exception as e: # Other unexpected errors in API Gateway before or after CPOA call
+        app.logger.error(f"Unexpected error during podcast generation task for topic '{topic}': {e}", exc_info=True)
+        conn_fail_unexp = None
+        try: # Try to update DB if podcast_id was generated
+            if 'podcast_id' in locals():
+                conn_fail_unexp = get_db_connection()
+                cursor_fail_unexp = conn_fail_unexp.cursor()
+                cursor_fail_unexp.execute("UPDATE podcasts SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ? WHERE podcast_id = ?",
+                                    ("failed_api_gateway_error", str(e), datetime.now().isoformat(), podcast_id))
+                conn_fail_unexp.commit()
+        except Exception as db_e:
+            app.logger.error(f"DB error updating status for unexpected API Gateway error: {db_e}")
+        finally:
+            if conn_fail_unexp: conn_fail_unexp.close()
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred."}), 500
+
+
+# --- List All Podcasts Endpoint ---
+@app.route('/api/v1/podcasts', methods=['GET'])
+def list_podcasts():
+    app.logger.info("Request received for /api/v1/podcasts (list all)")
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        if page < 1: page = 1
+        if per_page < 1: per_page = 10
+        if per_page > 100: per_page = 100 # Max limit
+    except ValueError:
+        app.logger.warning("Invalid pagination parameters received.")
+        return jsonify({"error": "Bad Request", "message": "Invalid page or per_page parameters."}), 400
+
+    offset = (page - 1) * per_page
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM podcasts")
+        total_podcasts_row = cursor.fetchone()
+        total_podcasts = total_podcasts_row[0] if total_podcasts_row else 0
+
+        total_pages = (total_podcasts + per_page - 1) // per_page if total_podcasts > 0 else 1
+
+        cursor.execute(
+            """SELECT podcast_id, topic, task_created_timestamp, cpoa_status, final_audio_filepath
+               FROM podcasts
+               ORDER BY task_created_timestamp DESC
+               LIMIT ? OFFSET ?""",
+            (per_page, offset)
+        )
+        podcasts_rows = cursor.fetchall()
+
+        podcasts_list = []
+        for row in podcasts_rows:
+            podcasts_list.append({
+                "podcast_id": row["podcast_id"],
+                "topic": row["topic"],
+                "task_created_timestamp": row["task_created_timestamp"],
+                "status": row["cpoa_status"],
+                "audio_url": f"/api/v1/podcasts/{row['podcast_id']}/audio.mp3" if row["final_audio_filepath"] else None,
+            })
+
+        app.logger.info(f"Returning {len(podcasts_list)} podcasts for page {page}.")
+        return jsonify({
+            "podcasts": podcasts_list,
+            "page": page,
+            "per_page": per_page,
+            "total_podcasts": total_podcasts,
+            "total_pages": total_pages
+        }), 200
+
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error listing podcasts: {e}", exc_info=True)
+        return jsonify({"error": "Database Error", "message": "Error retrieving podcast list."}), 500
+    except Exception as e: # Catch any other unexpected errors
+        app.logger.error(f"Unexpected error listing podcasts: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred."}), 500
+    finally:
+        if conn:
+            conn.close()
+
+# --- Get Specific Podcast Details Endpoint ---
+@app.route('/api/v1/podcasts/<string:podcast_id>', methods=['GET'])
+def get_podcast_details(podcast_id: str):
+    app.logger.info(f"Request received for /api/v1/podcasts/{podcast_id}")
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Fetch all new columns
+        cursor.execute(
+            """SELECT podcast_id, topic, cpoa_status, cpoa_error_message,
+                      final_audio_filepath, stream_id, asf_websocket_url,
+                      asf_notification_status, task_created_timestamp,
+                      last_updated_timestamp, cpoa_full_orchestration_log
+               FROM podcasts WHERE podcast_id = ?""", (podcast_id,))
+        row = cursor.fetchone()
+
+        if row:
+            orchestration_log_data = []
+            if row["cpoa_full_orchestration_log"]:
+                try:
+                    orchestration_log_data = json.loads(row["cpoa_full_orchestration_log"])
+                except json.JSONDecodeError as e:
+                    app.logger.error(f"Error parsing cpoa_full_orchestration_log JSON for podcast {podcast_id}: {e}")
+                    orchestration_log_data = [{"error": "Failed to parse orchestration log"}]
+
+            response_data = {
+                "podcast_id": row["podcast_id"],
+                "topic": row["topic"],
+                "status": row["cpoa_status"],
+                "error_message": row["cpoa_error_message"],
+                "audio_url": f"/api/v1/podcasts/{row['podcast_id']}/audio.mp3" if row["final_audio_filepath"] else None,
+                "final_audio_filepath": row["final_audio_filepath"], # For client info, might be removed from public response later
+                "stream_id": row["stream_id"],
+                "asf_websocket_url": row["asf_websocket_url"],
+                "asf_notification_status": row["asf_notification_status"],
+                "task_created_timestamp": row["task_created_timestamp"],
+                "last_updated_timestamp": row["last_updated_timestamp"],
+                "orchestration_log": orchestration_log_data
+            }
+            app.logger.info(f"Returning details for podcast {podcast_id}.")
+            return jsonify(response_data), 200
+        else:
+            app.logger.warning(f"Podcast ID '{podcast_id}' not found in database.")
+            return jsonify({"error": "Not Found", "message": "Podcast not found."}), 404
+
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error retrieving podcast {podcast_id}: {e}", exc_info=True)
+        return jsonify({"error": "Database Error", "message": "Error retrieving podcast details."}), 500
+    except Exception as e: # Catch any other unexpected errors
+        app.logger.error(f"Unexpected error retrieving podcast {podcast_id}: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred."}), 500
+    finally:
+        if conn:
+            conn.close()
+
 
 # --- Serve Podcast Audio Endpoint ---
 @app.route('/api/v1/podcasts/<string:podcast_id>/audio.mp3', methods=['GET'])
 def serve_podcast_audio(podcast_id: str):
     app.logger.info(f"Request received to serve audio for podcast_id: {podcast_id}")
     
-    audio_filepath = None
+    audio_filepath = None # Will be final_audio_filepath
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT audio_filepath FROM podcasts WHERE podcast_id = ?", (podcast_id,))
+        # Updated to select final_audio_filepath
+        cursor.execute("SELECT final_audio_filepath FROM podcasts WHERE podcast_id = ?", (podcast_id,))
         db_record = cursor.fetchone()
         
-        if db_record and db_record["audio_filepath"]:
-            audio_filepath = db_record["audio_filepath"]
+        if db_record and db_record["final_audio_filepath"]:
+            audio_filepath = db_record["final_audio_filepath"]
         else:
-            app.logger.warning(f"Podcast ID '{podcast_id}' not found in database or audio_filepath is null.")
-            return jsonify({"error": "Not Found", "message": "Invalid or expired podcast_id."}), 404
+            app.logger.warning(f"Podcast ID '{podcast_id}' not found in database or final_audio_filepath is null.")
+            return jsonify({"error": "Not Found", "message": "Audio not found for this podcast or generation is pending/failed."}), 404 # More specific message
             
     except sqlite3.Error as e:
-        app.logger.error(f"Database error retrieving audio_filepath for podcast_id '{podcast_id}': {e}", exc_info=True)
-        return jsonify({"error": "Database Error", "message": "Error retrieving podcast metadata."}), 500
+        app.logger.error(f"Database error retrieving final_audio_filepath for podcast_id '{podcast_id}': {e}", exc_info=True)
+        return jsonify({"error": "Database Error", "message": "Error retrieving audio metadata."}), 500
     finally:
         if conn:
             conn.close()

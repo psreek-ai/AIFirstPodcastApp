@@ -1,26 +1,130 @@
 # Web Content Harvester Agent (WCHA)
 
-The Web Content Harvester Agent (WCHA) is responsible for fetching and processing textual content from the web based on a given topic or specific URLs.
+## Purpose
 
-## Key Responsibilities:
+The Web Content Harvester Agent (WCHA) is a component of the Aethercast system responsible for fetching and extracting textual content from web pages. Given a topic, it uses web search (via DuckDuckGo) to find relevant URLs and then employs content extraction (via Trafilatura) to get the main text from those pages.
 
-1.  **Input Processing:** Receives a topic (e.g., a topic string or `TopicObject`) and/or a list of source URLs from the Central Podcast Orchestrator Agent (CPOA).
-2.  **Content Fetching:**
-    *   If URLs are provided, it fetches content directly from these URLs.
-    *   If only a topic is provided, it would (in a real implementation) use search engines or news APIs to find relevant articles.
-    *   **For current simulation:** It will use hardcoded data based on the input topic or return mock content for given URLs.
-3.  **Text Extraction & Cleaning:**
-    *   Extracts the main textual content from the fetched web pages (e.g., removing HTML, ads, boilerplate).
-    *   Performs basic text cleaning (e.g., normalizing whitespace).
-    *   **For current simulation:** The `retrieved_text_content` in the hardcoded data will be pre-cleaned.
-4.  **Content Structuring:** Organizes the harvested content, including source URLs, extracted text, and potentially titles or summaries, into a `HarvestedContentBundle`.
-5.  **Output:** Returns the `HarvestedContentBundle` to the CPOA.
+Key Responsibilities:
 
-## Integration:
+1.  **Topic-Based Search:** Uses `duckduckgo_search` to find relevant web pages for a given topic string.
+2.  **Content Fetching:** Makes HTTP GET requests to fetch the content of identified URLs.
+3.  **Text Extraction:** Utilizes the `trafilatura` library to extract the main textual content from the fetched HTML, aiming to remove boilerplate like ads, navigation, and footers.
+4.  **Content Consolidation:** Combines text extracted from multiple sources into a single string, usually demarcated by source URL.
+5.  **Error Handling:** Manages errors related to web requests (timeouts, HTTP errors), search failures, and content extraction issues.
 
-*   **Called by:** Central Podcast Orchestrator Agent (CPOA) via an API endpoint (e.g., `POST /harvest_content`).
-*   **Calls:** (Potentially) external search APIs or directly accesses web pages.
-*   **Output:** A `HarvestedContentBundle` containing the retrieved textual content and metadata.
+WCHA is primarily used as a library module by CPOA (`get_content_for_topic` function) but also includes a simple Flask endpoint for direct testing of its harvesting capabilities.
 
-This directory contains the source code and any specific configuration for the WCHA service.
-It will be a Python-based service (e.g., using Flask) that simulates web harvesting with hardcoded data.
+## Configuration
+
+WCHA is configured via environment variables, typically managed in a `.env` file within the `aethercast/wcha/` directory. Create one by copying the example:
+
+```bash
+cp .env.example .env
+```
+
+Then, edit the `.env` file. The following variables are used:
+
+-   `WCHA_SEARCH_MAX_RESULTS`: The maximum number of search results to fetch and process from DuckDuckGo for a given topic.
+    -   *Default:* `3`
+-   `WCHA_REQUEST_TIMEOUT`: Timeout in seconds for HTTP GET requests when fetching content from a URL.
+    -   *Default:* `10`
+-   `WCHA_USER_AGENT`: The User-Agent string to be used for HTTP requests made by WCHA.
+    -   *Default:* `AethercastContentHarvester/0.2`
+
+## Dependencies
+
+Project dependencies are listed in `requirements.txt`. Install them using pip:
+
+```bash
+pip install -r requirements.txt
+```
+This includes `Flask` (for the test endpoint), `python-dotenv`, `requests`, `beautifulsoup4` (though direct use is reduced), `duckduckgo_search`, and `trafilatura`.
+
+## Running and Testing
+
+**As a Library:**
+WCHA's core functionality (`get_content_for_topic` and `harvest_from_url`) is designed to be imported and used by other Python modules, primarily CPOA.
+
+**Standalone Testing (via `if __name__ == "__main__":`)**
+The `main.py` script includes a `if __name__ == "__main__":` block that allows for direct testing of its functions:
+1.  Ensure dependencies are installed.
+2.  Set up environment variables if you want to override defaults (e.g., in a `.env` file).
+3.  Execute the script directly:
+    ```bash
+    python aethercast/wcha/main.py
+    ```
+This will run tests for `harvest_content` (mocked data), `harvest_from_url` (against a live Wikipedia page), and `get_content_for_topic` (performing live web searches and harvesting).
+
+**Test Flask Endpoint (Optional):**
+WCHA also contains a simple Flask app with an endpoint for testing harvesting. If Flask is installed and you wish to run this:
+1.  Set environment variables.
+2.  Run the Flask development server (it defaults to port 5003 if not specified by Flask's own environment variables like `FLASK_RUN_PORT`):
+    ```bash
+    # Ensure FLASK_APP is set if using 'flask run'
+    export FLASK_APP=aethercast/wcha/main.py
+    flask run --port=5003
+    # Or, more simply, run the script directly if its __main__ block starts the app:
+    # python aethercast/wcha/main.py (if its __main__ is updated to run app)
+    ```
+    *Note: The `if __name__ == "__main__":` block in the current `wcha/main.py` primarily runs test functions, not the Flask app directly. To run the Flask app, you would typically use `flask run` as shown above or modify the `__main__` block to call `app.run()`.*
+
+## API Endpoints (Test Endpoint)
+
+WCHA provides a single Flask endpoint primarily for testing its harvesting functions.
+
+### Harvest Content (Test Endpoint)
+
+-   **HTTP Method:** `POST`
+-   **URL Path:** `/harvest_content_endpoint`
+-   **Description:** Allows testing of content harvesting. Can either use `get_content_for_topic` based on a topic string (uses web search) or `harvest_from_url` for a specific URL. It can also return mock data for specific topics.
+-   **Request Payload Example (JSON) - For Search & Harvest:**
+    ```json
+    {
+        "topic": "benefits of regular exercise",
+        "use_search": true
+    }
+    ```
+-   **Request Payload Example (JSON) - For Direct URL Harvest:**
+    ```json
+    {
+        "url": "https://en.wikipedia.org/wiki/Python_(programming_language)"
+    }
+    ```
+-   **Request Payload Example (JSON) - For Mock Data (Legacy):**
+    ```json
+    {
+        "topic": "ai in healthcare"
+    }
+    ```
+-   **Success Response (200 OK) Example (JSON - Search/URL):**
+    ```json
+    {
+        "topic": "benefits of regular exercise", // or "url": "..."
+        "source": "web_search_ddg", // or "direct_url"
+        "content": "Regular exercise offers numerous physical and mental health benefits..."
+    }
+    ```
+-   **Error Response Examples (JSON):**
+    -   **400 Bad Request (Invalid Payload):**
+        ```json
+        {
+            "error": "Invalid request, 'topic' or 'url' must be provided."
+        }
+        ```
+    -   **400 Bad Request (Harvesting Failed):**
+        If `get_content_for_topic` or `harvest_from_url` returns one of its error strings (e.g., due to search failure, Trafilatura failure, network issues).
+        ```json
+        {
+            "topic": "some very obscure topic", // or "url": "http://nonexistenturl123.invalid/"
+            "error": "WCHA: Failed to harvest usable content from any of the 0 search results for topic: some very obscure topic",
+            "content": null
+        }
+        ```
+        Or for a direct URL failure:
+        ```json
+        {
+            "url": "http://nonexistenturl123.invalid/",
+            "error": "Error fetching URL 'http://nonexistenturl123.invalid/': RequestException - ConnectionError - ...",
+            "content": null
+        }
+        ```

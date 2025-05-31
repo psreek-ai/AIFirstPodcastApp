@@ -131,26 +131,31 @@ def requests_with_retry(method: str, url: str, max_retries: int, backoff_factor:
 def get_timestamp() -> str: # This function seems unused in the provided snippet, consider removing if not used elsewhere.
     return datetime.utcnow().isoformat() + "Z"
 
-def _update_task_status_in_db(db_path: str, task_id: str, new_status: str, error_msg: Optional[str] = None) -> None:
-    """Updates the status, last_updated_timestamp, and error_message for a task in the database."""
-    logger.info(f"Task {task_id}: Attempting to update DB status to '{new_status}'. Error msg: '{error_msg if error_msg else 'None'}'")
-    timestamp = datetime.now().isoformat() # Use current time for DB update
+def _update_task_status_in_db(db_path: str, task_id: str, new_cpoa_status: str, error_msg: Optional[str] = None) -> None:
+    """
+    Updates the cpoa_status, cpoa_error_message, and last_updated_timestamp for a task in the database.
+    This function is called by CPOA during its orchestration process.
+    """
+    logger.info(f"Task {task_id}: Attempting to update CPOA status in DB to '{new_cpoa_status}'. Error msg: '{error_msg if error_msg else 'None'}'")
+    timestamp = datetime.now().isoformat()
     conn = None
     try:
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        # This assumes 'podcasts' table has 'podcast_id', 'status', 'last_updated_timestamp', 'error_message'
-        # The 'cpoa_details' and 'audio_filepath' are set by the API gateway thread after orchestration completes.
         cursor.execute(
-            "UPDATE podcasts SET status = ?, last_updated_timestamp = ?, error_message = ? WHERE podcast_id = ?",
-            (new_status, timestamp, error_msg, task_id)
+            """
+            UPDATE podcasts
+            SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ?
+            WHERE podcast_id = ?
+            """,
+            (new_cpoa_status, error_msg, timestamp, task_id)
         )
         conn.commit()
-        logger.info(f"Task {task_id}: Successfully updated DB status to '{new_status}'.")
+        logger.info(f"Task {task_id}: Successfully updated CPOA status in DB to '{new_cpoa_status}'.")
     except sqlite3.Error as e:
-        logger.error(f"CPOA: Database error for task {task_id} updating to status {new_status}: {type(e).__name__} - {e}")
-    except Exception as e:
-        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id}: {type(e).__name__} - {e}")
+        logger.error(f"CPOA: Database error for task {task_id} updating to status {new_cpoa_status}: {type(e).__name__} - {e}")
+    except Exception as e: # Catch any other unexpected error during DB update
+        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id} (status: {new_cpoa_status}): {type(e).__name__} - {e}", exc_info=True)
     finally:
         if conn:
             conn.close()
@@ -387,12 +392,10 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
             elif current_orchestration_stage == "vfa_audio_generation" and vfa_result_dict.get('status') != 'error': # If in VFA stage but no specific VFA error caught
                  vfa_result_dict = {"status": "error", "message": final_error_message, "audio_filepath": None, "stream_id": None}
 
-    # This final DB update happens regardless of WCHA_IMPORT_SUCCESSFUL outcome or try/except block.
+    # This final DB update by CPOA sets its final assessment of cpoa_status and cpoa_error_message.
+    # The API Gateway will then do one more update for fields like final_audio_filepath, etc.
     _update_task_status_in_db(db_path, task_id, final_cpoa_status, error_msg=final_error_message)
-    log_step(f"Orchestration ended with overall status: {final_cpoa_status}. Error (if any): {final_error_message}")
-
-    # The CPOA result dictionary, which will be used by the API Gateway thread
-    # to do the *final* update to the cpoa_details column in the database.
+    log_step(f"Orchestration ended with CPOA's final status: {final_cpoa_status}. Error (if any): {final_error_message}")
 
     # Ensure vfa_result_dict (which is final_audio_details) contains stream_id if available
     stream_id_for_url = vfa_result_dict.get("stream_id")
@@ -413,7 +416,7 @@ def orchestrate_podcast_generation(topic: str, task_id: str, db_path: str) -> Di
         "final_audio_details": vfa_result_dict, # This contains the stream_id from VFA
         "orchestration_log": orchestration_log
     }
-    # The API Gateway will use asf_websocket_url and final_audio_details.stream_id for client responses.
+    # The API Gateway will use this returned dict to perform its own final update on the podcast record.
     return cpoa_final_result
 
 def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
@@ -520,19 +523,22 @@ if __name__ == "__main__":
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS podcasts (
                 podcast_id TEXT PRIMARY KEY,
-                topic TEXT,
-                status TEXT,
-                created_timestamp TEXT,
+                topic TEXT NOT NULL,
+                cpoa_status TEXT,
+                cpoa_error_message TEXT,
+                final_audio_filepath TEXT,
+                stream_id TEXT,
+                asf_websocket_url TEXT,
+                asf_notification_status TEXT,
+                task_created_timestamp TEXT NOT NULL,
                 last_updated_timestamp TEXT,
-                error_message TEXT,
-                cpoa_details TEXT,
-                audio_filepath TEXT
+                cpoa_full_orchestration_log TEXT
             )
         """)
         conn.commit()
-        logger.info(f"Database '{db_path_main}' initialized for testing in __main__.")
+        logger.info(f"Database '{db_path_main}' initialized for testing in __main__ (using new schema).")
     except sqlite3.Error as e:
-        logger.error(f"Error creating DB table in __main__: {e}")
+        logger.error(f"Error creating DB table in __main__ with new schema: {e}")
     finally:
         if conn:
             conn.close()
@@ -543,11 +549,14 @@ if __name__ == "__main__":
     try:
         conn = sqlite3.connect(db_path_main)
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO podcasts (podcast_id, topic, status, created_timestamp) VALUES (?, ?, ?, ?)",
-                       (sample_task_id_1, sample_topic_1, "pending", datetime.now().isoformat()))
+        # Simulate initial record creation by API Gateway (simplified for test)
+        cursor.execute(
+            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
+            (sample_task_id_1, sample_topic_1, "pending_api_gateway", datetime.now().isoformat(), datetime.now().isoformat())
+        )
         conn.commit()
     except sqlite3.Error as e:
-        logger.error(f"Error inserting task {sample_task_id_1} in __main__: {e}")
+        logger.error(f"Error inserting initial task {sample_task_id_1} in __main__: {e}")
     finally:
         if conn:
             conn.close()
@@ -562,11 +571,14 @@ if __name__ == "__main__":
     try:
         conn = sqlite3.connect(db_path_main)
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO podcasts (podcast_id, topic, status, created_timestamp) VALUES (?, ?, ?, ?)",
-                       (sample_task_id_2, sample_topic_2, "pending", datetime.now().isoformat()))
+        # Simulate initial record creation by API Gateway
+        cursor.execute(
+            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
+            (sample_task_id_2, sample_topic_2, "pending_api_gateway", datetime.now().isoformat(), datetime.now().isoformat())
+        )
         conn.commit()
     except sqlite3.Error as e:
-        logger.error(f"Error inserting task {sample_task_id_2} in __main__: {e}")
+        logger.error(f"Error inserting initial task {sample_task_id_2} in __main__: {e}")
     finally:
         if conn:
             conn.close()

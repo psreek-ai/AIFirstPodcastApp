@@ -1,3 +1,217 @@
-This directory contains the configuration for the API Gateway.
-The configuration is broken down by endpoint for clarity.
-Each file describes the endpoint, its purpose, request validation, and expected response.
+# API Gateway
+
+## Purpose
+
+The API Gateway is the primary entry point for external clients (like the frontend UI) to interact with the Aethercast system. It provides a unified interface for discovering content, generating podcasts, and retrieving podcast information and audio.
+
+Key Responsibilities:
+
+1.  **Request Routing & Validation:** Receives HTTP requests from clients, validates them, and routes them to the appropriate internal services or handles them directly.
+2.  **Service Orchestration (Lightweight):** For some operations, it may directly call other backend services. For complex tasks like full podcast generation, it primarily calls the Central Podcast Orchestrator Agent (CPOA).
+3.  **Frontend Serving:** Serves the static files (HTML, CSS, JavaScript) for the Aethercast web frontend.
+4.  **Database Interaction:** Manages the `podcasts` database, creating initial records for podcast generation tasks and serving podcast metadata from this database.
+5.  **Response Formatting:** Consolidates responses from backend services (or its own data) and formats them into user-friendly JSON responses for the client.
+
+## Configuration
+
+The API Gateway is configured via environment variables, typically managed in a `.env` file within the `aethercast/api_gateway/` directory. Create one by copying the example:
+
+```bash
+cp .env.example .env
+```
+
+Then, edit the `.env` file. The following variables are used:
+
+-   `TDA_SERVICE_URL`: The URL of the Topic Discovery Agent (TDA) service, used by the `/api/v1/snippets` endpoint.
+    -   *Default:* `http://localhost:5000/discover_topics`
+-   `DATABASE_FILE`: Path to the SQLite database file where podcast task information is stored. This **must** be the same path used by the CPOA.
+    -   *Default:* `aethercast_podcasts.db`
+-   `# FEND_DIR`: (Commented out by default) Path to the frontend static files directory.
+    -   *Note:* This is typically derived in `main.py` relative to its own location (e.g., `../fend`). Setting this environment variable can override the derivation if needed for specific deployment scenarios.
+
+**Flask Application Parameters:**
+The following are standard Flask environment variables used by `main.py` when running the service directly:
+-   `FLASK_APP=aethercast/api_gateway/main.py` (standard way to specify app for flask command)
+-   `FLASK_RUN_HOST`: Host for the Flask development server.
+    -   *Default in `main.py` if run directly:* `0.0.0.0`
+-   `FLASK_RUN_PORT`: Port for the Flask development server.
+    -   *Default in `main.py` if run directly:* `5001`
+-   `FLASK_DEBUG`: To run Flask in debug mode (enables reloader and debugger).
+    -   *Default in `main.py` if run directly:* `True`
+
+*(Note: For a production deployment, a proper WSGI server like Gunicorn or uWSGI should be used instead of the Flask development server.)*
+
+## Dependencies
+
+Project dependencies are listed in `requirements.txt`. Install them using pip:
+
+```bash
+pip install -r requirements.txt
+```
+This includes `Flask`, `requests` (for calling TDA), and `python-dotenv`.
+
+## Running the Service
+
+1.  Ensure all backend services that the API Gateway depends on (CPOA and its dependencies like PSWA, VFA, SCA; TDA) are running and configured correctly.
+2.  Set up the necessary environment variables for the API Gateway (e.g., in a `.env` file or system environment).
+3.  Initialize the database (if it doesn't exist or if schema changes require it):
+    The `init_db()` function is called when `main.py` is run directly. If the database file specified by `DATABASE_FILE` does not exist, it will be created with the correct schema. If schema changes have occurred, you might need to manually delete the old database file during development.
+4.  Run the Flask development server:
+    ```bash
+    python aethercast/api_gateway/main.py
+    ```
+    This will start the service, typically on `http://0.0.0.0:5001`.
+
+Alternatively, using the `flask` command:
+```bash
+export FLASK_APP=aethercast/api_gateway/main.py
+export FLASK_DEBUG=1 # Optional
+flask run --host=0.0.0.0 --port=5001
+```
+
+## API Endpoints
+
+### Frontend
+
+-   **`GET /`**: Serves the main `index.html` of the frontend application.
+-   **`GET /style.css`**: Serves the CSS stylesheet.
+-   **`GET /app.js`**: Serves the main JavaScript application file.
+
+### Health Check
+
+-   **`GET /health`**
+    -   **Description:** Returns the health status of the API Gateway, including checks for CPOA module import and database connectivity.
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "status": "API Gateway is healthy",
+            "cpoa_podcast_function_status": "successfully imported", // or "failed to import (...)"
+            "cpoa_snippet_function_status": "successfully imported", // or "failed to import (...)"
+            "database_status": "Database connection successful." // or "Database connection error: ..."
+        }
+        ```
+
+### Snippets
+
+-   **`GET /api/v1/snippets`**
+    -   **Description:** Fetches a list of suggested podcast snippets. It calls the TDA to get topics and then CPOA to generate snippets for these topics.
+    -   **Query Parameters:**
+        -   `limit` (optional, integer): Number of topics to request from TDA. Defaults to 5.
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "snippets": [
+                {
+                    "snippet_id": "snippet_abcdef123",
+                    "topic_id": "topic_xyz789",
+                    "title": "The Future of AI in Snippets",
+                    "summary": "A brief look at how AI is changing snippet generation...",
+                    "text_content": "A brief look at how AI is changing snippet generation...",
+                    // ... other fields from SnippetDataObject as returned by CPOA's orchestrate_snippet_generation
+                }
+            ]
+        }
+        ```
+    -   **Error Responses:**
+        -   `503 Service Unavailable`: If CPOA snippet function is not loaded, or if TDA service call fails.
+        -   `500 Internal Server Error`: For other unexpected errors.
+
+### Podcast Task Management
+
+-   **`POST /api/v1/podcasts`**
+    -   **Description:** Initiates a new podcast generation task. The API Gateway creates a preliminary record in the database and then calls CPOA to orchestrate the generation.
+    -   **Request Payload (JSON):**
+        ```json
+        {
+            "topic": "The History of Podcasting"
+        }
+        ```
+    -   **Success Response (201 Created - if CPOA completes successfully with audio):**
+        ```json
+        {
+            "podcast_id": "uuid-generated-by-api-gw",
+            "topic": "The History of Podcasting",
+            "generation_status": "completed", // Status from CPOA
+            "audio_url": "/api/v1/podcasts/uuid-generated-by-api-gw/audio.mp3",
+            "message": "Podcast generation task processed. Final status: completed.",
+            "details": { /* Full cpoa_result from CPOA */ }
+        }
+        ```
+    -   **Success Response (200 OK - if CPOA processes but with warnings/errors, or fails internally):**
+        The HTTP status is 200 because the API Gateway successfully handled the request and CPOA processed it, even if the outcome from CPOA wasn't a clean success. The payload indicates the actual status.
+        ```json
+        {
+            "podcast_id": "uuid-generated-by-api-gw",
+            "topic": "The History of Podcasting",
+            "generation_status": "failed_vfa_tts", // Example failure status from CPOA
+            "message": "VFA service call failed after retries...", // Error message from CPOA
+            "details": { /* Full cpoa_result from CPOA */ }
+        }
+        ```
+    -   **Error Responses:**
+        -   `400 Bad Request`: If `topic` is missing or empty in the request.
+        -   `503 Service Unavailable`: If the CPOA's `orchestrate_podcast_generation` function cannot be imported/found.
+        -   `500 Internal Server Error`: For database errors during initial record creation or other unexpected issues within the API Gateway.
+
+-   **`GET /api/v1/podcasts`**
+    -   **Description:** Lists all podcast generation tasks with pagination.
+    -   **Query Parameters:**
+        -   `page` (optional, integer): Page number to retrieve. Defaults to 1.
+        -   `per_page` (optional, integer): Number of items per page. Defaults to 10 (max 100).
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "podcasts": [
+                {
+                    "podcast_id": "uuid-xyz",
+                    "topic": "Another Interesting Topic",
+                    "task_created_timestamp": "2024-03-15T10:00:00Z",
+                    "status": "completed", // cpoa_status from DB
+                    "audio_url": "/api/v1/podcasts/uuid-xyz/audio.mp3" // or null if no audio
+                }
+                // ... other podcasts
+            ],
+            "page": 1,
+            "per_page": 10,
+            "total_podcasts": 25,
+            "total_pages": 3
+        }
+        ```
+    -   **Error Responses:**
+        -   `400 Bad Request`: For invalid `page` or `per_page` parameters.
+        -   `500 Internal Server Error`: For database errors.
+
+-   **`GET /api/v1/podcasts/<podcast_id>`**
+    -   **Description:** Retrieves detailed information for a specific podcast task.
+    -   **Path Parameters:**
+        -   `podcast_id` (string): The unique ID of the podcast.
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "podcast_id": "uuid-xyz",
+            "topic": "Another Interesting Topic",
+            "status": "completed", // cpoa_status from DB
+            "error_message": null, // cpoa_error_message from DB
+            "audio_url": "/api/v1/podcasts/uuid-xyz/audio.mp3",
+            "final_audio_filepath": "/srv/aethercast/audio/file.mp3",
+            "stream_id": "stream_id_from_vfa",
+            "asf_websocket_url": "ws://asf_host/path/stream_id_from_vfa",
+            "asf_notification_status": "ASF notified successfully.",
+            "task_created_timestamp": "2024-03-15T10:00:00Z",
+            "last_updated_timestamp": "2024-03-15T10:05:00Z",
+            "orchestration_log": [ /* Parsed JSON from cpoa_full_orchestration_log */ ]
+        }
+        ```
+    -   **Error Responses:**
+        -   `404 Not Found`: If the `podcast_id` does not exist.
+        -   `500 Internal Server Error`: For database errors.
+
+-   **`GET /api/v1/podcasts/<podcast_id>/audio.mp3`**
+    -   **Description:** Serves the generated audio file for the specified podcast.
+    -   **Path Parameters:**
+        -   `podcast_id` (string): The unique ID of the podcast.
+    -   **Success Response (200 OK):**
+        -   The raw audio data (e.g., `audio/mpeg` content type).
+    -   **Error Responses:**
+        -   `404 Not Found`: If the podcast record doesn't exist, `final_audio_filepath` is null, or the audio file itself is missing from the filesystem.
+        -   `500 Internal Server Error`: For database errors when retrieving the filepath.

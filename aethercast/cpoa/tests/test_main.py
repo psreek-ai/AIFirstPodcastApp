@@ -1,281 +1,374 @@
 import unittest
-from unittest import mock
-import sys
+from unittest.mock import patch, MagicMock, call
 import os
+import sys
 import json
 
-# Ensure the 'aethercast' directory (which is one level up from 'cpoa')
-# is in the Python path for absolute imports.
-current_script_dir = os.path.dirname(os.path.abspath(__file__))
-cpoa_dir = os.path.dirname(current_script_dir) # aethercast/cpoa/
-aethercast_dir = os.path.dirname(cpoa_dir) # aethercast/
-project_root_dir = os.path.dirname(aethercast_dir) # repo root
+# Adjust path to import CPOA main module
+# Assuming this test file is in aethercast/cpoa/tests/
+current_dir = os.path.dirname(os.path.abspath(__file__))
+cpoa_dir = os.path.dirname(current_dir) # This should be aethercast/cpoa/
+aethercast_dir = os.path.dirname(cpoa_dir) # This should be aethercast/
+project_root_dir = os.path.dirname(aethercast_dir) # This should be the project root
 
+if cpoa_dir not in sys.path:
+    sys.path.insert(0, cpoa_dir)
+if aethercast_dir not in sys.path: # If cpoa.main imports other aethercast modules
+    sys.path.insert(0, aethercast_dir)
 if project_root_dir not in sys.path:
-    sys.path.insert(0, project_root_dir)
+     sys.path.insert(0, project_root_dir)
 
-from aethercast.cpoa.main import orchestrate_podcast_generation, TOPIC_TO_URL_MAP as CPOA_TOPIC_MAP # Import the map for reference if needed, but we will mock it
 
-class TestOrchestrationFlow(unittest.TestCase):
+from aethercast.cpoa import main as cpoa_main
+# Import requests specifically for requests.exceptions.RequestException etc.
+import requests
 
-    # Common mock setup for VFA and PSWA
-    def _configure_downstream_mocks(self, mock_pswa, mock_vfa, pswa_script_content=None):
-        if pswa_script_content is None:
-            # More realistic LLM-like script for default success
-            pswa_script_content = """[TITLE] Default Mock Podcast Title
-[INTRO] Welcome to this default mock podcast. We explore fascinating default topics.
-[SEGMENT_1_TITLE] Default Segment Alpha
-[SEGMENT_1_CONTENT] This is the detailed content for segment Alpha. It's quite engaging.
-[OUTRO] Thanks for listening to this default mock. Tune in next time!"""
+
+class TestUpdateTaskStatusInDb(unittest.TestCase):
+    @patch('sqlite3.connect')
+    def test_update_success(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        # Call the function to be tested from the imported cpoa_main
+        cpoa_main._update_task_status_in_db("dummy.db", "task_123", "completed", "All good")
+
+        mock_sqlite_connect.assert_called_once_with("dummy.db")
+        mock_conn.cursor.assert_called_once()
+        self.assertEqual(mock_cursor.execute.call_count, 1)
         
-        mock_pswa.return_value = pswa_script_content
+        args, _ = mock_cursor.execute.call_args
+        self.assertIn("UPDATE podcasts SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ?", args[0])
+        self.assertEqual(args[1][0], "completed")
+        self.assertEqual(args[1][1], "All good")
+        self.assertEqual(args[1][3], "task_123")
         
-        # Updated VFA success mock to include new fields
-        mock_vfa.return_value = {
-            "status": "success", 
-            "message": "Mock audio successfully synthesized for test.",
-            "audio_filepath": f"/tmp/aethercast_audio/mock_cpoa_test_audio_{len(pswa_script_content)}.mp3", # Example dynamic path
-            "audio_format": "mp3",
-            "script_char_count": len(pswa_script_content),
-            "engine_used": "mock_google_cloud_tts" 
+        mock_conn.commit.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    @patch('sqlite3.connect')
+    def test_update_db_error(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        # Simulate a database error during cursor execution
+        mock_cursor = MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.execute.side_effect = sqlite3.Error("Test DB error on execute")
+
+
+        with patch.object(cpoa_main.logger, 'error') as mock_logger_error:
+            cpoa_main._update_task_status_in_db("dummy.db", "task_error", "failed_db_error", "DB issue")
+
+            self.assertTrue(mock_logger_error.called)
+            call_args_list = mock_logger_error.call_args_list
+            found_error_log = False
+            for call_arg in call_args_list:
+                if "Database error for task task_error" in call_arg[0][0] and "Test DB error on execute" in call_arg[0][0]:
+                    found_error_log = True
+                    break
+            self.assertTrue(found_error_log, "Expected database execution error log message not found.")
+        
+        # Ensure commit was not called if execute failed
+        mock_conn.commit.assert_not_called()
+        mock_conn.close.assert_called_once() # Connection should still be closed
+
+
+class TestOrchestratePodcastGeneration(unittest.TestCase):
+
+    def setUp(self):
+        self.mock_env_vars = {
+            "PSWA_SERVICE_URL": "http://mockpswa.test/weave_script",
+            "VFA_SERVICE_URL": "http://mockvfa.test/forge_voice",
+            "ASF_NOTIFICATION_URL": "http://mockasf.test/notify",
+            "ASF_WEBSOCKET_BASE_URL": "ws://mockasf.test/stream",
+            "SCA_SERVICE_URL": "http://mocksca.test/craft_snippet",
+            "CPOA_DATABASE_PATH": "test_cpoa_orchestration.db",
+            "CPOA_SERVICE_RETRY_COUNT": "1",
+            "CPOA_SERVICE_RETRY_BACKOFF_FACTOR": "0.01"
         }
+        
+        # IMPORTANT: We need to patch os.getenv BEFORE cpoa_main is loaded if its constants
+        # are defined at the module level. However, cpoa_main is already imported.
+        # So, we will patch the global variables within cpoa_main directly after they've been loaded,
+        # or use patch.dict(os.environ, self.mock_env_vars) if cpoa_main re-reads from os.environ.
+        # For simplicity here, assuming cpoa_main's global config vars can be patched if necessary,
+        # or that its functions use os.getenv dynamically (which they do for retry counts).
+        
+        # Patching the globally loaded config values in cpoa_main
+        self.pswa_url_patch = patch.object(cpoa_main, 'PSWA_SERVICE_URL', self.mock_env_vars['PSWA_SERVICE_URL'])
+        self.vfa_url_patch = patch.object(cpoa_main, 'VFA_SERVICE_URL', self.mock_env_vars['VFA_SERVICE_URL'])
+        self.asf_url_patch = patch.object(cpoa_main, 'ASF_NOTIFICATION_URL', self.mock_env_vars['ASF_NOTIFICATION_URL'])
+        self.sca_url_patch = patch.object(cpoa_main, 'SCA_SERVICE_URL', self.mock_env_vars['SCA_SERVICE_URL'])
+        self.db_path_patch = patch.object(cpoa_main, 'CPOA_DATABASE_PATH', self.mock_env_vars['CPOA_DATABASE_PATH'])
+        self.retry_count_patch = patch.object(cpoa_main, 'CPOA_SERVICE_RETRY_COUNT', int(self.mock_env_vars['CPOA_SERVICE_RETRY_COUNT']))
+        self.backoff_patch = patch.object(cpoa_main, 'CPOA_SERVICE_RETRY_BACKOFF_FACTOR', float(self.mock_env_vars['CPOA_SERVICE_RETRY_BACKOFF_FACTOR']))
 
-    # Helper for VFA side effect in specific tests
-    def _vfa_side_effect_for_pswa_error_string(self, script_input_to_vfa: str):
-        pswa_error_indicators = [
-            "OpenAI library not available", "Error: OPENAI_API_KEY", 
-            "OpenAI API Error:", "An unexpected error occurred",
-            "[ERROR] Insufficient content" 
-        ]
-        is_error_string = any(script_input_to_vfa.startswith(prefix) for prefix in pswa_error_indicators)
+        self.pswa_url_patch.start()
+        self.vfa_url_patch.start()
+        self.asf_url_patch.start()
+        self.sca_url_patch.start()
+        self.db_path_patch.start()
+        self.retry_count_patch.start()
+        self.backoff_patch.start()
         
-        if is_error_string:
-            # Updated VFA "skipped" mock
-            return {
-                "status": "skipped", 
-                "message": "VFA skipped due to PSWA error string (mocked).",
-                "audio_filepath": None,
-                "audio_format": None, 
-                "script_char_count": len(script_input_to_vfa),
-                "engine_used": "google_cloud_tts" # VFA now specifies engine even if skipped
-            }
+        # Ensure WCHA is considered imported successfully for most tests
+        self.wcha_import_patch = patch.object(cpoa_main, 'WCHA_IMPORT_SUCCESSFUL', True)
+        self.mock_wcha_import = self.wcha_import_patch.start()
+
+
+    def tearDown(self):
+        self.pswa_url_patch.stop()
+        self.vfa_url_patch.stop()
+        self.asf_url_patch.stop()
+        self.sca_url_patch.stop()
+        self.db_path_patch.stop()
+        self.retry_count_patch.stop()
+        self.backoff_patch.stop()
+        self.wcha_import_patch.stop()
+
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_successful_run(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Detailed content about a fascinating topic."
+
+        mock_pswa_response = MagicMock(status_code=200)
+        mock_pswa_response.json.return_value = {"script_text": "A brilliant podcast script."}
         
-        # Updated VFA success mock for the side_effect path
-        return {
-            "status": "success", 
-            "message": "Mock audio generated for VFA (side_effect success path).", 
-            "audio_filepath": f"/tmp/aethercast_audio/mock_cpoa_side_effect_audio_{len(script_input_to_vfa)}.mp3",
-            "audio_format": "mp3",
-            "script_char_count": len(script_input_to_vfa),
-            "engine_used": "mock_google_cloud_tts_side_effect"
+        mock_vfa_response = MagicMock(status_code=200)
+        mock_vfa_response.json.return_value = {
+            "status": "success",
+            "audio_filepath": "/shared/audio/podcast_123.mp3",
+            "stream_id": "stream_abc"
         }
+        
+        mock_asf_response = MagicMock(status_code=200)
+        mock_asf_response.json.return_value = {"message": "ASF notified"}
+
+        def requests_side_effect(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL: return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL: return mock_vfa_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL: return mock_asf_response
+            m = MagicMock(status_code=500)
+            m.json.return_value={"error": "Unknown URL"}
+            return m # Should not happen
+        mock_requests_retry.side_effect = requests_side_effect
+
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic", "task_podcast_001", "dummy.db")
+
+        self.assertEqual(result['status'], "completed")
+        self.assertIsNotNone(result['final_audio_details'].get('audio_filepath'))
+        self.assertIsNone(result['error_message']) # Should be None for fully successful
+        self.assertTrue(result['asf_notification_status'].startswith("ASF notified successfully"))
+        
+        # Verify DB updates: initial, wcha, pswa, vfa, asf_notification (if success), final "completed"
+        # Example: check the final status update
+        final_db_call = mock_update_db.call_args_list[-1][0] # Get args of the last call
+        self.assertEqual(final_db_call[1], "task_podcast_001") # task_id
+        self.assertEqual(final_db_call[2], "completed")       # status
+        self.assertIsNone(final_db_call[3])                   # error_message
 
 
-    @mock.patch('aethercast.cpoa.main.TOPIC_TO_URL_MAP', {"ai in healthcare": "http://example.com/ai_health"})
-    @mock.patch('aethercast.vfa.main.forge_voice')
-    @mock.patch('aethercast.pswa.main.weave_script')
-    @mock.patch('aethercast.wcha.main.harvest_from_url')
-    @mock.patch('aethercast.wcha.main.harvest_content')
-    def test_orchestration_mapped_topic_live_fetch_success(self, mock_harvest_content, mock_harvest_from_url, mock_weave_script, mock_forge_voice, mock_topic_map_ignored):
-        """Test mapped topic with successful live fetch."""
-        # PSWA and VFA mocks are configured by _configure_downstream_mocks
-        # Get the expected VFA output from the helper for assertion
-        expected_pswa_script = """[TITLE] Default Mock Podcast Title
-[INTRO] Welcome to this default mock podcast. We explore fascinating default topics.
-[SEGMENT_1_TITLE] Default Segment Alpha
-[SEGMENT_1_CONTENT] This is the detailed content for segment Alpha. It's quite engaging.
-[OUTRO] Thanks for listening to this default mock. Tune in next time!"""
-        self._configure_downstream_mocks(mock_weave_script, mock_forge_voice, pswa_script_content=expected_pswa_script)
-        expected_vfa_dict = {
-            "status": "success", "message": "Mock audio successfully synthesized for test.",
-            "audio_filepath": f"/tmp/aethercast_audio/mock_cpoa_test_audio_{len(expected_pswa_script)}.mp3",
-            "audio_format": "mp3", "script_char_count": len(expected_pswa_script),
-            "engine_used": "mock_google_cloud_tts"
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_wcha_failure_returns_error_string(self, mock_get_content, mock_update_db):
+        mock_get_content.return_value = "WCHA: No search results found for topic: Obscure Topic"
+
+        result = cpoa_main.orchestrate_podcast_generation("Obscure Topic", "task_wcha_fail_001", "dummy.db")
+
+        self.assertEqual(result['status'], "failed_wcha_content_harvest")
+        self.assertIn("WCHA: No search results", result['error_message'])
+        
+        last_call_args = mock_update_db.call_args_list[-1][0]
+        self.assertEqual(last_call_args[1], "task_wcha_fail_001")
+        self.assertEqual(last_call_args[2], "failed_wcha_content_harvest")
+        self.assertIn("WCHA: No search results", last_call_args[3])
+
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_pswa_http_error(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Some content"
+        
+        # Mock PSWA call to raise HTTPError after retries (retry_count is 1 from setUp)
+        # The actual response object for HTTPError needs a status_code.
+        mock_response = MagicMock()
+        mock_response.status_code = 503
+        mock_response.json.return_value = {"error": "PSWA service unavailable"} # Example error payload
+        mock_response.text = '{"error": "PSWA service unavailable"}'
+        
+        # requests_with_retry is expected to raise RequestException (or a subclass like HTTPError)
+        # if all retries fail.
+        mock_requests_retry.side_effect = requests.exceptions.HTTPError(
+            "PSWA service unavailable", response=mock_response
+        )
+
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Fail", "task_pswa_fail_001", "dummy.db")
+
+        self.assertEqual(result['status'], "failed_pswa_request_exception")
+        self.assertIn("PSWA service call failed after retries", result['error_message'])
+        self.assertIn("503", result['error_message']) # Check if status code is in the message
+        
+        # retry_count is 1, so requests_with_retry should be called once for PSWA
+        pswa_call_made = False
+        for call_args in mock_requests_retry.call_args_list:
+            if call_args[0][1] == cpoa_main.PSWA_SERVICE_URL: # Check if URL matches PSWA
+                pswa_call_made = True
+                break
+        self.assertTrue(pswa_call_made)
+        # self.assertEqual(mock_requests_retry.call_count, 1) # This would be true if only PSWA was called
+
+        last_db_call_args = mock_update_db.call_args_list[-1][0]
+        self.assertEqual(last_db_call_args[2], "failed_pswa_request_exception")
+
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_vfa_failure_http_error(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Some content for VFA test"
+
+        mock_pswa_response = MagicMock(status_code=200)
+        mock_pswa_response.json.return_value = {"script_text": "A script for VFA test."}
+
+        # Mock VFA call to raise HTTPError
+        mock_vfa_error_response = MagicMock(status_code=500)
+        mock_vfa_error_response.json.return_value = {"message": "VFA internal server error"}
+        mock_vfa_error_response.text = '{"message": "VFA internal server error"}'
+        
+        def requests_side_effect(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL:
+                return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL:
+                # This will be raised by requests_with_retry after its attempts
+                raise requests.exceptions.HTTPError("VFA service error", response=mock_vfa_error_response)
+            return MagicMock(status_code=404) # Should not be called for other URLs in this test
+        mock_requests_retry.side_effect = requests_side_effect
+
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic VFA Fail", "task_vfa_fail_001", "dummy.db")
+
+        self.assertEqual(result['status'], "failed_vfa_request_exception")
+        self.assertIn("VFA service call failed after retries", result['error_message'])
+        self.assertIn("500", result['error_message'])
+
+        # Check that PSWA was called, then VFA was attempted
+        self.assertGreaterEqual(mock_requests_retry.call_count, 2) # At least PSWA and VFA attempt(s)
+        
+        last_db_call_args = mock_update_db.call_args_list[-1][0]
+        self.assertEqual(last_db_call_args[2], "failed_vfa_request_exception")
+
+
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_asf_notification_failure(self, mock_get_content, mock_requests_retry, mock_update_db):
+        mock_get_content.return_value = "Content for ASF test"
+        
+        mock_pswa_response = MagicMock(status_code=200)
+        mock_pswa_response.json.return_value = {"script_text": "Script for ASF test"}
+        
+        mock_vfa_response = MagicMock(status_code=200)
+        mock_vfa_response.json.return_value = {
+            "status": "success",
+            "audio_filepath": "/shared/audio/asf_test.mp3",
+            "stream_id": "stream_asf_test"
         }
-        mock_forge_voice.return_value = expected_vfa_dict # Ensure it's exactly this for the test
-
-        live_content = "live content for AI in healthcare from a reliable source"
-        mock_harvest_from_url.return_value = live_content
         
-        test_topic = "ai in healthcare"
-        result = orchestrate_podcast_generation(test_topic)
-        
-        mock_harvest_from_url.assert_called_once_with("http://example.com/ai_health")
-        mock_harvest_content.assert_not_called()
-        mock_weave_script.assert_called_once_with(content=live_content, topic=test_topic)
-        self.assertEqual(result.get("status"), "completed")
-        self.assertIn("Successfully harvested content from URL", result["orchestration_log"][-4]["message"]) 
-        self.assertEqual(result.get("final_audio_details"), expected_vfa_dict)
+        # Mock ASF call to raise RequestException (e.g., connection error)
+        mock_asf_error_response = MagicMock(status_code=500) # for HTTPError case if not ConnectionError
+        mock_asf_error_response.json.return_value = {"error": "ASF connection failed"}
+        mock_asf_error_response.text = '{"error": "ASF connection failed"}'
 
+        def requests_side_effect(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL: return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL: return mock_vfa_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL:
+                raise requests.exceptions.ConnectionError("ASF connection error")
+            return MagicMock(status_code=404)
+        mock_requests_retry.side_effect = requests_side_effect
 
-    @mock.patch('aethercast.cpoa.main.TOPIC_TO_URL_MAP', {"ai in healthcare": "http://example.com/ai_health_fail"})
-    @mock.patch('aethercast.vfa.main.forge_voice')
-    @mock.patch('aethercast.pswa.main.weave_script')
-    @mock.patch('aethercast.wcha.main.harvest_from_url')
-    @mock.patch('aethercast.wcha.main.harvest_content')
-    def test_orchestration_mapped_topic_live_fetch_fails_fallback_succeeds(self, mock_harvest_content, mock_harvest_from_url, mock_weave_script, mock_forge_voice, mock_topic_map_ignored):
-        """Test mapped topic, live fetch fails, fallback to mock succeeds."""
-        self._configure_downstream_mocks(mock_weave_script, mock_forge_voice) # Uses default realistic mocks
-        expected_vfa_dict_from_helper = mock_forge_voice.return_value # Capture what the helper set up
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic ASF Fail", "task_asf_fail_001", "dummy.db")
 
-        mock_harvest_from_url.return_value = "Error fetching URL..." 
-        fallback_content = "mock fallback for AI in healthcare from internal data"
-        mock_harvest_content.return_value = fallback_content
-        
-        test_topic = "ai in healthcare"
-        result = orchestrate_podcast_generation(test_topic)
-        
-        mock_harvest_from_url.assert_called_once_with("http://example.com/ai_health_fail")
-        mock_harvest_content.assert_called_once_with(topic=test_topic)
-        mock_weave_script.assert_called_once_with(content=fallback_content, topic=test_topic)
-        self.assertEqual(result.get("status"), "completed")
-        self.assertIn("Falling back to mock harvest", result["orchestration_log"][-5]["message"])
-        self.assertEqual(result.get("final_audio_details"), expected_vfa_dict_from_helper)
+        self.assertEqual(result['status'], "completed_with_asf_notification_failure")
+        self.assertIn("ASF notification failed after retries", result['error_message'])
+        self.assertIn("ConnectionError", result['error_message'])
+        self.assertIsNotNone(result['final_audio_details'].get('audio_filepath')) # Audio generation was successful
+
+        last_db_call_args = mock_update_db.call_args_list[-1][0]
+        self.assertEqual(last_db_call_args[2], "completed_with_asf_notification_failure")
+        self.assertIn("ASF notification failed", last_db_call_args[3]) # error_msg in DB
 
 
-    @mock.patch('aethercast.cpoa.main.TOPIC_TO_URL_MAP', {"climate change": "http://example.com/climate_fail"})
-    @mock.patch('aethercast.vfa.main.forge_voice')
-    @mock.patch('aethercast.pswa.main.weave_script')
-    @mock.patch('aethercast.wcha.main.harvest_from_url')
-    @mock.patch('aethercast.wcha.main.harvest_content')
-    def test_orchestration_mapped_topic_live_fetch_fails_fallback_fails(self, mock_harvest_content, mock_harvest_from_url, mock_weave_script, mock_forge_voice, mock_topic_map_ignored):
-        """Test mapped topic, live fetch fails, fallback to mock also returns 'not found'."""
-        pswa_generic_script_for_no_content = """[TITLE] Climate Change Update
-[INTRO] Today we discuss climate change, but current specific details are limited.
-[OUTRO] We'll revisit this topic with more information soon."""
-        self._configure_downstream_mocks(mock_weave_script, mock_forge_voice, pswa_script_content=pswa_generic_script_for_no_content)
-        # Capture the VFA response configured by the helper for this specific PSWA script
-        expected_vfa_dict_for_generic_script = mock_forge_voice.return_value.copy() 
-        expected_vfa_dict_for_generic_script['script_char_count'] = len(pswa_generic_script_for_no_content)
-        # Update the path to reflect the new script length if the helper makes it dynamic
-        expected_vfa_dict_for_generic_script['audio_filepath'] = f"/tmp/aethercast_audio/mock_cpoa_test_audio_{len(pswa_generic_script_for_no_content)}.mp3"
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    def test_wcha_module_import_failure(self, mock_update_db):
+        # Temporarily set WCHA_IMPORT_SUCCESSFUL to False for this test
+        with patch.object(cpoa_main, 'WCHA_IMPORT_SUCCESSFUL', False):
+            with patch.object(cpoa_main, 'WCHA_MISSING_IMPORT_ERROR', "Simulated WCHA import error"):
+                result = cpoa_main.orchestrate_podcast_generation("Test Topic WCHA Import Fail", "task_wcha_import_fail", "dummy.db")
+
+                self.assertEqual(result['status'], "failed_wcha_module_error")
+                self.assertIn("Simulated WCHA import error", result['error_message'])
+
+                last_db_call_args = mock_update_db.call_args_list[-1][0]
+                self.assertEqual(last_db_call_args[2], "failed_wcha_module_error")
+                self.assertIn("Simulated WCHA import error", last_db_call_args[3])
 
 
-        mock_harvest_from_url.return_value = "Error fetching URL..."
-        fallback_not_found_message = "No pre-defined content found for topic: climate change"
-        mock_harvest_content.return_value = fallback_not_found_message
-        
-        test_topic = "climate change"
-        result = orchestrate_podcast_generation(test_topic)
-        
-        mock_harvest_from_url.assert_called_once_with("http://example.com/climate_fail")
-        mock_harvest_content.assert_called_once_with(topic=test_topic)
-        mock_weave_script.assert_called_once_with(content=fallback_not_found_message, topic=test_topic)
-        
-        vfa_call_arg_script = mock_forge_voice.call_args[0][0]
-        self.assertEqual(vfa_call_arg_script, pswa_generic_script_for_no_content)
-        
-        # If VFA's MIN_SCRIPT_LENGTH_FOR_AUDIO is small enough, this might pass.
-        # The VFA mock in _configure_downstream_mocks assumes success by default.
-        # We need to check if the CPOA status reflects a VFA skip IF the generic script is too short.
-        # For now, assume the generic script is long enough for the default VFA mock.
-        if result.get("final_audio_details", {}).get("status") == "skipped":
-             self.assertEqual(result.get("status"), "completed_with_warnings")
-        else: 
-            self.assertEqual(result.get("status"), "completed")
-            self.assertEqual(result.get("final_audio_details"), expected_vfa_dict_for_generic_script) # Check full structure
-            
-        self.assertIn("Falling back to mock harvest", result["orchestration_log"][-5]["message"])
-        self.assertIn("Final content is a 'not found' message", result["orchestration_log"][-4]["message"])
-
-
-    @mock.patch('aethercast.cpoa.main.TOPIC_TO_URL_MAP', {}) 
-    @mock.patch('aethercast.vfa.main.forge_voice')
-    @mock.patch('aethercast.pswa.main.weave_script')
-    @mock.patch('aethercast.wcha.main.harvest_from_url')
-    @mock.patch('aethercast.wcha.main.harvest_content')
-    def test_orchestration_unmapped_topic_uses_mock_success(self, mock_harvest_content, mock_harvest_from_url, mock_weave_script, mock_forge_voice, mock_topic_map_ignored):
-        """Test unmapped topic, uses mock data successfully."""
-        self._configure_downstream_mocks(mock_weave_script, mock_forge_voice)
-        expected_vfa_dict_from_helper = mock_forge_voice.return_value
-
-        mock_content_str = "mock content for quantum computing from internal data"
-        mock_harvest_content.return_value = mock_content_str
-        
-        test_topic = "quantum computing"
-        result = orchestrate_podcast_generation(test_topic)
-        
-        mock_harvest_from_url.assert_not_called()
-        mock_harvest_content.assert_called_once_with(topic=test_topic)
-        mock_weave_script.assert_called_once_with(content=mock_content_str, topic=test_topic)
-        self.assertEqual(result.get("status"), "completed")
-        self.assertIn("Using mock harvest for topic", result["orchestration_log"][-4]["message"])
-        self.assertEqual(result.get("final_audio_details"), expected_vfa_dict_from_helper)
-
-
-    @mock.patch('aethercast.cpoa.main.TOPIC_TO_URL_MAP', {}) 
-    @mock.patch('aethercast.vfa.main.forge_voice')
-    @mock.patch('aethercast.pswa.main.weave_script')
-    @mock.patch('aethercast.wcha.main.harvest_from_url')
-    @mock.patch('aethercast.wcha.main.harvest_content')
-    def test_orchestration_unmapped_topic_uses_mock_not_found(self, mock_harvest_content, mock_harvest_from_url, mock_weave_script, mock_forge_voice, mock_topic_map_ignored):
-        """Test unmapped topic, mock data also returns 'not found'."""
-        pswa_generic_script_for_no_content = """[TITLE] Underwater Weaving Wonders
-[INTRO] Today we try to explore underwater basket weaving.
-[OUTRO] Our exploration was short today."""
-        self._configure_downstream_mocks(mock_weave_script, mock_forge_voice, pswa_script_content=pswa_generic_script_for_no_content)
-        expected_vfa_dict_for_generic_script = mock_forge_voice.return_value.copy()
-        expected_vfa_dict_for_generic_script['script_char_count'] = len(pswa_generic_script_for_no_content)
-        expected_vfa_dict_for_generic_script['audio_filepath'] = f"/tmp/aethercast_audio/mock_cpoa_test_audio_{len(pswa_generic_script_for_no_content)}.mp3"
-        
-        not_found_message = "No pre-defined content found for topic: underwater basket weaving"
-        mock_harvest_content.return_value = not_found_message
-        
-        test_topic = "underwater basket weaving"
-        result = orchestrate_podcast_generation(test_topic)
-        
-        mock_harvest_from_url.assert_not_called()
-        mock_harvest_content.assert_called_once_with(topic=test_topic)
-        mock_weave_script.assert_called_once_with(content=not_found_message, topic=test_topic)
-        
-        vfa_call_arg_script = mock_forge_voice.call_args[0][0]
-        self.assertEqual(vfa_call_arg_script, pswa_generic_script_for_no_content)
-
-        if result.get("final_audio_details", {}).get("status") == "skipped":
-             self.assertEqual(result.get("status"), "completed_with_warnings")
-        else:
-            self.assertEqual(result.get("status"), "completed")
-            self.assertEqual(result.get("final_audio_details"), expected_vfa_dict_for_generic_script)
-        self.assertIn("Final content is a 'not found' message", result["orchestration_log"][-4]["message"])
-
-    @mock.patch('aethercast.cpoa.main.TOPIC_TO_URL_MAP', {}) 
-    @mock.patch('aethercast.vfa.main.forge_voice')
-    @mock.patch('aethercast.pswa.main.weave_script')
-    @mock.patch('aethercast.wcha.main.harvest_from_url') 
-    @mock.patch('aethercast.wcha.main.harvest_content')
-    def test_vfa_skipped_status_propagation(self, mock_harvest_content, mock_harvest_from_url, mock_weave_script, mock_forge_voice, mock_topic_map_ignored):
-        """Test that VFA 'skipped' status propagates correctly."""
-        mock_harvest_content.return_value = "mock_content_short_enough_for_pswa"
-        
-        short_script_output = "[TITLE] Short\n[INTRO] Too short for VFA.\n[OUTRO] End."
-        self._configure_downstream_mocks(mock_weave_script, mock_forge_voice, pswa_script_content=short_script_output) # Base config
-        
-        # Explicitly set the VFA mock to return the detailed "skipped" structure
-        expected_vfa_skipped_dict = {
-            "status": "skipped", 
-            "message": "Script too short, VFA skipped (mocked).", 
-            "audio_filepath": None,
-            "audio_format": None,
-            "script_char_count": len(short_script_output), 
-            "engine_used": "google_cloud_tts" # VFA indicates engine even if skipped
+class TestOrchestrateSnippetGeneration(unittest.TestCase):
+    def setUp(self):
+        self.mock_env_vars = {
+            "SCA_SERVICE_URL": "http://mocksca.test/craft_snippet",
+            "CPOA_SERVICE_RETRY_COUNT": "1",
+            "CPOA_SERVICE_RETRY_BACKOFF_FACTOR": "0.01"
         }
-        mock_forge_voice.return_value = expected_vfa_skipped_dict
-        
-        test_topic = "short_script_topic_for_vfa_skip"
-        result = orchestrate_podcast_generation(test_topic)
-        
-        mock_harvest_content.assert_called_once_with(topic=test_topic)
-        mock_weave_script.assert_called_once_with(content="mock_content_short_enough_for_pswa", topic=test_topic)
-        mock_forge_voice.assert_called_once_with(script=short_script_output)
+        # Patching global config values in cpoa_main for SCA tests
+        self.sca_url_patch = patch.object(cpoa_main, 'SCA_SERVICE_URL', self.mock_env_vars['SCA_SERVICE_URL'])
+        self.retry_count_patch = patch.object(cpoa_main, 'CPOA_SERVICE_RETRY_COUNT', int(self.mock_env_vars['CPOA_SERVICE_RETRY_COUNT']))
+        self.backoff_patch = patch.object(cpoa_main, 'CPOA_SERVICE_RETRY_BACKOFF_FACTOR', float(self.mock_env_vars['CPOA_SERVICE_RETRY_BACKOFF_FACTOR']))
+        self.sca_url_patch.start()
+        self.retry_count_patch.start()
+        self.backoff_patch.start()
 
-        self.assertEqual(result.get("status"), "completed_with_warnings")
-        self.assertEqual(result.get("final_audio_details"), expected_vfa_skipped_dict) # Check full structure
-        
-        vfa_info_logged = any("VFA Info: Voice forging was not fully successful" in entry["message"] for entry in result["orchestration_log"])
-        self.assertTrue(vfa_info_logged, "VFA info log for skipped status was not found.")
-        
-        completion_log_message = result["orchestration_log"][-1]["message"]
-        self.assertIn(f"Orchestration finished with status: 'completed_with_warnings' for topic: '{test_topic}'", completion_log_message)
+    def tearDown(self):
+        self.sca_url_patch.stop()
+        self.retry_count_patch.stop()
+        self.backoff_patch.stop()
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    def test_snippet_generation_successful(self, mock_requests_retry):
+        mock_sca_response = MagicMock(status_code=200)
+        mock_sca_response.json.return_value = {"snippet_id": "snip_123", "snippet_text": "A great snippet."}
+        mock_requests_retry.return_value = mock_sca_response
+
+        topic_info = {"topic_id": "topic_abc", "title_suggestion": "A Great Topic"}
+        result = cpoa_main.orchestrate_snippet_generation(topic_info)
+
+        self.assertNotIn("error", result)
+        self.assertEqual(result["snippet_id"], "snip_123")
+        mock_requests_retry.assert_called_once()
+
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    def test_snippet_generation_sca_http_error(self, mock_requests_retry):
+        mock_response = MagicMock(status_code=500)
+        mock_response.json.return_value = {"error": "SCA internal error"}
+        mock_response.text = '{"error": "SCA internal error"}'
+        mock_requests_retry.side_effect = requests.exceptions.HTTPError(
+            "SCA service error", response=mock_response
+        )
+
+        topic_info = {"topic_id": "topic_xyz", "title_suggestion": "Another Topic"}
+        result = cpoa_main.orchestrate_snippet_generation(topic_info)
+
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "SCA_CALL_FAILED_AFTER_RETRIES")
+        self.assertIn("SCA service call failed", result["details"])
+        self.assertEqual(mock_requests_retry.call_count, 1) # Retry count is 1
+
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(verbosity=2)
