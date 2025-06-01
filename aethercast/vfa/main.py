@@ -66,11 +66,21 @@ def load_vfa_configuration():
     for key, value in vfa_config.items():
         if key == "GOOGLE_APPLICATION_CREDENTIALS" and value:
             logger.info(f"  {key}: Loaded (Path: {value})")
-        elif key == "GOOGLE_APPLICATION_CREDENTIALS" and not value:
-            logger.warning(f"  {key}: NOT SET. Real TTS will fail.")
-        else:
+        # Logging for unset GOOGLE_APPLICATION_CREDENTIALS will be handled by the check below
+        elif key != "GOOGLE_APPLICATION_CREDENTIALS": # Avoid double logging if it's not set
             logger.info(f"  {key}: {value}")
     logger.info("--- End VFA Configuration ---")
+
+    # Critical check for Google Credentials if imports were successful (i.e., real TTS is expected)
+    if VFA_IMPORTS_SUCCESSFUL and not vfa_config.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        error_msg = "CRITICAL: GOOGLE_APPLICATION_CREDENTIALS is not set, but Google Cloud SDK is installed. VFA cannot function for real TTS. Please set this environment variable."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    elif not vfa_config.get("GOOGLE_APPLICATION_CREDENTIALS"):
+        logger.warning("GOOGLE_APPLICATION_CREDENTIALS is NOT SET. Real TTS operations will fail if attempted.")
+    else: # Credentials are set
+        logger.info("GOOGLE_APPLICATION_CREDENTIALS path is configured.")
+
 
     if VFA_IMPORTS_SUCCESSFUL:
         google_audio_encoding_map.update({
@@ -87,6 +97,11 @@ def load_vfa_configuration():
 
 # Load configuration at startup
 load_vfa_configuration()
+
+# --- Test Mode Scenario Constants ---
+# These define the content of the JSON response for different test scenarios in VFA
+VFA_TEST_SCENARIO_TTS_ERROR_MSG = "Test scenario: Simulated TTS API error from VFA."
+VFA_TEST_SCENARIO_FILE_SAVE_ERROR_MSG = "Test scenario: Simulated file saving IO error in VFA."
 
 
 # PSWA Error Prefixes to identify scripts that are actually error messages
@@ -134,35 +149,56 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
     }
 
     if vfa_config.get('VFA_TEST_MODE_ENABLED'):
-        logger.info(f"[VFA_MAIN_LOGIC] Test mode enabled. Simulating audio generation for stream {stream_id}, topic '{original_topic}'.")
+        scenario = request.headers.get('X-Test-Scenario', 'default')
+        logger.info(f"[VFA_MAIN_LOGIC] Test mode enabled. Scenario: '{scenario}' for stream {stream_id}, topic '{original_topic}'.")
         shared_audio_dir = vfa_config.get('VFA_SHARED_AUDIO_DIR')
-        os.makedirs(shared_audio_dir, exist_ok=True)
 
-        # Create a small dummy MP3 file (very basic - not a valid MP3 header but enough for file existence)
-        file_extension = f".{used_tts_settings['audio_encoding'].lower()}" if used_tts_settings['audio_encoding'] else ".mp3"
-        dummy_filename = f"aethercast_audio_testmode_{stream_id}_{uuid.uuid4().hex[:6]}{file_extension}"
-        dummy_filepath = os.path.join(shared_audio_dir, dummy_filename)
+        if scenario == 'vfa_error_tts':
+            return {
+                "status": "error", "message": VFA_TEST_SCENARIO_TTS_ERROR_MSG,
+                "audio_filepath": None, "stream_id": stream_id,
+                "script_char_count": len(str(script_input)), "engine_used": "test_mode_tts_api_error",
+                "tts_settings_used": used_tts_settings
+            }
 
+        # For default success and file_save_error, we attempt to create the directory and dummy file.
         try:
+            os.makedirs(shared_audio_dir, exist_ok=True)
+            file_extension = f".{used_tts_settings['audio_encoding'].lower()}" if used_tts_settings['audio_encoding'] else ".mp3"
+            dummy_filename = f"aethercast_audio_testmode_{stream_id}_{uuid.uuid4().hex[:6]}{file_extension}"
+            dummy_filepath = os.path.join(shared_audio_dir, dummy_filename)
+
+            if scenario == 'vfa_error_file_save':
+                # Don't actually write the file, or simulate write failure after this block
+                logger.info(f"[VFA_MAIN_LOGIC] Test mode (vfa_error_file_save): Simulating file save error for path {dummy_filepath}")
+                return {
+                    "status": "error", "message": VFA_TEST_SCENARIO_FILE_SAVE_ERROR_MSG,
+                    "audio_filepath": dummy_filepath, # Filepath might be determined but saving fails
+                    "stream_id": stream_id,
+                    "script_char_count": len(str(script_input)), "engine_used": "test_mode_tts_file_error",
+                    "tts_settings_used": used_tts_settings
+                }
+
+            # Default success scenario
             with open(dummy_filepath, "wb") as f:
-                f.write(b"ID3\x03\x00\x00\x00\x00\x0fThis is a test MP3 file.") # Minimal dummy MP3 like content
-            logger.info(f"[VFA_MAIN_LOGIC] Test mode: Created dummy audio file at {dummy_filepath}")
+                f.write(b"ID3\x03\x00\x00\x00\x00\x0fThis is a test MP3 file.")
+            logger.info(f"[VFA_MAIN_LOGIC] Test mode (default): Created dummy audio file at {dummy_filepath}")
             return {
                 "status": "success",
                 "message": "Audio successfully synthesized (TEST MODE - dummy file).",
                 "audio_filepath": dummy_filepath,
                 "stream_id": stream_id,
                 "audio_format": used_tts_settings['audio_encoding'].lower(),
-                "script_char_count": len(str(script_input)), # Approximate length
-                "engine_used": "test_mode_tts",
+                "script_char_count": len(str(script_input)),
+                "engine_used": "test_mode_tts_success",
                 "tts_settings_used": used_tts_settings
             }
-        except IOError as e:
-            logger.error(f"[VFA_MAIN_LOGIC] Test mode: Failed to create dummy audio file: {e}")
+        except IOError as e: # Covers makedirs error or error during open() for default success
+            logger.error(f"[VFA_MAIN_LOGIC] Test mode: Failed during directory/file operation: {e}")
             return {
-                "status": "error", "message": f"Test mode failed to create dummy file: {e}",
+                "status": "error", "message": f"Test mode failed during disk op: {e}",
                 "audio_filepath": None, "stream_id": stream_id,
-                "script_char_count": 0, "engine_used": "test_mode_tts_error",
+                "script_char_count": 0, "engine_used": "test_mode_tts_io_error",
                 "tts_settings_used": used_tts_settings
             }
 

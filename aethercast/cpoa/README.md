@@ -81,7 +81,13 @@ python -m unittest discover aethercast/cpoa/tests
 ## Database Interaction & Output Structure
 
 -   CPOA expects the API Gateway to create an initial record for a podcast task in the shared database.
--   CPOA's `orchestrate_podcast_generation` function receives a `task_id` (which is the `podcast_id`), `db_path`, optional `voice_params_input`, and an optional `client_id` from the API Gateway.
+-   CPOA's `orchestrate_podcast_generation` function receives:
+    -   `task_id` (which is the `podcast_id`)
+    -   `db_path`
+    -   `voice_params_input` (optional): Specific voice parameters for this generation task.
+    -   `client_id` (optional): For sending UI updates via ASF.
+    -   `user_preferences` (optional, dict): User-specific preferences (e.g., preferred VFA voice name) fetched by the API Gateway. CPOA uses these to influence agent calls if not overridden by direct inputs (e.g., `voice_params_input`). For example, `user_preferences["preferred_vfa_voice_name"]` can set the voice if `voice_params_input` doesn't specify one.
+    -   `test_scenarios` (optional, dict): For integration testing. Allows specifying test scenarios for downstream services (e.g., `{"pswa": "insufficient_content"}`). CPOA passes these as `X-Test-Scenario` headers to the respective services.
 -   If `client_id` is provided, CPOA will attempt to send status updates (e.g., "Fetching content...", "Synthesizing audio...", "Task completed/failed") to the configured `CPOA_ASF_SEND_UI_UPDATE_URL`. These updates are intended to be relayed by ASF to the specific frontend client.
 -   During its operation, CPOA updates the `cpoa_status`, `cpoa_error_message`, and `last_updated_timestamp` fields of the existing record in the `podcasts` table using its internal `_update_task_status_in_db` function.
 -   The final dictionary returned by `orchestrate_podcast_generation` provides comprehensive details for the API Gateway. This includes:
@@ -95,5 +101,6 @@ python -m unittest discover aethercast/cpoa/tests
         -   `stream_id`: The stream ID for ASF.
         -   `tts_settings_used`: A dictionary of the actual TTS settings (voice name, language, rate, pitch, encoding) that VFA used for synthesis. This is passed through from VFA's response.
     -   `orchestration_log`: A detailed log of the orchestration steps.
+-   The `orchestrate_topic_exploration` function also accepts `user_preferences` and `test_scenarios` for similar logging and potential future use, though `test_scenarios` are not currently passed to TDA/SCA by this function.
 -   The `script` CPOA receives from PSWA and sends to VFA is a structured JSON object.
 ```

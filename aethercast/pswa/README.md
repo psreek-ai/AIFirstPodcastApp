@@ -62,6 +62,32 @@ Then, edit the `.env` file. The following variables are used:
     -   *Default (in code):* `true`
 -   `PSWA_SCRIPT_CACHE_MAX_AGE_HOURS`: Maximum age (in hours) for a cached script to be considered fresh and usable.
     -   *Default (in code):* `720` (which is 30 days)
+-   `PSWA_TEST_MODE_ENABLED`: Set to `true` to enable a simplified test mode that bypasses LLM calls and returns predefined script data. Useful for integration testing of downstream services without actual LLM costs or variability. See "Testing" section for more details.
+    -   *Default (in code):* `false`
+
+## Testing
+
+When `PSWA_TEST_MODE_ENABLED` is set to `true`, the `/weave_script` endpoint behaves differently:
+- It does not call the actual LLM service.
+- It returns predefined, structured script data based on an optional `X-Test-Scenario` HTTP header provided in the request:
+    - **No header or `default`**: Returns a standard, successful script structure (`SCENARIO_DEFAULT_SCRIPT_CONTENT`). The title and intro will be dynamically updated with the provided topic.
+    - **`X-Test-Scenario: insufficient_content`**: Returns a JSON structure indicating an "Insufficient content" error, as if the LLM determined it couldn't generate a script:
+      ```json
+      {
+          "script_id": "pswa_script_test_insufficient_content_...",
+          "topic": "Your Topic",
+          "llm_model_used": "test-mode-model",
+          "source": "test_mode_scenario_insufficient_content",
+          "error": "Insufficient content",
+          "message": "Test scenario: Insufficient content for the provided topic. Topic: Your Topic",
+          "full_raw_script": "{\"error\": \"Insufficient content\", ...}"
+      }
+      ```
+      The API Gateway endpoint (`/weave_script`) will typically convert this into an HTTP 400 error for CPOA.
+    - **`X-Test-Scenario: empty_segments`**: Returns a script with a title, intro, and outro, but the main `segments` list is empty (`SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT`).
+- The `source` field in the returned JSON will indicate the test scenario used (e.g., `"source": "test_mode_scenario_insufficient_content"`).
+
+This test mode is intended for integration tests to verify how CPOA and other downstream services handle different types of script outputs or error conditions from PSWA.
 
 ## Dependencies
 

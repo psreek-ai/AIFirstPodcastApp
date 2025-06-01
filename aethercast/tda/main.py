@@ -43,9 +43,9 @@ logging.info("--- End TDA Configuration ---")
 
 # Startup Check for API Key
 if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
-    logging.error("CRITICAL: USE_REAL_NEWS_API is True, but TDA_NEWS_API_KEY is not set. Real News API calls will fail.")
-    # Optionally, raise an error to prevent startup without API key:
-    # raise ValueError("TDA_NEWS_API_KEY is required when USE_REAL_NEWS_API is True")
+    error_message = "CRITICAL: USE_REAL_NEWS_API is True, but TDA_NEWS_API_KEY is not set. Real News API calls will fail. Please set TDA_NEWS_API_KEY."
+    logging.error(error_message)
+    raise ValueError(error_message)
 else:
     # This specific logging about API usage is fine here, complements the general config log.
     if tda_config["USE_REAL_NEWS_API"] and tda_config["TDA_NEWS_API_KEY"]:
@@ -55,6 +55,12 @@ else:
         logging.warning("TDA is configured to use REAL News API but KEY IS MISSING.")
     else:
         logging.info("TDA is configured to use SIMULATED data sources.")
+
+# --- Constants ---
+DB_TYPE_TOPIC = "topic"
+SOURCE_FEED_NEWS_API = "news_api_org"
+ENDPOINT_ERROR_INTERNAL_SERVER_TDA = "INTERNAL_SERVER_ERROR_TDA"
+NEWS_API_STATUS_OK = "ok"
 
 app = flask.Flask(__name__)
 
@@ -91,7 +97,7 @@ def _save_topic_to_db(topic_object: dict, db_path: str):
             """,
             (
                 topic_object.get("topic_id"),
-                'topic', # type
+                DB_TYPE_TOPIC, # type
                 topic_object.get("title_suggestion"),
                 topic_object.get("summary"),
                 keywords_json,
@@ -169,7 +175,7 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
         
         response_json = response.json()
 
-        if response_json.get("status") != "ok":
+        if response_json.get("status") != NEWS_API_STATUS_OK:
             logging.error(f"NewsAPI returned error status: {response_json.get('status')}. Message: {response_json.get('message')}")
             return []
 
@@ -198,7 +204,7 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
 
             topic_object = {
                 "topic_id": generate_topic_id(), # This will be 'id' in DB
-                "source_feed_name": "news_api_org",
+                "source_feed_name": SOURCE_FEED_NEWS_API,
                 "title_suggestion": title, # This will be 'title' in DB
                 "summary": summary_text,
                 "keywords": topic_keywords,
@@ -419,8 +425,8 @@ def discover_topics_endpoint():
         return flask.jsonify(response_data), 200
 
     except Exception as e:
-        logging.error(f"Error in /discover_topics endpoint: {e}")
-        return flask.jsonify({"error": "Internal server error during topic discovery"}), 500
+        logging.error(f"Error in /discover_topics endpoint: {e}", exc_info=True)
+        return flask.jsonify({"error": ENDPOINT_ERROR_INTERNAL_SERVER_TDA, "details": str(e)}), 500
 
 if __name__ == "__main__":
     # In a real deployment, use a proper WSGI server like Gunicorn or uWSGI

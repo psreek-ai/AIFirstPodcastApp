@@ -133,6 +133,123 @@ class TestFullPodcastFlow(unittest.TestCase):
 
         print(f"[INFO] Test test_successful_podcast_generation_in_test_modes for {podcast_id} PASSED.")
 
+    def test_podcast_generation_pswa_insufficient_content(self):
+        """
+        Tests podcast generation where PSWA is instructed (via test_scenarios)
+        to return an 'insufficient content' error.
+        """
+        client_id = f"test_client_pswa_fail_{uuid.uuid4().hex}"
+        topic = "PSWA Insufficient Content Scenario"
+        print(f"\n[INFO] Starting test_podcast_generation_pswa_insufficient_content for topic: '{topic}' with client_id: {client_id}")
+
+        initiate_payload = {
+            "topic": topic,
+            "client_id": client_id,
+            "test_scenarios": {"pswa": "insufficient_content"}
+        }
+        print(f"[INFO] POST {API_GATEWAY_BASE_URL}/podcasts with payload: {initiate_payload}")
+        initiate_response = requests.post(f"{API_GATEWAY_BASE_URL}/podcasts", json=initiate_payload, timeout=30)
+
+        self.assertIn(initiate_response.status_code, [200, 201],
+                      f"Initiate request failed: {initiate_response.status_code} - {initiate_response.text}")
+
+        init_data = initiate_response.json()
+        podcast_id = init_data["podcast_id"]
+        print(f"[INFO] Podcast task initiated for PSWA failure test. Podcast ID: {podcast_id}")
+
+        max_polls = 20
+        poll_interval_seconds = 3
+        failed_as_expected = False
+        final_status_data = None
+        current_status = "unknown"
+
+        for i in range(max_polls):
+            print(f"[INFO] Polling PSWA failure test ({i+1}/{max_polls}) for {podcast_id}...")
+            poll_response = requests.get(f"{API_GATEWAY_BASE_URL}/podcasts/{podcast_id}", timeout=10)
+            self.assertEqual(poll_response.status_code, 200)
+            poll_data = poll_response.json()
+            current_status = poll_data.get("status")
+            print(f"[INFO] Current status: {current_status}")
+
+            # PSWA's "insufficient_content" scenario returns a JSON error that PSWA endpoint turns into HTTP 400.
+            # CPOA catches this HTTP 400 and sets its status to "failed_pswa_request_exception".
+            if current_status == "failed_pswa_request_exception":
+                failed_as_expected = True
+                final_status_data = poll_data
+                print(f"[INFO] PSWA failure correctly processed for {podcast_id}.")
+                break
+            elif current_status == "completed" or (current_status and "failed" in current_status and current_status != "failed_pswa_request_exception"):
+                self.fail(f"Podcast generation reached unexpected status: {current_status}. Error: {poll_data.get('error_message')}")
+            time.sleep(poll_interval_seconds)
+
+        self.assertTrue(failed_as_expected, f"Podcast did not fail as expected for PSWA insufficient content. Last status: {current_status}")
+        self.assertIsNotNone(final_status_data)
+        # CPOA's error message for a failed HTTP request from PSWA will include details about the HTTP status.
+        self.assertIn("PSWA service call failed (HTTP status: 400", final_status_data.get("error_message", ""),
+                      "Error message from CPOA not as expected for PSWA insufficient content")
+        self.assertIn("LLM indicated content was insufficient", final_status_data.get("error_message", ""),
+                      "Original PSWA error not found in CPOA message")
+        print(f"[INFO] Test test_podcast_generation_pswa_insufficient_content for {podcast_id} PASSED.")
+
+
+    def test_podcast_generation_vfa_tts_error(self):
+        """
+        Tests podcast generation where VFA is instructed (via test_scenarios)
+        to return a TTS error.
+        """
+        client_id = f"test_client_vfa_fail_{uuid.uuid4().hex}"
+        topic = "VFA TTS Error Scenario"
+        print(f"\n[INFO] Starting test_podcast_generation_vfa_tts_error for topic: '{topic}' with client_id: {client_id}")
+
+        initiate_payload = {
+            "topic": topic,
+            "client_id": client_id,
+            "test_scenarios": {"vfa": "vfa_error_tts"} # PSWA will be default success
+        }
+        print(f"[INFO] POST {API_GATEWAY_BASE_URL}/podcasts with payload: {initiate_payload}")
+        initiate_response = requests.post(f"{API_GATEWAY_BASE_URL}/podcasts", json=initiate_payload, timeout=30)
+
+        self.assertIn(initiate_response.status_code, [200, 201],
+                      f"Initiate request failed: {initiate_response.status_code} - {initiate_response.text}")
+
+        init_data = initiate_response.json()
+        podcast_id = init_data["podcast_id"]
+        print(f"[INFO] Podcast task initiated for VFA TTS error test. Podcast ID: {podcast_id}")
+
+        max_polls = 20
+        poll_interval_seconds = 3
+        failed_as_expected = False
+        final_status_data = None
+        current_status = "unknown"
+
+        for i in range(max_polls):
+            print(f"[INFO] Polling VFA TTS error test ({i+1}/{max_polls}) for {podcast_id}...")
+            poll_response = requests.get(f"{API_GATEWAY_BASE_URL}/podcasts/{podcast_id}", timeout=10)
+            self.assertEqual(poll_response.status_code, 200)
+            poll_data = poll_response.json()
+            current_status = poll_data.get("status")
+            print(f"[INFO] Current status: {current_status}")
+
+            # VFA test mode for 'vfa_error_tts' returns HTTP 500 to CPOA.
+            # CPOA then sets status to CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION.
+            if current_status == "failed_vfa_request_exception":
+                failed_as_expected = True
+                final_status_data = poll_data
+                print(f"[INFO] VFA TTS failure correctly processed for {podcast_id}.")
+                break
+            elif current_status == "completed" or (current_status and "failed" in current_status and current_status != "failed_vfa_request_exception"):
+                self.fail(f"Podcast generation reached unexpected status: {current_status}. Error: {poll_data.get('error_message')}")
+            time.sleep(poll_interval_seconds)
+
+        self.assertTrue(failed_as_expected, f"Podcast did not fail as expected for VFA TTS error. Last status: {current_status}")
+        self.assertIsNotNone(final_status_data)
+        self.assertIn("VFA service call failed (HTTP status: 500", final_status_data.get("error_message", ""),
+                      "Error message from CPOA not as expected for VFA TTS error")
+        # VFA's specific message for this scenario is "Test scenario: Simulated TTS API error from VFA."
+        self.assertIn("Test scenario: Simulated TTS API error from VFA.", final_status_data.get("error_message", ""),
+                      "Original VFA error message not found in CPOA's error message")
+        print(f"[INFO] Test test_podcast_generation_vfa_tts_error for {podcast_id} PASSED.")
+
 
 if __name__ == "__main__":
     # This allows running the integration test directly.

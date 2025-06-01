@@ -115,7 +115,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         self.db_path_patch.start()
         self.retry_count_patch.start()
         self.backoff_patch.start()
-        
+
         # Ensure WCHA is considered imported successfully for most tests
         self.wcha_import_patch = patch.object(cpoa_main, 'WCHA_IMPORT_SUCCESSFUL', True)
         self.mock_wcha_import = self.wcha_import_patch.start()
@@ -147,7 +147,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         }
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = mock_pswa_structured_script
-        
+
         mock_vfa_response_data = {
             "status": "success", "audio_filepath": "/shared/audio/podcast_123.mp3",
             "stream_id": "stream_abc",
@@ -170,9 +170,9 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             return MagicMock(status_code=404)
         mock_requests_retry.side_effect = requests_side_effect
         client_id_test = "client_test_success"
-        result = cpoa_main.orchestrate_podcast_generation("Test Topic", "task_podcast_001", "dummy.db", client_id=client_id_test)
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic", "task_podcast_001", "dummy.db", client_id=client_id_test, user_preferences=None)
 
-        self.assertEqual(result['status'], "completed")
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED) # Use constant
         self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-TEST-Voice")
         self.assertTrue(result['asf_notification_status'].startswith("ASF notified successfully"))
 
@@ -200,7 +200,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         mock_pswa_response.json.return_value = mock_pswa_structured_script
 
         custom_voice_params = {"voice_name": "en-GB-Standard-A", "speaking_rate": 0.9, "pitch": -2.0}
-        
+
         # VFA response should reflect that it used these custom params
         mock_vfa_response_data_custom = {
             "status": "success", "audio_filepath": "/custom/audio.mp3", "stream_id": "stream_custom",
@@ -228,9 +228,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         result = cpoa_main.orchestrate_podcast_generation(
             "Custom Voice Topic", "task_custom_voice_001", "dummy.db",
             voice_params_input=custom_voice_params,
-            client_id=client_id_test_vp
+            client_id=client_id_test_vp,
+            user_preferences=None # Explicitly None for this test
         )
-        self.assertEqual(result['status'], "completed")
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED) # Use constant
         self.assertIn("tts_settings_used", result['final_audio_details'])
         mock_send_ui_update.assert_called() # Check that it was called, specific calls can be added if needed
         self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-GB-Standard-A")
@@ -241,18 +242,27 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, '_update_task_status_in_db')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_wcha_failure_returns_error_string(self, mock_get_content, mock_update_db, mock_send_ui_update):
+        mock_get_content.return_value = f"{cpoa_main.ERROR_WCHA_NO_SEARCH_RESULTS}: Obscure Topic" # Use constant from wcha via cpoa import if available, or define in cpoa
+        # For this test, assuming CPOA itself might have or relay specific prefixes it checks from WCHA
+        # Let's assume cpoa_main.WCHA_ERROR_INDICATORS includes the base string "WCHA: No search results"
+        # For a more robust test, we'd mock WCHA_ERROR_INDICATORS or ensure `cpoa_main.ERROR_WCHA_NO_SEARCH_RESULTS` is defined and used.
+        # For now, I'll use a direct string that matches CPOA's current logic.
+        # If CPOA's WCHA_ERROR_INDICATORS tuple is accessible, use that.
+        # Rechecking cpoa_main.py, WCHA_ERROR_INDICATORS is global there.
+        # So, we can use one of its elements if it's specific enough.
+        # "WCHA: No search results" is a specific string.
         mock_get_content.return_value = "WCHA: No search results found for topic: Obscure Topic"
         client_id_wcha_fail = "client_wcha_fail"
-        result = cpoa_main.orchestrate_podcast_generation("Obscure Topic", "task_wcha_fail_001", "dummy.db", client_id=client_id_wcha_fail)
+        result = cpoa_main.orchestrate_podcast_generation("Obscure Topic", "task_wcha_fail_001", "dummy.db", client_id=client_id_wcha_fail, user_preferences=None)
 
-        self.assertEqual(result['status'], "failed_wcha_content_harvest")
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST) # Use constant
         self.assertIn("WCHA: No search results", result['error_message'])
         # Check UI update for error
-        mock_send_ui_update.assert_any_call(client_id_wcha_fail, "task_error", {"message": result['error_message'], "stage": "wcha_content_retrieval"})
-        
+        mock_send_ui_update.assert_any_call(client_id_wcha_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_WCHA})
+
         last_call_args = mock_update_db.call_args_list[-1][0]
         self.assertEqual(last_call_args[1], "task_wcha_fail_001")
-        self.assertEqual(last_call_args[2], "failed_wcha_content_harvest")
+        self.assertEqual(last_call_args[2], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST)
         self.assertIn("WCHA: No search results", last_call_args[3])
 
 
@@ -262,12 +272,12 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_pswa_http_error(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
         mock_get_content.return_value = "Some content"
-        
+
         mock_pswa_error_response = MagicMock()
         mock_pswa_error_response.status_code = 503 # Simulate a server error from PSWA
         mock_pswa_error_response.json.return_value = {"error": "PSWA service overloaded"}
         mock_pswa_error_response.text = '{"error": "PSWA service overloaded"}'
-        
+
         # Configure requests_with_retry for PSWA to raise HTTPError
         # Need to ensure it's raised only for PSWA call if other calls exist in the same test scope for mock_requests_retry
         def selective_pswa_fail_side_effect(method, url, **kwargs):
@@ -280,13 +290,13 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         mock_requests_retry.side_effect = selective_pswa_fail_side_effect
         client_id_pswa_fail = "client_pswa_fail"
 
-        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Fail", "task_pswa_fail_001", "dummy.db", client_id=client_id_pswa_fail)
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Fail", "task_pswa_fail_001", "dummy.db", client_id=client_id_pswa_fail, user_preferences=None)
 
-        self.assertEqual(result['status'], "failed_pswa_request_exception")
-        self.assertIn("PSWA service call failed", result['error_message']) # Removed "after retries" as it's part of the generic message now
-        mock_send_ui_update.assert_any_call(client_id_pswa_fail, "task_error", {"message": result['error_message'], "stage": "pswa_script_generation"})
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION) # Use constant
+        self.assertIn("PSWA service call failed", result['error_message'])
+        mock_send_ui_update.assert_any_call(client_id_pswa_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_PSWA})
         self.assertIn("503", result['error_message'])
-        
+
         # Ensure PSWA call was attempted
         pswa_attempted = any(call[0][1] == cpoa_main.PSWA_SERVICE_URL for call in mock_requests_retry.call_args_list)
         self.assertTrue(pswa_attempted, "requests_with_retry was not called for PSWA URL")
@@ -310,13 +320,13 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         # This mock_requests_retry will only be for the PSWA call in this test.
         mock_requests_retry.return_value = mock_pswa_malformed_response
 
-        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Malformed Segments", "task_pswa_malformed_seg_001", "dummy.db")
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Malformed Segments", "task_pswa_malformed_seg_001", "dummy.db", user_preferences=None)
 
-        self.assertEqual(result['status'], "failed_pswa_bad_script_structure")
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE) # Use constant
         self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
 
         last_db_call_args = mock_update_db.call_args_list[-1][0] # Check the final status update to DB
-        self.assertEqual(last_db_call_args[2], "failed_pswa_bad_script_structure")
+        self.assertEqual(last_db_call_args[2], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE)
 
     @patch.object(cpoa_main, '_send_ui_update')
     @patch.object(cpoa_main, '_update_task_status_in_db')
@@ -332,13 +342,13 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         }
         mock_requests_retry.return_value = mock_pswa_malformed_response_missing_id
 
-        result = cpoa_main.orchestrate_podcast_generation("Test PSWA Malformed ID", "task_pswa_malformed_id_001", "dummy.db")
+        result = cpoa_main.orchestrate_podcast_generation("Test PSWA Malformed ID", "task_pswa_malformed_id_001", "dummy.db", user_preferences=None)
 
-        self.assertEqual(result['status'], "failed_pswa_bad_script_structure")
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE) # Use constant
         self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
 
         last_db_call_args = mock_update_db.call_args_list[-1][0]
-        self.assertEqual(last_db_call_args[2], "failed_pswa_bad_script_structure")
+        self.assertEqual(last_db_call_args[2], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE)
 
     @patch.object(cpoa_main, '_send_ui_update')
     @patch.object(cpoa_main, '_update_task_status_in_db')
@@ -370,18 +380,18 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             return MagicMock(status_code=404)
         mock_requests_retry.side_effect = requests_side_effect
         client_id_vfa_fail = "client_vfa_fail"
-        result = cpoa_main.orchestrate_podcast_generation("Test Topic VFA Fail", "task_vfa_fail_001", "dummy.db", client_id=client_id_vfa_fail)
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic VFA Fail", "task_vfa_fail_001", "dummy.db", client_id=client_id_vfa_fail, user_preferences=None)
 
-        self.assertEqual(result['status'], "failed_vfa_request_exception")
-        self.assertIn("VFA service call failed", result['error_message']) # Removed "after retries"
-        mock_send_ui_update.assert_any_call(client_id_vfa_fail, "task_error", {"message": result['error_message'], "stage": "vfa_audio_generation"})
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION) # Use constant
+        self.assertIn("VFA service call failed", result['error_message'])
+        mock_send_ui_update.assert_any_call(client_id_vfa_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_VFA})
         self.assertIn("500", result['error_message'])
 
         # Check that PSWA was called, then VFA was attempted
         self.assertGreaterEqual(mock_requests_retry.call_count, 2) # At least PSWA and VFA attempt(s)
-        
+
         last_db_call_args = mock_update_db.call_args_list[-1][0]
-        self.assertEqual(last_db_call_args[2], "failed_vfa_request_exception")
+        self.assertEqual(last_db_call_args[2], cpoa_main.CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION)
 
 
     @patch.object(cpoa_main, '_send_ui_update')
@@ -390,7 +400,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_asf_notification_failure(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
         mock_get_content.return_value = "Content for ASF test"
-        
+
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = {"script_text": "Script for ASF test"}
 
@@ -400,7 +410,7 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             "audio_filepath": "/shared/audio/asf_test.mp3",
             "stream_id": "stream_asf_test"
         }
-        
+
         # Mock ASF call to raise RequestException (e.g., connection error)
         mock_asf_error_response = MagicMock(status_code=500) # for HTTPError case if not ConnectionError
         mock_asf_error_response.json.return_value = {"error": "ASF connection failed"}
@@ -414,16 +424,16 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             return MagicMock(status_code=404)
         mock_requests_retry.side_effect = requests_side_effect
         client_id_asf_fail = "client_asf_fail"
-        result = cpoa_main.orchestrate_podcast_generation("Test Topic ASF Fail", "task_asf_fail_001", "dummy.db", client_id=client_id_asf_fail)
+        result = cpoa_main.orchestrate_podcast_generation("Test Topic ASF Fail", "task_asf_fail_001", "dummy.db", client_id=client_id_asf_fail, user_preferences=None)
 
-        self.assertEqual(result['status'], "completed_with_asf_notification_failure")
-        self.assertIn("ASF notification failed", result['error_message']) # Removed "after retries"
-        mock_send_ui_update.assert_any_call(client_id_asf_fail, "task_error", {"message": result['error_message'], "final_status": "completed_with_asf_notification_failure"})
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE) # Use constant
+        self.assertIn("ASF notification failed", result['error_message'])
+        mock_send_ui_update.assert_any_call(client_id_asf_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "final_status": cpoa_main.CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE})
         self.assertIn("ConnectionError", result['error_message'])
         self.assertIsNotNone(result['final_audio_details'].get('audio_filepath')) # Audio generation was successful
 
         last_db_call_args = mock_update_db.call_args_list[-1][0]
-        self.assertEqual(last_db_call_args[2], "completed_with_asf_notification_failure")
+        self.assertEqual(last_db_call_args[2], cpoa_main.CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE)
         self.assertIn("ASF notification failed", last_db_call_args[3]) # error_msg in DB
 
 
@@ -434,14 +444,14 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         with patch.object(cpoa_main, 'WCHA_IMPORT_SUCCESSFUL', False):
             with patch.object(cpoa_main, 'WCHA_MISSING_IMPORT_ERROR', "Simulated WCHA import error"):
                 client_id_wcha_import_fail = "client_wcha_import_fail"
-                result = cpoa_main.orchestrate_podcast_generation("Test Topic WCHA Import Fail", "task_wcha_import_fail", "dummy.db", client_id=client_id_wcha_import_fail)
+                result = cpoa_main.orchestrate_podcast_generation("Test Topic WCHA Import Fail", "task_wcha_import_fail", "dummy.db", client_id=client_id_wcha_import_fail, user_preferences=None)
 
-                self.assertEqual(result['status'], "failed_wcha_module_error")
+                self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_MODULE_ERROR) # Use constant
                 self.assertIn("Simulated WCHA import error", result['error_message'])
-                mock_send_ui_update.assert_called_with(client_id_wcha_import_fail, "task_error", {"message": "Simulated WCHA import error", "stage": "initialization_failure"})
+                mock_send_ui_update.assert_called_with(client_id_wcha_import_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": "Simulated WCHA import error", "stage": cpoa_main.ORCHESTRATION_STAGE_INITIALIZATION_FAILURE})
 
                 last_db_call_args = mock_update_db.call_args_list[-1][0]
-                self.assertEqual(last_db_call_args[2], "failed_wcha_module_error")
+                self.assertEqual(last_db_call_args[2], cpoa_main.CPOA_STATUS_FAILED_WCHA_MODULE_ERROR)
                 self.assertIn("Simulated WCHA import error", last_db_call_args[3])
 
     @patch.object(cpoa_main, '_send_ui_update')
@@ -474,9 +484,9 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         client_id_ui_send_fail = "client_ui_send_fail"
         with patch.object(cpoa_main.logger, 'error') as mock_logger_error:
-            result = cpoa_main.orchestrate_podcast_generation("UI Send Fail Topic", "task_ui_send_fail", "dummy.db", client_id=client_id_ui_send_fail)
+            result = cpoa_main.orchestrate_podcast_generation("UI Send Fail Topic", "task_ui_send_fail", "dummy.db", client_id=client_id_ui_send_fail, user_preferences=None)
 
-            self.assertEqual(result['status'], "completed") # Main orchestration should still complete
+            self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED) # Main orchestration should still complete
 
             # Check that logger.error was called due to _send_ui_update failure
             # The _send_ui_update function has its own logger.error call.
@@ -515,6 +525,120 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         # So, we check it wasn't called in a way that would make requests.
         for call_args in mock_send_ui_update.call_args_list:
             self.assertIsNone(call_args[0][0]) # client_id argument should be None
+
+    @patch.object(cpoa_main, '_send_ui_update')
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_orchestration_uses_voice_preference_from_user_prefs(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
+        mock_get_content.return_value = "Content for voice preference test."
+        mock_pswa_script = {"script_id": "s_voice_pref", "title": "Voice Pref Test", "segments": [{"content":"test"}]}
+        mock_pswa_response = MagicMock(status_code=200, json=lambda: mock_pswa_script)
+
+        # VFA should be called with preferred voice name
+        preferred_voice = "en-US-PreferredVoice"
+        user_prefs = {cpoa_main.PREF_KEY_VFA_VOICE_NAME: preferred_voice}
+
+        # Mock VFA to check params and return success
+        mock_vfa_response_data = {"status": "success", "audio_filepath": "/audio_pref.mp3", "stream_id": "st_pref", "tts_settings_used": {"voice_name": preferred_voice}}
+        mock_vfa_response = MagicMock(status_code=200, json=lambda: mock_vfa_response_data)
+
+        mock_asf_response = MagicMock(status_code=200, json=lambda: {"message": "ASF notified"})
+
+        def service_calls_side_effect(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL:
+                return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL:
+                self.assertIn("json", kwargs)
+                self.assertIn("voice_params", kwargs["json"])
+                self.assertEqual(kwargs["json"]["voice_params"]["voice_name"], preferred_voice)
+                # Other params should be default if not in user_prefs or voice_params_input
+                return mock_vfa_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL:
+                return mock_asf_response
+            return MagicMock(status_code=404)
+        mock_requests_retry.side_effect = service_calls_side_effect
+
+        result = cpoa_main.orchestrate_podcast_generation(
+            "Voice Pref Topic", "task_voice_pref", "dummy.db",
+            voice_params_input=None, # Crucial: no direct voice params
+            user_preferences=user_prefs
+        )
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], preferred_voice)
+
+    @patch.object(cpoa_main, '_send_ui_update')
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_orchestration_direct_voice_params_override_user_prefs(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
+        mock_get_content.return_value = "Content for voice param override test."
+        mock_pswa_script = {"script_id": "s_override", "title": "Override Test", "segments": [{"content":"test"}]}
+        mock_pswa_response = MagicMock(status_code=200, json=lambda: mock_pswa_script)
+
+        direct_voice_params = {"voice_name": "en-GB-OverrideDirect"}
+        user_prefs_ignored = {cpoa_main.PREF_KEY_VFA_VOICE_NAME: "en-US-IgnoredPreference"}
+
+        mock_vfa_response_data = {"status": "success", "audio_filepath": "/audio_override.mp3", "stream_id": "st_override", "tts_settings_used": direct_voice_params}
+        mock_vfa_response = MagicMock(status_code=200, json=lambda: mock_vfa_response_data)
+        mock_asf_response = MagicMock(status_code=200, json=lambda: {"message": "ASF notified"})
+
+        def service_calls_side_effect(method, url, **kwargs):
+            if url == cpoa_main.PSWA_SERVICE_URL: return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL:
+                self.assertIn("json", kwargs)
+                self.assertIn("voice_params", kwargs["json"])
+                self.assertEqual(kwargs["json"]["voice_params"]["voice_name"], "en-GB-OverrideDirect") # Direct param takes precedence
+                return mock_vfa_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL: return mock_asf_response
+            return MagicMock(status_code=404)
+        mock_requests_retry.side_effect = service_calls_side_effect
+
+        result = cpoa_main.orchestrate_podcast_generation(
+            "Override Test Topic", "task_override", "dummy.db",
+            voice_params_input=direct_voice_params,
+            user_preferences=user_prefs_ignored
+        )
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-GB-OverrideDirect")
+
+    @patch.object(cpoa_main, '_send_ui_update')
+    @patch.object(cpoa_main, '_update_task_status_in_db')
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'get_content_for_topic')
+    def test_orchestration_passes_test_scenario_headers(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
+        mock_get_content.return_value = "Content for test scenario header test."
+        mock_pswa_script = {"script_id": "s_scenario", "title": "Scenario Test", "segments": [{"content":"test"}]}
+        mock_pswa_response = MagicMock(status_code=200, json=lambda: mock_pswa_script)
+
+        mock_vfa_response_data = {"status": "success", "audio_filepath": "/audio_scenario.mp3", "stream_id": "st_scenario", "tts_settings_used": {}}
+        mock_vfa_response = MagicMock(status_code=200, json=lambda: mock_vfa_response_data)
+
+        mock_asf_response = MagicMock(status_code=200, json=lambda: {"message": "ASF notified"})
+
+        test_scenarios_payload = {"pswa": "insufficient_content", "vfa": "vfa_error_tts"}
+
+        def service_calls_side_effect(method, url, **kwargs):
+            headers = kwargs.get("headers", {})
+            if url == cpoa_main.PSWA_SERVICE_URL:
+                self.assertEqual(headers.get('X-Test-Scenario'), "insufficient_content")
+                return mock_pswa_response
+            if url == cpoa_main.VFA_SERVICE_URL:
+                self.assertEqual(headers.get('X-Test-Scenario'), "vfa_error_tts")
+                return mock_vfa_response
+            if url == cpoa_main.ASF_NOTIFICATION_URL:
+                return mock_asf_response
+            return MagicMock(status_code=404)
+        mock_requests_retry.side_effect = service_calls_side_effect
+
+        result = cpoa_main.orchestrate_podcast_generation(
+            "Scenario Header Test", "task_scenario_header", "dummy.db",
+            test_scenarios=test_scenarios_payload
+        )
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        # Verify requests_with_retry was called for PSWA and VFA
+        self.assertTrue(any(call[0][1] == cpoa_main.PSWA_SERVICE_URL for call in mock_requests_retry.call_args_list))
+        self.assertTrue(any(call[0][1] == cpoa_main.VFA_SERVICE_URL for call in mock_requests_retry.call_args_list))
 
 
 class TestOrchestrateSnippetGeneration(unittest.TestCase):
@@ -567,6 +691,179 @@ class TestOrchestrateSnippetGeneration(unittest.TestCase):
         self.assertEqual(result["error"], "SCA_CALL_FAILED_AFTER_RETRIES")
         self.assertIn("SCA service call failed", result["details"])
         self.assertEqual(mock_requests_retry.call_count, 1) # Retry count is 1
+
+
+class TestGetTopicDetailsFromDb(unittest.TestCase):
+    @patch('sqlite3.connect')
+    def test_get_topic_success(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        # Simulate a row being found
+        mock_row = {"id": "topic123", "title": "Test Topic", "keywords": '["kw1", "kw2"]', "type": "topic"}
+        mock_cursor.fetchone.return_value = mock_row
+
+        result = cpoa_main._get_topic_details_from_db("dummy.db", "topic123")
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["title"], "Test Topic")
+        self.assertEqual(result["keywords"], ["kw1", "kw2"]) # Check JSON deserialization
+        mock_cursor.execute.assert_called_once_with("SELECT * FROM topics_snippets WHERE id = ? AND type = 'topic'", ("topic123",))
+
+    @patch('sqlite3.connect')
+    def test_get_topic_not_found(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.fetchone.return_value = None # Simulate no row found
+
+        result = cpoa_main._get_topic_details_from_db("dummy.db", "topic_not_exist")
+        self.assertIsNone(result)
+
+    @patch('sqlite3.connect')
+    def test_get_topic_db_error(self, mock_sqlite_connect):
+        mock_sqlite_connect.side_effect = sqlite3.Error("DB connection failed")
+        with patch.object(cpoa_main.logger, 'error') as mock_logger_error:
+            result = cpoa_main._get_topic_details_from_db("dummy.db", "topic_any")
+            self.assertIsNone(result)
+            mock_logger_error.assert_called_once()
+            self.assertIn("Database error fetching topic topic_any", mock_logger_error.call_args[0][0])
+
+
+class TestOrchestrateTopicExploration(unittest.TestCase):
+    def setUp(self):
+        self.mock_env_vars = {
+            "TDA_SERVICE_URL": "http://mocktda.test/discover_topics",
+            "CPOA_DATABASE_PATH": "test_explore_cpoa.db", # Use a distinct DB for these tests if needed
+            "SCA_SERVICE_URL": "http://mocksca.test/craft_snippet", # orchestrate_snippet_generation uses this
+            "CPOA_SERVICE_RETRY_COUNT": "1",
+            "CPOA_SERVICE_RETRY_BACKOFF_FACTOR": "0.01"
+        }
+        # Patch module-level constants in cpoa_main
+        self.tda_url_patch = patch.object(cpoa_main, 'TDA_SERVICE_URL', self.mock_env_vars['TDA_SERVICE_URL'])
+        self.db_path_patch = patch.object(cpoa_main, 'CPOA_DATABASE_PATH', self.mock_env_vars['CPOA_DATABASE_PATH'])
+        self.sca_url_patch = patch.object(cpoa_main, 'SCA_SERVICE_URL', self.mock_env_vars['SCA_SERVICE_URL'])
+        self.retry_patch = patch.object(cpoa_main, 'CPOA_SERVICE_RETRY_COUNT', int(self.mock_env_vars['CPOA_SERVICE_RETRY_COUNT']))
+        self.backoff_patch = patch.object(cpoa_main, 'CPOA_SERVICE_RETRY_BACKOFF_FACTOR', float(self.mock_env_vars['CPOA_SERVICE_RETRY_BACKOFF_FACTOR']))
+
+        self.tda_url_patch.start()
+        self.db_path_patch.start()
+        self.sca_url_patch.start()
+        self.retry_patch.start()
+        self.backoff_patch.start()
+
+    def tearDown(self):
+        self.tda_url_patch.stop()
+        self.db_path_patch.stop()
+        self.sca_url_patch.stop()
+        self.retry_patch.stop()
+        self.backoff_patch.stop()
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'orchestrate_snippet_generation')
+    @patch.object(cpoa_main, '_get_topic_details_from_db', return_value=None) # Assume topic ID not found or not used
+    def test_exploration_with_keywords_success(self, mock_get_details, mock_orch_snippet, mock_requests_retry):
+        mock_tda_response = MagicMock()
+        mock_tda_response.json.return_value = {"topics": [{"id": "tda1", "title": "Explored Topic 1"}]}
+        mock_requests_retry.return_value = mock_tda_response
+
+        mock_orch_snippet.return_value = {"snippet_id": "snip1", "title": "Snippet for Explored Topic 1"}
+
+        result = cpoa_main.orchestrate_topic_exploration(keywords=["new keyword"], user_preferences=None, test_scenarios=None)
+
+        mock_requests_retry.assert_called_once()
+        self.assertEqual(mock_requests_retry.call_args[0][1], cpoa_main.TDA_SERVICE_URL)
+        self.assertEqual(mock_requests_retry.call_args[1]['json']['query'], "new keyword")
+
+        mock_orch_snippet.assert_called_once()
+        self.assertEqual(mock_orch_snippet.call_args[0][0]['title_suggestion'], "Explored Topic 1")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["snippet_id"], "snip1")
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'orchestrate_snippet_generation')
+    @patch.object(cpoa_main, '_get_topic_details_from_db')
+    def test_exploration_with_topic_id_success(self, mock_get_details, mock_orch_snippet, mock_requests_retry):
+        mock_original_topic = {"id": "orig_topic", "title": "Original Topic Title", "keywords": ["orig", "key"]}
+        mock_get_details.return_value = mock_original_topic
+
+        mock_tda_response = MagicMock()
+        mock_tda_response.json.return_value = {"topics": [{"id": "tda2", "title": "Deeper Dive Topic"}]}
+        mock_requests_retry.return_value = mock_tda_response
+
+        mock_orch_snippet.return_value = {"snippet_id": "snip2", "title": "Snippet for Deeper Dive"}
+
+        result = cpoa_main.orchestrate_topic_exploration(current_topic_id="orig_topic", user_preferences=None, test_scenarios=None)
+
+        mock_get_details.assert_called_once_with(cpoa_main.CPOA_DATABASE_PATH, "orig_topic")
+        mock_requests_retry.assert_called_once()
+        self.assertEqual(mock_requests_retry.call_args[1]['json']['query'], "orig key") # From keywords
+
+        mock_orch_snippet.assert_called_once()
+        self.assertEqual(mock_orch_snippet.call_args[0][0]['title_suggestion'], "Deeper Dive Topic")
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["snippet_id"], "snip2")
+
+    def test_exploration_no_identifier_raises_error(self):
+        with self.assertRaises(ValueError) as context:
+            cpoa_main.orchestrate_topic_exploration(user_preferences=None, test_scenarios=None)
+        self.assertIn("Cannot explore topic without a valid current_topic_id or keywords", str(context.exception))
+
+    @patch.object(cpoa_main, '_get_topic_details_from_db', return_value=None)
+    def test_exploration_topic_id_not_found(self, mock_get_details):
+        # If only topic_id is provided and it's not found, and no keywords.
+        result = cpoa_main.orchestrate_topic_exploration(current_topic_id="unknown_topic", user_preferences=None, test_scenarios=None)
+        mock_get_details.assert_called_once_with(cpoa_main.CPOA_DATABASE_PATH, "unknown_topic")
+        self.assertEqual(result, []) # Returns empty list as per current logic
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, '_get_topic_details_from_db', return_value=None) # Ensure keywords are used
+    def test_exploration_tda_fails(self, mock_get_details, mock_requests_retry):
+        mock_requests_retry.side_effect = requests.exceptions.RequestException("TDA down")
+        with patch.object(cpoa_main.logger, 'error') as mock_logger_error:
+            result = cpoa_main.orchestrate_topic_exploration(keywords=["test"], user_preferences=None, test_scenarios=None)
+            self.assertEqual(result, [])
+            self.assertTrue(any("TDA service call failed during exploration" in call_arg[0][0] for call_arg in mock_logger_error.call_args_list))
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, '_get_topic_details_from_db', return_value=None)
+    def test_exploration_tda_returns_no_topics(self, mock_get_details, mock_requests_retry):
+        mock_tda_response = MagicMock()
+        mock_tda_response.json.return_value = {"topics": []} # TDA found nothing
+        mock_requests_retry.return_value = mock_tda_response
+
+        result = cpoa_main.orchestrate_topic_exploration(keywords=["obscure"], user_preferences=None, test_scenarios=None)
+        self.assertEqual(result, [])
+
+    @patch.object(cpoa_main, 'requests_with_retry')
+    @patch.object(cpoa_main, 'orchestrate_snippet_generation')
+    @patch.object(cpoa_main, '_get_topic_details_from_db', return_value=None)
+    def test_exploration_snippet_generation_fails_for_some(self, mock_get_details, mock_orch_snippet, mock_requests_retry):
+        mock_tda_response = MagicMock()
+        mock_tda_response.json.return_value = {
+            "topics": [
+                {"id": "tda_ok", "title": "Good Topic"},
+                {"id": "tda_fail", "title": "Bad Topic for SCA"}
+            ]
+        }
+        mock_requests_retry.return_value = mock_tda_response
+
+        def snippet_side_effect(topic_info):
+            if topic_info["title_suggestion"] == "Good Topic":
+                return {"snippet_id": "snip_good", "title": "Good Snippet"}
+            else:
+                return {"error": "SCA failed", "details": "SCA could not process Bad Topic"}
+        mock_orch_snippet.side_effect = snippet_side_effect
+
+        result = cpoa_main.orchestrate_topic_exploration(keywords=["mixed results"], user_preferences=None, test_scenarios=None)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["snippet_id"], "snip_good")
+        self.assertEqual(mock_orch_snippet.call_count, 2)
 
 
 if __name__ == '__main__':

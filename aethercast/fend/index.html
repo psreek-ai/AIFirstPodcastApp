@@ -32,6 +32,14 @@
                 </div>
             </section>
 
+            <div id="preferences-section" style="margin-top: 20px; padding:10px; border:1px solid #ddd;">
+                <h3>My Preferences</h3>
+                <label for="pref-news-category">Preferred News Category (for topic suggestions):</label>
+                <input type="text" id="pref-news-category" placeholder="e.g., technology, sports, science">
+                <button id="save-prefs-btn">Save Preferences</button>
+                <p id="prefs-status" style="margin-top: 5px;"></p>
+            </div>
+
             <section class="input-section">
                 <h2>Create Full Podcast</h2>
                 <label for="topic-input">Enter Topic:</label>
@@ -75,7 +83,7 @@
     <!-- Diagnostics Modal -->
     <div id="diagnostics-modal" class="modal" style="display:none;">
         <div class="modal-content">
-            <span class.close-btn" id="diagnostics-modal-close-btn">&times;</span>
+            <span class="close-btn" id="diagnostics-modal-close-btn">&times;</span>
             <h2>Podcast Generation Diagnostics</h2>
             <p><strong>Podcast ID:</strong> <span id="diag-podcast-id"></span></p>
             <p><strong>Topic:</strong> <span id="diag-topic"></span></p>

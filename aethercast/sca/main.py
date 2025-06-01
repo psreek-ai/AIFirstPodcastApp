@@ -57,6 +57,10 @@ def load_sca_configuration():
 # --- Initialize Configuration ---
 load_sca_configuration()
 
+# --- Endpoint Error Constants ---
+ENDPOINT_ERROR_INVALID_PAYLOAD = "INVALID_JSON_PAYLOAD"
+ENDPOINT_ERROR_MISSING_FIELDS = "MISSING_REQUIRED_FIELDS"
+ENDPOINT_ERROR_INTERNAL_SERVER = "INTERNAL_SERVER_ERROR"
 
 app = flask.Flask(__name__)
 
@@ -317,7 +321,7 @@ def craft_snippet_endpoint():
     try:
         request_data = flask.request.get_json()
         if not request_data:
-            return flask.jsonify({"error": "Invalid JSON payload"}), 400
+            return flask.jsonify({"error": ENDPOINT_ERROR_INVALID_PAYLOAD, "details": "Invalid or missing JSON payload."}), 400
 
         topic_id = request_data.get("topic_id")
         content_brief = request_data.get("content_brief") 
@@ -325,14 +329,14 @@ def craft_snippet_endpoint():
         error_trigger = request_data.get("error_trigger") 
 
         if not topic_id or not content_brief: 
-            return flask.jsonify({"error": "'topic_id' and 'content_brief' are required."}), 400
+            return flask.jsonify({"error": ENDPOINT_ERROR_MISSING_FIELDS, "details": "'topic_id' and 'content_brief' are required fields."}), 400
 
         logging.info(f"[SCA_REQUEST] Received /craft_snippet request. Topic ID: '{topic_id}', Brief: '{content_brief}', ErrorTrigger: '{error_trigger}'")
         
         if error_trigger == "sca_error":
             logging.warning(f"[SCA_SIMULATED_ERROR] Simulating an error for /craft_snippet based on error_trigger: {error_trigger}")
             return flask.jsonify({
-                "error": "Simulated SCA Error",
+                "error": "SIMULATED_SCA_ERROR", # Keeping this specific for simulation
                 "details": "This is a controlled error triggered for testing purposes in SnippetCraftAgent."
             }), 500
 
@@ -413,7 +417,7 @@ def craft_snippet_endpoint():
 
     except Exception as e:
         logging.error(f"Error in /craft_snippet endpoint: {e}", exc_info=True)
-        return flask.jsonify({"error": f"Internal server error in SCA: {str(e)}"}), 500
+        return flask.jsonify({"error": ENDPOINT_ERROR_INTERNAL_SERVER, "details": str(e)}), 500
 
 if __name__ == "__main__":
     # load_sca_configuration() is called when the module is imported.

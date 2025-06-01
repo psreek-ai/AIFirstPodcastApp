@@ -243,10 +243,24 @@ class TestForgeVoiceEndpoint(unittest.TestCase):
     def setUp(self):
         vfa_main.app.config['TESTING'] = True
         self.client = vfa_main.app.test_client()
-        self.config_patcher = patch.dict(vfa_main.vfa_config, {
-             "GOOGLE_APPLICATION_CREDENTIALS": "fake_creds.json"
-        })
+        # Add VFA_TEST_MODE_ENABLED to the mock_config for this test class
+        self.mock_vfa_config_for_endpoint = {
+            "GOOGLE_APPLICATION_CREDENTIALS": "fake_creds.json", # Still needed for non-test mode paths if any
+            "VFA_SHARED_AUDIO_DIR": "/tmp/vfa_test_audio_endpoint", # Use a specific dir for endpoint tests
+            "VFA_TTS_VOICE_NAME": "en-US-Standard-A",
+            "VFA_TTS_LANG_CODE": "en-US",
+            "VFA_TTS_AUDIO_ENCODING_STR": "MP3",
+            "VFA_MIN_SCRIPT_LENGTH": 5, # Lower for some test scenarios if needed
+            "VFA_TTS_DEFAULT_SPEAKING_RATE": 1.0,
+            "VFA_TTS_DEFAULT_PITCH": 0.0,
+            "VFA_TEST_MODE_ENABLED": True # Crucial: Enable Test Mode
+        }
+        self.config_patcher = patch.dict(vfa_main.vfa_config, self.mock_vfa_config_for_endpoint, clear=True)
         self.mock_config = self.config_patcher.start()
+
+        self.makedirs_patcher = patch('os.makedirs') # Patch os.makedirs for endpoint tests too
+        self.mock_makedirs = self.makedirs_patcher.start()
+
         # Ensure imports are considered successful for endpoint tests that call forge_voice
         self.imports_patcher = patch.object(vfa_main, 'VFA_IMPORTS_SUCCESSFUL', True)
         self.mock_imports = self.imports_patcher.start()
@@ -303,6 +317,61 @@ class TestForgeVoiceEndpoint(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         json_data = response.get_json()
         self.assertEqual(json_data["status"], "error")
+
+    # --- New Tests for Scenario-Based Test Mode in Endpoint ---
+
+    @patch('os.path.exists') # Mock os.path.exists as forge_voice (test mode) might not create file
+    @patch('builtins.open', new_callable=mock_open) # Mock open to check if file write is attempted
+    def test_forge_voice_endpoint_test_mode_default_scenario(self, mock_file_open, mock_os_path_exists):
+        """Test VFA endpoint in test mode with default success scenario."""
+        mock_os_path_exists.return_value = True # Assume file "created" by test mode exists for this check
+
+        payload = {"script": {"topic": "Test Default", "full_raw_script":"Sufficiently long script for test."}}
+        # No X-Test-Scenario header, should use default success
+        response = self.client.post('/forge_voice', json=payload)
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["status"], "success")
+        self.assertIn("(TEST MODE - dummy file)", data["message"])
+        self.assertIsNotNone(data["audio_filepath"])
+        self.assertTrue(data["audio_filepath"].startswith(self.mock_vfa_config_for_endpoint["VFA_SHARED_AUDIO_DIR"]))
+        self.assertEqual(data["engine_used"], "test_mode_tts_success")
+        mock_file_open.assert_called_once() # Check that dummy file write was attempted
+
+    @patch('os.path.exists')
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_endpoint_test_mode_vfa_error_tts_scenario(self, mock_file_open, mock_os_path_exists):
+        """Test VFA endpoint in test mode for 'vfa_error_tts' scenario."""
+        headers = {'X-Test-Scenario': 'vfa_error_tts'}
+        payload = {"script": {"topic": "Test TTS Error", "full_raw_script":"Script for TTS error test."}}
+        response = self.client.post('/forge_voice', json=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 500) # Should be 500 as it's an error status
+        data = response.get_json()
+        self.assertEqual(data["status"], "error")
+        self.assertEqual(data["message"], vfa_main.VFA_TEST_SCENARIO_TTS_ERROR_MSG)
+        self.assertIsNone(data["audio_filepath"])
+        self.assertEqual(data["engine_used"], "test_mode_tts_api_error")
+        mock_file_open.assert_not_called() # No file should be created or attempted
+
+    @patch('os.path.exists')
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_endpoint_test_mode_vfa_error_file_save_scenario(self, mock_file_open, mock_os_path_exists):
+        """Test VFA endpoint in test mode for 'vfa_error_file_save' scenario."""
+        headers = {'X-Test-Scenario': 'vfa_error_file_save'}
+        payload = {"script": {"topic": "Test File Save Error", "full_raw_script":"Script for file save error test."}}
+        response = self.client.post('/forge_voice', json=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 500) # Should be 500
+        data = response.get_json()
+        self.assertEqual(data["status"], "error")
+        self.assertEqual(data["message"], vfa_main.VFA_TEST_SCENARIO_FILE_SAVE_ERROR_MSG)
+        self.assertIsNotNone(data["audio_filepath"]) # Filepath might be determined
+        self.assertEqual(data["engine_used"], "test_mode_tts_file_error")
+        # In this specific scenario, os.makedirs might be called, but open() for writing the file itself shouldn't.
+        # The current VFA test mode logic for 'vfa_error_file_save' doesn't attempt to write the file.
+        mock_file_open.assert_not_called()
 
 
 if __name__ == '__main__':

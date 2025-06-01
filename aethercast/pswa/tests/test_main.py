@@ -248,7 +248,7 @@ class TestWeaveScriptLogic(unittest.TestCase):
             self.assertEqual(result.get("source"), "generation")
             mock_get_cache.assert_called_once()
             mock_save_cache.assert_called_once()
-        
+
         self.assertEqual(len(result["segments"]), 3)
         self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
         self.assertEqual(result["segments"][0]["content"], "Welcome to a discussion on how AI is reshaping education.")
@@ -483,9 +483,10 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
             "PSWA_LLM_MODEL": "gpt-endpoint-model",
             "PSWA_LLM_TEMPERATURE": 0.7,
             "PSWA_LLM_MAX_TOKENS": 1500,
-            "PSWA_LLM_JSON_MODE": True, # For endpoint tests, assume JSON mode is generally active
+            "PSWA_LLM_JSON_MODE": True,
             "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System msg for endpoint",
-            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User: {topic} - {content} (endpoint)"
+            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User: {topic} - {content} (endpoint)",
+            "PSWA_TEST_MODE_ENABLED": True # Enable test mode for these endpoint tests
         }
         # Use clear=True to ensure only these values are in pswa_config for this test class
         self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
@@ -563,7 +564,57 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
         self.assertEqual(response.status_code, 500)
         json_data = response.get_json()
         self.assertEqual(json_data["error"], "PSWA_SCRIPT_PARSING_FAILURE")
-        self.assertIn("Failed to parse essential script structure", json_data["message"])
+        self.assertIn("Failed to parse essential script structure", json_data["details"]) # Changed message to details to match other errors
+
+
+    # --- New Tests for Scenario-Based Test Mode ---
+    def test_weave_script_test_mode_default_scenario(self):
+        """Test test mode with no scenario header, should return default script."""
+        # No X-Test-Scenario header, or an unrecognised one.
+        response = self.client.post('/weave_script', json={'content': 'Some content', 'topic': 'Test Default Scenario'})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+
+        self.assertEqual(data['source'], 'test_mode_scenario_default')
+        self.assertEqual(data['topic'], 'Test Default Scenario')
+        self.assertTrue(data['title'].startswith("Test Mode: Test Default Scenario")) # Title is dynamic
+        self.assertTrue(data['intro'].startswith("This is the intro for the test mode topic: Test Default Scenario"))
+        self.assertEqual(len(data['segments']), pswa_main.SCENARIO_DEFAULT_SCRIPT_CONTENT['segments'].__len__())
+        # Check full_raw_script reflects the dynamic title and intro
+        raw_script_content = json.loads(data['full_raw_script'])
+        self.assertTrue(raw_script_content['title'].startswith("Test Mode: Test Default Scenario"))
+
+    def test_weave_script_test_mode_insufficient_content_scenario(self):
+        """Test test mode with 'insufficient_content' scenario header."""
+        headers = {'X-Test-Scenario': 'insufficient_content'}
+        response = self.client.post('/weave_script', json={'content': 'Tiny content', 'topic': 'Test Insufficient'}, headers=headers)
+        self.assertEqual(response.status_code, 200) # PSWA itself doesn't error, it returns the error structure from LLM
+        data = response.get_json()
+
+        self.assertEqual(data['source'], 'test_mode_scenario_insufficient_content')
+        self.assertEqual(data['topic'], 'Test Insufficient')
+        self.assertEqual(data[pswa_main.KEY_ERROR], "Insufficient content")
+        self.assertIn("Test Insufficient", data[pswa_main.KEY_MESSAGE])
+        # The endpoint might interpret this as a 400, check endpoint logic if this fails.
+        # Current endpoint logic for insufficient content:
+        # if result_data.get(KEY_SEGMENTS) and result_data[KEY_SEGMENTS][0][KEY_SEGMENT_TITLE] == SEGMENT_TITLE_ERROR ... returns 400
+        # This is not directly hit here as the returned structure for this scenario is {"error": ..., "message": ...}
+        # The endpoint test for insufficient content (`test_handle_weave_script_insufficient_content`) covers the 400.
+        # This unit test for weave_script just checks the direct output of weave_script.
+
+    def test_weave_script_test_mode_empty_segments_scenario(self):
+        """Test test mode with 'empty_segments' scenario header."""
+        headers = {'X-Test-Scenario': 'empty_segments'}
+        response = self.client.post('/weave_script', json={'content': 'Content for empty seg', 'topic': 'Test Empty Segments'}, headers=headers)
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+
+        self.assertEqual(data['source'], 'test_mode_scenario_empty_segments')
+        self.assertEqual(data['topic'], 'Test Empty Segments')
+        self.assertEqual(data[pswa_main.KEY_TITLE], pswa_main.SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT[pswa_main.KEY_TITLE])
+        self.assertEqual(data[pswa_main.KEY_INTRO], pswa_main.SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT[pswa_main.KEY_INTRO])
+        self.assertEqual(len(data[pswa_main.KEY_SEGMENTS]), 0) # Key check: segments list is empty
+        self.assertEqual(data[pswa_main.KEY_OUTRO], pswa_main.SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT[pswa_main.KEY_OUTRO])
 
 
 if __name__ == '__main__':

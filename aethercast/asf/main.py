@@ -53,6 +53,30 @@ else:
 # Load configuration at startup
 load_asf_configuration()
 
+# --- Constants ---
+# Socket.IO Event Names - Audio Namespace
+AUDIO_EVENT_CONNECT_ACK = 'connection_ack'
+AUDIO_EVENT_ERROR = 'error' # Generic client-facing error
+AUDIO_EVENT_STREAM_ERROR = 'stream_error' # Specific to stream failures
+AUDIO_EVENT_STREAM_STATUS = 'stream_status'
+AUDIO_EVENT_AUDIO_CHUNK = 'audio_chunk'
+AUDIO_EVENT_AUDIO_CONTROL = 'audio_control'
+AUDIO_EVENT_START_OF_STREAM = 'start_of_stream' # Used as data in AUDIO_EVENT_AUDIO_CONTROL
+AUDIO_EVENT_END_OF_STREAM = 'end_of_stream'   # Used as data in AUDIO_EVENT_AUDIO_CONTROL
+
+# Socket.IO Event Names - UI Namespace
+UI_EVENT_CONNECT_ACK = 'ui_connection_ack'
+UI_EVENT_ERROR = 'ui_error' # Generic client-facing error for UI namespace
+UI_EVENT_SUBSCRIBED = 'subscribed_ui_updates'
+# Event names for CPOA to send (used by send_ui_update, received by client)
+# Example: 'generation_status', 'task_error' - these are dynamic based on CPOA needs, not ASF internals.
+
+# HTTP Endpoint Error Types/Messages
+HTTP_ERROR_NO_PAYLOAD = "NO_JSON_PAYLOAD"
+HTTP_ERROR_MISSING_PARAMETERS = "MISSING_PARAMETERS"
+HTTP_ERROR_ASF_CONFIG_ERROR = "ASF_SERVER_CONFIG_ERROR"
+HTTP_ERROR_SOCKETIO_EMIT_FAILED = "SOCKETIO_EMIT_FAILED"
+
 # --- Flask App and SocketIO Setup ---
 app = flask.Flask(__name__)
 app.config['SECRET_KEY'] = asf_config['ASF_SECRET_KEY']
@@ -80,7 +104,7 @@ def handle_connect():
     We'll expect a 'join_stream' event with stream_id from client.
     """
     logger.info(f"ASF: Client connected with sid: {flask.request.sid} to namespace /api/v1/podcasts/stream")
-    emit('connection_ack', {'message': 'Connected to ASF. Please send join_stream with your stream_id.'})
+    emit(AUDIO_EVENT_CONNECT_ACK, {'message': 'Connected to ASF. Please send join_stream with your stream_id.'})
 
 @socketio.on('join_stream', namespace='/api/v1/podcasts/stream')
 def handle_join_stream(data):
@@ -91,7 +115,7 @@ def handle_join_stream(data):
     stream_id = data.get('stream_id')
     if not stream_id:
         logger.warning(f"ASF: Client {flask.request.sid} tried to join stream without stream_id.")
-        emit('error', {'message': 'stream_id is required for join_stream.'})
+        emit(AUDIO_EVENT_ERROR, {'message': 'stream_id is required for join_stream.'})
         return
 
     join_room(stream_id) # Use SocketIO rooms to manage clients for specific streams
@@ -101,23 +125,23 @@ def handle_join_stream(data):
 
     if not filepath:
         logger.error(f"ASF: Stream ID {stream_id} not found in map. Cannot stream audio.")
-        emit('stream_error', {'message': 'Audio stream ID not found or not yet processed.'}, room=stream_id)
+        emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio stream ID not found or not yet processed.'}, room=stream_id)
         return
 
     if not os.path.exists(filepath):
         logger.error(f"ASF: Audio file not found for stream ID {stream_id} at path: {filepath}")
-        emit('stream_error', {'message': 'Audio file unavailable for this stream.'}, room=stream_id)
+        emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio file unavailable for this stream.'}, room=stream_id)
         return
     
-    emit('stream_status', {'status': 'joined', 'stream_id': stream_id, 'message': f'Successfully joined stream {stream_id}. Preparing to stream audio.'}, room=stream_id)
+    emit(AUDIO_EVENT_STREAM_STATUS, {'status': 'joined', 'stream_id': stream_id, 'message': f'Successfully joined stream {stream_id}. Preparing to stream audio.'}, room=stream_id)
     logger.info(f"ASF: Starting audio stream for {stream_id} from {filepath}")
 
     chunk_size = asf_config.get('ASF_CHUNK_SIZE', 4096)
     stream_sleep_interval = asf_config.get('ASF_STREAM_SLEEP_INTERVAL', 0.01)
 
     try:
-        emit('audio_control', {'event': 'start_of_stream', 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
-        logger.info(f"ASF: Sent start_of_stream for stream_id: {stream_id}")
+        emit(AUDIO_EVENT_AUDIO_CONTROL, {'event': AUDIO_EVENT_START_OF_STREAM, 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
+        logger.info(f"ASF: Sent {AUDIO_EVENT_START_OF_STREAM} for stream_id: {stream_id}")
 
         with open(filepath, 'rb') as audio_file:
             sequence_number = 0
@@ -127,19 +151,18 @@ def handle_join_stream(data):
                     break # End of file
 
                 # Emit the binary audio chunk.
-                # The event name 'audio_chunk' is used here.
                 # The `binary=True` argument is implicitly handled by Flask-SocketIO if the data is `bytes`.
-                socketio.emit('audio_chunk', audio_chunk, namespace='/api/v1/podcasts/stream', room=stream_id)
+                socketio.emit(AUDIO_EVENT_AUDIO_CHUNK, audio_chunk, namespace='/api/v1/podcasts/stream', room=stream_id)
                 logger.debug(f"ASF: Sent audio chunk {sequence_number} for stream {stream_id} (size: {len(audio_chunk)} bytes)")
                 sequence_number += 1
                 socketio.sleep(stream_sleep_interval) # Use configured sleep interval
 
-        emit('audio_control', {'event': 'end_of_stream', 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
-        logger.info(f"ASF: Sent end_of_stream for stream_id: {stream_id} from file {filepath}")
+        emit(AUDIO_EVENT_AUDIO_CONTROL, {'event': AUDIO_EVENT_END_OF_STREAM, 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
+        logger.info(f"ASF: Sent {AUDIO_EVENT_END_OF_STREAM} for stream_id: {stream_id} from file {filepath}")
 
     except Exception as e:
         logger.error(f"ASF: Error during audio streaming for stream_id {stream_id}: {e}", exc_info=True)
-        emit('stream_error', {'message': f'An error occurred during streaming for stream {stream_id}.'}, room=stream_id)
+        emit(AUDIO_EVENT_STREAM_ERROR, {'message': f'An error occurred during streaming for stream {stream_id}.'}, room=stream_id)
     finally:
         # Optionally, leave room or close connection if appropriate.
         # For now, client manages connection lifecycle after stream ends or errors.
@@ -166,7 +189,7 @@ def notify_new_audio():
     data = request.get_json()
     if not data:
         logger.error("ASF_NOTIFY: Received empty payload for /notify_new_audio")
-        return jsonify({"error": "No JSON payload received"}), 400
+        return jsonify({"error": HTTP_ERROR_NO_PAYLOAD, "details": "No JSON payload received"}), 400
 
     stream_id = data.get('stream_id')
     filepath = data.get('filepath')
@@ -178,7 +201,7 @@ def notify_new_audio():
         if not filepath:
             missing_params.append('filepath')
         logger.error(f"ASF_NOTIFY: Missing parameters in /notify_new_audio: {', '.join(missing_params)}. Payload: {data}")
-        return jsonify({"error": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+        return jsonify({"error": HTTP_ERROR_MISSING_PARAMETERS, "details": f"Missing required parameters: {', '.join(missing_params)}"}), 400
 
     # Store the mapping
     stream_id_to_filepath_map[stream_id] = filepath
@@ -195,7 +218,7 @@ def notify_new_audio():
 @socketio.on('connect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE) # Use lambda to access config post-init
 def handle_ui_connect():
     logger.info(f"ASF: Client {request.sid} connected to UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
-    emit('ui_connection_ack', {'message': f'Connected to ASF UI updates on namespace {ASF_UI_UPDATES_NAMESPACE}.'})
+    emit(UI_EVENT_CONNECT_ACK, {'message': f'Connected to ASF UI updates on namespace {ASF_UI_UPDATES_NAMESPACE}.'})
 
 @socketio.on('disconnect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE)
 def handle_ui_disconnect():
@@ -207,12 +230,12 @@ def handle_subscribe_ui_updates(data):
     client_id = data.get('client_id')
     if not client_id:
         logger.warning(f"ASF: Client {request.sid} attempted to subscribe to UI updates without a client_id.")
-        emit('ui_error', {'message': 'client_id is required for UI update subscription.'})
+        emit(UI_EVENT_ERROR, {'message': 'client_id is required for UI update subscription.'})
         return
 
     join_room(client_id) # Use client_id as the room name
     logger.info(f"ASF: Client {request.sid} (client_id: {client_id}) subscribed to UI updates in room '{client_id}' on namespace {ASF_UI_UPDATES_NAMESPACE}.")
-    emit('subscribed_ui_updates', {'status': 'success', 'client_id': client_id, 'subscribed_to_room': client_id})
+    emit(UI_EVENT_SUBSCRIBED, {'status': 'success', 'client_id': client_id, 'subscribed_to_room': client_id})
 
 
 # --- Internal HTTP Endpoint for CPOA to send UI updates ---
@@ -225,7 +248,7 @@ def send_ui_update():
     payload = request.get_json()
     if not payload:
         logger.error("ASF_SEND_UI: Received empty payload for /send_ui_update")
-        return jsonify({"error": "No JSON payload received"}), 400
+        return jsonify({"error": HTTP_ERROR_NO_PAYLOAD, "details": "No JSON payload received"}), 400
 
     client_id = payload.get('client_id')
     event_name = payload.get('event_name')
@@ -236,11 +259,11 @@ def send_ui_update():
         if event_data is None and "data" not in missing_params : missing_params.append("data")
 
         logger.error(f"ASF_SEND_UI: Missing parameters in /send_ui_update: {', '.join(missing_params)}. Payload: {payload}")
-        return jsonify({"error": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+        return jsonify({"error": HTTP_ERROR_MISSING_PARAMETERS, "details": f"Missing required parameters: {', '.join(missing_params)}"}), 400
 
     if not ASF_UI_UPDATES_NAMESPACE: # Ensure namespace is loaded
         logger.error("ASF_SEND_UI: ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message.")
-        return jsonify({"error": "ASF server configuration error for UI namespace."}), 500
+        return jsonify({"error": HTTP_ERROR_ASF_CONFIG_ERROR, "details": "ASF server configuration error for UI namespace."}), 500
 
     try:
         logger.info(f"ASF_SEND_UI: Emitting '{event_name}' to client_id (room) '{client_id}' in namespace '{ASF_UI_UPDATES_NAMESPACE}' with data: {event_data}")
@@ -248,7 +271,7 @@ def send_ui_update():
         return jsonify({"status": "success", "message": "UI update sent to client."}), 200
     except Exception as e:
         logger.error(f"ASF_SEND_UI: Failed to emit SocketIO event for client_id '{client_id}': {e}", exc_info=True)
-        return jsonify({"error": "Failed to send UI update via SocketIO.", "details": str(e)}), 500
+        return jsonify({"error": HTTP_ERROR_SOCKETIO_EMIT_FAILED, "details": str(e)}), 500
 
 
 if __name__ == '__main__':

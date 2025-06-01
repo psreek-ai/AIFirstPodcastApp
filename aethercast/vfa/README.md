@@ -60,6 +60,42 @@ Then, edit the `.env` file. Key variables include:
     -   *Default:* `5005`
 -   `VFA_DEBUG`: Enables/disables Flask debug mode.
     -   *Default:* `True`
+-   `VFA_TEST_MODE_ENABLED`: Set to `true` to enable a simplified test mode that bypasses actual TTS calls and returns predefined responses or simulates errors. Useful for integration testing. See "Testing" section.
+    -   *Default (in code):* `false`
+
+## Testing
+
+When `VFA_TEST_MODE_ENABLED` is set to `true`, the `/forge_voice` endpoint behaves differently:
+- It does not call the actual Google Cloud TTS service.
+- It can return predefined responses based on an optional `X-Test-Scenario` HTTP header:
+    - **No header or `default`**: Simulates a successful TTS operation. It creates a small, dummy audio file in the `VFA_SHARED_AUDIO_DIR` and returns a success JSON response including a filepath and stream ID. The `tts_settings_used` in the response will reflect the default or input voice parameters.
+    - **`X-Test-Scenario: vfa_error_tts`**: Simulates an error occurring during the TTS API call. It returns a JSON response like:
+      ```json
+      {
+          "status": "error",
+          "message": "Test scenario: Simulated TTS API error from VFA.",
+          "audio_filepath": null,
+          "stream_id": "strm_...",
+          // ... other fields ...
+          "engine_used": "test_mode_tts_api_error"
+      }
+      ```
+      No dummy audio file is created. The endpoint returns an HTTP 500 status.
+    - **`X-Test-Scenario: vfa_error_file_save`**: Simulates an error during the file saving stage (after a conceptual successful TTS). It returns a JSON response like:
+      ```json
+      {
+          "status": "error",
+          "message": "Test scenario: Simulated file saving IO error in VFA.",
+          "audio_filepath": "/path/to/where/file/would/be.mp3", // Filepath might be determined
+          "stream_id": "strm_...",
+          // ... other fields ...
+          "engine_used": "test_mode_tts_file_error"
+      }
+      ```
+      No dummy audio file is actually saved. The endpoint returns an HTTP 500 status.
+- The `engine_used` field in the response will indicate the test mode scenario (e.g., `"test_mode_tts_success"`, `"test_mode_tts_api_error"`).
+
+This test mode helps verify how CPOA and other services handle various outcomes from VFA without incurring TTS costs or relying on external service availability.
 
 ## Dependencies
 

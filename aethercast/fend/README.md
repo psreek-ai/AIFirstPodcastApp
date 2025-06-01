@@ -90,6 +90,32 @@ The `app.js` script relies on specific element IDs being present in `index.html`
     -   `#diag-podcast-id`, `#diag-topic`, `#diag-overall-status`, `#diag-final-error`: Spans within the modal to display basic info of the diagnosed podcast.
     -   `#diag-orchestration-log-container`: A div within the modal to display the formatted orchestration log entries.
     -   `.view-diagnostics-btn`: Class for "View Diagnostics" buttons dynamically added after a podcast generation attempt.
+    *   `#preferences-section`: Container for the user preferences UI.
+    *   `#pref-news-category`: Input field for the "Preferred News Category" preference.
+    *   `#save-prefs-btn`: Button to save the preferences.
+    *   `#prefs-status`: Paragraph element to display status messages related to saving/loading preferences.
+
+## User Preferences
+
+The frontend supports basic user preferences that are saved on the backend per user session.
+
+1.  **Client/Session ID:**
+    *   On first load, `app.js` generates a unique `currentUiClientId`.
+    *   This ID is sent to the API Gateway (`POST /api/v1/session/init`) to initialize or retrieve an existing session.
+2.  **Loading Preferences:**
+    *   After session initialization, any existing preferences for the `currentUiClientId` are fetched from the server and stored locally in `currentUserPreferences`.
+    *   The `populatePreferencesForm()` function then updates the UI fields (e.g., `#pref-news-category`) with these loaded values.
+3.  **Displaying & Modifying Preferences:**
+    *   A "My Preferences" section in `index.html` allows users to view and modify their settings.
+    *   Currently, a "Preferred News Category" can be set. This is intended to (eventually) influence topic suggestions from TDA, though the deep integration is pending.
+4.  **Saving Preferences:**
+    *   Clicking the "Save Preferences" button (`#save-prefs-btn`) triggers a `POST` request to `/api/v1/session/preferences`.
+    *   The payload includes the `currentUiClientId` and the current set of preferences from the UI form.
+    *   Success or error messages are displayed in `#prefs-status`. The local `currentUserPreferences` variable is updated on successful save.
+5.  **Using Preferences in Podcast Generation:**
+    *   When a podcast generation is triggered (`POST /api/v1/podcasts`), the frontend automatically includes the `currentUiClientId`.
+    *   The API Gateway uses this `client_id` to fetch the user's saved preferences from the `user_sessions` table and passes them to CPOA.
+    *   CPOA can then use these preferences (e.g., a preferred VFA voice name if no explicit voice parameters are given in the podcast request).
 
 ## Dependencies
 
