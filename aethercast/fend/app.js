@@ -387,7 +387,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Snippet & Topic Exploration Logic (existing functions, ensure renderSnippetCard etc. are preserved) ---
     // For brevity, I'm assuming these are largely unchanged unless they need to interact with preferences.
     // The triggerPodcastGeneration call from snippet buttons already uses the main function.
-    async function newFetchSnippets() {
+    async function newFetchSnippets() { 
         if (!snippetListContainer || !snippetStatusMessage) {
             console.warn("Snippet UI elements not found, skipping snippet fetch.");
             return;
@@ -425,9 +425,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const imagePlaceholderDiv = document.createElement('div');
         imagePlaceholderDiv.className = 'snippet-image-placeholder';
-        // CSS handles the default background image. No specific JS style needed for that.
-        // If snippet.cover_art_url was available:
-        // imagePlaceholderDiv.style.backgroundImage = `url('${snippet.cover_art_url}')`;
+        
+        if (snippet.image_url && typeof snippet.image_url === 'string' && snippet.image_url.trim() !== '') {
+            imagePlaceholderDiv.style.backgroundImage = `url('${snippet.image_url}')`;
+        } else {
+            // CSS default background for .snippet-image-placeholder will apply here
+        }
 
         const textContentDiv = document.createElement('div');
         textContentDiv.className = 'snippet-text-content';
@@ -461,7 +464,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 // A better approach might be to pass a status display target to renderSnippetCard
                 // or have a dedicated status area for "quick play" from cards.
                 updateStatus(`Initiating podcast for snippet: '${topicForGeneration}'...`, 'info', statusMessagesDiv);
-                triggerPodcastGeneration(topicForGeneration, 'status-messages');
+                triggerPodcastGeneration(topicForGeneration, 'status-messages'); 
                 // Scroll to the main player/status area after initiating
                 podcastDisplayDiv.scrollIntoView({ behavior: 'smooth' });
             } else {
@@ -483,16 +486,16 @@ document.addEventListener('DOMContentLoaded', () => {
     async function triggerTopicExploration(payload) { /* ... (existing function) ... */ }
     function handleExploreRelated(event) { /* ... (existing function) ... */ }
 
-    if (refreshSnippetsBtn) {
+    if (refreshSnippetsBtn) { 
         refreshSnippetsBtn.addEventListener('click', fetchAndRenderSnippets);
     }
-
+    
     // Remove or adapt the old generic snippetListContainer listener if it conflicts.
     // The new "Listen Now" buttons have their own direct listeners.
     // If other interactions on snippet cards are needed, this might be adapted.
     // For now, let's comment it out to avoid potential double handling or conflicts.
     /*
-    snippetListContainer.addEventListener('click', (event) => {
+    snippetListContainer.addEventListener('click', (event) => { 
         // Example: if (event.target.classList.contains('some-other-button-on-card')) { ... }
     });
     */

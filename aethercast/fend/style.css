@@ -391,12 +391,12 @@ footer {
 }
 
 /* 3. Section Titles & Subtitles */
-#latest-episodes-section h2,
-#popular-categories-section h2,
-#topic-exploration-section h2,
+#latest-episodes-section h2, 
+#popular-categories-section h2, 
+#topic-exploration-section h2, 
 .input-section h2,
 #podcast-snippets-section h2 /* Keep old snippet section selector for now */
- {
+ { 
     text-align: center;
     font-size: 2rem;
     font-weight: bold;
@@ -457,7 +457,7 @@ footer {
     background-color: #e0e0e0; /* Neutral-300 approx for placeholder */
     border-radius: 0.5rem;
     margin-bottom: 1rem;
-    flex-shrink: 0;
+    flex-shrink: 0; 
     /* Added a placeholder image via CSS for demonstration */
     background-image: url('https://source.unsplash.com/random/400x225?podcast,abstract');
     background-size: cover;
@@ -480,7 +480,7 @@ footer {
     color: #4b5563; /* Neutral-600 approx */
     line-height: 1.5;
     margin: 0 0 1rem 0;
-    flex-grow: 1;
+    flex-grow: 1; 
 }
 .snippet-card .listen-now-button {
     padding: 0.5rem 1rem;
@@ -583,7 +583,7 @@ header h1 {
 }
 
 /* Original footer style if it was just 'footer' tag, now it's 'footer.site-footer' */
-footer {
+footer { 
     /* This will be overridden by footer.site-footer if that class is applied */
     /* If old footer without class might exist, ensure it's reset or styled appropriately */
     border-top: none; /* Example reset */

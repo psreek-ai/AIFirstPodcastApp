@@ -114,6 +114,8 @@ flask run --host=0.0.0.0 --port=5001
                     "title": "The Future of AI in Snippets",
                     "summary": "A brief look at how AI is changing snippet generation...",
                     "text_content": "A brief look at how AI is changing snippet generation...",
+                    "cover_art_prompt": "Abstract concept of AI and creativity",
+                    "image_url": "https://example.com/images/snippet_abcdef123.jpg", 
                     // ... other fields from SnippetDataObject as returned by CPOA's orchestrate_snippet_generation
                 }
             ]
@@ -261,6 +263,7 @@ flask run --host=0.0.0.0 --port=5001
                     "title": "AI Revolutionizing Healthcare Diagnostics",
                     "summary": "An AI-generated summary about how artificial intelligence is making strides in diagnosing medical conditions with greater accuracy and speed.",
                     "cover_art_prompt": "Abstract image of AI and medical symbols intertwined",
+                    "image_url": "https://example.com/images/search_res_snippet_uuid_1.jpg", 
                     "keywords": ["AI", "healthcare", "diagnostics"]
                 }
                 // ... more search results

@@ -46,8 +46,11 @@ Then, edit the `.env` file with your desired settings. The following variables a
     -   *Default:* `http://localhost:5002/craft_snippet`
 -   `CPOA_ASF_SEND_UI_UPDATE_URL`: The internal URL on the AudioStreamFeeder (ASF) service that CPOA calls to send real-time UI status updates for a specific client.
     -   *Default:* `http://localhost:5006/asf/internal/send_ui_update`
--   `CPOA_DATABASE_PATH`: Path to the shared SQLite database file. This **must** be the same path used by the API Gateway and TDA. CPOA uses this database to update podcast task statuses in the `podcasts` table and to save generated snippets into the `topics_snippets` table.
-    -   *Default:* `cpoa_orchestration_tasks.db` (Note: The default name set in `os.getenv` might differ from the API Gateway's default `aethercast_podcasts.db`. Ensure the actual environment variable in `.env` or the deployment environment points to the correct shared database, e.g., `../api_gateway/aethercast_podcasts.db`.)
+-   `IGA_SERVICE_URL`: URL of the Image Generation Agent (IGA) placeholder service. Used by CPOA to fetch image URLs for snippets based on prompts from SCA.
+    -   *Default (in code if env var not set):* `http://localhost:5007`
+    -   *Docker Compose value (from common.env via CPOA's .env):* `http://iga:5007`
+-   `SHARED_DATABASE_PATH`: Path to the shared SQLite database file (formerly CPOA_DATABASE_PATH). This **must** be the same path used by the API Gateway and TDA. CPOA uses this database to update podcast task statuses in the `podcasts` table and to save generated snippets into the `topics_snippets` table.
+    -   *Default (in code if env var not set):* `/app/database/aethercast_podcasts.db` (This aligns with recent standardization).
 -   `CPOA_SERVICE_RETRY_COUNT`: Number of times to retry failed HTTP requests to downstream services.
     -   *Default:* `3`
 -   `CPOA_SERVICE_RETRY_BACKOFF_FACTOR`: Base factor for exponential backoff between retries (in seconds).

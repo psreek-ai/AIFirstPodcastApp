@@ -89,6 +89,24 @@ services:
       - common.env
       - ./aethercast/asf/.env
 
+  iga:
+    build:
+      context: ./aethercast/iga # Corrected context
+      dockerfile: Dockerfile
+    ports:
+      - "5007:5007" # Expose port 5007 for IGA
+    env_file:
+      - ./aethercast/iga/.env.example # Base config
+      # - ./aethercast/iga/.env # Optional local overrides - keep commented if .env not committed
+    environment:
+      PYTHONUNBUFFERED: 1
+      # FLASK_DEBUG: 'false' # Example override if needed
+    volumes:
+      - ./aethercast/iga:/app # For live development
+    # networks: # Add if using a custom network
+    #   - aethercast_network
+    restart: unless-stopped
+
 # Note on .env files for services:
 # Each service's .env file (e.g., aethercast/api_gateway/.env) will need to be updated.
 # It should source common.env variables and then define its specific ones.
@@ -116,3 +134,4 @@ services:
 # and the PYTHONPATH=/app should make this work.
 # The CMD ["python", "aethercast/service_dir/main.py"] should also work with this structure.
 # The build context for each service is set to '.' (project root) to allow Dockerfiles to COPY ./aethercast.
+# For IGA, context is specific to its directory as it's self-contained.
