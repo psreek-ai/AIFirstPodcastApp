@@ -12,6 +12,11 @@ Key responsibilities include:
         -   Accepts optional voice parameters (e.g., voice name, language, speaking rate, pitch) and an optional `client_id` (for UI updates) from the caller (API Gateway). Voice parameters are forwarded to VFA.
         -   It also notifies the AudioStreamFeeder (ASF) when new audio is ready for streaming.
     -   **Snippet Generation:** Coordinates with SnippetCraftAgent (SCA) (which might internally use a TopicDiscoveryAgent or similar logic). After SCA generates a snippet, CPOA saves this snippet to the shared `topics_snippets` database (using the `CPOA_DATABASE_PATH` configuration).
+    -   **Search Results Generation:**
+        -   Accepts a search query from the API Gateway.
+        -   Calls the Topic Discovery Agent (TDA) to find relevant topics based on the query.
+        -   For each topic found by TDA, it then calls the Snippet Craft Agent (SCA) (via the internal `orchestrate_snippet_generation` function) to generate a descriptive snippet.
+        -   Returns a list of these generated snippets to the API Gateway to be used as search results.
 -   **Task State Management:** Updates the status of podcast generation tasks in a shared database (specifically, the `podcasts` table). The API Gateway initiates tasks, and CPOA updates their progress.
 -   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF). For VFA, this includes the structured script from PSWA and any optional voice parameters.
 -   **Real-time UI Updates:** If a `client_id` is provided for a podcast generation task, CPOA sends status update messages (e.g., "Fetching content...", "Synthesizing audio...", "Task completed/failed") to an internal endpoint on ASF. ASF then relays these messages to the specific frontend client identified by `client_id` via WebSockets.

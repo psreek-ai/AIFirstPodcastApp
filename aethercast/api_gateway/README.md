@@ -240,6 +240,38 @@ flask run --host=0.0.0.0 --port=5001
         -   `404 Not Found`: If the podcast record doesn't exist, `final_audio_filepath` is null, or the audio file itself is missing from the filesystem.
         -   `500 Internal Server Error`: For database errors when retrieving the filepath.
 
+### Search Podcasts
+
+-   **`POST /api/v1/search/podcasts`**
+    -   **Description:** Searches for podcast topics based on a query string and returns a list of AI-generated summaries or snippets for the matching topics.
+    -   **Request Payload (JSON):**
+        ```json
+        {
+            "query": "artificial intelligence in healthcare"
+        }
+        ```
+        -   `query` (string, required): The search query string.
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "search_results": [
+                {
+                    "snippet_id": "search_res_snippet_uuid_1",
+                    "topic_id": "topic_uuid_abc",
+                    "title": "AI Revolutionizing Healthcare Diagnostics",
+                    "summary": "An AI-generated summary about how artificial intelligence is making strides in diagnosing medical conditions with greater accuracy and speed.",
+                    "cover_art_prompt": "Abstract image of AI and medical symbols intertwined",
+                    "keywords": ["AI", "healthcare", "diagnostics"]
+                }
+                // ... more search results
+            ]
+        }
+        ```
+    -   **Error Responses:**
+        -   `400 Bad Request`: If `query` is missing, empty, or invalid.
+        -   `500 Internal Server Error`: For unexpected errors during search processing (e.g., CPOA failure).
+        -   `503 Service Unavailable`: If a critical downstream service (like TDA or SCA via CPOA) is unavailable.
+
 ### Session Management
 
 -   **`POST /api/v1/session/init`**

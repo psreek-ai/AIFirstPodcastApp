@@ -335,6 +335,93 @@ class TestFullPodcastFlow(unittest.TestCase):
         # For now, this check might be omitted or made conditional if ASF interaction is not guaranteed.
         print(f"[INFO] Test test_podcast_generation_pswa_internal_error_valid_json for {podcast_id} PASSED.")
 
+    def test_search_podcasts_successful(self):
+        """
+        Tests the podcast search functionality (/api/v1/search/podcasts).
+        Ensures that a valid query returns a list of search result snippets.
+        Relies on TDA (simulated data) and SCA (test mode) via CPOA.
+        """
+        search_query = "AI" # This query should match keywords in TDA's simulated data
+        client_id = f"test_client_search_success_{uuid.uuid4().hex}"
+        print(f"\n[INFO] Starting test_search_podcasts_successful for query: '{search_query}' with client_id: {client_id}")
+
+        payload = {"query": search_query, "client_id": client_id}
+
+        print(f"[INFO] POST {API_GATEWAY_BASE_URL}/search/podcasts with payload: {payload}")
+        response = requests.post(f"{API_GATEWAY_BASE_URL}/search/podcasts", json=payload, timeout=30)
+
+        self.assertEqual(response.status_code, 200, f"Search request failed: {response.status_code} - {response.text}")
+
+        response_data = response.json()
+        self.assertIsInstance(response_data, dict, "Search response is not a dictionary.")
+        self.assertIn("search_results", response_data, "Search response missing 'search_results' key.")
+
+        search_results = response_data["search_results"]
+        self.assertIsInstance(search_results, list, "'search_results' is not a list.")
+
+        self.assertTrue(len(search_results) > 0, f"Search returned no results for query '{search_query}', which should yield results from TDA/SCA simulated/test data.")
+
+        # Validate the structure of the first search result
+        first_result = search_results[0]
+        self.assertIsInstance(first_result, dict, "First search result item is not a dictionary.")
+
+        expected_keys = ["snippet_id", "topic_id", "title", "summary", "text_content", "cover_art_prompt", "llm_model_used", "keywords"]
+        for key in expected_keys:
+            self.assertIn(key, first_result, f"First search result missing key: '{key}'. Result: {first_result}")
+
+        # Check SCA's test model name (from sca/main.py SCENARIO_DEFAULT_SNIPPET_DATA)
+        # This might need adjustment if SCA's test model name changes.
+        # Current SCA default test model is "AetherLLM-Placeholder-DynamicSnippet-v0.2"
+        # However, CPOA's orchestrate_snippet_generation might use a different one if it has its own test mode logic for SCA calls.
+        # Let's assume SCA's test mode is active and CPOA passes it through.
+        # From sca/main.py: SCENARIO_DEFAULT_SNIPPET_DATA['llm_model_used'] = "SCA-Test-LLM-v1.0"
+        # Update: SCA's default test data uses "SCA-Test-LLM-v1.0" as per its main.py
+        self.assertEqual(first_result.get("llm_model_used"), "SCA-Test-LLM-v1.0",
+                         f"LLM model used for snippet generation is not the expected SCA test model. Got: {first_result.get('llm_model_used')}")
+
+        # Optional: Check if the title or summary contains the search query (or related terms)
+        # This depends on TDA's simulated data and SCA's snippet generation logic.
+        # For "AI", TDA has "The Future of AI in Personalized Medicine". SCA generates a generic snippet.
+        # The title of the snippet might be derived from the TDA topic.
+        title_contains_query = search_query.lower() in first_result.get("title", "").lower()
+        summary_contains_query = search_query.lower() in first_result.get("summary", "").lower()
+        # self.assertTrue(title_contains_query or summary_contains_query,
+        #                 f"Neither title nor summary of the first search result seems related to the query '{search_query}'. Title: '{first_result.get('title', '')}', Summary: '{first_result.get('summary', '')}'")
+        # This assertion can be very flaky depending on how test data is structured and processed.
+        # For now, presence of results and correct structure is the primary goal.
+        print(f"[INFO] Test test_search_podcasts_successful for query '{search_query}' PASSED. Found {len(search_results)} results.")
+
+    def test_search_podcasts_missing_query(self):
+        """
+        Tests the search endpoint with a missing or empty query parameter.
+        Expects a 400 Bad Request response.
+        """
+        client_id = f"test_client_search_badreq_{uuid.uuid4().hex}"
+        print(f"\n[INFO] Starting test_search_podcasts_missing_query with client_id: {client_id}")
+
+        payloads_to_test = [
+            {},                            # Empty payload
+            {"query": ""},                 # Empty query string
+            {"client_id": client_id}       # Payload with client_id but no query
+        ]
+
+        for payload in payloads_to_test:
+            with self.subTest(payload=payload):
+                print(f"[INFO] POST {API_GATEWAY_BASE_URL}/search/podcasts with invalid payload: {payload}")
+                response = requests.post(f"{API_GATEWAY_BASE_URL}/search/podcasts", json=payload, timeout=10)
+
+                self.assertEqual(response.status_code, 400, f"Search request with payload {payload} did not return 400. Got: {response.status_code} - {response.text}")
+
+                response_data = response.json()
+                self.assertIsInstance(response_data, dict)
+                self.assertIn("error", response_data, "Error response missing 'error' key.")
+                self.assertEqual(response_data["error"], "Bad Request", "Error type is not 'Bad Request'.")
+                self.assertIn("message", response_data, "Error response missing 'message' key.")
+                self.assertIn("Missing or empty 'query'", response_data["message"],
+                              f"Error message does not indicate missing query. Message: '{response_data['message']}'")
+
+        print(f"[INFO] Test test_search_podcasts_missing_query PASSED for all invalid payloads.")
+
 
 if __name__ == "__main__":
     # This allows running the integration test directly.

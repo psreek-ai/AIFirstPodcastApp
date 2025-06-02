@@ -169,14 +169,17 @@ def _update_session_preferences(db_conn, session_id: str, preferences: dict) -> 
 def _cpoa_placeholder_podcast(*args, **kwargs): raise ImportError("CPOA's orchestrate_podcast_generation function is not available due to import failure.")
 def _cpoa_placeholder_snippet(*args, **kwargs): raise ImportError("CPOA's orchestrate_snippet_generation function is not available due to import failure.")
 def _cpoa_placeholder_explore(*args, **kwargs): raise ImportError("CPOA's orchestrate_topic_exploration function is not available due to import failure.")
+def _cpoa_placeholder_search(*args, **kwargs): raise ImportError("CPOA's orchestrate_search_results_generation function is not available due to import failure.")
 
 orchestrate_podcast_generation = _cpoa_placeholder_podcast
 orchestrate_snippet_generation = _cpoa_placeholder_snippet
 orchestrate_topic_exploration = _cpoa_placeholder_explore
+orchestrate_search_results_generation = _cpoa_placeholder_search
 
 cpoa_podcast_func_imported = False
 cpoa_snippet_func_imported = False
 cpoa_exploration_func_imported = False
+cpoa_search_func_imported = False # Added
 CPOA_OVERALL_IMPORT_ERROR_MESSAGE = []
 
 _pre_init_logger = print
@@ -204,6 +207,14 @@ try:
     _pre_init_logger("Successfully imported CPOA.orchestrate_topic_exploration.")
 except ImportError as e:
     CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_topic_exploration: {e}")
+
+try:
+    from aethercast.cpoa.main import orchestrate_search_results_generation as osrg_real
+    orchestrate_search_results_generation = osrg_real
+    cpoa_search_func_imported = True
+    _pre_init_logger("Successfully imported CPOA.orchestrate_search_results_generation.")
+except ImportError as e:
+    CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_search_results_generation: {e}")
 
 if CPOA_OVERALL_IMPORT_ERROR_MESSAGE:
     _pre_init_logger(f"CPOA Module Import Errors: {'; '.join(CPOA_OVERALL_IMPORT_ERROR_MESSAGE)}")
@@ -243,8 +254,52 @@ def serve_script():
 # --- Health Check Endpoint ---
 @app.route('/health', methods=['GET'])
 def health_check():
-    # ... (existing health check logic - can be kept as is)
-    return jsonify({"status": "API Gateway is healthy"}), 200
+    db_status = "Database connection successful."
+    try:
+        conn = get_db_connection()
+        conn.execute("SELECT 1 FROM podcasts LIMIT 1;") # Simple query
+        conn.close()
+    except Exception as e:
+        db_status = f"Database connection error: {e}"
+        app.logger.error(f"Health check DB error: {e}", exc_info=True)
+
+    # Consolidate CPOA import statuses
+    cpoa_import_summary = []
+    if not cpoa_podcast_func_imported: cpoa_import_summary.append("podcast_generation")
+    if not cpoa_snippet_func_imported: cpoa_import_summary.append("snippet_generation")
+    if not cpoa_exploration_func_imported: cpoa_import_summary.append("topic_exploration")
+    if not cpoa_search_func_imported: cpoa_import_summary.append("search_generation") # Added search
+
+    cpoa_overall_status = "fully operational"
+    if cpoa_import_summary:
+        cpoa_overall_status = f"partially operational (missing: {', '.join(cpoa_import_summary)})"
+        if len(cpoa_import_summary) == 4: # If all known CPOA functions failed to import
+            cpoa_overall_status = "CPOA module critical functions failed to import"
+
+    if CPOA_OVERALL_IMPORT_ERROR_MESSAGE and not cpoa_import_summary : # Errors logged but flags are true (should not happen)
+        cpoa_overall_status = "inconsistent import state (errors logged but functions flagged as imported)"
+
+
+    health_data = {
+        "status": "API Gateway is healthy" if db_status.startswith("Database connection successful.") and not cpoa_import_summary else "API Gateway has issues",
+        "cpoa_module_status": cpoa_overall_status,
+        "cpoa_podcast_function_status": "successfully imported" if cpoa_podcast_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
+        "cpoa_snippet_function_status": "successfully imported" if cpoa_snippet_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
+        "cpoa_exploration_function_status": "successfully imported" if cpoa_exploration_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
+        "cpoa_search_function_status": "successfully imported" if cpoa_search_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Added
+        "database_status": db_status,
+        "cpoa_detailed_import_errors": CPOA_OVERALL_IMPORT_ERROR_MESSAGE if CPOA_OVERALL_IMPORT_ERROR_MESSAGE else "None"
+    }
+
+    status_code = 200
+    if not db_status.startswith("Database connection successful.") or not IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS(): # Define IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS or check each flag
+        status_code = 503 # Service Unavailable if critical parts are down
+
+    return jsonify(health_data), status_code
+
+# Helper for health check to see if all CPOA functions are up
+def IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS():
+    return cpoa_podcast_func_imported and cpoa_snippet_func_imported and cpoa_exploration_func_imported and cpoa_search_func_imported
 
 
 # --- Session Management Endpoints ---
@@ -358,11 +413,90 @@ def get_dynamic_snippets():
 def explore_topic():
     # ... (existing topic exploration logic - can be kept as is)
     app.logger.info("Request received for /api/v1/topics/explore")
-    if not cpoa_exploration_func_imported:
-        app.logger.error("CPOA exploration function not available.")
-        return jsonify({"error": "Service Unavailable", "message": "Topic exploration service not available."}), 503
-    return jsonify({"explored_topics_or_snippets": [{"id": "dummy_explored_1", "title": "Dummy Explored Topic", "summary": "Exploration result."}]}), 200
+    if not cpoa_exploration_func_imported: # Assuming placeholder and flag exist
+        app.logger.error("CPOA topic exploration function not available.")
+        return jsonify({"error": "Service Unavailable", "message": "Topic exploration service is currently unavailable."}), 503
 
+    # Dummy data for now, replace with actual call to CPOA's orchestrate_topic_exploration
+    # This endpoint's logic for calling CPOA needs to be fully implemented similar to search.
+    # For now, just returning placeholder if function is imported.
+    try:
+        # Example: Placeholder for actual call
+        # result = orchestrate_topic_exploration(current_topic_id=request.args.get("topic_id"), keywords=request.args.getlist("keyword"))
+        # return jsonify(result), 200
+        return jsonify({"message": "Topic exploration endpoint placeholder.", "explored_topics_or_snippets": [{"id": "dummy_explored_1", "title": "Dummy Explored Topic", "summary": "Exploration result."}]}), 200
+    except ImportError:
+         app.logger.critical("CPOA topic exploration function became unavailable after initial check.", exc_info=True)
+         return jsonify({"error": "Service Configuration Error", "message": "Topic exploration module component is critically unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /api/v1/topics/explore endpoint: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred during topic exploration."}), 500
+
+# --- Search Endpoint ---
+@app.route('/api/v1/search/podcasts', methods=['POST'])
+def search_podcasts_endpoint():
+    app.logger.info("Request received for /api/v1/search/podcasts")
+    if not cpoa_search_func_imported:
+        app.logger.error("CPOA search function not available.")
+        return jsonify({"error": "Service Unavailable", "message": "Search orchestration service not available."}), 503
+
+    data = request.get_json()
+    if not data or not data.get("query"):
+        app.logger.warning("Bad request to /api/v1/search/podcasts: Missing or empty 'query'.")
+        return jsonify({"error": "Bad Request", "message": "Missing or empty 'query' in request body."}), 400
+
+    query = data["query"]
+    client_id = data.get("client_id")
+    user_preferences = None
+
+    if client_id:
+        conn_prefs = None
+        try:
+            conn_prefs = get_db_connection()
+            session_data = _get_session(conn_prefs, client_id)
+            if session_data and session_data["preferences_json"]:
+                user_preferences = json.loads(session_data["preferences_json"])
+                app.logger.info(f"Fetched preferences for client_id {client_id} for search: {user_preferences}")
+                _touch_session_last_seen(conn_prefs, client_id)
+            elif not session_data:
+                _create_session(conn_prefs, client_id)
+                app.logger.info(f"No session found for client_id {client_id} during search. Created one.")
+            else: # Session exists but no preferences
+                 _touch_session_last_seen(conn_prefs, client_id)
+        except sqlite3.Error as e_prefs_sql:
+            app.logger.error(f"DB error fetching preferences for client {client_id} during search: {e_prefs_sql}")
+        except json.JSONDecodeError as e_prefs_json:
+            app.logger.error(f"JSON decode error for preferences for client {client_id} during search: {e_prefs_json}")
+        finally:
+            if conn_prefs:
+                conn_prefs.close()
+
+    try:
+        app.logger.info(f"Calling CPOA orchestrate_search_results_generation with query: '{query}'")
+        cpoa_search_response = orchestrate_search_results_generation(query=query, user_preferences=user_preferences)
+
+        if "error" in cpoa_search_response:
+            app.logger.error(f"CPOA returned an error during search: {cpoa_search_response}")
+            error_type = cpoa_search_response.get("error", "UNKNOWN_CPOA_ERROR")
+            # Determine status code based on cpoa_search_response["error"]
+            status_code = 500 # Default to general server error
+            if "TDA_" in error_type or "SCA_" in error_type or "CPOA_CONFIG_ERROR" in error_type:
+                status_code = 503 # Service Unavailable for downstream or config issues
+
+            return jsonify({
+                "error": error_type,
+                "message": cpoa_search_response.get("details", "Search processing failed internally.")
+            }), status_code
+
+        # Expecting {"search_results": [...]} from CPOA on success
+        return jsonify(cpoa_search_response), 200
+
+    except ImportError:
+        app.logger.critical("CPOA search function became unavailable after initial check.", exc_info=True)
+        return jsonify({"error": "Service Configuration Error", "message": "Search module component is critically unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in search_podcasts_endpoint: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred during search."}), 500
 
 # --- Podcast Generation Endpoint ---
 @app.route('/api/v1/podcasts', methods=['POST'])

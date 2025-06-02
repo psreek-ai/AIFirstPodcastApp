@@ -1085,3 +1085,99 @@ def orchestrate_topic_exploration(
 
     logger.info(f"Topic exploration for '{original_topic_title}' yielded {len(explored_snippets)} new snippets.")
     return explored_snippets
+
+
+def orchestrate_search_results_generation(query: str, user_preferences: Optional[dict] = None) -> Dict[str, Any]:
+    logger.info(f"CPOA: Starting search results generation for query: '{query}'")
+    search_results_snippets: List[Dict[str, Any]] = []
+
+    # 1. Call TDA
+    # TDA_SERVICE_URL is loaded from environment at module level
+    if not TDA_SERVICE_URL:
+        error_msg = "CPOA: TDA_SERVICE_URL is not configured. Cannot perform search."
+        logger.error(error_msg)
+        return {"error": "CPOA_CONFIG_ERROR", "details": "TDA_SERVICE_URL not set.", "search_results": []}
+
+    tda_payload = {"query": query, "limit": 7} # Set limit for TDA results, e.g., 7
+
+    try:
+        logger.info(f"CPOA: Calling TDA service for search query '{query}' with payload: {tda_payload}")
+        response = requests_with_retry("post", TDA_SERVICE_URL, # TDA_SERVICE_URL is global
+                                       max_retries=CPOA_SERVICE_RETRY_COUNT,
+                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                       json=tda_payload, timeout=30) # Standard timeout for TDA
+        tda_data = response.json()
+        # Ensure discovered_topics is always a list
+        # TDA returns topics under "topics" or "discovered_topics"
+        discovered_topics = tda_data.get("topics", tda_data.get("discovered_topics"))
+        if discovered_topics is None:
+            discovered_topics = [] # Default to empty list if key missing or None
+
+        logger.info(f"CPOA: TDA returned {len(discovered_topics)} topics for query '{query}'.")
+
+        if not discovered_topics:
+            return {"search_results": []}
+
+    except requests.exceptions.RequestException as e_req:
+        error_msg = f"CPOA: TDA service call failed for search query '{query}': {e_req}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": "TDA_REQUEST_FAILED", "details": str(e_req), "search_results": []}
+    except json.JSONDecodeError as e_json:
+        response_text_preview = "N/A"
+        if 'response' in locals() and hasattr(response, 'text'):
+            response_text_preview = response.text[:200]
+        error_msg = f"CPOA: Failed to decode TDA response for search query '{query}': {e_json}. Response preview: {response_text_preview}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": "TDA_RESPONSE_INVALID_JSON", "details": str(e_json), "search_results": []}
+    except Exception as e_gen_tda: # Catch any other unexpected error during TDA call
+        error_msg = f"CPOA: Unexpected error during TDA call for search query '{query}': {e_gen_tda}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": "TDA_UNEXPECTED_ERROR", "details": str(e_gen_tda), "search_results": []}
+
+    # 2. For each topic, generate a snippet using orchestrate_snippet_generation
+    successful_snippet_generations = 0
+    for topic_obj in discovered_topics:
+        if not isinstance(topic_obj, dict):
+            logger.warning(f"CPOA: Skipping non-dictionary topic object from TDA during search processing: {topic_obj}")
+            continue
+
+        # TDA's TopicObject might have 'title' or 'title_suggestion'.
+        # orchestrate_snippet_generation expects 'title_suggestion' for the content_brief.
+        # We need to ensure the topic_obj passed to orchestrate_snippet_generation has the necessary fields.
+        # Let's form `topic_info_for_sca` as done in `orchestrate_topic_exploration`.
+        topic_info_for_sca = {
+            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id"), # TDA might use 'id' or 'topic_id'
+            "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"), # Prefer 'title_suggestion'
+            "summary": topic_obj.get("summary"),
+            "keywords": topic_obj.get("keywords", []),
+            "original_topic_details_from_tda": topic_obj # Pass full TDA object for context
+        }
+
+        # Ensure there's a brief for SCA to work with
+        if not topic_info_for_sca["title_suggestion"]:
+            logger.warning(f"CPOA: Skipping snippet generation for TDA topic due to missing title/title_suggestion. Topic object: {topic_obj}")
+            continue
+
+        logger.info(f"CPOA: Generating search snippet for TDA topic_id: {topic_info_for_sca.get('topic_id', 'N/A')}, title: {topic_info_for_sca.get('title_suggestion', 'N/A')}")
+        try:
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
+            if snippet_result and "error" not in snippet_result:
+                # Ensure snippet_id is present, as expected by API Gateway's search response
+                if "snippet_id" not in snippet_result and "id" in snippet_result: # SCA might return 'id'
+                    snippet_result["snippet_id"] = snippet_result["id"]
+                elif "snippet_id" not in snippet_result: # Generate one if missing
+                     snippet_result["snippet_id"] = f"search_snippet_{uuid.uuid4().hex[:8]}"
+                     logger.warning(f"CPOA: Generated missing snippet_id for search result: {snippet_result['snippet_id']}")
+
+                search_results_snippets.append(snippet_result)
+                successful_snippet_generations += 1
+            else:
+                err_detail = "Unknown SCA error"
+                if snippet_result: # Check if snippet_result is not None
+                    err_detail = snippet_result.get('details', snippet_result.get('error', err_detail))
+                logger.warning(f"CPOA: Snippet generation failed or returned error for search topic: {topic_info_for_sca.get('title_suggestion', 'N/A')}. Error: {err_detail}")
+        except Exception as e_sca_orch: # Catch unexpected errors from orchestrate_snippet_generation
+            logger.error(f"CPOA: Unexpected error calling orchestrate_snippet_generation for search topic {topic_info_for_sca.get('title_suggestion', 'N/A')}: {e_sca_orch}", exc_info=True)
+
+    logger.info(f"CPOA: Successfully generated {successful_snippet_generations} snippets for search query '{query}' out of {len(discovered_topics)} topics found.")
+    return {"search_results": search_results_snippets}
