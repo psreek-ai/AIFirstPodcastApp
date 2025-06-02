@@ -22,7 +22,7 @@ tda_config = {
     "TDA_NEWS_PAGE_SIZE": int(os.getenv("TDA_NEWS_PAGE_SIZE", "25")),
     "TDA_NEWS_REQUEST_TIMEOUT": int(os.getenv("TDA_NEWS_REQUEST_TIMEOUT", "15")),
     "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"),
-    "TDA_DATABASE_PATH": os.getenv("TDA_DATABASE_PATH", "../api_gateway/aethercast_podcasts.db") # Added, assuming relative path for dev
+    "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db") # Added, assuming relative path for dev
 }
 
 # --- Additional Imports ---
@@ -180,9 +180,9 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
             return []
 
         articles = response_json.get("articles", [])
-        db_path = tda_config.get("TDA_DATABASE_PATH")
+        db_path = tda_config.get("SHARED_DATABASE_PATH")
         if not db_path:
-            logging.error("TDA_DATABASE_PATH not configured. Cannot save topics to DB.")
+            logging.error("SHARED_DATABASE_PATH not configured. Cannot save topics to DB.")
         
         for article in articles:
             title = article.get('title')
@@ -309,9 +309,9 @@ def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
     """
     identified_topics = []
     all_articles = []
-    db_path = tda_config.get("TDA_DATABASE_PATH")
+    db_path = tda_config.get("SHARED_DATABASE_PATH")
     if not db_path:
-        logging.warning("TDA_DATABASE_PATH not configured. Simulated topics will not be saved to DB.")
+        logging.warning("SHARED_DATABASE_PATH not configured. Simulated topics will not be saved to DB.")
 
     logging.info(f"[TDA_LOGIC] Scanning simulated data sources. Query: '{query}', Limit: {limit}")
 

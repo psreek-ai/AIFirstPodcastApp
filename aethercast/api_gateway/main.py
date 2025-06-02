@@ -24,7 +24,7 @@ TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_t
 
 
 # --- Database Configuration ---
-DATABASE_FILE = os.getenv("DATABASE_FILE", "aethercast_podcasts.db")
+DATABASE_FILE = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db")
 
 DB_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS podcasts (
@@ -218,7 +218,7 @@ FEND_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'fend')
 with app.app_context():
     app.logger.info("--- API Gateway Configuration ---")
     app.logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}")
-    app.logger.info(f"DATABASE_FILE: {DATABASE_FILE}")
+    app.logger.info(f"SHARED_DATABASE_PATH: {DATABASE_FILE}")
     app.logger.info(f"FEND_DIR: {FEND_DIR}")
     app.logger.info(f"API_GW_SNIPPET_CACHE_SIZE: {API_GW_SNIPPET_CACHE_SIZE}")
     app.logger.info(f"API_GW_SNIPPET_CACHE_MAX_AGE_HOURS: {API_GW_SNIPPET_CACHE_MAX_AGE_HOURS}")
@@ -474,11 +474,39 @@ def create_podcast_generation_task():
         tts_settings_used_json = json.dumps(tts_settings_used_dict) if tts_settings_used_dict else None
         # ... (DB update call) ...
 
-        # Simplified response for brevity, original detailed response construction is fine
-        return jsonify({
-            "podcast_id": podcast_id, "topic": topic, "generation_status": final_cpoa_status,
-            "message": cpoa_result.get("error_message", "Task processed."), "details": cpoa_result
-        }), 200 if final_cpoa_status.startswith("failed") else 201
+        response_payload = {
+            "podcast_id": podcast_id,
+            "topic": topic,
+            "generation_status": final_cpoa_status,
+            "details": cpoa_result  # Keep full details for now
+        }
+
+        http_status_code = 201 # Default for success
+
+        if final_cpoa_status.startswith("failed"):
+            # Prioritize specific error message from CPOA
+            error_message = cpoa_result.get("error_message")
+            if not error_message:
+                error_message = f"Podcast generation failed with status: {final_cpoa_status}"
+            response_payload["message"] = error_message
+
+            # Determine appropriate HTTP status code
+            if "request_exception" in final_cpoa_status or                "reported_error" in final_cpoa_status or                "bad_script_structure" in final_cpoa_status or                "json_decode" in final_cpoa_status: # Errors related to downstream services
+                http_status_code = 502 # Bad Gateway
+            else: # More general CPOA failures
+                http_status_code = 500 # Internal Server Error
+        elif final_cpoa_status.startswith("completed_with_vfa_skipped") or              final_cpoa_status.startswith("completed_with_asf_notification_failure") or              final_cpoa_status.startswith("completed_with_vfa_data_missing"):
+            # Task completed but with issues, still a form of success but message is important
+            response_payload["message"] = cpoa_result.get("error_message", f"Task completed with status: {final_cpoa_status}")
+            http_status_code = 200 # OK, as it did complete, but with caveats
+        else: # Successful completion
+            response_payload["message"] = cpoa_result.get("message", "Podcast generation task initiated and completed successfully.")
+            # Add audio_url if available from CPOA result, for successful completion
+            if cpoa_result.get("final_audio_details", {}).get("audio_filepath"):
+                response_payload["audio_url"] = f"/api/v1/podcasts/{podcast_id}/audio.mp3"
+
+
+        return jsonify(response_payload), http_status_code
 
     except ImportError as ie:
         app.logger.error(f"CPOA function unavailable: {ie}")

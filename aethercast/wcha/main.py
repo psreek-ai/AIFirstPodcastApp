@@ -36,16 +36,25 @@ load_wcha_configuration()
 
 # --- Error Message Constants ---
 # Prefixes/messages used for returning errors from core functions
-ERROR_PREFIX_HARVEST_FAILED_FETCH = "Error fetching URL" # Covers timeout, http, request exceptions
-ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED = "WCHA: Trafilatura failed to extract content from URL"
-ERROR_PREFIX_HARVEST_TRAFILATURA_NO_CONTENT = "WCHA: Trafilatura extracted no content from URL"
-ERROR_PREFIX_HARVEST_LIB_MISSING_TRAFILATURA = "WCHA Error: Trafilatura library not installed"
-ERROR_PREFIX_HARVEST_LIB_MISSING_REQUESTS = "Cannot 'harvest_from_url' because requests library is missing" # More specific than generic WCHA_LIB_MISSING
+ERROR_PREFIX_HARVEST_FAILED_FETCH = "Error fetching URL" # Covers timeout, http, request exceptions # Retained for now
+ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED = "WCHA: Trafilatura failed to extract content from URL" # Retained for now
+ERROR_PREFIX_HARVEST_TRAFILATURA_NO_CONTENT = "WCHA: Trafilatura extracted no content from URL" # Retained for now
+ERROR_PREFIX_HARVEST_LIB_MISSING_TRAFILATURA = "WCHA Error: Trafilatura library not installed" # Retained for now
+ERROR_PREFIX_HARVEST_LIB_MISSING_REQUESTS = "Cannot 'harvest_from_url' because requests library is missing" # Retained for now
 
 ERROR_WCHA_LIB_MISSING = "WCHA: Cannot 'get_content_for_topic' due to missing libraries:" # Note: full message includes details
 ERROR_WCHA_SEARCH_FAILED = "Error during web search for topic" # Note: full message includes details
 ERROR_WCHA_NO_SEARCH_RESULTS = "WCHA: No search results found for topic" # Note: full message includes details
 ERROR_WCHA_HARVEST_ALL_FAILED = "WCHA: Failed to harvest usable content from any of the" # Note: full message includes details
+
+# --- New Error Type Constants for Structured Error Reporting in harvest_from_url ---
+WCHA_ERROR_TYPE_LIB_MISSING = "library_missing"
+WCHA_ERROR_TYPE_FETCH = "fetch_error"
+WCHA_ERROR_TYPE_EXTRACTION = "extraction_error"
+WCHA_ERROR_TYPE_NO_CONTENT = "no_content_extracted"
+WCHA_ERROR_TYPE_CONTENT_TOO_SHORT = "content_too_short" # For future use with min_length strictness
+WCHA_ERROR_TYPE_UNKNOWN = "unknown_harvest_error"
+
 
 # For the test endpoint
 ENDPOINT_ERROR_INVALID_PAYLOAD = "INVALID_JSON_PAYLOAD_WCHA" # Make specific if used only here
@@ -137,7 +146,7 @@ def generate_harvest_id() -> str:
     return f"harvest_{uuid.uuid4().hex[:10]}"
 
 # --- Existing harvest_content function (Preserved) ---
-def harvest_content(topic: str) -> str:
+def harvest_content(topic: str) -> str: # This is the mock function, returns string
     logger.info(f"[WCHA_LOGIC_MOCK] harvest_content (mock data) called with topic: '{topic}'")
     normalized_topic = topic.lower().strip() if topic else ""
     if normalized_topic in SIMULATED_WEB_CONTENT:
@@ -148,71 +157,75 @@ def harvest_content(topic: str) -> str:
         logger.warning(f"[WCHA_LOGIC_MOCK] No pre-defined mock content found for topic: '{topic}'.")
         return f"No pre-defined content found for topic: {topic}"
 
-# --- Existing harvest_from_url function (Modified to use Trafilatura) ---
-def harvest_from_url(url: str) -> str:
-    if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4: # Still need requests
-        error_msg = f"{ERROR_PREFIX_HARVEST_LIB_MISSING_REQUESTS} ({_MISSING_IMPORT_ERROR_REQUESTS_BS4})"
+# --- Refactored harvest_from_url function ---
+def harvest_from_url(url: str, min_length: int = 150) -> dict: # min_length default matches old constant for now
+    # Using wcha_config for timeout and user_agent
+    request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
+    headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
+
+    if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4: # Check for requests
+        error_msg = f"Required library missing: requests/bs4 ({_MISSING_IMPORT_ERROR_REQUESTS_BS4})"
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
-        return error_msg
+        return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_LIB_MISSING, "error_message": error_msg}
 
     if not _IMPORTS_SUCCESSFUL_TRAFILATURA:
-        error_msg = f"{ERROR_PREFIX_HARVEST_LIB_MISSING_TRAFILATURA} ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
+        error_msg = f"Required library missing: trafilatura ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
-        return error_msg
+        return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_LIB_MISSING, "error_message": error_msg}
 
     logger.info(f"[WCHA_LOGIC_WEB] Attempting to harvest content from URL: {url} using Trafilatura")
-    headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
-    request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
 
     try:
         response = requests.get(url, headers=headers, timeout=request_timeout)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
 
-        # Check content type - Trafilatura might handle non-HTML better, but good to be aware.
         content_type = response.headers.get('Content-Type', '').lower()
         if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
             logger.warning(f"[WCHA_LOGIC_WEB] Content at URL '{url}' may not be HTML (Content-Type: {content_type}). Trafilatura will attempt extraction.")
 
-        # Use Trafilatura for extraction
-        # The `url` parameter helps trafilatura resolve relative links if it were fetching, but here we pass raw content.
-        # It still can be useful for some internal heuristics of trafilatura.
         extracted_text = trafilatura.extract(response.content, url=url, output_format='txt',
                                              include_comments=False, include_tables=False,
-                                             favor_precision=True) # Favor quality over quantity
+                                             favor_precision=True)
 
         if extracted_text:
+            if len(extracted_text) < min_length:
+                # Optional: Treat as error if too short, or return content as is.
+                # For now, returning content as is, but logging a warning.
+                logger.warning(f"[WCHA_LOGIC_WEB] Content from {url} is shorter ({len(extracted_text)} chars) than min_length ({min_length} chars).")
+                # If it should be an error:
+                # return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_CONTENT_TOO_SHORT,
+                #         "error_message": f"Extracted content length ({len(extracted_text)}) is less than minimum ({min_length})."}
             logger.info(f"[WCHA_LOGIC_WEB] Trafilatura successfully extracted {len(extracted_text)} characters from {url}.")
-            return extracted_text
+            return {"url": url, "content": extracted_text, "error_type": None, "error_message": None}
         else:
-            # This case means trafilatura ran but decided there was no main content.
-            logger.warning(f"[WCHA_LOGIC_WEB] Trafilatura extracted no content from URL: {url}. This might be a non-article page or content is not extractable.")
-            return f"{ERROR_PREFIX_HARVEST_TRAFILATURA_NO_CONTENT}: {url}"
+            logger.warning(f"[WCHA_LOGIC_WEB] Trafilatura extracted no content from URL: {url}.")
+            return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
 
     except requests.exceptions.Timeout:
-        error_msg = f"{ERROR_PREFIX_HARVEST_FAILED_FETCH} '{url}': Timeout after {request_timeout} seconds."
+        error_msg = f"Timeout after {request_timeout} seconds while fetching '{url}'."
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
-        return error_msg
-    except requests.exceptions.HTTPError as e_http: # Handles 4xx/5xx errors
-        error_msg = f"{ERROR_PREFIX_HARVEST_FAILED_FETCH} '{url}'. HTTP Status code: {e_http.response.status_code}."
+        return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
+    except requests.exceptions.HTTPError as e_http:
+        error_msg = f"HTTP Status {e_http.response.status_code} while fetching '{url}'."
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg} Response: {e_http.response.text[:200]}")
-        return error_msg
-    except requests.exceptions.RequestException as e_req: # Other requests issues (ConnectionError etc.)
-        error_msg = f"{ERROR_PREFIX_HARVEST_FAILED_FETCH} '{url}': RequestException - {type(e_req).__name__} - {e_req}"
+        return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
+    except requests.exceptions.RequestException as e_req:
+        error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url}': {e_req}"
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
-        return error_msg
-    except Exception as e_traf: # Catch potential errors from trafilatura itself, though it's usually robust
-        error_msg = f"{ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED} '{url}': {type(e_traf).__name__} - {e_traf}"
+        return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
+    except Exception as e_traf: # Catch potential errors from trafilatura itself
+        error_msg = f"Trafilatura processing failed for '{url}': {type(e_traf).__name__} - {e_traf}"
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
-        return error_msg
+        return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_EXTRACTION, "error_message": error_msg}
 
-# --- New get_content_for_topic function (Updated error prefixes) ---
-def get_content_for_topic(topic: str, max_results_override: Optional[int] = None) -> str:
+# --- Refactored get_content_for_topic function ---
+def get_content_for_topic(topic: str, max_results_override: Optional[int] = None) -> str: # Return type remains string (aggregated content or error message)
     """
     Performs a web search for the given topic, harvests content from multiple URLs,
     and consolidates the text.
     Uses WCHA_SEARCH_MAX_RESULTS from config, but can be overridden by max_results_override.
     """
-    if not IMPORTS_SUCCESSFUL:
+    if not IMPORTS_SUCCESSFUL: # This checks all required libs including Trafilatura now
         error_msg = f"{ERROR_WCHA_LIB_MISSING} {MISSING_IMPORT_ERROR}"
         logger.error(error_msg)
         return error_msg
@@ -247,37 +260,34 @@ def get_content_for_topic(topic: str, max_results_override: Optional[int] = None
 
     all_harvested_text = []
     successful_harvest_count = 0
-    
-    # Use defined constants for error checking
-    harvest_error_prefixes_tuple = (
-        ERROR_PREFIX_HARVEST_FAILED_FETCH,
-        ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED,
-        ERROR_PREFIX_HARVEST_TRAFILATURA_NO_CONTENT,
-        ERROR_PREFIX_HARVEST_LIB_MISSING_TRAFILATURA,
-        ERROR_PREFIX_HARVEST_LIB_MISSING_REQUESTS
-        # "Content at URL" - this was an old error, less likely with current structure but could be added if observed.
-    )
+    last_harvest_error_details = "No specific harvest error recorded." # For overall error reporting
+    min_content_length_for_aggregation = 150 # Define or get from config if needed
 
-    for i, url in enumerate(urls): # Iterate through found URLs
-        # The ddgs.text(max_results=...) should already limit the number of URLs.
-        # This loop just processes what was returned.
+    for i, url in enumerate(urls):
         logger.info(f"[WCHA_SEARCH_HARVEST] Attempting to harvest from URL ({i+1}/{len(urls)}): {url}")
-        content_from_single_url = harvest_from_url(url)
+        # Pass min_length to harvest_from_url; it will log if content is too short but still return it.
+        # Here, we can decide if short content should be part of aggregation.
+        harvest_result = harvest_from_url(url, min_length=min_content_length_for_aggregation)
         
-        # Check if harvesting was successful
-        # content_from_single_url should not be None and not start with any of the error prefixes
-        if content_from_single_url and not any(content_from_single_url.startswith(prefix) for prefix in harvest_error_prefixes_tuple):
-            all_harvested_text.append(f"Source: {url}\n{content_from_single_url}")
+        if harvest_result.get("content"):
+            # Optional: Add a check here if truly short content should be skipped for aggregation
+            # if len(harvest_result["content"]) < min_content_length_for_aggregation:
+            #     logger.warning(f"[WCHA_SEARCH_HARVEST] Content from {url} was too short ({len(harvest_result['content'])} chars) and will be skipped for aggregation.")
+            #     last_harvest_error_details = f"URL: {url}, Type: {WCHA_ERROR_TYPE_CONTENT_TOO_SHORT}, Message: Content too short."
+            # else:
+            all_harvested_text.append(f"Source: {harvest_result['url']}\n{harvest_result['content']}")
             successful_harvest_count += 1
             logger.info(f"[WCHA_SEARCH_HARVEST] Successfully harvested and validated content from: {url}")
         else:
-            # Log the failure reason more clearly. content_from_single_url itself is the error message here.
-            logger.warning(f"[WCHA_SEARCH_HARVEST] Failed to harvest valid content from URL: {url}. Reason/Response: '{content_from_single_url}'")
+            error_type = harvest_result.get("error_type", WCHA_ERROR_TYPE_UNKNOWN)
+            error_message = harvest_result.get("error_message", "Unknown error during harvest.")
+            last_harvest_error_details = f"URL: {url}, Type: {error_type}, Message: {error_message}"
+            logger.warning(f"[WCHA_SEARCH_HARVEST] Failed to harvest valid content from URL: {url}. Type: {error_type}, Reason: {error_message}")
 
     if successful_harvest_count == 0:
-        message = f"{ERROR_WCHA_HARVEST_ALL_FAILED} {len(urls)} search results for topic: {topic}. Last URL error (if any): {content_from_single_url if urls else 'No URLs found'}"
+        message = f"{ERROR_WCHA_HARVEST_ALL_FAILED} {len(urls)} search results for topic: {topic}. Last error: {last_harvest_error_details}"
         logger.warning(f"[WCHA_SEARCH_HARVEST] {message}")
-        return message
+        return message # Return the detailed error message
     
     final_content = "\n\n---\n\n".join(all_harvested_text)
     logger.info(f"[WCHA_SEARCH_HARVEST] Consolidated content from {successful_harvest_count} sources for topic '{topic}'. Total length: {len(final_content)} chars.")
@@ -298,39 +308,61 @@ try:
 
             topic = request_data.get("topic")
             url_to_harvest = request_data.get("url")
-            use_search = request_data.get("use_search", False)
+            use_search = request_data.get("use_search", False) # For get_content_for_topic
+            # Optional: allow overriding timeout and min_length via request for direct URL harvest
+            timeout_override = request_data.get("timeout")
+            min_length_override = request_data.get("min_length")
+
 
             if use_search and topic:
                 logger.info(f"[WCHA_API] Received API request to search and harvest for topic: '{topic}'")
-                content_result = get_content_for_topic(topic)
-                if any(content_result.startswith(prefix) for prefix in [ERROR_WCHA_SEARCH_FAILED, ERROR_WCHA_NO_SEARCH_RESULTS, ERROR_WCHA_HARVEST_ALL_FAILED, ERROR_WCHA_LIB_MISSING]):
-                    return flask.jsonify({"topic": topic, "error": content_result, "content": None}), 400 # Or 500 for some
-                return flask.jsonify({"topic": topic, "source": "web_search_ddg", "content": content_result}), 200
-
-            elif topic: # Original mock data path (less critical for constant error prefixes)
-                logger.info(f"[WCHA_API] Received API request for mock topic: '{topic}'")
-                content_result = harvest_content(topic)
-                if content_result.startswith("No pre-defined content found"): # This is a specific mock message
-                     return flask.jsonify({"topic": topic, "message": content_result, "content": None}), 200
-                return flask.jsonify({"topic": topic, "source": "mock_data", "content": content_result}), 200
+                # get_content_for_topic still returns a string (content or error message)
+                content_result_str = get_content_for_topic(topic)
+                # Check if the returned string indicates an error based on its prefixes
+                # (This part remains similar as get_content_for_topic's return signature wasn't changed to dict for this subtask)
+                if any(content_result_str.startswith(prefix) for prefix in [ERROR_WCHA_LIB_MISSING, ERROR_WCHA_SEARCH_FAILED, ERROR_WCHA_NO_SEARCH_RESULTS, ERROR_WCHA_HARVEST_ALL_FAILED]):
+                    return flask.jsonify({"topic": topic, "error": content_result_str, "content": None}), 400 # Or 500 depending on error
+                return flask.jsonify({"topic": topic, "source": "web_search_ddg", "content": content_result_str}), 200
 
             elif url_to_harvest:
-                logger.info(f"[WCHA_API] Received API request for URL: '{url_to_harvest}'")
-                content_result = harvest_from_url(url_to_harvest)
-                # Check against a tuple of harvest error prefixes
-                harvest_fail_prefixes_for_endpoint = (
-                    ERROR_PREFIX_HARVEST_FAILED_FETCH,
-                    ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED,
-                    ERROR_PREFIX_HARVEST_TRAFILATURA_NO_CONTENT,
-                    ERROR_PREFIX_HARVEST_LIB_MISSING_TRAFILATURA,
-                    ERROR_PREFIX_HARVEST_LIB_MISSING_REQUESTS
-                )
-                if any(content_result.startswith(prefix) for prefix in harvest_fail_prefixes_for_endpoint):
-                    return flask.jsonify({"url": url_to_harvest, "error": content_result, "content": None}), 400 # Or 500
-                return flask.jsonify({"url": url_to_harvest, "source": "direct_url", "content": content_result}), 200
+                logger.info(f"[WCHA_API] Received API request for direct URL harvest: '{url_to_harvest}'")
+                harvest_params = {}
+                if timeout_override is not None: harvest_params["timeout"] = timeout_override
+                if min_length_override is not None: harvest_params["min_length"] = min_length_override
+
+                harvest_result_dict = harvest_from_url(url_to_harvest, **harvest_params)
+
+                if harvest_result_dict.get("content"):
+                    return flask.jsonify({
+                        "url": url_to_harvest,
+                        "source": "direct_url",
+                        "content": harvest_result_dict["content"]
+                    }), 200
+                else:
+                    error_type = harvest_result_dict.get("error_type", WCHA_ERROR_TYPE_UNKNOWN)
+                    error_message = harvest_result_dict.get("error_message", "Unknown error during harvest.")
+                    status_code = 500 # Default
+                    if error_type == WCHA_ERROR_TYPE_LIB_MISSING: status_code = 503
+                    elif error_type == WCHA_ERROR_TYPE_FETCH: status_code = 502
+                    elif error_type == WCHA_ERROR_TYPE_NO_CONTENT: status_code = 404
+                    # WCHA_ERROR_TYPE_EXTRACTION or WCHA_ERROR_TYPE_UNKNOWN remains 500
+
+                    return flask.jsonify({
+                        "url": url_to_harvest,
+                        "error": error_message,
+                        "error_type": error_type,
+                        "content": None
+                    }), status_code
+
+            elif topic: # Fallback to mock data if no use_search and no url, but topic is present
+                logger.info(f"[WCHA_API] Received API request for mock topic (no use_search or url): '{topic}'")
+                content_result_mock = harvest_content(topic) # Mock function
+                if content_result_mock.startswith("No pre-defined content found"):
+                     return flask.jsonify({"topic": topic, "message": content_result_mock, "content": None}), 200 # Or 404
+                return flask.jsonify({"topic": topic, "source": "mock_data", "content": content_result_mock}), 200
 
             else:
-                logger.warning("[WCHA_API] Invalid API request. 'topic' (for mock/search) or 'url' (for direct) must be provided.")
+                logger.warning("[WCHA_API] Invalid API request. 'url' or 'topic' (with use_search=true for web search, or alone for mock) must be provided.")
                 return flask.jsonify({"error": ENDPOINT_ERROR_MISSING_FIELDS, "details": "'topic' (with use_search=true) or 'url' must be provided."}), 400
 
         except Exception as e:

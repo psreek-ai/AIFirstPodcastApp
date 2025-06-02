@@ -89,7 +89,7 @@ VFA_SERVICE_URL = os.getenv("VFA_SERVICE_URL", "http://localhost:5005/forge_voic
 ASF_NOTIFICATION_URL = os.getenv("ASF_NOTIFICATION_URL", "http://localhost:5006/asf/internal/notify_new_audio")
 ASF_WEBSOCKET_BASE_URL = os.getenv("ASF_WEBSOCKET_BASE_URL", "ws://localhost:5006/api/v1/podcasts/stream")
 SCA_SERVICE_URL = os.getenv("SCA_SERVICE_URL", "http://localhost:5002/craft_snippet")
-CPOA_DATABASE_PATH = os.getenv("CPOA_DATABASE_PATH", "cpoa_orchestration_tasks.db")
+CPOA_DATABASE_PATH = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db")
 CPOA_ASF_SEND_UI_UPDATE_URL = os.getenv("CPOA_ASF_SEND_UI_UPDATE_URL", "http://localhost:5006/asf/internal/send_ui_update") # Added
 CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3"))
 CPOA_SERVICE_RETRY_BACKOFF_FACTOR = float(os.getenv("CPOA_SERVICE_RETRY_BACKOFF_FACTOR", "0.5"))
@@ -118,7 +118,7 @@ logger.info(f"VFA_SERVICE_URL: {VFA_SERVICE_URL}")
 logger.info(f"ASF_NOTIFICATION_URL: {ASF_NOTIFICATION_URL}")
 logger.info(f"ASF_WEBSOCKET_BASE_URL: {ASF_WEBSOCKET_BASE_URL}")
 logger.info(f"SCA_SERVICE_URL: {SCA_SERVICE_URL}")
-logger.info(f"CPOA_DATABASE_PATH: {CPOA_DATABASE_PATH}")
+logger.info(f"SHARED_DATABASE_PATH: {CPOA_DATABASE_PATH}")
 logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}") # Added
 logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}")
 logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}")
@@ -373,25 +373,34 @@ def orchestrate_podcast_generation(
             if any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
                  wcha_data_log["wcha_error_content"] = wcha_output # Capture full error if it's an error string
             log_step("WCHA finished.", data=wcha_data_log)
+            # Enhanced logging for WCHA output preview
+            wcha_data_log["wcha_output_preview"] = wcha_output[:200] + "..." if wcha_output and not any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS) else "N/A"
 
 
             if not wcha_output or any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
                 final_error_message = str(wcha_output) if wcha_output else "WCHA returned no content or an error string."
-                log_step(f"WCHA content retrieval failure.", data={"error_message": final_error_message, "wcha_output_preview": wcha_output[:100]}, is_error_payload=True)
+                log_step(f"WCHA content retrieval failure.", data={"error_message": final_error_message, "wcha_output_preview": wcha_output[:100]}, is_error_payload=True) # Keep existing error log
                 final_cpoa_status = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
                 raise Exception(f"WCHA critical failure: {final_error_message}")
 
             current_orchestration_stage = ORCHESTRATION_STAGE_PSWA
             _update_task_status_in_db(db_path, task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, error_msg=None)
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting podcast script with AI...", "stage": current_orchestration_stage})
+
+            pswa_payload_for_log = {"content_preview": wcha_output[:100] + "..." if wcha_output else "N/A", "topic": topic} # Avoid logging full content
+            pswa_headers_for_log = {}
+            if test_scenarios and test_scenarios.get("pswa"):
+                pswa_headers_for_log['X-Test-Scenario'] = test_scenarios["pswa"]
+
             log_step("Calling PSWA Service (weave_script)...",
-                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output)})
+                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output),
+                           "payload_preview": pswa_payload_for_log, "headers": pswa_headers_for_log})
             try:
                 pswa_payload = {"content": wcha_output, "topic": topic}
-                pswa_headers = {}
+                pswa_headers = {} # Actual headers for request
                 if test_scenarios and test_scenarios.get("pswa"):
                     pswa_headers['X-Test-Scenario'] = test_scenarios["pswa"]
-                    logger.info(f"Task {task_id}: Sending X-Test-Scenario header to PSWA: {test_scenarios['pswa']}")
+                    # logger.info already logs this, so log_step covers it well.
 
                 response = requests_with_retry("post", PSWA_SERVICE_URL,
                                                max_retries=retry_count, backoff_factor=backoff_factor,
@@ -456,18 +465,22 @@ def orchestrate_podcast_generation(
 
             vfa_call_data = {"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title")}
             if effective_voice_params: # Check if there are any params to send
-                vfa_call_data["voice_params_input"] = effective_voice_params # Log what's being sent
+                vfa_call_data["voice_params_input"] = effective_voice_params
 
-            log_step("Calling VFA Service (forge_voice)...", data=vfa_call_data)
+            vfa_headers_for_log = {}
+            if test_scenarios and test_scenarios.get("vfa"):
+                vfa_headers_for_log['X-Test-Scenario'] = test_scenarios["vfa"]
+
+            log_step("Calling VFA Service (forge_voice)...", data={**vfa_call_data, "headers": vfa_headers_for_log})
             try:
                 vfa_payload = {"script": structured_script_from_pswa}
-                if effective_voice_params: # Use potentially modified params
+                if effective_voice_params:
                     vfa_payload["voice_params"] = effective_voice_params
 
-                vfa_headers = {}
+                vfa_headers = {} # Actual headers for request
                 if test_scenarios and test_scenarios.get("vfa"):
                     vfa_headers['X-Test-Scenario'] = test_scenarios["vfa"]
-                    logger.info(f"Task {task_id}: Sending X-Test-Scenario header to VFA: {test_scenarios['vfa']}")
+                    # logger.info already logs this
 
                 response = requests_with_retry("post", VFA_SERVICE_URL,
                                                max_retries=retry_count, backoff_factor=backoff_factor,
@@ -595,10 +608,18 @@ def orchestrate_podcast_generation(
     _update_task_status_in_db(db_path, task_id, final_cpoa_status, error_msg=final_error_message)
 
     current_orchestration_stage = ORCHESTRATION_STAGE_FINALIZATION # For the final log step
-    log_step(f"Orchestration process ended.",
-             data={"final_cpoa_status": final_cpoa_status,
-                   "final_error_message_preview": final_error_message[:200] if final_error_message else None,
-                   "asf_notification_outcome": asf_notification_status_message})
+    final_log_data = {
+        "task_id": task_id, # Added task_id
+        "final_cpoa_status": final_cpoa_status,
+        "final_error_message_preview": final_error_message[:200] if final_error_message else None,
+        "asf_notification_outcome": asf_notification_status_message,
+        "vfa_outcome_summary": { # Added VFA summary
+            "status": vfa_result_dict.get("status"),
+            "stream_id": vfa_result_dict.get("stream_id"),
+            "audio_filepath_exists": bool(vfa_result_dict.get("audio_filepath"))
+        }
+    }
+    log_step(f"Orchestration process ended.", data=final_log_data)
 
     # Send final UI update on overall success or specific handled failures
     if final_cpoa_status.startswith("failed_") or final_cpoa_status.startswith("completed_with_"):
