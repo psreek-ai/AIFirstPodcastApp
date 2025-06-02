@@ -387,14 +387,116 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Snippet & Topic Exploration Logic (existing functions, ensure renderSnippetCard etc. are preserved) ---
     // For brevity, I'm assuming these are largely unchanged unless they need to interact with preferences.
     // The triggerPodcastGeneration call from snippet buttons already uses the main function.
-    async function newFetchSnippets() { /* ... (existing function) ... */ }
+    async function newFetchSnippets() {
+        if (!snippetListContainer || !snippetStatusMessage) {
+            console.warn("Snippet UI elements not found, skipping snippet fetch.");
+            return;
+        }
+        snippetStatusMessage.textContent = 'Loading fresh snippets...';
+        snippetStatusMessage.className = 'status-messages status-info';
+        snippetListContainer.innerHTML = ''; // Clear existing snippets
+
+        try {
+            const response = await fetch('/api/v1/snippets'); // Assuming this endpoint exists
+            if (!response.ok) {
+                throw new Error(`HTTP error ${response.status}`);
+            }
+            const data = await response.json();
+
+            if (data.snippets && data.snippets.length > 0) {
+                data.snippets.forEach(snippet => renderSnippetCard(snippet, snippetListContainer));
+                snippetStatusMessage.textContent = `Showing ${data.snippets.length} snippets. Source: ${data.source}`;
+                snippetStatusMessage.className = 'status-messages status-success';
+            } else {
+                snippetStatusMessage.textContent = 'No snippets available at the moment.';
+                snippetStatusMessage.className = 'status-messages status-info';
+            }
+        } catch (error) {
+            console.error('Error fetching snippets:', error);
+            snippetStatusMessage.textContent = `Error fetching snippets: ${error.message}`;
+            snippetStatusMessage.className = 'status-messages status-error';
+        }
+    }
     const fetchAndRenderSnippets = newFetchSnippets;
-    function renderSnippetCard(snippet, containerElement) { /* ... (existing function) ... */ }
+
+    function renderSnippetCard(snippet, containerElement) {
+        const cardDiv = document.createElement('div');
+        cardDiv.className = 'snippet-card';
+
+        const imagePlaceholderDiv = document.createElement('div');
+        imagePlaceholderDiv.className = 'snippet-image-placeholder';
+        // CSS handles the default background image. No specific JS style needed for that.
+        // If snippet.cover_art_url was available:
+        // imagePlaceholderDiv.style.backgroundImage = `url('${snippet.cover_art_url}')`;
+
+        const textContentDiv = document.createElement('div');
+        textContentDiv.className = 'snippet-text-content';
+
+        const titleH3 = document.createElement('h3');
+        titleH3.textContent = snippet.title || "Untitled Snippet";
+
+        const summaryP = document.createElement('p');
+        summaryP.className = 'snippet-summary';
+        summaryP.textContent = snippet.summary || snippet.text_content || "No summary available.";
+
+        const listenNowButton = document.createElement('button');
+        listenNowButton.className = 'listen-now-button';
+        listenNowButton.dataset.topic = snippet.title; // Use title as topic for generation
+
+        const iconSpan = document.createElement('span');
+        iconSpan.className = 'material-icons-outlined'; // For Material Icons, if used
+        iconSpan.textContent = 'play_circle_filled'; // Icon name
+
+        const textSpan = document.createElement('span');
+        textSpan.textContent = 'Listen Now';
+
+        listenNowButton.appendChild(iconSpan);
+        listenNowButton.appendChild(textSpan);
+
+        listenNowButton.addEventListener('click', (event) => {
+            const topicForGeneration = event.currentTarget.dataset.topic;
+            if (topicForGeneration) {
+                // Use a more generic status display if this card is outside main podcast output area
+                // For now, using the main 'status-messages' div.
+                // A better approach might be to pass a status display target to renderSnippetCard
+                // or have a dedicated status area for "quick play" from cards.
+                updateStatus(`Initiating podcast for snippet: '${topicForGeneration}'...`, 'info', statusMessagesDiv);
+                triggerPodcastGeneration(topicForGeneration, 'status-messages');
+                // Scroll to the main player/status area after initiating
+                podcastDisplayDiv.scrollIntoView({ behavior: 'smooth' });
+            } else {
+                console.error("No topic data found on 'Listen Now' button.");
+                updateStatus("Could not start podcast: topic data missing.", "error", statusMessagesDiv);
+            }
+        });
+
+        textContentDiv.appendChild(titleH3);
+        textContentDiv.appendChild(summaryP);
+
+        cardDiv.appendChild(imagePlaceholderDiv);
+        cardDiv.appendChild(textContentDiv);
+        cardDiv.appendChild(listenNowButton);
+
+        containerElement.appendChild(cardDiv);
+    }
+
     async function triggerTopicExploration(payload) { /* ... (existing function) ... */ }
     function handleExploreRelated(event) { /* ... (existing function) ... */ }
 
-    if (refreshSnippetsBtn) { /* ... */ }
-    snippetListContainer.addEventListener('click', (event) => { /* ... */ });
+    if (refreshSnippetsBtn) {
+        refreshSnippetsBtn.addEventListener('click', fetchAndRenderSnippets);
+    }
+
+    // Remove or adapt the old generic snippetListContainer listener if it conflicts.
+    // The new "Listen Now" buttons have their own direct listeners.
+    // If other interactions on snippet cards are needed, this might be adapted.
+    // For now, let's comment it out to avoid potential double handling or conflicts.
+    /*
+    snippetListContainer.addEventListener('click', (event) => {
+        // Example: if (event.target.classList.contains('some-other-button-on-card')) { ... }
+    });
+    */
+
     if (exploredTopicsContainer) { /* ... */ }
     if (exploreKeywordsBtn) { /* ... */ }
 

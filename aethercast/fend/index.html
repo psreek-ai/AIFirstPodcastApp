@@ -8,22 +8,56 @@
 </head>
 <body>
     <div class="container">
-        <header>
-            <h1>Aethercast - Your Personal AI Podcast Generator</h1>
+        <header class="site-header">
+            <div class="header-branding">
+                <!-- Placeholder for an actual SVG or Font Awesome icon -->
+                <span class="podcast-icon">&#127908;</span>
+                <h1>Aethercast</h1>
+            </div>
+            <nav class="header-navigation">
+                <ul>
+                    <li><a href="#">Home</a></li>
+                    <li><a href="#" class="active">Episodes</a></li>
+                    <li><a href="#">About</a></li>
+                    <li><a href="#">Contact</a></li>
+                </ul>
+            </nav>
+            <div class="header-actions">
+                <input type="search" placeholder="Search Aethercast..." class="search-input-header">
+                <button class="subscribe-button">Subscribe</button>
+            </div>
         </header>
 
         <main>
-            <section id="podcast-snippets-section" class="hidden">
-                <h2>Fresh Podcast Snippets</h2>
-                <div id="snippet-list-container">
-                    <!-- Snippets will be loaded here by app.js -->
+            <section id="latest-episodes-section">
+                <h2>Latest Episodes on Aethercast</h2>
+                <p class="section-subtitle">Catch up on our newest releases.</p>
+                <div class="episodes-search-bar-container">
+                    <input type="search" id="episodes-search-input" placeholder="Search within latest episodes..." class="search-input-episodes">
+                    <button id="episodes-search-btn">Search</button>
                 </div>
-                <p id="snippet-status-message" class="status-messages status-info">Loading snippets...</p>
-                <!-- Re-using status-messages class for consistency, but could be specific -->
+                <div id="snippet-list-container">
+                    <!-- Snippets will be loaded here by app.js (renamed from podcast-snippets-section) -->
+                </div>
+                <p id="snippet-status-message" class="status-messages status-info">Loading episodes...</p>
+            </section>
+
+            <section id="popular-categories-section">
+                <h2>Popular Categories on Aethercast</h2>
+                <p class="section-subtitle">Explore topics that listeners love.</p>
+                <div class="category-list-container">
+                    <a href="#" class="category-link">Business</a>
+                    <a href="#" class="category-link">Technology</a>
+                    <a href="#" class="category-link">Lifestyle</a>
+                    <a href="#" class="category-link">Science</a>
+                    <a href="#" class="category-link">Arts & Culture</a>
+                    <a href="#" class="category-link">News & Current Events</a>
+                </div>
             </section>
 
             <section id="topic-exploration-section">
                 <h2>Explore New Topics</h2>
+                 <p class="section-subtitle">Let AI help you discover and generate content on novel subjects.</p>
                 <input type="text" id="explore-keywords-input" placeholder="Enter keywords to explore...">
                 <button id="explore-keywords-btn">Explore Keywords</button>
                 <div id="explored-topics-status" class="status-messages status-info" style="display:none;"></div>
@@ -42,6 +76,7 @@
 
             <section class="input-section">
                 <h2>Create Full Podcast</h2>
+                <p class="section-subtitle">Generate a complete podcast episode from a topic of your choice.</p>
                 <label for="topic-input">Enter Topic:</label>
                 <input type="text" id="topic-input" name="topic" placeholder="e.g., The Future of AI">
                 <button id="generate-btn">Generate Podcast</button>
@@ -75,7 +110,7 @@
             </section>
         </main>
 
-        <footer>
+        <footer class="site-footer">
             <p>&copy; 2024 Aethercast AI. All rights reserved.</p>
         </footer>
     </div>

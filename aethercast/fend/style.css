@@ -22,21 +22,19 @@
 
 body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    margin: 0;
+    margin: 0; /* Updated */
     padding: 0;
-    background-color: var(--background-light);
-    color: var(--text-color);
+    background-color: #f4f4f9; /* Updated - Neutral-100 approx */
+    color: #333; /* Updated - Neutral-800 approx */
     line-height: 1.6;
 }
 
 /* Container */
 .container {
-    max-width: 1000px;
-    margin: 30px auto;
-    padding: 25px;
-    background-color: var(--background-white);
-    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
-    border-radius: 8px;
+    max-width: 1200px; /* Wider for the new design */
+    margin: 0 auto; /* Centered, no top/bottom margin from here */
+    padding: 0 1rem; /* Padding for sides */
+    /* Removed background-color, box-shadow, border-radius from old .container */
 }
 
 /* Header */
@@ -316,4 +314,277 @@ footer {
 
 #diag-orchestration-log-container p {
     margin: 5px 0;
+}
+
+/* New Styles for UI Update */
+
+/* 1. General Body/Font - Already handled by previous body update */
+
+/* 2. Site Header (.site-header) */
+.site-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 2rem;
+    background-color: rgba(255, 255, 255, 0.8);
+    backdrop-filter: blur(10px);
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+}
+.header-branding {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.header-branding .podcast-icon {
+    font-size: 2rem; /* Placeholder style for icon */
+    color: #6366f1; /* Indigo-600 approx */
+}
+.header-branding h1 { /* Overriding existing header h1 */
+    font-size: 1.5rem;
+    font-weight: bold;
+    color: #1f2937; /* Neutral-800 approx */
+    margin: 0;
+    text-align: left; /* Reset text-align from old header h1 */
+    border-bottom: none; /* Reset border from old header h1 */
+    padding-bottom: 0; /* Reset padding from old header h1 */
+}
+.header-navigation ul {
+    list-style: none;
+    display: flex;
+    gap: 1.5rem;
+    margin: 0;
+    padding: 0;
+}
+.header-navigation a {
+    text-decoration: none;
+    color: #374151; /* Neutral-700 approx */
+    font-size: 0.9rem;
+    font-weight: 500;
+}
+.header-navigation a.active {
+    color: #6366f1; /* Indigo-600 approx */
+    font-weight: bold;
+}
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.search-input-header {
+    padding: 0.5rem 0.75rem;
+    border: 1px solid #d1d5db; /* Neutral-300 approx */
+    border-radius: 0.375rem;
+    font-size: 0.9rem;
+}
+.subscribe-button {
+    padding: 0.5rem 1rem;
+    background-color: #6366f1; /* Indigo-600 approx */
+    color: white;
+    border: none;
+    border-radius: 0.375rem;
+    font-weight: 600;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
+/* 3. Section Titles & Subtitles */
+#latest-episodes-section h2,
+#popular-categories-section h2,
+#topic-exploration-section h2,
+.input-section h2,
+#podcast-snippets-section h2 /* Keep old snippet section selector for now */
+ {
+    text-align: center;
+    font-size: 2rem;
+    font-weight: bold;
+    color: #1f2937; /* Neutral-800 approx */
+    margin-bottom: 0.5rem;
+    border-bottom: none; /* Remove border from old section h2s */
+    padding-bottom: 0; /* Remove padding from old section h2s */
+}
+.section-subtitle {
+    text-align: center;
+    font-size: 1.1rem;
+    color: #4b5563; /* Neutral-600 approx */
+    margin-bottom: 2rem;
+}
+
+/* 4. Episodes Search Bar (.episodes-search-bar-container) */
+.episodes-search-bar-container {
+    display: flex;
+    max-width: 600px;
+    margin: 0 auto 2rem auto;
+}
+.search-input-episodes { /* Applies to #episodes-search-input */
+    flex-grow: 1;
+    padding: 0.75rem 1rem;
+    border: 2px solid #e5e7eb; /* Neutral-200 */
+    border-radius: 0.5rem 0 0 0.5rem;
+    font-size: 1rem;
+    background-color: #f9fafb; /* Neutral-50 */
+}
+#episodes-search-btn {
+    padding: 0.75rem 1.5rem;
+    background-color: #6366f1; /* Indigo-600 approx */
+    color: white;
+    border: none;
+    border-radius: 0 0.5rem 0.5rem 0;
+    cursor: pointer;
+    font-weight: 500;
+}
+
+/* 5. Snippet List Container & Card Styling */
+#snippet-list-container {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); /* auto-fill for responsiveness */
+    gap: 2rem;
+}
+.snippet-card { /* This is a new class for snippet items */
+    background-color: #f9fafb; /* Neutral-50 */
+    border-radius: 0.75rem;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.05), 0 10px 15px rgba(0,0,0,0.1);
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 1.5rem;
+}
+.snippet-card .snippet-image-placeholder {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background-color: #e0e0e0; /* Neutral-300 approx for placeholder */
+    border-radius: 0.5rem;
+    margin-bottom: 1rem;
+    flex-shrink: 0;
+    /* Added a placeholder image via CSS for demonstration */
+    background-image: url('https://source.unsplash.com/random/400x225?podcast,abstract');
+    background-size: cover;
+    background-position: center;
+}
+.snippet-card .snippet-text-content {
+    flex-grow: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+.snippet-card h3 {
+    font-size: 1.25rem;
+    font-weight: bold;
+    color: #1f2937; /* Neutral-800 approx */
+    margin: 0 0 0.5rem 0;
+}
+.snippet-card p.snippet-summary {
+    font-size: 0.9rem;
+    color: #4b5563; /* Neutral-600 approx */
+    line-height: 1.5;
+    margin: 0 0 1rem 0;
+    flex-grow: 1;
+}
+.snippet-card .listen-now-button {
+    padding: 0.5rem 1rem;
+    background-color: #e0e7ff; /* Indigo-100 approx */
+    color: #4338ca; /* Indigo-700 approx */
+    border: none;
+    border-radius: 0.375rem;
+    font-weight: 600;
+    cursor: pointer;
+    text-align: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center; /* Center content in button */
+    gap: 0.5rem;
+    width: fit-content; /* Button width fits content */
+    text-decoration: none; /* If it's an <a> tag styled as button */
+}
+.snippet-card .listen-now-button .material-icons-outlined { /* Example for icon if using Material Icons */
+    font-size: 1.25rem;
+}
+
+/* 6. Popular Categories Section */
+#popular-categories-section {
+    padding: 2rem 1rem; /* Added side padding to match .container */
+    background-color: #f0f2f5; /* Neutral-100 approx, slightly different from body for emphasis */
+    margin-top: 2rem; /* Spacing from previous section */
+    margin-bottom: 2rem; /* Spacing to next section */
+}
+.category-list-container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 0.75rem;
+}
+.category-link {
+    padding: 0.5rem 1.25rem;
+    background-color: white;
+    color: #374151; /* Neutral-700 approx */
+    border: 1px solid #d1d5db; /* Neutral-300 approx */
+    border-radius: 9999px; /* pill shape */
+    text-decoration: none;
+    font-size: 0.9rem;
+    font-weight: 500;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+    transition: all 0.2s ease;
+}
+.category-link:hover {
+    background-color: #eff6ff; /* Indigo-50 approx */
+    color: #4f46e5; /* Indigo-700 approx */
+    border-color: #a5b4fc; /* Indigo-300 approx */
+}
+
+/* 7. Footer */
+footer.site-footer { /* Specific to new footer class */
+    text-align: center;
+    padding: 2rem;
+    background-color: #e5e7eb; /* Neutral-200 approx */
+    color: #4b5563; /* Neutral-600 approx */
+    font-size: 0.9rem;
+    margin-top: 2rem;
+    border-top: none; /* Remove border from old footer */
+}
+
+/* Ensure old header h1 doesn't conflict if it's still somewhere */
+header h1 {
+    /* Styles for old header h1 are already overridden by .header-branding h1 */
+    /* If the old header structure might still exist, add specific overrides here */
+}
+
+/* Adjustments for existing elements to fit new design */
+#podcast-snippets-section { /* This ID is now #latest-episodes-section */
+    /* Styles for the old section if any were specific and not handled by general section title styling */
+}
+#latest-episodes-section { /* New ID for the snippet list section */
+    padding: 2rem 0; /* Add some top/bottom padding */
+}
+
+/* Ensure inputs inside other sections maintain their specific styles if not overridden */
+#explore-keywords-input, #pref-news-category, input[type="text"]#topic-input {
+    /* These might need width adjustments if they look too wide in the new layout */
+    /* Example: max-width: 400px; margin-left:auto; margin-right:auto; display:block; */
+}
+#explore-keywords-btn, #save-prefs-btn, button#generate-btn {
+    /* Example: max-width: 200px; margin-left:auto; margin-right:auto; display:block; */
+}
+
+/* Preferences section might need some centering or width adjustment too */
+#preferences-section {
+    max-width: 600px; /* Example */
+    margin-left: auto;
+    margin-right: auto;
+}
+
+/* Input and Output sections for podcast generation */
+.input-section, .output-section {
+    /* These were flex items. If main isn't flex anymore, they might stack. */
+    /* Consider if they need to be wrapped or given specific widths. */
+    /* For now, assuming they stack or are handled by main's new layout. */
+    margin-bottom: 2rem; /* Add some spacing */
+}
+
+/* Original footer style if it was just 'footer' tag, now it's 'footer.site-footer' */
+footer {
+    /* This will be overridden by footer.site-footer if that class is applied */
+    /* If old footer without class might exist, ensure it's reset or styled appropriately */
+    border-top: none; /* Example reset */
 }
