@@ -125,6 +125,30 @@ flask run --host=0.0.0.0 --port=5001
         -   `503 Service Unavailable`: If CPOA snippet function is not loaded, or if TDA service call fails.
         -   `500 Internal Server Error`: For other unexpected errors.
 
+### Popular Categories
+
+-   **`GET /api/v1/categories`**
+    -   **Description:** Fetches a list of predefined podcast categories by calling the Central Podcast Orchestrator Agent (CPOA).
+    -   **Request Payload:** None.
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "categories": [
+                "Technology",
+                "Science",
+                "Lifestyle",
+                "Business",
+                "Health & Wellness",
+                "Arts & Culture",
+                "Education",
+                "News & Current Events"
+            ]
+        }
+        ```
+    -   **Error Responses:**
+        -   `500 Internal Server Error`: If CPOA encounters an issue providing the categories.
+        -   `503 Service Unavailable`: If the CPOA categories function is not available.
+
 ### Podcast Task Management
 
 -   **`POST /api/v1/podcasts`**

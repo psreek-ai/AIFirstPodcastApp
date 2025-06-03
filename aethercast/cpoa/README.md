@@ -22,6 +22,9 @@ Key responsibilities include:
         -   Calls the Topic Discovery Agent (TDA) to obtain a list of current or relevant topics (accepts a `limit` parameter).
         -   For each topic retrieved from TDA, it then calls the `orchestrate_snippet_generation` function. This ensures each snippet is fully formed, including a title, summary, and an `image_url` obtained by calling the Image Generation Agent (IGA) with the `cover_art_prompt` from SCA.
         -   Returns a list of these `SnippetDataObjects`.
+    -   **Popular Category Provisioning (`get_popular_categories`):**
+        -   Provides a predefined list of popular podcast categories. This list is intended for use by the frontend, for example, to display category filters or navigation.
+        -   Currently, the list is hardcoded within CPOA. Future enhancements could involve dynamic category determination based on content trends from TDA or other metrics.
 -   **Task State Management:** Updates the status of podcast generation tasks in a shared database (specifically, the `podcasts` table). The API Gateway initiates tasks, and CPOA updates their progress.
 -   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF, TDA, IGA). For VFA, this includes the structured script from PSWA and any optional voice parameters.
 -   **Real-time UI Updates:** If a `client_id` is provided for a podcast generation task, CPOA sends status update messages (e.g., "Fetching content...", "Synthesizing audio...", "Task completed/failed") to an internal endpoint on ASF. ASF then relays these messages to the specific frontend client identified by `client_id` via WebSockets.

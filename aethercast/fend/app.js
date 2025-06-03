@@ -22,7 +22,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const episodesSearchBtn = document.getElementById('episodes-search-btn'); // Kept
 
     // Header Search Input
-    const headerSearchInput = document.getElementById('header-search-input'); // Added
+    const headerSearchInput = document.getElementById('header-search-input');
+
+    // Popular Categories container
+    const popularCategoriesContainer = document.querySelector('#popular-categories-section .category-list-container'); // Added
 
     // Topic Exploration elements
     const exploreKeywordsInput = document.getElementById('explore-keywords-input');
@@ -611,5 +614,6 @@ document.addEventListener('DOMContentLoaded', () => {
     generateOrGetClientId();
     updateStatus("Enter a topic and click 'Generate Podcast', explore keywords, or choose a snippet below.", "info", statusMessagesDiv);
     fetchAndRenderSnippets();
+    fetchAndRenderPopularCategories(); // Added call
     cleanupMSE();
 });

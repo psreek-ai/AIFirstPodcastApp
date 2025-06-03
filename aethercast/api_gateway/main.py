@@ -167,23 +167,26 @@ def _update_session_preferences(db_conn, session_id: str, preferences: dict) -> 
 
 # --- Attempt CPOA Import ---
 def _cpoa_placeholder_podcast(*args, **kwargs): raise ImportError("CPOA's orchestrate_podcast_generation function is not available due to import failure.")
-def _cpoa_placeholder_snippet(*args, **kwargs): raise ImportError("CPOA's orchestrate_snippet_generation function is not available due to import failure.") # This might be an old one if orchestrate_landing_page_snippets replaces its use-case
+def _cpoa_placeholder_snippet(*args, **kwargs): raise ImportError("CPOA's orchestrate_snippet_generation function is not available due to import failure.")
 def _cpoa_placeholder_explore(*args, **kwargs): raise ImportError("CPOA's orchestrate_topic_exploration function is not available due to import failure.")
 def _cpoa_placeholder_search(*args, **kwargs): raise ImportError("CPOA's orchestrate_search_results_generation function is not available due to import failure.")
 def _cpoa_placeholder_landing_snippets(*args, **kwargs): raise ImportError("CPOA's orchestrate_landing_page_snippets function is not available due to import failure.")
+def _cpoa_placeholder_categories(*args, **kwargs): raise ImportError("CPOA's get_popular_categories function is not available due to import failure.")
 
 
 orchestrate_podcast_generation = _cpoa_placeholder_podcast
-orchestrate_snippet_generation = _cpoa_placeholder_snippet # Retained for now, might be unused by /snippets
+orchestrate_snippet_generation = _cpoa_placeholder_snippet
 orchestrate_topic_exploration = _cpoa_placeholder_explore
 orchestrate_search_results_generation = _cpoa_placeholder_search
-orchestrate_landing_page_snippets = _cpoa_placeholder_landing_snippets # Added
+orchestrate_landing_page_snippets = _cpoa_placeholder_landing_snippets
+get_popular_categories = _cpoa_placeholder_categories # Added
 
 cpoa_podcast_func_imported = False
-cpoa_snippet_func_imported = False # Retained for now
+cpoa_snippet_func_imported = False
 cpoa_exploration_func_imported = False
 cpoa_search_func_imported = False
-cpoa_landing_snippets_func_imported = False # Added
+cpoa_landing_snippets_func_imported = False
+cpoa_categories_func_imported = False # Added
 CPOA_OVERALL_IMPORT_ERROR_MESSAGE = []
 
 _pre_init_logger = print
@@ -227,6 +230,14 @@ try:
     _pre_init_logger("Successfully imported CPOA.orchestrate_landing_page_snippets.")
 except ImportError as e:
     CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_landing_page_snippets: {e}")
+
+try:
+    from aethercast.cpoa.main import get_popular_categories as gpc_real
+    get_popular_categories = gpc_real
+    cpoa_categories_func_imported = True
+    _pre_init_logger("Successfully imported CPOA.get_popular_categories.")
+except ImportError as e:
+    CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"get_popular_categories: {e}")
 
 
 if CPOA_OVERALL_IMPORT_ERROR_MESSAGE:
@@ -279,17 +290,19 @@ def health_check():
     # Consolidate CPOA import statuses
     cpoa_import_summary = []
     if not cpoa_podcast_func_imported: cpoa_import_summary.append("podcast_generation")
-    if not cpoa_snippet_func_imported: cpoa_import_summary.append("snippet_generation (legacy)") # Clarify if it's legacy
+    if not cpoa_snippet_func_imported: cpoa_import_summary.append("snippet_generation (legacy)")
     if not cpoa_exploration_func_imported: cpoa_import_summary.append("topic_exploration")
     if not cpoa_search_func_imported: cpoa_import_summary.append("search_generation")
-    if not cpoa_landing_snippets_func_imported: cpoa_import_summary.append("landing_snippets_generation") # Added
+    if not cpoa_landing_snippets_func_imported: cpoa_import_summary.append("landing_snippets_generation")
+    if not cpoa_categories_func_imported: cpoa_import_summary.append("categories_generation") # Added
 
     cpoa_overall_status = "fully operational"
     if cpoa_import_summary:
         cpoa_overall_status = f"partially operational (missing: {', '.join(cpoa_import_summary)})"
-        # Adjust count if number of critical CPOA functions changes
-        if len(cpoa_import_summary) >= 3: # Example: if 3 out of 5 are critical, or all are critical
-            cpoa_overall_status = "CPOA module critical functions may have issues or failed to import"
+        # If any CPOA function fails to import, it's a potential issue.
+        # Consider if all 5 are critical for "fully operational" status.
+        if len(cpoa_import_summary) > 0:
+            cpoa_overall_status = f"CPOA module has import issues (missing: {', '.join(cpoa_import_summary)})"
 
     if CPOA_OVERALL_IMPORT_ERROR_MESSAGE and not cpoa_import_summary :
         cpoa_overall_status = "inconsistent import state (errors logged but functions flagged as imported)"
@@ -302,28 +315,26 @@ def health_check():
         "cpoa_snippet_function_status": "successfully imported" if cpoa_snippet_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Kept for now
         "cpoa_exploration_function_status": "successfully imported" if cpoa_exploration_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
         "cpoa_search_function_status": "successfully imported" if cpoa_search_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
-        "cpoa_landing_snippets_function_status": "successfully imported" if cpoa_landing_snippets_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Added
+        "cpoa_landing_snippets_function_status": "successfully imported" if cpoa_landing_snippets_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
+        "cpoa_categories_function_status": "successfully imported" if cpoa_categories_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Added
         "database_status": db_status,
         "cpoa_detailed_import_errors": CPOA_OVERALL_IMPORT_ERROR_MESSAGE if CPOA_OVERALL_IMPORT_ERROR_MESSAGE else "None"
     }
 
     status_code = 200
-    # Update condition for 503 to include the new critical function
     if not db_status.startswith("Database connection successful.") or not IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS():
-        status_code = 503 # Service Unavailable if critical parts are down
+        status_code = 503
 
     return jsonify(health_data), status_code
 
 # Helper for health check to see if all CPOA functions are up
 def IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS():
-    # Add cpoa_landing_snippets_func_imported to this check
-    # Assuming cpoa_snippet_func_imported (old one for /snippets) might become non-critical if landing_snippets replaces it.
-    # For now, let's assume all currently imported CPOA functions are important.
     return cpoa_podcast_func_imported and \
            cpoa_snippet_func_imported and \
            cpoa_exploration_func_imported and \
            cpoa_search_func_imported and \
-           cpoa_landing_snippets_func_imported
+           cpoa_landing_snippets_func_imported and \
+           cpoa_categories_func_imported
 
 
 # --- Session Management Endpoints ---
@@ -465,6 +476,34 @@ def get_dynamic_snippets():
         app.logger.error(f"Unexpected error in get_dynamic_snippets: {e}", exc_info=True)
         return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred while fetching snippets."}), 500
 
+# --- Categories Endpoint ---
+@app.route('/api/v1/categories', methods=['GET'])
+def get_categories_endpoint():
+    app.logger.info("Request received for /api/v1/categories")
+    if not cpoa_categories_func_imported:
+        app.logger.error("CPOA get_popular_categories function not available.")
+        return jsonify({"error": "Service Unavailable", "message": "Category service (CPOA) not available."}), 503
+
+    try:
+        app.logger.info("Calling CPOA get_popular_categories...")
+        cpoa_response = get_popular_categories() # This function in CPOA returns {"categories": [...]}
+
+        if "error" in cpoa_response: # Should not happen if CPOA's func is just returning a list
+            app.logger.error(f"CPOA returned an error for categories: {cpoa_response}")
+            return jsonify({
+                "error": cpoa_response.get("error", "CPOA_ERROR"),
+                "message": cpoa_response.get("details", "Failed to get categories due to an internal CPOA error.")
+            }), 500
+
+        # Expected CPOA response: {"categories": ["Tech", "Science", ...]}
+        return jsonify(cpoa_response), 200
+
+    except ImportError: # Safeguard, though caught by flag
+        app.logger.critical("CPOA get_popular_categories function became unavailable after initial check.", exc_info=True)
+        return jsonify({"error": "Service Configuration Error", "message": "Category module component is critically unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /api/v1/categories endpoint: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred while fetching categories."}), 500
 
 # --- Topic Exploration Endpoint ---
 @app.route('/api/v1/topics/explore', methods=['POST'])

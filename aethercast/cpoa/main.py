@@ -1226,3 +1226,24 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
 
     logger.info(f"CPOA: Successfully generated {successful_snippet_generations} snippets for search query '{query}' out of {len(discovered_topics)} topics found.")
     return {"search_results": search_results_snippets}
+
+def get_popular_categories() -> Dict[str, Any]:
+    """
+    Returns a predefined list of popular podcast categories.
+    In the future, this could be made dynamic, e.g., by analyzing TDA output
+    or other metrics.
+    """
+    logger.info("CPOA: get_popular_categories called. Returning predefined list.")
+    # This list should match the one intended for the frontend UI design.
+    predefined_categories = [
+        "Business",
+        "Technology",
+        "Lifestyle",
+        "Entertainment",
+        "Health",
+        "Science",
+        "Education",
+        "Arts"
+    ]
+    # The API Gateway expects a dictionary like {"categories": [...]}
+    return {"categories": predefined_categories}
