@@ -11,18 +11,25 @@ Key responsibilities include:
         -   Receives a structured JSON script from PSWA, which it then forwards to VFA.
         -   Accepts optional voice parameters (e.g., voice name, language, speaking rate, pitch) and an optional `client_id` (for UI updates) from the caller (API Gateway). Voice parameters are forwarded to VFA.
         -   It also notifies the AudioStreamFeeder (ASF) when new audio is ready for streaming.
-    -   **Snippet Generation:** Coordinates with SnippetCraftAgent (SCA) (which might internally use a TopicDiscoveryAgent or similar logic). After SCA generates a snippet, CPOA saves this snippet to the shared `topics_snippets` database (using the `CPOA_DATABASE_PATH` configuration).
-    -   **Search Results Generation:**
+    -   **Individual Snippet Generation (`orchestrate_snippet_generation`):** Coordinates with SnippetCraftAgent (SCA) to generate snippet text and a `cover_art_prompt` based on input `topic_info`. After SCA, it calls the Image Generation Agent (IGA) with the `cover_art_prompt` to get an `image_url`. The final snippet (potentially with `image_url`) is saved to the database and returned. This function is used by both search result generation and landing page snippet orchestration.
+    -   **Search Results Generation (`orchestrate_search_results_generation`):**
         -   Accepts a search query from the API Gateway.
         -   Calls the Topic Discovery Agent (TDA) to find relevant topics based on the query.
-        -   For each topic found by TDA, it then calls the Snippet Craft Agent (SCA) (via the internal `orchestrate_snippet_generation` function) to generate a descriptive snippet.
+        -   For each topic found by TDA, it then calls the `orchestrate_snippet_generation` function (which includes IGA call) to generate a descriptive snippet.
         -   Returns a list of these generated snippets to the API Gateway to be used as search results.
+    -   **Landing Page Snippet Orchestration (`orchestrate_landing_page_snippets`):**
+        -   Orchestrates the generation of multiple diverse snippets, typically for the application's landing page.
+        -   Calls the Topic Discovery Agent (TDA) to obtain a list of current or relevant topics (accepts a `limit` parameter).
+        -   For each topic retrieved from TDA, it then calls the `orchestrate_snippet_generation` function. This ensures each snippet is fully formed, including a title, summary, and an `image_url` obtained by calling the Image Generation Agent (IGA) with the `cover_art_prompt` from SCA.
+        -   Returns a list of these `SnippetDataObjects`.
 -   **Task State Management:** Updates the status of podcast generation tasks in a shared database (specifically, the `podcasts` table). The API Gateway initiates tasks, and CPOA updates their progress.
--   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF). For VFA, this includes the structured script from PSWA and any optional voice parameters.
+-   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF, TDA, IGA). For VFA, this includes the structured script from PSWA and any optional voice parameters.
 -   **Real-time UI Updates:** If a `client_id` is provided for a podcast generation task, CPOA sends status update messages (e.g., "Fetching content...", "Synthesizing audio...", "Task completed/failed") to an internal endpoint on ASF. ASF then relays these messages to the specific frontend client identified by `client_id` via WebSockets.
 -   **Error Handling and Resilience:** Implements retry mechanisms for service calls and manages failures within the orchestration process, providing detailed error feedback (including to the UI if `client_id` is available).
 
 CPOA itself is not a directly exposed service with its own API endpoints for external clients. Instead, it's a Python module whose functions are called by the API Gateway.
+        -   For each topic found by TDA, it then calls the Snippet Craft Agent (SCA) (via the internal `orchestrate_snippet_generation` function) to generate a descriptive snippet.
+        -   Returns a list of these generated snippets to the API Gateway to be used as search results.
 
 ## Configuration
 

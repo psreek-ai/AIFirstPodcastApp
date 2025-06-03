@@ -167,19 +167,23 @@ def _update_session_preferences(db_conn, session_id: str, preferences: dict) -> 
 
 # --- Attempt CPOA Import ---
 def _cpoa_placeholder_podcast(*args, **kwargs): raise ImportError("CPOA's orchestrate_podcast_generation function is not available due to import failure.")
-def _cpoa_placeholder_snippet(*args, **kwargs): raise ImportError("CPOA's orchestrate_snippet_generation function is not available due to import failure.")
+def _cpoa_placeholder_snippet(*args, **kwargs): raise ImportError("CPOA's orchestrate_snippet_generation function is not available due to import failure.") # This might be an old one if orchestrate_landing_page_snippets replaces its use-case
 def _cpoa_placeholder_explore(*args, **kwargs): raise ImportError("CPOA's orchestrate_topic_exploration function is not available due to import failure.")
 def _cpoa_placeholder_search(*args, **kwargs): raise ImportError("CPOA's orchestrate_search_results_generation function is not available due to import failure.")
+def _cpoa_placeholder_landing_snippets(*args, **kwargs): raise ImportError("CPOA's orchestrate_landing_page_snippets function is not available due to import failure.")
+
 
 orchestrate_podcast_generation = _cpoa_placeholder_podcast
-orchestrate_snippet_generation = _cpoa_placeholder_snippet
+orchestrate_snippet_generation = _cpoa_placeholder_snippet # Retained for now, might be unused by /snippets
 orchestrate_topic_exploration = _cpoa_placeholder_explore
 orchestrate_search_results_generation = _cpoa_placeholder_search
+orchestrate_landing_page_snippets = _cpoa_placeholder_landing_snippets # Added
 
 cpoa_podcast_func_imported = False
-cpoa_snippet_func_imported = False
+cpoa_snippet_func_imported = False # Retained for now
 cpoa_exploration_func_imported = False
-cpoa_search_func_imported = False # Added
+cpoa_search_func_imported = False
+cpoa_landing_snippets_func_imported = False # Added
 CPOA_OVERALL_IMPORT_ERROR_MESSAGE = []
 
 _pre_init_logger = print
@@ -215,6 +219,15 @@ try:
     _pre_init_logger("Successfully imported CPOA.orchestrate_search_results_generation.")
 except ImportError as e:
     CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_search_results_generation: {e}")
+
+try:
+    from aethercast.cpoa.main import orchestrate_landing_page_snippets as olps_real
+    orchestrate_landing_page_snippets = olps_real
+    cpoa_landing_snippets_func_imported = True
+    _pre_init_logger("Successfully imported CPOA.orchestrate_landing_page_snippets.")
+except ImportError as e:
+    CPOA_OVERALL_IMPORT_ERROR_MESSAGE.append(f"orchestrate_landing_page_snippets: {e}")
+
 
 if CPOA_OVERALL_IMPORT_ERROR_MESSAGE:
     _pre_init_logger(f"CPOA Module Import Errors: {'; '.join(CPOA_OVERALL_IMPORT_ERROR_MESSAGE)}")
@@ -266,17 +279,19 @@ def health_check():
     # Consolidate CPOA import statuses
     cpoa_import_summary = []
     if not cpoa_podcast_func_imported: cpoa_import_summary.append("podcast_generation")
-    if not cpoa_snippet_func_imported: cpoa_import_summary.append("snippet_generation")
+    if not cpoa_snippet_func_imported: cpoa_import_summary.append("snippet_generation (legacy)") # Clarify if it's legacy
     if not cpoa_exploration_func_imported: cpoa_import_summary.append("topic_exploration")
-    if not cpoa_search_func_imported: cpoa_import_summary.append("search_generation") # Added search
+    if not cpoa_search_func_imported: cpoa_import_summary.append("search_generation")
+    if not cpoa_landing_snippets_func_imported: cpoa_import_summary.append("landing_snippets_generation") # Added
 
     cpoa_overall_status = "fully operational"
     if cpoa_import_summary:
         cpoa_overall_status = f"partially operational (missing: {', '.join(cpoa_import_summary)})"
-        if len(cpoa_import_summary) == 4: # If all known CPOA functions failed to import
-            cpoa_overall_status = "CPOA module critical functions failed to import"
+        # Adjust count if number of critical CPOA functions changes
+        if len(cpoa_import_summary) >= 3: # Example: if 3 out of 5 are critical, or all are critical
+            cpoa_overall_status = "CPOA module critical functions may have issues or failed to import"
 
-    if CPOA_OVERALL_IMPORT_ERROR_MESSAGE and not cpoa_import_summary : # Errors logged but flags are true (should not happen)
+    if CPOA_OVERALL_IMPORT_ERROR_MESSAGE and not cpoa_import_summary :
         cpoa_overall_status = "inconsistent import state (errors logged but functions flagged as imported)"
 
 
@@ -284,22 +299,31 @@ def health_check():
         "status": "API Gateway is healthy" if db_status.startswith("Database connection successful.") and not cpoa_import_summary else "API Gateway has issues",
         "cpoa_module_status": cpoa_overall_status,
         "cpoa_podcast_function_status": "successfully imported" if cpoa_podcast_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
-        "cpoa_snippet_function_status": "successfully imported" if cpoa_snippet_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
+        "cpoa_snippet_function_status": "successfully imported" if cpoa_snippet_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Kept for now
         "cpoa_exploration_function_status": "successfully imported" if cpoa_exploration_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
-        "cpoa_search_function_status": "successfully imported" if cpoa_search_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Added
+        "cpoa_search_function_status": "successfully imported" if cpoa_search_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)",
+        "cpoa_landing_snippets_function_status": "successfully imported" if cpoa_landing_snippets_func_imported else f"failed to import (see CPOA_OVERALL_IMPORT_ERROR_MESSAGE in logs)", # Added
         "database_status": db_status,
         "cpoa_detailed_import_errors": CPOA_OVERALL_IMPORT_ERROR_MESSAGE if CPOA_OVERALL_IMPORT_ERROR_MESSAGE else "None"
     }
 
     status_code = 200
-    if not db_status.startswith("Database connection successful.") or not IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS(): # Define IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS or check each flag
+    # Update condition for 503 to include the new critical function
+    if not db_status.startswith("Database connection successful.") or not IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS():
         status_code = 503 # Service Unavailable if critical parts are down
 
     return jsonify(health_data), status_code
 
 # Helper for health check to see if all CPOA functions are up
 def IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS():
-    return cpoa_podcast_func_imported and cpoa_snippet_func_imported and cpoa_exploration_func_imported and cpoa_search_func_imported
+    # Add cpoa_landing_snippets_func_imported to this check
+    # Assuming cpoa_snippet_func_imported (old one for /snippets) might become non-critical if landing_snippets replaces it.
+    # For now, let's assume all currently imported CPOA functions are important.
+    return cpoa_podcast_func_imported and \
+           cpoa_snippet_func_imported and \
+           cpoa_exploration_func_imported and \
+           cpoa_search_func_imported and \
+           cpoa_landing_snippets_func_imported
 
 
 # --- Session Management Endpoints ---
@@ -398,14 +422,48 @@ def update_session_preferences_endpoint():
 # --- Snippets Endpoint ---
 @app.route('/api/v1/snippets', methods=['GET'])
 def get_dynamic_snippets():
-    # ... (existing snippet logic - can be kept as is)
-    app.logger.info("Request received for /api/v1/snippets")
-    # Placeholder if CPOA is not available
-    if not cpoa_snippet_func_imported:
-        app.logger.error("CPOA snippet function not available.")
-        return jsonify({"error": "Service Unavailable", "message": "Snippet generation service not available."}), 503
-    # Simulate fetching from cache or generating
-    return jsonify({"snippets": [{"id": "dummy_snippet_1", "title": "Dummy Snippet Title", "summary":"This is a dummy snippet."}], "source": "dummy_cache"}), 200
+    app.logger.info("Request received for /api/v1/snippets (dynamic generation using orchestrate_landing_page_snippets)")
+    if not cpoa_landing_snippets_func_imported:
+        app.logger.error("CPOA landing page snippets function not available.")
+        return jsonify({"error": "Service Unavailable", "message": "Snippet generation service (landing page) not available."}), 503
+
+    try:
+        limit = request.args.get('limit', default=6, type=int)
+        if not 1 <= limit <= 20:
+            app.logger.warning(f"Invalid limit value '{request.args.get('limit')}' requested for /snippets, defaulting to 6.")
+            limit = 6
+
+        # User preferences are not yet passed for general landing page snippets.
+        # client_id = request.args.get('client_id')
+        # user_preferences = None
+        # if client_id: ... fetch preferences ... (can be added later)
+
+        app.logger.info(f"Calling CPOA orchestrate_landing_page_snippets with limit: {limit}")
+        cpoa_response = orchestrate_landing_page_snippets(limit=limit) # user_preferences can be added later
+
+        if "error" in cpoa_response:
+            app.logger.error(f"CPOA returned an error for landing page snippets: {cpoa_response}")
+            error_type = cpoa_response.get("error", "UNKNOWN_CPOA_ERROR")
+            # Determine status code based on cpoa_response["error"]
+            status_code = 500 # Default to general server error
+            if "TDA_" in error_type or "SCA_" in error_type or "IGA_" in error_type or "CPOA_CONFIG_ERROR" in error_type:
+                status_code = 503 # Service Unavailable for downstream or config issues
+
+            return jsonify({
+                "error": error_type,
+                "message": cpoa_response.get("details", "Failed to generate landing page snippets due to an internal error.")
+            }), status_code
+
+        # Expected successful response from CPOA: {"snippets": [...], "source": "generation"}
+        # The API Gateway now directly returns what CPOA provides.
+        return jsonify(cpoa_response), 200
+
+    except ImportError:
+        app.logger.critical("CPOA landing snippets function became unavailable after initial check.", exc_info=True)
+        return jsonify({"error": "Service Configuration Error", "message": "Snippet generation module is critically unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in get_dynamic_snippets: {e}", exc_info=True)
+        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred while fetching snippets."}), 500
 
 
 # --- Topic Exploration Endpoint ---

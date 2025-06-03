@@ -100,7 +100,7 @@ flask run --host=0.0.0.0 --port=5001
 ### Snippets
 
 -   **`GET /api/v1/snippets`**
-    -   **Description:** Fetches a list of suggested podcast snippets. It first attempts to retrieve recent and relevant snippets from a local database cache (`topics_snippets` table). If the cache is insufficient or stale (older than `API_GW_SNIPPET_CACHE_MAX_AGE_HOURS`), it then calls the TDA to get topics and CPOA to generate new snippets. These newly generated items are also saved to the database by TDA and CPOA for future caching.
+    -   **Description:** Fetches a list of dynamically generated podcast snippets, suitable for a landing page or general display. This endpoint calls the Central Podcast Orchestrator Agent (CPOA) which orchestrates topic discovery (via TDA), snippet text and cover art prompt generation (via SCA), and image URL generation (via IGA) for a configurable number of snippets. The old database cache for snippets at this endpoint has been removed in favor of on-demand generation.
     -   **Query Parameters:**
         -   `limit` (optional, integer): Number of topics to request from TDA if generating new snippets. Defaults to 5.
     -   **Success Response (200 OK):**

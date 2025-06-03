@@ -94,8 +94,8 @@ CPOA_ASF_SEND_UI_UPDATE_URL = os.getenv("CPOA_ASF_SEND_UI_UPDATE_URL", "http://l
 IGA_SERVICE_URL = os.getenv("IGA_SERVICE_URL", "http://localhost:5007") # Added IGA
 CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3"))
 CPOA_SERVICE_RETRY_BACKOFF_FACTOR = float(os.getenv("CPOA_SERVICE_RETRY_BACKOFF_FACTOR", "0.5"))
-
-# Moved TDA_SERVICE_URL to be loaded in load_cpoa_configuration
+TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics") # Added TDA global
+# Moved TDA_SERVICE_URL to be loaded in load_cpoa_configuration was a comment, now adding actual global
 
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__)
@@ -119,9 +119,10 @@ logger.info(f"VFA_SERVICE_URL: {VFA_SERVICE_URL}")
 logger.info(f"ASF_NOTIFICATION_URL: {ASF_NOTIFICATION_URL}")
 logger.info(f"ASF_WEBSOCKET_BASE_URL: {ASF_WEBSOCKET_BASE_URL}")
 logger.info(f"SCA_SERVICE_URL: {SCA_SERVICE_URL}")
-logger.info(f"IGA_SERVICE_URL: {IGA_SERVICE_URL}") # Added IGA
+logger.info(f"IGA_SERVICE_URL: {IGA_SERVICE_URL}")
+logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}") # Added TDA logging
 logger.info(f"SHARED_DATABASE_PATH: {CPOA_DATABASE_PATH}")
-logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}") # Added
+logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}")
 logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}")
 logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}")
 logger.info("--- End CPOA Configuration ---")

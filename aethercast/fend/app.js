@@ -459,24 +459,32 @@ document.addEventListener('DOMContentLoaded', () => {
         snippetListContainer.innerHTML = ''; // Clear existing snippets
 
         try {
-            const response = await fetch('/api/v1/snippets'); // Assuming this endpoint exists
+            const response = await fetch('/api/v1/snippets');
             if (!response.ok) {
-                throw new Error(`HTTP error ${response.status}`);
+                let errorMsg = `Server responded with ${response.status}`;
+                try {
+                    const errorData = await response.json();
+                    // Prefer specific message from server if available
+                    errorMsg = errorData.message || errorData.details || errorData.error || errorMsg;
+                } catch (e) {
+                    // Ignore if error response is not JSON, use the HTTP status based message
+                }
+                throw new Error(errorMsg); // Throw the more detailed error message
             }
             const data = await response.json();
 
-            if (data.snippets && data.snippets.length > 0) {
+            if (data.snippets && Array.isArray(data.snippets) && data.snippets.length > 0) {
                 data.snippets.forEach(snippet => renderSnippetCard(snippet, snippetListContainer));
-                snippetStatusMessage.textContent = `Showing ${data.snippets.length} snippets. Source: ${data.source}`;
-                snippetStatusMessage.className = 'status-messages status-success';
+                updateStatus(`Showing ${data.snippets.length} snippets. Source: ${data.source}`, 'success', snippetStatusMessage);
+            } else if (data.snippets && Array.isArray(data.snippets) && data.snippets.length === 0) {
+                updateStatus('No snippets available at the moment.', 'info', snippetStatusMessage);
             } else {
-                snippetStatusMessage.textContent = 'No snippets available at the moment.';
-                snippetStatusMessage.className = 'status-messages status-info';
+                console.warn("Snippets response format unexpected:", data);
+                updateStatus('Unexpected response format from server for snippets.', 'error', snippetStatusMessage);
             }
         } catch (error) {
             console.error('Error fetching snippets:', error);
-            snippetStatusMessage.textContent = `Error fetching snippets: ${error.message}`;
-            snippetStatusMessage.className = 'status-messages status-error';
+            updateStatus(`Error fetching snippets: ${error.message}`, 'error', snippetStatusMessage);
         }
     }
     const fetchAndRenderSnippets = newFetchSnippets;
