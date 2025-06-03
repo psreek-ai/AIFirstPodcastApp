@@ -55,37 +55,10 @@
                 </div>
             </section>
 
-            <section id="topic-exploration-section">
-                <h2>Explore New Topics</h2>
-                 <p class="section-subtitle">Let AI help you discover and generate content on novel subjects.</p>
-                <input type="text" id="explore-keywords-input" placeholder="Enter keywords to explore...">
-                <button id="explore-keywords-btn">Explore Keywords</button>
-                <div id="explored-topics-status" class="status-messages status-info" style="display:none;"></div>
-                <div id="explored-topics-container">
-                    <!-- Explored snippets/topics will be loaded here -->
-                </div>
-            </section>
-
-            <div id="preferences-section" style="margin-top: 20px; padding:10px; border:1px solid #ddd;">
-                <h3>My Preferences</h3>
-                <label for="pref-news-category">Preferred News Category (for topic suggestions):</label>
-                <input type="text" id="pref-news-category" placeholder="e.g., technology, sports, science">
-                <button id="save-prefs-btn">Save Preferences</button>
-                <p id="prefs-status" style="margin-top: 5px;"></p>
-            </div>
-
-            <section class="input-section">
-                <h2>Create Full Podcast</h2>
-                <p class="section-subtitle">Generate a complete podcast episode from a topic of your choice.</p>
-                <label for="topic-input">Enter Topic:</label>
-                <input type="text" id="topic-input" name="topic" placeholder="e.g., The Future of AI">
-                <button id="generate-btn">Generate Podcast</button>
-            </section>
-
-            <section class="output-section">
-                <h2>Podcast Output</h2>
+            <section id="podcast-output-area">
+                <!-- This section now primarily houses the status messages and podcast player -->
                 <div id="status-messages">
-                    <p>Please enter a topic and click 'Generate Podcast' to begin.</p>
+                    <p>Welcome to Aethercast! Select an episode or search to begin.</p>
                 </div>
                 <!-- Area for generation progress simulation -->
                 <div id="generation-progress-display" class="status-messages status-info" style="display:none;"></div>

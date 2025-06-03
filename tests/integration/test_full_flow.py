@@ -392,18 +392,32 @@ class TestFullPodcastFlow(unittest.TestCase):
         if cover_art_prompt_from_snippet:
             # IGA placeholder uses: keywords = "+".join(prompt.split()[:3])
             # The prompt IGA receives is the cover_art_prompt_from_snippet itself.
-            # Sanitize keywords from prompt similar to how IGA does (alphanumeric, join with '+')
-            raw_keywords_from_prompt = cover_art_prompt_from_snippet.split()[:3]
-            sanitized_prompt_keywords_list = ["".join(c if c.isalnum() else '' for c in kw) for kw in raw_keywords_from_prompt]
-            expected_url_keywords_segment = "+".join(filter(None, sanitized_prompt_keywords_list))
+            # IGA's main.py:
+            # keywords_from_prompt_for_iga = "+".join(cover_art_prompt_from_snippet.split()[:3])
+            # sanitized_keywords_for_iga = "".join(c if c.isalnum() or c == '+' else '+' for c in keywords_from_prompt_for_iga)
+            # expected_url_keywords_segment = "+".join(filter(None, sanitized_keywords_for_iga.split('+')))
+
+            # Simplified simulation of IGA's keyword extraction for URL for the test assertion:
+            # Takes the first 3 words of the prompt, makes them alphanumeric, joins with '+'
+            prompt_words = cover_art_prompt_from_snippet.split()
+            keywords_for_url_list = []
+            for word in prompt_words[:3]:
+                sanitized_word = "".join(filter(str.isalnum, word))
+                if sanitized_word:
+                    keywords_for_url_list.append(sanitized_word)
+            expected_url_keywords_segment = "+".join(keywords_for_url_list)
 
 
-            if expected_url_keywords_segment: # Ensure we have keywords to check
-                # The IGA placeholder URL structure is `.../?<keywords>,podcast,abstract`
-                # We need to check if the generated keyword segment is part of the query params in the URL
-                # A simple check is if `expected_url_keywords_segment` is in the URL string before ",podcast,abstract"
-                self.assertTrue(expected_url_keywords_segment.lower() in image_url.lower(),
-                                f"Expected keyword segment '{expected_url_keywords_segment.lower()}' from prompt not found or mismatched in image_url '{image_url.lower()}'. Prompt: '{cover_art_prompt_from_snippet}'")
+            if expected_url_keywords_segment:
+                # The Unsplash URL from IGA is like: https://source.unsplash.com/random/400x225/?{sanitized_keywords_from_prompt},podcast,abstract
+                # We need to check if our `expected_url_keywords_segment` is in the path part of `image_url`
+                # Extract the keyword part from the image_url. It's between "/?" and ",podcast,abstract".
+                try:
+                    url_keyword_part = image_url.split("/?")[1].split(",podcast,abstract")[0]
+                    self.assertTrue(expected_url_keywords_segment.lower() in url_keyword_part.lower(),
+                                    f"Expected keyword segment '{expected_url_keywords_segment.lower()}' from prompt not found or mismatched in image_url's keyword part '{url_keyword_part.lower()}'. Prompt: '{cover_art_prompt_from_snippet}'")
+                except IndexError:
+                    self.fail(f"Could not parse keyword segment from image_url: {image_url}")
 
         # Optional: Check if the title or summary contains the search query (or related terms)
         # This depends on TDA's simulated data and SCA's snippet generation logic.
