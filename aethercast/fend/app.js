@@ -18,8 +18,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const refreshSnippetsBtn = document.getElementById('refresh-snippets-btn'); // Assuming this might be removed or repurposed
 
     // Episode Search elements (within Latest Episodes section)
-    const episodesSearchInput = document.getElementById('episodes-search-input');
-    const episodesSearchBtn = document.getElementById('episodes-search-btn');
+    const episodesSearchInput = document.getElementById('episodes-search-input'); // Kept
+    const episodesSearchBtn = document.getElementById('episodes-search-btn'); // Kept
+
+    // Header Search Input
+    const headerSearchInput = document.getElementById('header-search-input'); // Added
 
     // Topic Exploration elements
     const exploreKeywordsInput = document.getElementById('explore-keywords-input');
