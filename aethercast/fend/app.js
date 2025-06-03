@@ -11,10 +11,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const generationDetailsLog = document.getElementById('generation-details-log');
 
     // New DOM Element References for Snippets
-    const podcastSnippetsSection = document.getElementById('podcast-snippets-section');
+    const podcastSnippetsSection = document.getElementById('podcast-snippets-section'); // This ID might be 'latest-episodes-section' in new HTML
+    const latestEpisodesSection = document.getElementById('latest-episodes-section'); // Added for clarity if used
     const snippetListContainer = document.getElementById('snippet-list-container');
     const snippetStatusMessage = document.getElementById('snippet-status-message');
-    const refreshSnippetsBtn = document.getElementById('refresh-snippets-btn');
+    const refreshSnippetsBtn = document.getElementById('refresh-snippets-btn'); // Assuming this might be removed or repurposed
+
+    // Episode Search elements (within Latest Episodes section)
+    const episodesSearchInput = document.getElementById('episodes-search-input');
+    const episodesSearchBtn = document.getElementById('episodes-search-btn');
 
     // Topic Exploration elements
     const exploreKeywordsInput = document.getElementById('explore-keywords-input');
@@ -387,7 +392,64 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Snippet & Topic Exploration Logic (existing functions, ensure renderSnippetCard etc. are preserved) ---
     // For brevity, I'm assuming these are largely unchanged unless they need to interact with preferences.
     // The triggerPodcastGeneration call from snippet buttons already uses the main function.
-    async function newFetchSnippets() { 
+
+    async function fetchAndRenderSearchResults(query) {
+        if (!snippetStatusMessage || !snippetListContainer) {
+            console.warn("Search UI elements (status message or list container) not found. Cannot perform search.");
+            return;
+        }
+
+        updateStatus(`Searching for '${query}'...`, 'info', snippetStatusMessage);
+        snippetListContainer.innerHTML = ''; // Clear previous results
+
+        const payload = { query: query };
+        if (currentUiClientId) { // currentUiClientId is a global in app.js
+            payload.client_id = currentUiClientId;
+        }
+
+        try {
+            const response = await fetch('/api/v1/search/podcasts', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(payload),
+            });
+
+            if (!response.ok) {
+                let errorMsg = `Server responded with ${response.status}`;
+                try {
+                    const errorData = await response.json();
+                    // Prefer specific message from server if available
+                    errorMsg = errorData.message || errorData.details || errorData.error || errorMsg;
+                } catch (e) {
+                    // Ignore if error response is not JSON, use the HTTP status based message
+                }
+                // Throw an error to be caught by the catch block
+                throw new Error(errorMsg);
+            }
+
+            const data = await response.json();
+
+            if (data.search_results && Array.isArray(data.search_results) && data.search_results.length > 0) {
+                data.search_results.forEach(snippet => renderSnippetCard(snippet, snippetListContainer));
+                updateStatus(`Found ${data.search_results.length} results for '${query}'.`, 'success', snippetStatusMessage);
+            } else if (data.search_results && Array.isArray(data.search_results) && data.search_results.length === 0) {
+                 updateStatus(`No results found for '${query}'.`, 'info', snippetStatusMessage);
+            }
+            else { // Handle cases where search_results key might be missing or not an array
+                console.warn("Search response format unexpected:", data);
+                updateStatus(`Unexpected response format from server for query '${query}'.`, 'error', snippetStatusMessage);
+            }
+
+        } catch (error) {
+            console.error('Error fetching or rendering search results:', error);
+            // error.message here will be the one thrown from (!response.ok) block or from fetch/json parse failures
+            updateStatus(`An error occurred while fetching search results: ${error.message}`, 'error', snippetStatusMessage);
+        }
+    }
+
+    async function newFetchSnippets() {
         if (!snippetListContainer || !snippetStatusMessage) {
             console.warn("Snippet UI elements not found, skipping snippet fetch.");
             return;
@@ -425,7 +487,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const imagePlaceholderDiv = document.createElement('div');
         imagePlaceholderDiv.className = 'snippet-image-placeholder';
-        
+
         if (snippet.image_url && typeof snippet.image_url === 'string' && snippet.image_url.trim() !== '') {
             imagePlaceholderDiv.style.backgroundImage = `url('${snippet.image_url}')`;
         } else {
@@ -464,7 +526,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 // A better approach might be to pass a status display target to renderSnippetCard
                 // or have a dedicated status area for "quick play" from cards.
                 updateStatus(`Initiating podcast for snippet: '${topicForGeneration}'...`, 'info', statusMessagesDiv);
-                triggerPodcastGeneration(topicForGeneration, 'status-messages'); 
+                triggerPodcastGeneration(topicForGeneration, 'status-messages');
                 // Scroll to the main player/status area after initiating
                 podcastDisplayDiv.scrollIntoView({ behavior: 'smooth' });
             } else {
@@ -486,22 +548,45 @@ document.addEventListener('DOMContentLoaded', () => {
     async function triggerTopicExploration(payload) { /* ... (existing function) ... */ }
     function handleExploreRelated(event) { /* ... (existing function) ... */ }
 
-    if (refreshSnippetsBtn) { 
+    if (refreshSnippetsBtn) {
         refreshSnippetsBtn.addEventListener('click', fetchAndRenderSnippets);
     }
-    
+
     // Remove or adapt the old generic snippetListContainer listener if it conflicts.
     // The new "Listen Now" buttons have their own direct listeners.
     // If other interactions on snippet cards are needed, this might be adapted.
     // For now, let's comment it out to avoid potential double handling or conflicts.
     /*
-    snippetListContainer.addEventListener('click', (event) => { 
+    snippetListContainer.addEventListener('click', (event) => {
         // Example: if (event.target.classList.contains('some-other-button-on-card')) { ... }
     });
     */
 
     if (exploredTopicsContainer) { /* ... */ }
-    if (exploreKeywordsBtn) { /* ... */ }
+    if (exploreKeywordsBtn) {
+        exploreKeywordsBtn.addEventListener('click', () => {
+            const keywords = exploreKeywordsInput.value.trim();
+            if (!keywords) {
+                updateStatus("Please enter keywords to explore.", "error", exploredTopicsStatus);
+                return;
+            }
+            triggerTopicExploration({ keywords: keywords.split(',').map(k => k.trim()) });
+        });
+    }
+
+    // Event listener for the new episode search button
+    if (episodesSearchBtn && episodesSearchInput) {
+        episodesSearchBtn.addEventListener('click', () => {
+            const query = episodesSearchInput.value.trim();
+            if (!query) {
+                updateStatus("Please enter a search query.", "error", snippetStatusMessage);
+                return;
+            }
+            fetchAndRenderSearchResults(query);
+        });
+    } else {
+        console.warn("Episode search input or button not found. Search functionality in 'Latest Episodes' section will not be available.");
+    }
 
     // --- Diagnostics Modal Logic (existing functions) ---
     function escapeHtml(unsafe) { /* ... */ }

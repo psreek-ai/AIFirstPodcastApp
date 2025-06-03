@@ -26,20 +26,20 @@ def generate_image_endpoint():
         # Simulate image generation by returning a dynamic Unsplash URL based on keywords from prompt
         # For simplicity, take the first few words of the prompt as keywords
         keywords = "+".join(prompt.split()[:3]) # e.g., "A+futuristic+podcast"
-        
+
         # Sanitize keywords: replace non-alphanumeric with '+' (except '+') and remove trailing/leading '+'
         sanitized_keywords = "".join(c if c.isalnum() or c == '+' else '+' for c in keywords)
         sanitized_keywords = "+".join(filter(None, sanitized_keywords.split('+'))) # Remove multiple/empty '+'
-        
+
         image_url = f"https://source.unsplash.com/random/400x225/?{sanitized_keywords},podcast,abstract"
-        
+
         # Fallback if keywords are empty after sanitization
         if not sanitized_keywords:
             image_url = "https://source.unsplash.com/random/400x225/?podcast,abstract"
 
 
         logging.info(f"IGA: Returning placeholder image URL: {image_url} for prompt: '{prompt}'")
-        
+
         response_data = {
             "image_url": image_url,
             "prompt_used": prompt,

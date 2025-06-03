@@ -271,7 +271,7 @@ class TestFullPodcastFlow(unittest.TestCase):
         # 1. Initiate podcast generation
         print(f"[INFO] POST {API_GATEWAY_BASE_URL}/podcasts with payload: {initiate_payload}")
         initiate_response = requests.post(f"{API_GATEWAY_BASE_URL}/podcasts", json=initiate_payload, timeout=30)
-        
+
         self.assertIn(initiate_response.status_code, [200, 201, 502, 500], # Expecting API GW to return error status from CPOA
                       f"Initiate request failed unexpectedly: {initiate_response.status_code} - {initiate_response.text}")
 
@@ -279,7 +279,7 @@ class TestFullPodcastFlow(unittest.TestCase):
         podcast_id = init_data.get("podcast_id")
         self.assertIsNotNone(podcast_id, msg="Podcast ID not found in initiation response.")
         print(f"[INFO] Podcast task initiated for PSWA internal error test. Podcast ID: {podcast_id}")
-        
+
         # If API GW immediately returns the final error (e.g. 500/502), we check that.
         # Otherwise, we poll.
         if initiate_response.status_code in [500, 502]:
@@ -298,7 +298,7 @@ class TestFullPodcastFlow(unittest.TestCase):
                 print(f"[INFO] Polling PSWA internal error test ({i+1}/{max_polls}) for {podcast_id}...")
                 poll_response = requests.get(f"{API_GATEWAY_BASE_URL}/podcasts/{podcast_id}", timeout=10)
                 self.assertEqual(poll_response.status_code, 200, f"Polling request failed: {poll_response.status_code} - {poll_response.text}")
-                
+
                 poll_data = poll_response.json()
                 current_status = poll_data.get("status")
                 print(f"[INFO] Current status: {current_status}")
@@ -313,22 +313,22 @@ class TestFullPodcastFlow(unittest.TestCase):
                 elif current_status == "completed":
                     final_status_data = poll_data # Capture data
                     self.fail(f"Podcast generation completed unexpectedly for PSWA internal error scenario. Status: '{current_status}'")
-                
+
                 time.sleep(poll_interval_seconds)
-            
+
             if not final_status_data: # If loop finishes without setting final_status_data
                  self.fail(f"Polling timeout: Podcast did not reach expected status '{expected_final_cpoa_status}'. Last status: '{current_status}'")
 
 
         # 3. Assertions
         self.assertIsNotNone(final_status_data, msg="Final status data was not captured.")
-        
+
         self.assertEqual(final_status_data.get("generation_status"), expected_final_cpoa_status,
                          msg=f"CPOA status was '{final_status_data.get('generation_status')}', expected '{expected_final_cpoa_status}'. Full data: {json.dumps(final_status_data, indent=2)}")
-        
+
         self.assertIn(expected_error_message_substring, final_status_data.get("message", final_status_data.get("error_message", "")), # Check 'message' from API GW, or 'error_message' from details
                       msg=f"Error message substring '{expected_error_message_substring}' not found in CPOA error message. Full data: {json.dumps(final_status_data, indent=2)}")
-        
+
         # Note: ASF UI updates check might be less relevant here if the task fails very early in CPOA due to PSWA's bad script structure.
         # However, CPOA should still attempt to send a task_error update.
         # We would need to ensure the mock ASF service is running and accessible for this part of the test.
@@ -346,7 +346,7 @@ class TestFullPodcastFlow(unittest.TestCase):
         print(f"\n[INFO] Starting test_search_podcasts_successful for query: '{search_query}' with client_id: {client_id}")
 
         payload = {"query": search_query, "client_id": client_id}
-        
+
         print(f"[INFO] POST {API_GATEWAY_BASE_URL}/search/podcasts with payload: {payload}")
         response = requests.post(f"{API_GATEWAY_BASE_URL}/search/podcasts", json=payload, timeout=30)
 
@@ -355,16 +355,16 @@ class TestFullPodcastFlow(unittest.TestCase):
         response_data = response.json()
         self.assertIsInstance(response_data, dict, "Search response is not a dictionary.")
         self.assertIn("search_results", response_data, "Search response missing 'search_results' key.")
-        
+
         search_results = response_data["search_results"]
         self.assertIsInstance(search_results, list, "'search_results' is not a list.")
-        
+
         self.assertTrue(len(search_results) > 0, f"Search returned no results for query '{search_query}', which should yield results from TDA/SCA simulated/test data.")
 
         # Validate the structure of the first search result
         first_result = search_results[0]
         self.assertIsInstance(first_result, dict, "First search result item is not a dictionary.")
-        
+
         expected_keys = ["snippet_id", "topic_id", "title", "summary", "text_content", "cover_art_prompt", "llm_model_used", "keywords"]
         for key in expected_keys:
             self.assertIn(key, first_result, f"First search result missing key: '{key}'. Result: {first_result}")
@@ -376,7 +376,7 @@ class TestFullPodcastFlow(unittest.TestCase):
         # Let's assume SCA's test mode is active and CPOA passes it through.
         # From sca/main.py: SCENARIO_DEFAULT_SNIPPET_DATA['llm_model_used'] = "SCA-Test-LLM-v1.0"
         # Update: SCA's default test data uses "SCA-Test-LLM-v1.0" as per its main.py
-        self.assertEqual(first_result.get("llm_model_used"), "SCA-Test-LLM-v1.0", 
+        self.assertEqual(first_result.get("llm_model_used"), "SCA-Test-LLM-v1.0",
                          f"LLM model used for snippet generation is not the expected SCA test model. Got: {first_result.get('llm_model_used')}")
 
         # Assertions for image_url
@@ -411,7 +411,7 @@ class TestFullPodcastFlow(unittest.TestCase):
         # The title of the snippet might be derived from the TDA topic.
         title_contains_query = search_query.lower() in first_result.get("title", "").lower()
         summary_contains_query = search_query.lower() in first_result.get("summary", "").lower()
-        # self.assertTrue(title_contains_query or summary_contains_query, 
+        # self.assertTrue(title_contains_query or summary_contains_query,
         #                 f"Neither title nor summary of the first search result seems related to the query '{search_query}'. Title: '{first_result.get('title', '')}', Summary: '{first_result.get('summary', '')}'")
         # This assertion can be very flaky depending on how test data is structured and processed.
         # For now, presence of results and correct structure is the primary goal.
@@ -435,17 +435,17 @@ class TestFullPodcastFlow(unittest.TestCase):
             with self.subTest(payload=payload):
                 print(f"[INFO] POST {API_GATEWAY_BASE_URL}/search/podcasts with invalid payload: {payload}")
                 response = requests.post(f"{API_GATEWAY_BASE_URL}/search/podcasts", json=payload, timeout=10)
-                
+
                 self.assertEqual(response.status_code, 400, f"Search request with payload {payload} did not return 400. Got: {response.status_code} - {response.text}")
-                
+
                 response_data = response.json()
                 self.assertIsInstance(response_data, dict)
                 self.assertIn("error", response_data, "Error response missing 'error' key.")
                 self.assertEqual(response_data["error"], "Bad Request", "Error type is not 'Bad Request'.")
                 self.assertIn("message", response_data, "Error response missing 'message' key.")
-                self.assertIn("Missing or empty 'query'", response_data["message"], 
+                self.assertIn("Missing or empty 'query'", response_data["message"],
                               f"Error message does not indicate missing query. Message: '{response_data['message']}'")
-        
+
         print(f"[INFO] Test test_search_podcasts_missing_query PASSED for all invalid payloads.")
 
 

@@ -388,14 +388,14 @@ def orchestrate_podcast_generation(
             current_orchestration_stage = ORCHESTRATION_STAGE_PSWA
             _update_task_status_in_db(db_path, task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, error_msg=None)
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting podcast script with AI...", "stage": current_orchestration_stage})
-            
+
             pswa_payload_for_log = {"content_preview": wcha_output[:100] + "..." if wcha_output else "N/A", "topic": topic} # Avoid logging full content
             pswa_headers_for_log = {}
             if test_scenarios and test_scenarios.get("pswa"):
                 pswa_headers_for_log['X-Test-Scenario'] = test_scenarios["pswa"]
-            
+
             log_step("Calling PSWA Service (weave_script)...",
-                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output), 
+                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output),
                            "payload_preview": pswa_payload_for_log, "headers": pswa_headers_for_log})
             try:
                 pswa_payload = {"content": wcha_output, "topic": topic}
@@ -467,8 +467,8 @@ def orchestrate_podcast_generation(
 
             vfa_call_data = {"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title")}
             if effective_voice_params: # Check if there are any params to send
-                vfa_call_data["voice_params_input"] = effective_voice_params 
-            
+                vfa_call_data["voice_params_input"] = effective_voice_params
+
             vfa_headers_for_log = {}
             if test_scenarios and test_scenarios.get("vfa"):
                 vfa_headers_for_log['X-Test-Scenario'] = test_scenarios["vfa"]
@@ -476,7 +476,7 @@ def orchestrate_podcast_generation(
             log_step("Calling VFA Service (forge_voice)...", data={**vfa_call_data, "headers": vfa_headers_for_log})
             try:
                 vfa_payload = {"script": structured_script_from_pswa}
-                if effective_voice_params: 
+                if effective_voice_params:
                     vfa_payload["voice_params"] = effective_voice_params
 
                 vfa_headers = {} # Actual headers for request
@@ -786,14 +786,14 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
             logger.info(f"CPOA: Orchestrating image generation for snippet '{snippet_data.get('snippet_id')}' with prompt: '{cover_art_prompt}'")
             iga_payload = {"prompt": cover_art_prompt}
             iga_endpoint = f"{IGA_SERVICE_URL.rstrip('/')}/generate_image"
-            
+
             try:
                 iga_response = requests_with_retry("post", iga_endpoint,
                                                    max_retries=CPOA_SERVICE_RETRY_COUNT,
                                                    backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                                   json=iga_payload, 
+                                                   json=iga_payload,
                                                    timeout=20) # IGA specific timeout
-                
+
                 iga_response_data = iga_response.json()
                 if iga_response.status_code == 200 and iga_response_data.get("image_url"):
                     snippet_data["image_url"] = iga_response_data["image_url"]
@@ -815,7 +815,7 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
             snippet_data["image_url"] = None
         else: # No cover_art_prompt
              snippet_data["image_url"] = None
-        
+
         # Now save to DB (it won't save image_url yet as schema not updated)
         if db_path:
             _save_snippet_to_db(snippet_data, db_path)
@@ -1143,7 +1143,7 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
         return {"error": "CPOA_CONFIG_ERROR", "details": "TDA_SERVICE_URL not set.", "search_results": []}
 
     tda_payload = {"query": query, "limit": 7} # Set limit for TDA results, e.g., 7
-    
+
     try:
         logger.info(f"CPOA: Calling TDA service for search query '{query}' with payload: {tda_payload}")
         response = requests_with_retry("post", TDA_SERVICE_URL, # TDA_SERVICE_URL is global
@@ -1154,9 +1154,9 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
         # Ensure discovered_topics is always a list
         # TDA returns topics under "topics" or "discovered_topics"
         discovered_topics = tda_data.get("topics", tda_data.get("discovered_topics"))
-        if discovered_topics is None: 
+        if discovered_topics is None:
             discovered_topics = [] # Default to empty list if key missing or None
-        
+
         logger.info(f"CPOA: TDA returned {len(discovered_topics)} topics for query '{query}'.")
 
         if not discovered_topics:
@@ -1196,7 +1196,7 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
             "keywords": topic_obj.get("keywords", []),
             "original_topic_details_from_tda": topic_obj # Pass full TDA object for context
         }
-        
+
         # Ensure there's a brief for SCA to work with
         if not topic_info_for_sca["title_suggestion"]:
             logger.warning(f"CPOA: Skipping snippet generation for TDA topic due to missing title/title_suggestion. Topic object: {topic_obj}")
@@ -1204,7 +1204,7 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
 
         logger.info(f"CPOA: Generating search snippet for TDA topic_id: {topic_info_for_sca.get('topic_id', 'N/A')}, title: {topic_info_for_sca.get('title_suggestion', 'N/A')}")
         try:
-            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca) 
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
             if snippet_result and "error" not in snippet_result:
                 # Ensure snippet_id is present, as expected by API Gateway's search response
                 if "snippet_id" not in snippet_result and "id" in snippet_result: # SCA might return 'id'
@@ -1212,7 +1212,7 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
                 elif "snippet_id" not in snippet_result: # Generate one if missing
                      snippet_result["snippet_id"] = f"search_snippet_{uuid.uuid4().hex[:8]}"
                      logger.warning(f"CPOA: Generated missing snippet_id for search result: {snippet_result['snippet_id']}")
-                
+
                 search_results_snippets.append(snippet_result)
                 successful_snippet_generations += 1
             else:

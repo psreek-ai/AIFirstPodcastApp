@@ -275,7 +275,7 @@ def health_check():
         cpoa_overall_status = f"partially operational (missing: {', '.join(cpoa_import_summary)})"
         if len(cpoa_import_summary) == 4: # If all known CPOA functions failed to import
             cpoa_overall_status = "CPOA module critical functions failed to import"
-    
+
     if CPOA_OVERALL_IMPORT_ERROR_MESSAGE and not cpoa_import_summary : # Errors logged but flags are true (should not happen)
         cpoa_overall_status = "inconsistent import state (errors logged but functions flagged as imported)"
 
@@ -290,7 +290,7 @@ def health_check():
         "database_status": db_status,
         "cpoa_detailed_import_errors": CPOA_OVERALL_IMPORT_ERROR_MESSAGE if CPOA_OVERALL_IMPORT_ERROR_MESSAGE else "None"
     }
-    
+
     status_code = 200
     if not db_status.startswith("Database connection successful.") or not IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS(): # Define IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS or check each flag
         status_code = 503 # Service Unavailable if critical parts are down
@@ -416,7 +416,7 @@ def explore_topic():
     if not cpoa_exploration_func_imported: # Assuming placeholder and flag exist
         app.logger.error("CPOA topic exploration function not available.")
         return jsonify({"error": "Service Unavailable", "message": "Topic exploration service is currently unavailable."}), 503
-    
+
     # Dummy data for now, replace with actual call to CPOA's orchestrate_topic_exploration
     # This endpoint's logic for calling CPOA needs to be fully implemented similar to search.
     # For now, just returning placeholder if function is imported.
@@ -444,9 +444,9 @@ def search_podcasts_endpoint():
     if not data or not data.get("query"):
         app.logger.warning("Bad request to /api/v1/search/podcasts: Missing or empty 'query'.")
         return jsonify({"error": "Bad Request", "message": "Missing or empty 'query' in request body."}), 400
-    
+
     query = data["query"]
-    client_id = data.get("client_id") 
+    client_id = data.get("client_id")
     user_preferences = None
 
     if client_id:
@@ -459,7 +459,7 @@ def search_podcasts_endpoint():
                 app.logger.info(f"Fetched preferences for client_id {client_id} for search: {user_preferences}")
                 _touch_session_last_seen(conn_prefs, client_id)
             elif not session_data:
-                _create_session(conn_prefs, client_id) 
+                _create_session(conn_prefs, client_id)
                 app.logger.info(f"No session found for client_id {client_id} during search. Created one.")
             else: # Session exists but no preferences
                  _touch_session_last_seen(conn_prefs, client_id)
@@ -470,7 +470,7 @@ def search_podcasts_endpoint():
         finally:
             if conn_prefs:
                 conn_prefs.close()
-    
+
     try:
         app.logger.info(f"Calling CPOA orchestrate_search_results_generation with query: '{query}'")
         cpoa_search_response = orchestrate_search_results_generation(query=query, user_preferences=user_preferences)
@@ -482,16 +482,16 @@ def search_podcasts_endpoint():
             status_code = 500 # Default to general server error
             if "TDA_" in error_type or "SCA_" in error_type or "CPOA_CONFIG_ERROR" in error_type:
                 status_code = 503 # Service Unavailable for downstream or config issues
-            
+
             return jsonify({
-                "error": error_type, 
+                "error": error_type,
                 "message": cpoa_search_response.get("details", "Search processing failed internally.")
             }), status_code
-        
+
         # Expecting {"search_results": [...]} from CPOA on success
         return jsonify(cpoa_search_response), 200
 
-    except ImportError: 
+    except ImportError:
         app.logger.critical("CPOA search function became unavailable after initial check.", exc_info=True)
         return jsonify({"error": "Service Configuration Error", "message": "Search module component is critically unavailable."}), 503
     except Exception as e:
@@ -623,7 +623,7 @@ def create_podcast_generation_task():
             if not error_message:
                 error_message = f"Podcast generation failed with status: {final_cpoa_status}"
             response_payload["message"] = error_message
-            
+
             # Determine appropriate HTTP status code
             if "request_exception" in final_cpoa_status or                "reported_error" in final_cpoa_status or                "bad_script_structure" in final_cpoa_status or                "json_decode" in final_cpoa_status: # Errors related to downstream services
                 http_status_code = 502 # Bad Gateway

@@ -193,7 +193,7 @@ def harvest_from_url(url: str, min_length: int = 150) -> dict: # min_length defa
                 # For now, returning content as is, but logging a warning.
                 logger.warning(f"[WCHA_LOGIC_WEB] Content from {url} is shorter ({len(extracted_text)} chars) than min_length ({min_length} chars).")
                 # If it should be an error:
-                # return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_CONTENT_TOO_SHORT, 
+                # return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_CONTENT_TOO_SHORT,
                 #         "error_message": f"Extracted content length ({len(extracted_text)}) is less than minimum ({min_length})."}
             logger.info(f"[WCHA_LOGIC_WEB] Trafilatura successfully extracted {len(extracted_text)} characters from {url}.")
             return {"url": url, "content": extracted_text, "error_type": None, "error_message": None}
@@ -310,32 +310,32 @@ try:
             url_to_harvest = request_data.get("url")
             use_search = request_data.get("use_search", False) # For get_content_for_topic
             # Optional: allow overriding timeout and min_length via request for direct URL harvest
-            timeout_override = request_data.get("timeout") 
+            timeout_override = request_data.get("timeout")
             min_length_override = request_data.get("min_length")
 
 
             if use_search and topic:
                 logger.info(f"[WCHA_API] Received API request to search and harvest for topic: '{topic}'")
                 # get_content_for_topic still returns a string (content or error message)
-                content_result_str = get_content_for_topic(topic) 
+                content_result_str = get_content_for_topic(topic)
                 # Check if the returned string indicates an error based on its prefixes
                 # (This part remains similar as get_content_for_topic's return signature wasn't changed to dict for this subtask)
                 if any(content_result_str.startswith(prefix) for prefix in [ERROR_WCHA_LIB_MISSING, ERROR_WCHA_SEARCH_FAILED, ERROR_WCHA_NO_SEARCH_RESULTS, ERROR_WCHA_HARVEST_ALL_FAILED]):
                     return flask.jsonify({"topic": topic, "error": content_result_str, "content": None}), 400 # Or 500 depending on error
                 return flask.jsonify({"topic": topic, "source": "web_search_ddg", "content": content_result_str}), 200
-            
+
             elif url_to_harvest:
                 logger.info(f"[WCHA_API] Received API request for direct URL harvest: '{url_to_harvest}'")
                 harvest_params = {}
                 if timeout_override is not None: harvest_params["timeout"] = timeout_override
                 if min_length_override is not None: harvest_params["min_length"] = min_length_override
-                
+
                 harvest_result_dict = harvest_from_url(url_to_harvest, **harvest_params)
 
                 if harvest_result_dict.get("content"):
                     return flask.jsonify({
-                        "url": url_to_harvest, 
-                        "source": "direct_url", 
+                        "url": url_to_harvest,
+                        "source": "direct_url",
                         "content": harvest_result_dict["content"]
                     }), 200
                 else:
@@ -346,14 +346,14 @@ try:
                     elif error_type == WCHA_ERROR_TYPE_FETCH: status_code = 502
                     elif error_type == WCHA_ERROR_TYPE_NO_CONTENT: status_code = 404
                     # WCHA_ERROR_TYPE_EXTRACTION or WCHA_ERROR_TYPE_UNKNOWN remains 500
-                    
+
                     return flask.jsonify({
-                        "url": url_to_harvest, 
-                        "error": error_message, 
-                        "error_type": error_type, 
+                        "url": url_to_harvest,
+                        "error": error_message,
+                        "error_type": error_type,
                         "content": None
                     }), status_code
-            
+
             elif topic: # Fallback to mock data if no use_search and no url, but topic is present
                 logger.info(f"[WCHA_API] Received API request for mock topic (no use_search or url): '{topic}'")
                 content_result_mock = harvest_content(topic) # Mock function
