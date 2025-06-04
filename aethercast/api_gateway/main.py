@@ -770,4 +770,9 @@ def serve_podcast_audio(podcast_id: str):
 # --- Main Block ---
 if __name__ == '__main__':
     init_db()
-    app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False) # use_reloader=False for simpler debugging with multiple services
+    host = os.getenv("API_GW_HOST", "0.0.0.0")
+    port = int(os.getenv("API_GW_PORT", "5001"))
+    debug_mode = os.getenv("API_GW_DEBUG_MODE", "True").lower() == "true"
+    # Add logging for these specific run parameters
+    app.logger.info(f"Starting API Gateway: Host={host}, Port={port}, DebugMode={debug_mode}")
+    app.run(host=host, port=port, debug=debug_mode, use_reloader=False)

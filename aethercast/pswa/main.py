@@ -51,7 +51,7 @@ Remember, your entire response must be a single JSON object conforming to the sc
 
     pswa_config['PSWA_HOST'] = os.getenv("PSWA_HOST", "0.0.0.0")
     pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
-    pswa_config['PSWA_DEBUG'] = os.getenv("PSWA_DEBUG", "True").lower() == "true"
+    pswa_config['PSWA_DEBUG_MODE'] = os.getenv("PSWA_DEBUG_MODE", "True").lower() == "true"
 
     # Script Caching Configuration
     pswa_config['SHARED_DATABASE_PATH'] = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db")
@@ -675,7 +675,7 @@ if __name__ == "__main__":
     # Start Flask app using configured values
     host = pswa_config.get("PSWA_HOST", "0.0.0.0")
     port = pswa_config.get("PSWA_PORT", 5004)
-    debug_mode = pswa_config.get("PSWA_DEBUG", True)
+    debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
 
     print(f"\n--- PSWA LLM Service starting on {host}:{port} (Debug: {debug_mode}) ---")
     # Check if API key is present before trying to run, as it's critical

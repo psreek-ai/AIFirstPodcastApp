@@ -28,7 +28,7 @@ def load_asf_configuration():
 
     asf_config['ASF_HOST'] = os.getenv("ASF_HOST", '0.0.0.0')
     asf_config['ASF_PORT'] = int(os.getenv("ASF_PORT", 5006))
-    asf_config['ASF_DEBUG_MODE'] = os.getenv("ASF_DEBUG", "True").lower() == "true"
+    asf_config['ASF_DEBUG_MODE'] = os.getenv("ASF_DEBUG_MODE", "True").lower() == "true"
 
     logger.info("--- ASF Configuration ---")
     for key, value in asf_config.items():

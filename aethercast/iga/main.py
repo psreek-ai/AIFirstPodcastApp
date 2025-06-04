@@ -10,6 +10,21 @@ app = Flask(__name__)
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - IGA - %(message)s')
 
+iga_config = {}
+
+def load_iga_configuration():
+    global iga_config
+    iga_config['IGA_HOST'] = os.getenv("IGA_HOST", "0.0.0.0")
+    iga_config['IGA_PORT'] = int(os.getenv("IGA_PORT", 5007))
+    iga_config['IGA_DEBUG_MODE'] = os.getenv("IGA_DEBUG_MODE", "True").lower() == "true"
+    # Add logging of loaded config here
+    logging.info("--- IGA Configuration ---")
+    for key, value in iga_config.items():
+        logging.info(f"  {key}: {value}")
+    logging.info("--- End IGA Configuration ---")
+
+load_iga_configuration()
+
 IGA_MODEL_VERSION = "iga-placeholder-v0.1"
 
 @app.route("/generate_image", methods=["POST"])
@@ -52,8 +67,7 @@ def generate_image_endpoint():
         return jsonify({"error": "INTERNAL_SERVER_ERROR", "message": "IGA placeholder encountered an unexpected error."}), 500
 
 if __name__ == "__main__":
-    host = os.getenv("IGA_HOST", "0.0.0.0")
-    port = int(os.getenv("IGA_PORT", 5007))
-    # FLASK_DEBUG from .env will be a string 'True' or 'False', convert to boolean
-    is_debug_mode = os.getenv("FLASK_DEBUG", "True").lower() == "true"
+    host = iga_config.get("IGA_HOST")
+    port = iga_config.get("IGA_PORT")
+    is_debug_mode = iga_config.get("IGA_DEBUG_MODE")
     app.run(host=host, port=port, debug=is_debug_mode)

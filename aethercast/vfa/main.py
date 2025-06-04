@@ -60,7 +60,7 @@ def load_vfa_configuration():
 
     vfa_config['VFA_HOST'] = os.getenv("VFA_HOST", "0.0.0.0")
     vfa_config['VFA_PORT'] = int(os.getenv("VFA_PORT", 5005))
-    vfa_config['VFA_DEBUG'] = os.getenv("VFA_DEBUG", "True").lower() == "true"
+    vfa_config['VFA_DEBUG_MODE'] = os.getenv("VFA_DEBUG_MODE", "True").lower() == "true"
 
     logger.info("--- VFA Configuration ---")
     for key, value in vfa_config.items():
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     # Start Flask app using configured values
     host = vfa_config.get("VFA_HOST", "0.0.0.0")
     port = vfa_config.get("VFA_PORT", 5005)
-    debug_mode = vfa_config.get("VFA_DEBUG", True)
+    debug_mode = vfa_config.get("VFA_DEBUG_MODE", True)
 
     print(f"\n--- VFA Service starting on {host}:{port} (Debug: {debug_mode}) ---")
     if not vfa_config.get("GOOGLE_APPLICATION_CREDENTIALS") and VFA_IMPORTS_SUCCESSFUL :

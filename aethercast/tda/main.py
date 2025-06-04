@@ -22,7 +22,10 @@ tda_config = {
     "TDA_NEWS_PAGE_SIZE": int(os.getenv("TDA_NEWS_PAGE_SIZE", "25")),
     "TDA_NEWS_REQUEST_TIMEOUT": int(os.getenv("TDA_NEWS_REQUEST_TIMEOUT", "15")),
     "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"),
-    "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db") # Added, assuming relative path for dev
+    "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db"),
+    "TDA_HOST": os.getenv("TDA_HOST", os.getenv("FLASK_RUN_HOST", "0.0.0.0")),
+    "TDA_PORT": int(os.getenv("TDA_PORT", os.getenv("FLASK_RUN_PORT", "5000"))),
+    "TDA_DEBUG_MODE": os.getenv("TDA_DEBUG_MODE", "True").lower() == "true"
 }
 
 # --- Additional Imports ---
@@ -433,4 +436,7 @@ if __name__ == "__main__":
     # For development, Flask's built-in server is fine.
     # The CPOA will call this service, so it needs to be running.
     # Example: python aethercast/tda/main.py
-    app.run(host="0.0.0.0", port=5001, debug=True) # Running on a different port than CPOA
+    host = tda_config.get("TDA_HOST")
+    port = tda_config.get("TDA_PORT")
+    debug_mode = tda_config.get("TDA_DEBUG_MODE")
+    app.run(host=host, port=port, debug=debug_mode)
