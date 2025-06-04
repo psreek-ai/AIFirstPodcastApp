@@ -37,7 +37,7 @@ The Aethercast vision, particularly detailed in `docs/vision/03_Podcast_App_Mani
 *   **Audio Stream Feeder (ASF):**
     *   **Vision:** Not explicitly listed as an "AI agent" in the manifesto, but it's a crucial component.
     *   **Mapping:** Implemented as the **Audio Stream Feeder (asf)** service (`aethercast/asf/`). It handles the streaming of generated audio.
-```
+
 
 ## 2. AI Model Evaluation and Recommendations
 
@@ -86,7 +86,7 @@ This section details the AI model recommendations for each agent, focusing on le
     *   **AI Model Suggestion:** If this agent were to be implemented as per the vision, **Gemini Pro** could be used for generating code for UI components based on prompts describing desired layout, style, and functionality.
     *   **Cost-Effectiveness:** This is an advanced and potentially costly application of LLMs. While Gemini Pro is capable of code generation, the complexity of ensuring valid, functional, and aesthetically pleasing UIs through pure AI generation would be high. Iterative prompting and refinement would be needed.
     *   **Test Mode:** If implemented, a test mode would be critical, perhaps defaulting to a very simple static UI or pre-generated components.
-```
+
 
 ## 3. Gaps and Future Considerations
 
@@ -117,4 +117,4 @@ This section addresses discrepancies between the project's vision and its curren
     *   **Consideration:** The vision documents (`01_AI_First_Agentic_System_Requirements.md#7` and `03_Podcast_App_Manifesto.md#5`) rightly emphasize safety, ethics, and content moderation. As the system relies more heavily on generative AI (especially Gemini Pro) for various components, robust mechanisms for content filtering, bias detection, and ensuring factual accuracy (a known challenge with LLMs) will be paramount. This might involve integrating additional AI tools or services specifically for content safety, or fine-tuning prompts and models to adhere to safety guidelines.
 
 By addressing these gaps and considering these future enhancements, Aethercast can move closer to the ambitious AI-first vision outlined in the project documentation.
-```
+
