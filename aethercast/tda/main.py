@@ -375,7 +375,8 @@ def discover_topics_endpoint():
         if error_trigger == "tda_error":
             logging.warning(f"[TDA_SIMULATED_ERROR] Simulating an error for /discover_topics based on error_trigger: {error_trigger}")
             return flask.jsonify({
-                "error": "Simulated TDA Error",
+                "error_code": "TDA_SIMULATED_ERROR",
+                "message": "A simulated error occurred in TDA.",
                 "details": "This is a controlled error triggered for testing purposes in TopicDiscoveryAgent."
             }), 500
 
@@ -429,7 +430,11 @@ def discover_topics_endpoint():
 
     except Exception as e:
         logging.error(f"Error in /discover_topics endpoint: {e}", exc_info=True)
-        return flask.jsonify({"error": ENDPOINT_ERROR_INTERNAL_SERVER_TDA, "details": str(e)}), 500
+        return flask.jsonify({
+            "error_code": ENDPOINT_ERROR_INTERNAL_SERVER_TDA,
+            "message": "An unexpected error occurred in the Topic Discovery Agent.",
+            "details": str(e)
+        }), 500
 
 if __name__ == "__main__":
     # In a real deployment, use a proper WSGI server like Gunicorn or uWSGI

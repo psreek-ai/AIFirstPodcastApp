@@ -71,11 +71,11 @@ UI_EVENT_SUBSCRIBED = 'subscribed_ui_updates'
 # Event names for CPOA to send (used by send_ui_update, received by client)
 # Example: 'generation_status', 'task_error' - these are dynamic based on CPOA needs, not ASF internals.
 
-# HTTP Endpoint Error Types/Messages
-HTTP_ERROR_NO_PAYLOAD = "NO_JSON_PAYLOAD"
-HTTP_ERROR_MISSING_PARAMETERS = "MISSING_PARAMETERS"
-HTTP_ERROR_ASF_CONFIG_ERROR = "ASF_SERVER_CONFIG_ERROR"
-HTTP_ERROR_SOCKETIO_EMIT_FAILED = "SOCKETIO_EMIT_FAILED"
+# HTTP Endpoint Error Types/Messages (Old constants, replaced by specific error_code strings)
+# HTTP_ERROR_NO_PAYLOAD = "NO_JSON_PAYLOAD"
+# HTTP_ERROR_MISSING_PARAMETERS = "MISSING_PARAMETERS"
+# HTTP_ERROR_ASF_CONFIG_ERROR = "ASF_SERVER_CONFIG_ERROR"
+# HTTP_ERROR_SOCKETIO_EMIT_FAILED = "SOCKETIO_EMIT_FAILED"
 
 # --- Flask App and SocketIO Setup ---
 app = flask.Flask(__name__)
@@ -189,7 +189,11 @@ def notify_new_audio():
     data = request.get_json()
     if not data:
         logger.error("ASF_NOTIFY: Received empty payload for /notify_new_audio")
-        return jsonify({"error": HTTP_ERROR_NO_PAYLOAD, "details": "No JSON payload received"}), 400
+        return jsonify({
+            "error_code": "ASF_NOTIFY_NO_PAYLOAD",
+            "message": "Request payload is missing or not valid JSON.",
+            "details": "No JSON payload received"
+        }), 400
 
     stream_id = data.get('stream_id')
     filepath = data.get('filepath')
@@ -201,7 +205,11 @@ def notify_new_audio():
         if not filepath:
             missing_params.append('filepath')
         logger.error(f"ASF_NOTIFY: Missing parameters in /notify_new_audio: {', '.join(missing_params)}. Payload: {data}")
-        return jsonify({"error": HTTP_ERROR_MISSING_PARAMETERS, "details": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+        return jsonify({
+            "error_code": "ASF_NOTIFY_MISSING_PARAMETERS",
+            "message": "Required parameters are missing for audio notification.",
+            "details": f"Missing required parameters: {', '.join(missing_params)}"
+        }), 400
 
     # Store the mapping
     stream_id_to_filepath_map[stream_id] = filepath
@@ -248,7 +256,11 @@ def send_ui_update():
     payload = request.get_json()
     if not payload:
         logger.error("ASF_SEND_UI: Received empty payload for /send_ui_update")
-        return jsonify({"error": HTTP_ERROR_NO_PAYLOAD, "details": "No JSON payload received"}), 400
+        return jsonify({
+            "error_code": "ASF_SENDUI_NO_PAYLOAD",
+            "message": "Request payload is missing or not valid JSON for sending UI update.",
+            "details": "No JSON payload received"
+        }), 400
 
     client_id = payload.get('client_id')
     event_name = payload.get('event_name')
@@ -259,11 +271,19 @@ def send_ui_update():
         if event_data is None and "data" not in missing_params : missing_params.append("data")
 
         logger.error(f"ASF_SEND_UI: Missing parameters in /send_ui_update: {', '.join(missing_params)}. Payload: {payload}")
-        return jsonify({"error": HTTP_ERROR_MISSING_PARAMETERS, "details": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+        return jsonify({
+            "error_code": "ASF_SENDUI_MISSING_PARAMETERS",
+            "message": "Required parameters are missing for sending UI update.",
+            "details": f"Missing required parameters: {', '.join(missing_params)}"
+        }), 400
 
     if not ASF_UI_UPDATES_NAMESPACE: # Ensure namespace is loaded
         logger.error("ASF_SEND_UI: ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message.")
-        return jsonify({"error": HTTP_ERROR_ASF_CONFIG_ERROR, "details": "ASF server configuration error for UI namespace."}), 500
+        return jsonify({
+            "error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE",
+            "message": "ASF server configuration error for UI updates namespace.",
+            "details": "ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message."
+        }), 500
 
     try:
         logger.info(f"ASF_SEND_UI: Emitting '{event_name}' to client_id (room) '{client_id}' in namespace '{ASF_UI_UPDATES_NAMESPACE}' with data: {event_data}")
@@ -271,7 +291,11 @@ def send_ui_update():
         return jsonify({"status": "success", "message": "UI update sent to client."}), 200
     except Exception as e:
         logger.error(f"ASF_SEND_UI: Failed to emit SocketIO event for client_id '{client_id}': {e}", exc_info=True)
-        return jsonify({"error": HTTP_ERROR_SOCKETIO_EMIT_FAILED, "details": str(e)}), 500
+        return jsonify({
+            "error_code": "ASF_SOCKETIO_EMIT_FAILED",
+            "message": "Failed to emit SocketIO event for UI update.",
+            "details": str(e)
+        }), 500
 
 
 if __name__ == '__main__':

@@ -343,7 +343,11 @@ def session_init():
     data = request.get_json()
     client_id = data.get('client_id') if data else None
     if not client_id:
-        return jsonify({"error": "Bad Request", "message": "client_id is required."}), 400
+        return jsonify({
+            "error_code": "API_GW_SESSION_CLIENT_ID_REQUIRED",
+            "message": "Client ID is required for session initialization.",
+            "details": "client_id is required."
+        }), 400
 
     conn = None
     try:
@@ -362,7 +366,11 @@ def session_init():
         return jsonify({"client_id": client_id, "preferences": preferences}), 200
     except sqlite3.Error as e:
         app.logger.error(f"Database error during session init for {client_id}: {e}", exc_info=True)
-        return jsonify({"error": "Database Error", "message": "Failed to initialize session."}), 500
+        return jsonify({
+            "error_code": "API_GW_SESSION_DB_ERROR_INIT",
+            "message": "Could not initialize session due to a database issue.",
+            "details": f"Failed to initialize session: {str(e)}" # Include original error string
+        }), 500
     except json.JSONDecodeError as e:
         app.logger.error(f"Error decoding preferences for session {client_id}: {e}", exc_info=True)
         # Return empty preferences if stored JSON is corrupted
@@ -375,7 +383,11 @@ def session_init():
 def get_session_preferences():
     client_id = request.args.get('client_id')
     if not client_id:
-        return jsonify({"error": "Bad Request", "message": "client_id query parameter is required."}), 400
+        return jsonify({
+            "error_code": "API_GW_SESSION_CLIENT_ID_REQUIRED",
+            "message": "Client ID query parameter is required to get preferences.",
+            "details": "client_id query parameter is required."
+        }), 400
 
     conn = None
     try:
@@ -388,10 +400,18 @@ def get_session_preferences():
         else:
             # Optionally create session here if preferred, or require /init first
             app.logger.warning(f"Preferences GET: Session not found for client_id: {client_id}. Client should call /init.")
-            return jsonify({"error": "Not Found", "message": "Session not found. Please initialize session first."}), 404
+            return jsonify({
+                "error_code": "API_GW_SESSION_NOT_FOUND",
+                "message": "User session not found. Please initialize session first.",
+                "details": "Session not found. Please initialize session first."
+            }), 404
     except sqlite3.Error as e:
         app.logger.error(f"Database error getting preferences for {client_id}: {e}", exc_info=True)
-        return jsonify({"error": "Database Error", "message": "Failed to retrieve preferences."}), 500
+        return jsonify({
+            "error_code": "API_GW_SESSION_DB_ERROR_GET_PREFS",
+            "message": "Could not retrieve session preferences due to a database issue.",
+            "details": f"Failed to retrieve preferences: {str(e)}" # Include original error string
+        }), 500
     except json.JSONDecodeError as e:
         app.logger.error(f"Error decoding preferences for session {client_id}: {e}", exc_info=True)
         return jsonify({"client_id": client_id, "preferences": {}, "warning": "Corrupted preferences found, reset to default."}), 200 # Or 500
@@ -406,9 +426,17 @@ def update_session_preferences_endpoint():
     preferences = data.get('preferences') if data else None
 
     if not client_id:
-        return jsonify({"error": "Bad Request", "message": "client_id is required."}), 400
+        return jsonify({
+            "error_code": "API_GW_SESSION_CLIENT_ID_REQUIRED",
+            "message": "Client ID is required to update preferences.",
+            "details": "client_id is required."
+        }), 400
     if preferences is None or not isinstance(preferences, dict):
-        return jsonify({"error": "Bad Request", "message": "preferences (dictionary) is required."}), 400
+        return jsonify({
+            "error_code": "API_GW_SESSION_INVALID_PREFERENCES_PAYLOAD",
+            "message": "Preferences payload is invalid or missing.",
+            "details": "preferences (dictionary) is required."
+        }), 400
 
     conn = None
     try:
@@ -421,10 +449,18 @@ def update_session_preferences_endpoint():
             # To be strict, require session to be initialized first.
             # Alternatively, could create session here: _create_session(conn, client_id, preferences)
             app.logger.warning(f"Preferences POST: Session not found for client_id: {client_id}. Client should call /init.")
-            return jsonify({"error": "Not Found", "message": "Session not found. Please initialize session first."}), 404
+            return jsonify({
+                "error_code": "API_GW_SESSION_NOT_FOUND",
+                "message": "User session not found. Please initialize session first.",
+                "details": "Session not found. Please initialize session first."
+            }), 404
     except sqlite3.Error as e:
         app.logger.error(f"Database error updating preferences for {client_id}: {e}", exc_info=True)
-        return jsonify({"error": "Database Error", "message": "Failed to update preferences."}), 500
+        return jsonify({
+            "error_code": "API_GW_SESSION_DB_ERROR_UPDATE_PREFS",
+            "message": "Could not update session preferences due to a database issue.",
+            "details": f"Failed to update preferences: {str(e)}" # Include original error string
+        }), 500
     finally:
         if conn:
             conn.close()
@@ -436,7 +472,11 @@ def get_dynamic_snippets():
     app.logger.info("Request received for /api/v1/snippets (dynamic generation using orchestrate_landing_page_snippets)")
     if not cpoa_landing_snippets_func_imported:
         app.logger.error("CPOA landing page snippets function not available.")
-        return jsonify({"error": "Service Unavailable", "message": "Snippet generation service (landing page) not available."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_SNIPPET_SERVICE_UNAVAILABLE",
+            "message": "Snippet generation service is currently unavailable.",
+            "details": "CPOA landing page snippets function not available."
+        }), 503
 
     try:
         limit = request.args.get('limit', default=6, type=int)
@@ -461,8 +501,9 @@ def get_dynamic_snippets():
                 status_code = 503 # Service Unavailable for downstream or config issues
 
             return jsonify({
-                "error": error_type,
-                "message": cpoa_response.get("details", "Failed to generate landing page snippets due to an internal error.")
+                "error_code": f"API_GW_CPOA_SNIPPET_ERROR_{error_type.replace('.', '_').upper()}", # Sanitize error_type for code
+                "message": "Failed to generate landing page snippets.",
+                "details": cpoa_response.get("details", "An internal error occurred during snippet orchestration.")
             }), status_code
 
         # Expected successful response from CPOA: {"snippets": [...], "source": "generation"}
@@ -471,10 +512,18 @@ def get_dynamic_snippets():
 
     except ImportError:
         app.logger.critical("CPOA landing snippets function became unavailable after initial check.", exc_info=True)
-        return jsonify({"error": "Service Configuration Error", "message": "Snippet generation module is critically unavailable."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_SNIPPET_MODULE_UNAVAILABLE",
+            "message": "Snippet generation module is critically unavailable.",
+            "details": "CPOA landing snippets function became unavailable after initial check."
+        }), 503
     except Exception as e:
         app.logger.error(f"Unexpected error in get_dynamic_snippets: {e}", exc_info=True)
-        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred while fetching snippets."}), 500
+        return jsonify({
+            "error_code": "API_GW_SNIPPETS_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred while fetching snippets.",
+            "details": str(e)
+        }), 500
 
 # --- Categories Endpoint ---
 @app.route('/api/v1/categories', methods=['GET'])
@@ -482,7 +531,11 @@ def get_categories_endpoint():
     app.logger.info("Request received for /api/v1/categories")
     if not cpoa_categories_func_imported:
         app.logger.error("CPOA get_popular_categories function not available.")
-        return jsonify({"error": "Service Unavailable", "message": "Category service (CPOA) not available."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_CATEGORY_SERVICE_UNAVAILABLE",
+            "message": "Category service is currently unavailable.",
+            "details": "CPOA get_popular_categories function not available."
+        }), 503
 
     try:
         app.logger.info("Calling CPOA get_popular_categories...")
@@ -490,9 +543,11 @@ def get_categories_endpoint():
 
         if "error" in cpoa_response: # Should not happen if CPOA's func is just returning a list
             app.logger.error(f"CPOA returned an error for categories: {cpoa_response}")
+            error_code_from_cpoa = cpoa_response.get("error", "CPOA_ERROR")
             return jsonify({
-                "error": cpoa_response.get("error", "CPOA_ERROR"),
-                "message": cpoa_response.get("details", "Failed to get categories due to an internal CPOA error.")
+                "error_code": f"API_GW_CPOA_CATEGORY_ERROR_{error_code_from_cpoa.replace('.', '_').upper()}",
+                "message": "Failed to get categories due to an internal CPOA error.",
+                "details": cpoa_response.get("details", "An internal error occurred during category retrieval.")
             }), 500
 
         # Expected CPOA response: {"categories": ["Tech", "Science", ...]}
@@ -500,10 +555,18 @@ def get_categories_endpoint():
 
     except ImportError: # Safeguard, though caught by flag
         app.logger.critical("CPOA get_popular_categories function became unavailable after initial check.", exc_info=True)
-        return jsonify({"error": "Service Configuration Error", "message": "Category module component is critically unavailable."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_CATEGORY_MODULE_UNAVAILABLE",
+            "message": "Category module component is critically unavailable.",
+            "details": "CPOA get_popular_categories function became unavailable after initial check."
+        }), 503
     except Exception as e:
         app.logger.error(f"Unexpected error in /api/v1/categories endpoint: {e}", exc_info=True)
-        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred while fetching categories."}), 500
+        return jsonify({
+            "error_code": "API_GW_CATEGORIES_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred while fetching categories.",
+            "details": str(e)
+        }), 500
 
 # --- Topic Exploration Endpoint ---
 @app.route('/api/v1/topics/explore', methods=['POST'])
@@ -535,12 +598,20 @@ def search_podcasts_endpoint():
     app.logger.info("Request received for /api/v1/search/podcasts")
     if not cpoa_search_func_imported:
         app.logger.error("CPOA search function not available.")
-        return jsonify({"error": "Service Unavailable", "message": "Search orchestration service not available."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_SEARCH_SERVICE_UNAVAILABLE",
+            "message": "Search orchestration service is currently unavailable.",
+            "details": "CPOA search function not available."
+        }), 503
 
     data = request.get_json()
     if not data or not data.get("query"):
         app.logger.warning("Bad request to /api/v1/search/podcasts: Missing or empty 'query'.")
-        return jsonify({"error": "Bad Request", "message": "Missing or empty 'query' in request body."}), 400
+        return jsonify({
+            "error_code": "API_GW_SEARCH_QUERY_REQUIRED",
+            "message": "A search query is required.",
+            "details": "Missing or empty 'query' in request body."
+        }), 400
 
     query = data["query"]
     client_id = data.get("client_id")
@@ -572,17 +643,17 @@ def search_podcasts_endpoint():
         app.logger.info(f"Calling CPOA orchestrate_search_results_generation with query: '{query}'")
         cpoa_search_response = orchestrate_search_results_generation(query=query, user_preferences=user_preferences)
 
-        if "error" in cpoa_search_response:
+        if "error" in cpoa_search_response: # CPOA still uses "error" for its own error structure
             app.logger.error(f"CPOA returned an error during search: {cpoa_search_response}")
-            error_type = cpoa_search_response.get("error", "UNKNOWN_CPOA_ERROR")
-            # Determine status code based on cpoa_search_response["error"]
+            error_code_from_cpoa = cpoa_search_response.get("error", "UNKNOWN_CPOA_SEARCH_ERROR")
             status_code = 500 # Default to general server error
-            if "TDA_" in error_type or "SCA_" in error_type or "CPOA_CONFIG_ERROR" in error_type:
+            if "TDA_" in error_code_from_cpoa or "SCA_" in error_code_from_cpoa or "CPOA_CONFIG_ERROR" in error_code_from_cpoa:
                 status_code = 503 # Service Unavailable for downstream or config issues
 
             return jsonify({
-                "error": error_type,
-                "message": cpoa_search_response.get("details", "Search processing failed internally.")
+                "error_code": f"API_GW_CPOA_SEARCH_ERROR_{error_code_from_cpoa.replace('.', '_').upper()}",
+                "message": "Search processing failed internally.", # User-friendly message
+                "details": cpoa_search_response.get("details", "An internal error occurred during search orchestration.")
             }), status_code
 
         # Expecting {"search_results": [...]} from CPOA on success
@@ -590,10 +661,18 @@ def search_podcasts_endpoint():
 
     except ImportError:
         app.logger.critical("CPOA search function became unavailable after initial check.", exc_info=True)
-        return jsonify({"error": "Service Configuration Error", "message": "Search module component is critically unavailable."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_SEARCH_MODULE_UNAVAILABLE",
+            "message": "Search module component is critically unavailable.",
+            "details": "CPOA search function became unavailable after initial check."
+        }), 503
     except Exception as e:
         app.logger.error(f"Unexpected error in search_podcasts_endpoint: {e}", exc_info=True)
-        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred during search."}), 500
+        return jsonify({
+            "error_code": "API_GW_SEARCH_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred during search.",
+            "details": str(e)
+        }), 500
 
 # --- Podcast Generation Endpoint ---
 @app.route('/api/v1/podcasts', methods=['POST'])
@@ -602,7 +681,11 @@ def create_podcast_generation_task():
 
     if not data or 'topic' not in data or not data['topic']:
         app.logger.warning("Bad request to /api/v1/podcasts: Missing or empty 'topic'.")
-        return jsonify({"error": "Bad Request", "message": "Missing or empty 'topic' in request body."}), 400
+        return jsonify({
+            "error_code": "API_GW_PODCAST_TOPIC_REQUIRED",
+            "message": "A topic is required to generate a podcast.",
+            "details": "Missing or empty 'topic' in request body."
+        }), 400
     
     topic = data['topic']
     voice_params_from_request = data.get('voice_params')
@@ -611,21 +694,37 @@ def create_podcast_generation_task():
 
     if voice_params_from_request is not None and not isinstance(voice_params_from_request, dict):
         app.logger.warning("Bad request to /api/v1/podcasts: 'voice_params' was provided but not as a valid JSON object.")
-        return jsonify({"error": "Bad Request", "message": "'voice_params' must be a valid JSON object if provided."}), 400
+        return jsonify({
+            "error_code": "API_GW_PODCAST_INVALID_VOICE_PARAMS",
+            "message": "Provided voice parameters are invalid.",
+            "details": "'voice_params' must be a valid JSON object if provided."
+        }), 400
 
     if client_id_from_request is not None and not isinstance(client_id_from_request, str):
         app.logger.warning("Bad request to /api/v1/podcasts: 'client_id' was provided but not as a string.")
-        return jsonify({"error": "Bad Request", "message": "'client_id' must be a string if provided."}), 400
+        return jsonify({
+            "error_code": "API_GW_PODCAST_INVALID_CLIENT_ID",
+            "message": "Provided client ID is invalid.",
+            "details": "'client_id' must be a string if provided."
+        }), 400
 
     if test_scenarios_from_request is not None and not isinstance(test_scenarios_from_request, dict): # Added validation
         app.logger.warning("Bad request to /api/v1/podcasts: 'test_scenarios' was provided but not as a valid JSON object.")
-        return jsonify({"error": "Bad Request", "message": "'test_scenarios' must be a valid JSON object if provided."}), 400
+        return jsonify({
+            "error_code": "API_GW_PODCAST_INVALID_TEST_SCENARIOS",
+            "message": "Provided test_scenarios are invalid.",
+            "details": "'test_scenarios' must be a valid JSON object if provided."
+        }), 400
 
     app.logger.info(f"Received podcast generation request for topic string: '{topic}'. Voice params: {voice_params_from_request}. Client ID: {client_id_from_request}. Test Scenarios: {test_scenarios_from_request}")
 
     if not cpoa_podcast_func_imported:
         app.logger.error("CPOA podcast generation function not loaded.")
-        return jsonify({"error": "Service Unavailable", "message": f"Core podcast orchestration module (podcast func) not loaded. Import error: {CPOA_OVERALL_IMPORT_ERROR_MESSAGE}"}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_PODCAST_SERVICE_UNAVAILABLE",
+            "message": "Core podcast orchestration module is currently unavailable.",
+            "details": f"Core podcast orchestration module (podcast func) not loaded. Import error: {CPOA_OVERALL_IMPORT_ERROR_MESSAGE}"
+        }), 503
 
     # Fetch user preferences if client_id is provided
     user_preferences = None
@@ -678,7 +777,11 @@ def create_podcast_generation_task():
             app.logger.info(f"Initial record for podcast_id {podcast_id} created with topic '{topic}'.")
         except sqlite3.Error as e:
             app.logger.error(f"Database error creating initial record for topic '{topic}', podcast_id {podcast_id}: {e}", exc_info=True)
-            return jsonify({"error": "Database Error", "message": "Failed to create initial podcast task record."}), 500
+            return jsonify({
+                "error_code": "API_GW_PODCAST_DB_ERROR_CREATE_TASK",
+                "message": "Failed to create initial podcast task record due to a database issue.",
+                "details": f"Failed to create initial podcast task record: {str(e)}"
+            }), 500
         finally:
             if conn:
                 conn.close()
@@ -719,8 +822,15 @@ def create_podcast_generation_task():
             error_message = cpoa_result.get("error_message")
             if not error_message:
                 error_message = f"Podcast generation failed with status: {final_cpoa_status}"
-            response_payload["message"] = error_message
-
+            # Standardize response_payload for error case
+            response_payload = {
+                "error_code": f"API_GW_CPOA_ORCHESTRATION_FAILED_{final_cpoa_status.upper().replace('FAILED_', '')}",
+                "message": error_message, # This is usually user-friendly from CPOA
+                "details": cpoa_result.get("details", error_message), # Use CPOA details or error_message as details
+                "podcast_id": podcast_id, # Still include podcast_id for tracking
+                "topic": topic,
+                "generation_status": final_cpoa_status # Keep original status for context
+            }
             # Determine appropriate HTTP status code
             if "request_exception" in final_cpoa_status or                "reported_error" in final_cpoa_status or                "bad_script_structure" in final_cpoa_status or                "json_decode" in final_cpoa_status: # Errors related to downstream services
                 http_status_code = 502 # Bad Gateway
@@ -729,42 +839,196 @@ def create_podcast_generation_task():
         elif final_cpoa_status.startswith("completed_with_vfa_skipped") or              final_cpoa_status.startswith("completed_with_asf_notification_failure") or              final_cpoa_status.startswith("completed_with_vfa_data_missing"):
             # Task completed but with issues, still a form of success but message is important
             response_payload["message"] = cpoa_result.get("error_message", f"Task completed with status: {final_cpoa_status}")
+            # Add context to details if not already there from CPOA
+            if "details" not in response_payload: response_payload["details"] = cpoa_result
             http_status_code = 200 # OK, as it did complete, but with caveats
         else: # Successful completion
             response_payload["message"] = cpoa_result.get("message", "Podcast generation task initiated and completed successfully.")
+            if "details" not in response_payload: response_payload["details"] = cpoa_result # Ensure details is populated
             # Add audio_url if available from CPOA result, for successful completion
             if cpoa_result.get("final_audio_details", {}).get("audio_filepath"):
                 response_payload["audio_url"] = f"/api/v1/podcasts/{podcast_id}/audio.mp3"
-
 
         return jsonify(response_payload), http_status_code
 
     except ImportError as ie:
         app.logger.error(f"CPOA function unavailable: {ie}")
-        return jsonify({"error": "Service Unavailable", "message": "Core podcast module unavailable."}), 503
+        return jsonify({
+            "error_code": "API_GW_CPOA_PODCAST_MODULE_UNAVAILABLE", # More specific than generic service unavailable
+            "message": "Core podcast orchestration module is critically unavailable.",
+            "details": f"CPOA orchestrate_podcast_generation function import failed: {str(ie)}"
+        }), 503
     except Exception as e:
         app.logger.error(f"Unexpected error: {e}", exc_info=True)
-        return jsonify({"error": "Internal Server Error"}), 500
+        return jsonify({
+            "error_code": "API_GW_PODCAST_CREATE_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred while creating podcast task.",
+            "details": str(e)
+        }), 500
 
 
 # --- List All Podcasts Endpoint ---
 @app.route('/api/v1/podcasts', methods=['GET'])
 def list_podcasts():
-    # ... (existing list podcasts logic - can be kept as is)
-    return jsonify({"podcasts": [], "message": "List placeholder"}), 200
+    try:
+        page = request.args.get('page', 1, type=int)
+        per_page = request.args.get('per_page', 10, type=int)
+        if page < 1: page = 1
+        if per_page < 1: per_page = 10 # Min per_page
+        if per_page > 100: per_page = 100 # Max per_page to prevent abuse
+        offset = (page - 1) * per_page
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM podcasts")
+        total_podcasts_row = cursor.fetchone()
+        total_podcasts = total_podcasts_row[0] if total_podcasts_row else 0
+
+        cursor.execute(
+            "SELECT podcast_id, topic, task_created_timestamp, cpoa_status, final_audio_filepath FROM podcasts ORDER BY task_created_timestamp DESC LIMIT ? OFFSET ?",
+            (per_page, offset)
+        )
+        podcasts_rows = cursor.fetchall()
+        conn.close()
+
+        podcasts_list = []
+        for row in podcasts_rows:
+            audio_url = f"/api/v1/podcasts/{row['podcast_id']}/audio.mp3" if row["final_audio_filepath"] else None
+            podcasts_list.append({
+                "podcast_id": row["podcast_id"],
+                "topic": row["topic"],
+                "task_created_timestamp": row["task_created_timestamp"],
+                "status": row["cpoa_status"],
+                "audio_url": audio_url
+            })
+
+        total_pages = (total_podcasts + per_page - 1) // per_page if total_podcasts > 0 else 0
+
+        return jsonify({
+            "podcasts": podcasts_list,
+            "page": page,
+            "per_page": per_page,
+            "total_podcasts": total_podcasts,
+            "total_pages": total_pages
+        }), 200
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error listing podcasts: {e}", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_PODCAST_DB_ERROR_LIST",
+            "message": "Could not list podcasts due to a database issue.",
+            "details": str(e)
+        }), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error listing podcasts: {e}", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_PODCAST_LIST_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred while listing podcasts.",
+            "details": str(e)
+        }), 500
 
 # --- Get Specific Podcast Details Endpoint ---
 @app.route('/api/v1/podcasts/<string:podcast_id>', methods=['GET'])
 def get_podcast_details(podcast_id: str):
-    # ... (existing get details logic - can be kept as is)
-    return jsonify({"podcast_id": podcast_id, "message": "Details placeholder"}), 200
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM podcasts WHERE podcast_id = ?", (podcast_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row:
+            return jsonify({
+                "error_code": "API_GW_PODCAST_NOT_FOUND",
+                "message": "Podcast task not found.",
+                "details": f"Podcast with ID {podcast_id} not found."
+            }), 404
+
+        podcast_details = dict(row)
+        # Parse JSON fields
+        try:
+            podcast_details["cpoa_full_orchestration_log"] = json.loads(row["cpoa_full_orchestration_log"]) if row["cpoa_full_orchestration_log"] else []
+        except json.JSONDecodeError:
+            app.logger.warning(f"Could not parse orchestration_log for podcast {podcast_id}")
+            podcast_details["cpoa_full_orchestration_log"] = [{"error": "log parsing failed"}] # Or provide raw string
+        try:
+            podcast_details["tts_settings_used"] = json.loads(row["tts_settings_used"]) if row["tts_settings_used"] else {}
+        except json.JSONDecodeError:
+            app.logger.warning(f"Could not parse tts_settings_used for podcast {podcast_id}")
+            podcast_details["tts_settings_used"] = {"error": "tts settings parsing failed"}
+
+        # Add audio_url if applicable
+        if podcast_details.get("final_audio_filepath"):
+            podcast_details["audio_url"] = f"/api/v1/podcasts/{podcast_id}/audio.mp3"
+        else:
+            podcast_details["audio_url"] = None
+
+        return jsonify(podcast_details), 200
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error getting details for podcast {podcast_id}: {e}", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_PODCAST_DB_ERROR_DETAILS",
+            "message": "Could not retrieve podcast details due to a database issue.",
+            "details": str(e)
+        }), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error getting details for podcast {podcast_id}: {e}", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_PODCAST_DETAILS_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred while retrieving podcast details.",
+            "details": str(e)
+        }), 500
 
 
 # --- Serve Podcast Audio Endpoint ---
 @app.route('/api/v1/podcasts/<string:podcast_id>/audio.mp3', methods=['GET'])
 def serve_podcast_audio(podcast_id: str):
-    # ... (existing audio serving logic - can be kept as is)
-    return jsonify({"error": "Not Found", "message": "Audio placeholder"}), 404
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT final_audio_filepath FROM podcasts WHERE podcast_id = ?", (podcast_id,))
+        row = cursor.fetchone()
+        conn.close()
+
+        if not row or not row["final_audio_filepath"]:
+            return jsonify({
+                "error_code": "API_GW_AUDIO_NOT_FOUND_DB",
+                "message": "Audio not found or not generated for this podcast.",
+                "details": f"Audio record not found or filepath missing for podcast ID {podcast_id}."
+            }), 404
+
+        audio_filepath = row["final_audio_filepath"]
+        if not os.path.exists(audio_filepath):
+            app.logger.error(f"Audio file missing on disk for podcast {podcast_id}: {audio_filepath}")
+            return jsonify({
+                "error_code": "API_GW_AUDIO_NOT_FOUND_DISK",
+                "message": "Audio file is missing.",
+                "details": f"Audio file not found on disk at path: {audio_filepath}"
+            }), 404
+
+        # Determine mimetype based on extension, default to mpeg for .mp3
+        mimetype = "audio/mpeg"
+        if audio_filepath.lower().endswith(".wav"):
+            mimetype = "audio/wav"
+        elif audio_filepath.lower().endswith(".ogg"): # Assuming ogg opus
+            mimetype = "audio/ogg"
+
+        return send_file(audio_filepath, mimetype=mimetype)
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error serving audio for podcast {podcast_id}: {e}", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_AUDIO_DB_ERROR",
+            "message": "Could not serve audio due to a database issue.",
+            "details": str(e)
+        }), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error serving audio for podcast {podcast_id}: {e}", exc_info=True)
+        # Avoid sending full exception details for file serving issues if they might leak path info not already logged
+        return jsonify({
+            "error_code": "API_GW_AUDIO_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred while serving audio.",
+            "details": "Unexpected server error."
+        }), 500
 
 
 # --- Main Block ---

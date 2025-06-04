@@ -57,10 +57,10 @@ def load_sca_configuration():
 # --- Initialize Configuration ---
 load_sca_configuration()
 
-# --- Endpoint Error Constants ---
-ENDPOINT_ERROR_INVALID_PAYLOAD = "INVALID_JSON_PAYLOAD"
-ENDPOINT_ERROR_MISSING_FIELDS = "MISSING_REQUIRED_FIELDS"
-ENDPOINT_ERROR_INTERNAL_SERVER = "INTERNAL_SERVER_ERROR"
+# --- (Old Endpoint Error Constants - Removed as errors are now more specific) ---
+# ENDPOINT_ERROR_INVALID_PAYLOAD = "INVALID_JSON_PAYLOAD"
+# ENDPOINT_ERROR_MISSING_FIELDS = "MISSING_REQUIRED_FIELDS"
+# ENDPOINT_ERROR_INTERNAL_SERVER = "INTERNAL_SERVER_ERROR"
 
 app = flask.Flask(__name__)
 
@@ -143,7 +143,11 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
 
     if provider != 'openai':
         logging.warning(f"LLM provider '{provider}' is not supported by this implementation. Only 'openai' is currently supported.")
-        return {"error": "UNSUPPORTED_LLM_PROVIDER", "details": f"Provider '{provider}' not supported."}
+        return {
+            "error_code": "SCA_UNSUPPORTED_LLM_PROVIDER",
+            "message": f"LLM provider '{provider}' not supported.",
+            "details": f"Provider '{provider}' not supported. Only 'openai' is currently available."
+        }
 
     api_key = sca_config.get('SCA_LLM_API_KEY')
     base_url = sca_config.get('SCA_LLM_BASE_URL')
@@ -155,7 +159,11 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
     # Ensure critical OpenAI configs are present (should be caught at startup, but double check)
     if not all([api_key, base_url, model_id]):
         logging.error("[SCA_REAL_LLM_CALL] Critical OpenAI configurations (API Key, Base URL, Model ID) are missing.")
-        return {"error": "LLM_CONFIG_MISSING", "details": "OpenAI API Key, Base URL, or Model ID is not configured."}
+        return {
+            "error_code": "SCA_LLM_CONFIG_MISSING",
+            "message": "Critical LLM configurations (API Key, Base URL, or Model ID) are missing.",
+            "details": "OpenAI API Key, Base URL, or Model ID is not configured for SCA."
+        }
 
     # Construct Endpoint URL for OpenAI
     endpoint_part = "/chat/completions" 
@@ -247,27 +255,55 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
         except json.JSONDecodeError:
             error_details += f" Raw LLM Service Response: {e_http.response.text[:200]}"
         logging.error(f"[SCA_REAL_LLM_CALL] {error_details}", exc_info=True)
-        return {"error": "LLM_HTTP_ERROR", "details": error_details, "status_code": e_http.response.status_code}
+        return {
+            "error_code": "SCA_LLM_HTTP_ERROR",
+            "message": "LLM service request failed with HTTP error.",
+            "details": error_details,
+            "status_code": e_http.response.status_code
+        }
 
     except requests.exceptions.Timeout:
         logging.error(f"[SCA_REAL_LLM_CALL] Timeout error after {timeout}s for URL: {endpoint_url}", exc_info=True)
-        return {"error": "LLM_REQUEST_TIMEOUT", "details": "Request to LLM service timed out", "status_code": 408}
+        return {
+            "error_code": "SCA_LLM_REQUEST_TIMEOUT",
+            "message": "Request to LLM service timed out.",
+            "details": "Request to LLM service timed out",
+            "status_code": 408
+        }
 
     except requests.exceptions.RequestException as e_req:
         logging.error(f"[SCA_REAL_LLM_CALL] Request exception: {e_req}", exc_info=True)
-        return {"error": "LLM_REQUEST_EXCEPTION", "details": str(e_req), "status_code": 500} # Generic 500 for other request issues
+        return {
+            "error_code": "SCA_LLM_REQUEST_EXCEPTION",
+            "message": "An exception occurred while requesting LLM service.",
+            "details": str(e_req),
+            "status_code": 500 # Generic 500 for other request issues
+        }
 
     except json.JSONDecodeError as e_json:
         logging.error(f"[SCA_REAL_LLM_CALL] JSONDecodeError parsing LLM response: {e_json}. Raw response: {response.text[:500] if 'response' in locals() else 'N/A'}", exc_info=True)
-        return {"error": "LLM_RESPONSE_JSON_DECODE_ERROR", "details": str(e_json), "status_code": 502} # Bad Gateway
+        return {
+            "error_code": "SCA_LLM_RESPONSE_JSON_DECODE_ERROR",
+            "message": "Failed to decode JSON response from LLM service.",
+            "details": str(e_json),
+            "status_code": 502 # Bad Gateway
+        }
 
     except (KeyError, IndexError, TypeError) as e_extract:
         logging.error(f"[SCA_REAL_LLM_CALL] Error extracting content from LLM JSON: {e_extract}. Response: {llm_response_data if 'llm_response_data' in locals() else 'N/A'}", exc_info=True)
-        return {"error": "LLM_RESPONSE_STRUCTURE_ERROR", "details": f"Could not navigate LLM response JSON: {e_extract}"}
+        return {
+            "error_code": "SCA_LLM_RESPONSE_STRUCTURE_ERROR",
+            "message": "Could not extract content from LLM response due to unexpected structure.",
+            "details": f"Could not navigate LLM response JSON: {e_extract}"
+        }
 
     except Exception as e_unexpected: # Catch-all for any other unexpected error
         logging.error(f"[SCA_REAL_LLM_CALL] Unexpected error: {e_unexpected}", exc_info=True)
-        return {"error": "LLM_UNEXPECTED_ERROR", "details": str(e_unexpected)}
+        return {
+            "error_code": "SCA_LLM_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred during LLM interaction.",
+            "details": str(e_unexpected)
+        }
 
 
 def parse_llm_response_for_snippet(llm_response_text: str) -> tuple[str, str]:
@@ -321,7 +357,11 @@ def craft_snippet_endpoint():
     try:
         request_data = flask.request.get_json()
         if not request_data:
-            return flask.jsonify({"error": ENDPOINT_ERROR_INVALID_PAYLOAD, "details": "Invalid or missing JSON payload."}), 400
+            return flask.jsonify({
+                "error_code": "SCA_INVALID_PAYLOAD",
+                "message": "Invalid or missing JSON payload.",
+                "details": "The request body must be a valid JSON object."
+            }), 400
 
         topic_id = request_data.get("topic_id")
         content_brief = request_data.get("content_brief") 
@@ -329,14 +369,19 @@ def craft_snippet_endpoint():
         error_trigger = request_data.get("error_trigger") 
 
         if not topic_id or not content_brief: 
-            return flask.jsonify({"error": ENDPOINT_ERROR_MISSING_FIELDS, "details": "'topic_id' and 'content_brief' are required fields."}), 400
+            return flask.jsonify({
+                "error_code": "SCA_MISSING_FIELDS",
+                "message": "'topic_id' and 'content_brief' are required fields.",
+                "details": "Ensure both 'topic_id' and 'content_brief' are provided in the JSON payload."
+            }), 400
 
         logging.info(f"[SCA_REQUEST] Received /craft_snippet request. Topic ID: '{topic_id}', Brief: '{content_brief}', ErrorTrigger: '{error_trigger}'")
         
         if error_trigger == "sca_error":
             logging.warning(f"[SCA_SIMULATED_ERROR] Simulating an error for /craft_snippet based on error_trigger: {error_trigger}")
             return flask.jsonify({
-                "error": "SIMULATED_SCA_ERROR", # Keeping this specific for simulation
+                "error_code": "SCA_SIMULATED_ERROR",
+                "message": "A simulated error occurred in SCA.",
                 "details": "This is a controlled error triggered for testing purposes in SnippetCraftAgent."
             }), 500
 
@@ -370,11 +415,17 @@ def craft_snippet_endpoint():
             logging.info("Attempting to use REAL LLM service as per configuration.")
             llm_result = call_real_llm_service(prompt, topic_info)
 
-            if "error" in llm_result: 
-                 error_detail_msg = llm_result.get('details', 'Unknown error from LLM service.')
-                 logging.error(f"Error from real LLM service call: {error_detail_msg} (Status: {llm_result.get('status_code')})")
-                 return flask.jsonify({"error": llm_result.get("error", "LLM_SERVICE_CALL_FAILED"), 
-                                       "details": error_detail_msg}), llm_result.get("status_code", 500)
+            if "error_code" in llm_result:
+                error_code = llm_result.get("error_code", "SCA_LLM_CALL_FAILED")
+                error_message = llm_result.get("message", "LLM service call failed.")
+                error_details = llm_result.get('details', 'Unknown error from LLM service.')
+                http_status_code = llm_result.get("status_code", 500)
+                logging.error(f"Error from real LLM service call: {error_code} - {error_message} - {error_details} (HTTP Status: {http_status_code})")
+                return flask.jsonify({
+                    "error_code": error_code,
+                    "message": error_message,
+                    "details": error_details
+                }), http_status_code
 
             # Successfully got data from real LLM
             snippet_title = llm_result.get("title")
@@ -417,7 +468,11 @@ def craft_snippet_endpoint():
 
     except Exception as e:
         logging.error(f"Error in /craft_snippet endpoint: {e}", exc_info=True)
-        return flask.jsonify({"error": ENDPOINT_ERROR_INTERNAL_SERVER, "details": str(e)}), 500
+        return flask.jsonify({
+            "error_code": "SCA_INTERNAL_SERVER_ERROR", # Using existing constant value for code if desired, or new "SCA_INTERNAL_SERVER_ERROR"
+            "message": "An unexpected error occurred in the Snippet Craft Agent.",
+            "details": str(e)
+        }), 500
 
 if __name__ == "__main__":
     # load_sca_configuration() is called when the module is imported.

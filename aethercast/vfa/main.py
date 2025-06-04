@@ -155,7 +155,9 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
 
         if scenario == 'vfa_error_tts':
             return {
-                "status": "error", "message": VFA_TEST_SCENARIO_TTS_ERROR_MSG,
+                "error_code": "VFA_TEST_MODE_TTS_API_ERROR",
+                "message": "Simulated TTS API error from VFA (Test Mode).",
+                "details": VFA_TEST_SCENARIO_TTS_ERROR_MSG,
                 "audio_filepath": None, "stream_id": stream_id,
                 "script_char_count": len(str(script_input)), "engine_used": "test_mode_tts_api_error",
                 "tts_settings_used": used_tts_settings
@@ -172,7 +174,9 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
                 # Don't actually write the file, or simulate write failure after this block
                 logger.info(f"[VFA_MAIN_LOGIC] Test mode (vfa_error_file_save): Simulating file save error for path {dummy_filepath}")
                 return {
-                    "status": "error", "message": VFA_TEST_SCENARIO_FILE_SAVE_ERROR_MSG,
+                    "error_code": "VFA_TEST_MODE_FILE_SAVE_ERROR",
+                    "message": "Simulated file saving IO error in VFA (Test Mode).",
+                    "details": VFA_TEST_SCENARIO_FILE_SAVE_ERROR_MSG,
                     "audio_filepath": dummy_filepath, # Filepath might be determined but saving fails
                     "stream_id": stream_id,
                     "script_char_count": len(str(script_input)), "engine_used": "test_mode_tts_file_error",
@@ -196,7 +200,9 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         except IOError as e: # Covers makedirs error or error during open() for default success
             logger.error(f"[VFA_MAIN_LOGIC] Test mode: Failed during directory/file operation: {e}")
             return {
-                "status": "error", "message": f"Test mode failed during disk op: {e}",
+                "error_code": "VFA_TEST_MODE_IO_ERROR",
+                "message": "Test mode failed during disk operation.",
+                "details": f"Test mode failed during disk op: {str(e)}", # Make sure e is string
                 "audio_filepath": None, "stream_id": stream_id,
                 "script_char_count": 0, "engine_used": "test_mode_tts_io_error",
                 "tts_settings_used": used_tts_settings
@@ -239,7 +245,9 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         else:
             logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: No usable text in script_input for topic '{original_topic}'.")
             return {
-                "status": "error", "message": "Invalid script structure: Missing text content.",
+                "error_code": "VFA_SCRIPT_ERROR_NO_TEXT",
+                "message": "Script does not contain usable text for synthesis.",
+                "details": "Invalid script structure: Missing text content.",
                 "audio_filepath": None, "stream_id": stream_id,
                 "script_char_count": 0, "engine_used": "google_cloud_tts", "tts_settings_used": None
             }
@@ -256,7 +264,10 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         error_msg = f"Google Cloud Text-to-Speech library not available. {VFA_MISSING_IMPORT_ERROR}"
         logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: {error_msg}")
         return {
-            "status": "error", "message": error_msg, "audio_filepath": None, "stream_id": stream_id,
+            "error_code": "VFA_IMPORT_ERROR_GOOGLE_SDK",
+            "message": "Google Cloud Text-to-Speech library not available.",
+            "details": error_msg,
+            "audio_filepath": None, "stream_id": stream_id,
             "script_char_count": script_char_count, "engine_used": "google_cloud_tts_unavailable",
             "tts_settings_used": used_tts_settings
         }
@@ -265,7 +276,10 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         error_msg = "Error: GOOGLE_APPLICATION_CREDENTIALS environment variable not set."
         logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id} (Topic: {original_topic}): {error_msg}")
         return {
-            "status": "error", "message": error_msg, "audio_filepath": None, "stream_id": stream_id,
+            "error_code": "VFA_CONFIG_ERROR_NO_CREDENTIALS",
+            "message": "Google Cloud TTS credentials are not set.",
+            "details": error_msg,
+            "audio_filepath": None, "stream_id": stream_id,
             "script_char_count": script_char_count, "engine_used": "google_cloud_tts_no_credentials",
             "tts_settings_used": used_tts_settings
         }
@@ -341,18 +355,24 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         }
 
     except google_exceptions.GoogleAPIError as e:
-        error_msg = f"Google TTS API Error: {type(e).__name__} - {e}"
+        error_msg = f"Google TTS API Error: {type(e).__name__} - {str(e)}" # str(e) for details
         logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: {error_msg}", exc_info=True)
         return {
-            "status": "error", "message": error_msg, "audio_filepath": None, "stream_id": stream_id,
+            "error_code": "VFA_TTS_API_ERROR",
+            "message": "An error occurred with the Google TTS API.",
+            "details": error_msg,
+            "audio_filepath": None, "stream_id": stream_id,
             "script_char_count": script_char_count, "engine_used": "google_cloud_tts",
             "tts_settings_used": used_tts_settings
         }
     except Exception as e:
-        error_msg = f"Unexpected error during TTS synthesis or file saving: {type(e).__name__} - {e}"
+        error_msg = f"Unexpected error during TTS synthesis or file saving: {type(e).__name__} - {str(e)}" # str(e) for details
         logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: {error_msg}", exc_info=True)
         return {
-            "status": "error", "message": error_msg, "audio_filepath": None, "stream_id": stream_id,
+            "error_code": "VFA_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred during voice forging.",
+            "details": error_msg,
+            "audio_filepath": None, "stream_id": stream_id,
             "script_char_count": script_char_count, "engine_used": "google_cloud_tts",
             "tts_settings_used": used_tts_settings
         }
@@ -385,15 +405,23 @@ def handle_forge_voice():
     logger.info(f"[VFA_FLASK_ENDPOINT] Calling forge_voice with script data for topic: '{script_payload.get('topic', 'N/A')}' and voice_params: {voice_params_payload}")
     result = forge_voice(script_payload, voice_params_input=voice_params_payload)
 
-    status_code = 500
-    if result.get("status") == "success":
+    status_code = 500 # Default for errors
+    if "error_code" in result: # This is the new way to check for an error from forge_voice
+        logger.error(f"[VFA_FLASK_ENDPOINT] forge_voice returned error: {result.get('error_code')} - {result.get('message')}")
+        # Potentially map specific VFA error_codes to HTTP status codes if needed
+        if result.get("error_code") == "VFA_SCRIPT_ERROR_NO_TEXT":
+            status_code = 400 # Bad Request for script errors
+        elif result.get("error_code") == "VFA_CONFIG_ERROR_NO_CREDENTIALS":
+            status_code = 503 # Service Unavailable
+        else:
+            status_code = 500 # Default for other VFA errors
+    elif result.get("status") == "success": # "status" key still used for success/skipped
         status_code = 200
         logger.info(f"[VFA_FLASK_ENDPOINT] forge_voice returned success: {result.get('message')}")
     elif result.get("status") == "skipped":
         status_code = 200
         logger.warning(f"[VFA_FLASK_ENDPOINT] forge_voice returned skipped: {result.get('message')}")
-    else:
-        logger.error(f"[VFA_FLASK_ENDPOINT] forge_voice returned error: {result.get('message')}")
+    # else: remains 500 if status is missing and no error_code (should ideally not happen with new structure)
 
     return jsonify(result), status_code
 

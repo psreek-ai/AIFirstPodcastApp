@@ -33,7 +33,11 @@ def generate_image_endpoint():
         data = request.get_json()
         if not data or "prompt" not in data or not data["prompt"]:
             logging.warning("IGA: Bad request to /generate_image: Missing or empty 'prompt'.")
-            return jsonify({"error": "BAD_REQUEST", "message": "Missing 'prompt' in request body."}), 400
+            return jsonify({
+                "error_code": "IGA_BAD_REQUEST_PROMPT_MISSING",
+                "message": "Prompt is required for image generation.",
+                "details": "Missing or empty 'prompt' in request body."
+            }), 400
 
         prompt = data["prompt"]
         logging.info(f"IGA: Received prompt for image generation: '{prompt}'")
@@ -64,7 +68,11 @@ def generate_image_endpoint():
 
     except Exception as e:
         logging.error(f"IGA: Error in /generate_image endpoint: {e}", exc_info=True)
-        return jsonify({"error": "INTERNAL_SERVER_ERROR", "message": "IGA placeholder encountered an unexpected error."}), 500
+        return jsonify({
+            "error_code": "IGA_INTERNAL_SERVER_ERROR",
+            "message": "IGA placeholder encountered an unexpected error.",
+            "details": str(e)
+        }), 500
 
 if __name__ == "__main__":
     host = iga_config.get("IGA_HOST")
