@@ -573,24 +573,30 @@ def get_categories_endpoint():
 def explore_topic():
     # ... (existing topic exploration logic - can be kept as is)
     app.logger.info("Request received for /api/v1/topics/explore")
-    if not cpoa_exploration_func_imported: # Assuming placeholder and flag exist
+    if not cpoa_exploration_func_imported:
         app.logger.error("CPOA topic exploration function not available.")
-        return jsonify({"error": "Service Unavailable", "message": "Topic exploration service is currently unavailable."}), 503
+        return jsonify({"error_code": "API_GW_CPOA_EXPLORE_SERVICE_UNAVAILABLE", "message": "Topic exploration service is currently unavailable.", "details": "CPOA topic exploration function not available."}), 503
 
-    # Dummy data for now, replace with actual call to CPOA's orchestrate_topic_exploration
-    # This endpoint's logic for calling CPOA needs to be fully implemented similar to search.
-    # For now, just returning placeholder if function is imported.
+    # TODO: Add payload validation (e.g., for keywords or topic_id) when fully implemented
+    # data = request.get_json()
+    # current_topic_id = data.get("current_topic_id")
+    # keywords = data.get("keywords")
+    # if not current_topic_id and not keywords:
+    #    return jsonify({"error_code": "API_GW_EXPLORE_INPUT_REQUIRED", "message": "Either current_topic_id or keywords must be provided.", "details": "Missing input for topic exploration."}), 400
+
     try:
-        # Example: Placeholder for actual call
+        # Placeholder for actual call to CPOA's orchestrate_topic_exploration
+        # For now, just returning placeholder if function is considered imported.
         # result = orchestrate_topic_exploration(current_topic_id=request.args.get("topic_id"), keywords=request.args.getlist("keyword"))
         # return jsonify(result), 200
+        # This is the current placeholder logic:
         return jsonify({"message": "Topic exploration endpoint placeholder.", "explored_topics_or_snippets": [{"id": "dummy_explored_1", "title": "Dummy Explored Topic", "summary": "Exploration result."}]}), 200
-    except ImportError:
+    except ImportError: # Should be caught by the flag, but as a safeguard for direct call issues
          app.logger.critical("CPOA topic exploration function became unavailable after initial check.", exc_info=True)
-         return jsonify({"error": "Service Configuration Error", "message": "Topic exploration module component is critically unavailable."}), 503
+         return jsonify({"error_code": "API_GW_CPOA_EXPLORE_MODULE_UNAVAILABLE", "message": "Topic exploration module component is critically unavailable.", "details": "CPOA topic exploration function became unavailable after initial check."}), 503
     except Exception as e:
         app.logger.error(f"Unexpected error in /api/v1/topics/explore endpoint: {e}", exc_info=True)
-        return jsonify({"error": "Internal Server Error", "message": "An unexpected error occurred during topic exploration."}), 500
+        return jsonify({"error_code": "API_GW_EXPLORE_UNEXPECTED_ERROR", "message": "An unexpected error occurred during topic exploration.", "details": str(e)}), 500
 
 # --- Search Endpoint ---
 @app.route('/api/v1/search/podcasts', methods=['POST'])
