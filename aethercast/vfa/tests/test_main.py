@@ -238,6 +238,196 @@ class TestForgeVoiceLogic(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIn("Google TTS API Error", result["message"])
 
+    @patch('aethercast.vfa.main.VFA_IMPORTS_SUCCESSFUL', False)
+    @patch('aethercast.vfa.main.VFA_MISSING_IMPORT_ERROR', "Simulated google.cloud.texttospeech import error")
+    def test_forge_voice_google_sdk_import_failure(self):
+        # This test relies on VFA_IMPORTS_SUCCESSFUL being False at the module level
+        # when forge_voice is called. Patching it globally for the duration of this test.
+
+        # Script input needs to be long enough to pass the min_length check,
+        # otherwise it will return "skipped" before hitting the import check.
+        # Constructing text_to_synthesize based on how forge_voice does it:
+        title = "SDK Import Fail Title"
+        intro_content = "Content to make it long enough past min_script_length which is 10 for this test class."
+        # Ensure combined length is > vfa_config['VFA_MIN_SCRIPT_LENGTH'] (default 10 from setUp)
+        text_to_synthesize_example = f"{title}. {intro_content}"
+        # Manually check length based on setUp's config
+        self.assertTrue(len(text_to_synthesize_example) > self.mock_vfa_config['VFA_MIN_SCRIPT_LENGTH'])
+
+
+        valid_script_long_enough = {
+            "script_id": "s_sdk_fail", "topic": "SDK Import Fail", "title": title,
+            "full_raw_script": "This is a sufficiently long script to ensure we pass initial length checks and hit the SDK import error path.",
+            "segments": [{"segment_title": "INTRO", "content": intro_content }]
+        }
+        # Ensure the min_script_length in mocked config is less than len(text_to_synthesize)
+        # Default min_script_length is 10 in setUp, this script is longer.
+
+        result = vfa_main.forge_voice(script_input=valid_script_long_enough)
+
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "VFA_IMPORT_ERROR_GOOGLE_SDK")
+        self.assertIn("Google Cloud Text-to-Speech library not available.", result["message"])
+        self.assertIn("Simulated google.cloud.texttospeech import error", result["details"])
+        self.assertEqual(result["engine_used"], "google_cloud_tts_unavailable")
+        self.assertIsNotNone(result["tts_settings_used"]) # Should still contain attempted settings
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient') # Mock the client
+    @patch('os.makedirs') # Target os.makedirs directly
+    def test_forge_voice_os_makedirs_io_error(self, mock_os_makedirs, mock_tts_client_constructor):
+        # Ensure imports are successful for this path
+        # self.mock_imports_successful is True from setUp
+
+        mock_os_makedirs.side_effect = IOError("Simulated os.makedirs failure")
+
+        # Mock TTS client because it's initialized before makedirs is called
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
+
+        valid_script_long_enough = {
+            "script_id": "s_mkdir_fail", "topic": "Mkdir Fail", "title": "Mkdir Fail Title",
+            "full_raw_script": "This script is long enough to pass length checks.",
+            "segments": [{"segment_title": "INTRO", "content": "Content to ensure it's long enough."}]
+        }
+        # This test assumes VFA_TEST_MODE_ENABLED is False, which is not the default in setUp.
+        # We need to override it for this test.
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            with patch.object(vfa_main.logger, 'error') as mock_logger_error:
+                result = vfa_main.forge_voice(script_input=valid_script_long_enough)
+
+                self.assertIn("error_code", result)
+                self.assertEqual(result["error_code"], "VFA_FILE_SYSTEM_ERROR_MKDIR")
+                self.assertIn("VFA failed to create output directory.", result["message"])
+                self.assertEqual(result["details"], "Simulated os.makedirs failure")
+                self.assertEqual(result["engine_used"], "google_cloud_tts")
+                self.assertIsNotNone(result["tts_settings_used"])
+
+                # Verify logging if specific logging for this was added
+                # Example: self.assertTrue(any("Failed to create directory" in call_arg[0][0] for call_arg in mock_logger_error.call_args_list))
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('os.makedirs', return_value=None) # Mock makedirs to succeed
+    @patch('builtins.open', new_callable=mock_open) # Mock open
+    def test_forge_voice_file_open_io_error(self, mock_file_open_builtin, mock_os_makedirs, mock_tts_client_constructor):
+        # Ensure imports are successful
+        # self.mock_imports_successful is True from setUp
+
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio data")
+
+        # Configure mock_open to raise IOError only for 'wb' mode
+        mock_file_open_builtin.side_effect = lambda file, mode='r', *args, **kwargs: \
+            mock_open(file, mode, *args, **kwargs).return_value if mode != 'wb' \
+            else (_ for _ in ()).throw(IOError("Simulated file open for write failure"))
+
+
+        valid_script_long_enough = {
+            "script_id": "s_fopen_fail", "topic": "Fopen Fail", "title": "Fopen Fail Title",
+            "full_raw_script": "This script is also long enough.",
+            "segments": [{"segment_title": "INTRO", "content": "Sufficient content here."}]
+        }
+
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            with patch.object(vfa_main.logger, 'error') as mock_logger_error:
+                result = vfa_main.forge_voice(script_input=valid_script_long_enough)
+
+                self.assertIn("error_code", result)
+                self.assertEqual(result["error_code"], "VFA_FILE_SYSTEM_ERROR_WRITE_AUDIO")
+                self.assertIn("VFA failed to write synthesized audio to file.", result["message"])
+                self.assertEqual(result["details"], "Simulated file open for write failure")
+                self.assertEqual(result["engine_used"], "google_cloud_tts")
+                self.assertIsNotNone(result["tts_settings_used"])
+
+                # Verify logging if specific logging for this was added
+                # Example: self.assertTrue(any("Failed to open file for writing" in call_arg[0][0] for call_arg in mock_logger_error.call_args_list))
+
+    # --- Tests for Voice Parameter Clamping ---
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('os.makedirs', return_value=None)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_speaking_rate_clamped_low(self, mock_file_open_builtin, mock_os_makedirs, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
+
+        script_input = {"script_id": "s_clamp1", "topic": "Clamping", "title": "Rate Low", "segments": [{"content": "Long enough content for test."}]}
+        voice_params = {"speaking_rate": 0.1} # Below min 0.25
+
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            vfa_main.forge_voice(script_input, voice_params_input=voice_params)
+
+        mock_tts_client_instance.synthesize_speech.assert_called_once()
+        called_audio_config = mock_tts_client_instance.synthesize_speech.call_args[1]['request']['audio_config']
+        self.assertEqual(called_audio_config.speaking_rate, 0.25) # Clamped to min
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('os.makedirs', return_value=None)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_speaking_rate_clamped_high(self, mock_file_open_builtin, mock_os_makedirs, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
+
+        script_input = {"script_id": "s_clamp2", "topic": "Clamping", "title": "Rate High", "segments": [{"content": "Long enough content for test."}]}
+        voice_params = {"speaking_rate": 10.0} # Above max 4.0
+
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            vfa_main.forge_voice(script_input, voice_params_input=voice_params)
+
+        mock_tts_client_instance.synthesize_speech.assert_called_once()
+        called_audio_config = mock_tts_client_instance.synthesize_speech.call_args[1]['request']['audio_config']
+        self.assertEqual(called_audio_config.speaking_rate, 4.0) # Clamped to max
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('os.makedirs', return_value=None)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_pitch_clamped_low(self, mock_file_open_builtin, mock_os_makedirs, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
+
+        script_input = {"script_id": "s_clamp3", "topic": "Clamping", "title": "Pitch Low", "segments": [{"content": "Long enough content for test."}]}
+        voice_params = {"pitch": -30.0} # Below min -20.0
+
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            vfa_main.forge_voice(script_input, voice_params_input=voice_params)
+
+        mock_tts_client_instance.synthesize_speech.assert_called_once()
+        called_audio_config = mock_tts_client_instance.synthesize_speech.call_args[1]['request']['audio_config']
+        self.assertEqual(called_audio_config.pitch, -20.0) # Clamped to min
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('os.makedirs', return_value=None)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_pitch_clamped_high(self, mock_file_open_builtin, mock_os_makedirs, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
+
+        script_input = {"script_id": "s_clamp4", "topic": "Clamping", "title": "Pitch High", "segments": [{"content": "Long enough content for test."}]}
+        voice_params = {"pitch": 30.0} # Above max 20.0
+
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            vfa_main.forge_voice(script_input, voice_params_input=voice_params)
+
+        mock_tts_client_instance.synthesize_speech.assert_called_once()
+        called_audio_config = mock_tts_client_instance.synthesize_speech.call_args[1]['request']['audio_config']
+        self.assertEqual(called_audio_config.pitch, 20.0) # Clamped to max
+
+    @patch('aethercast.vfa.main.texttospeech.TextToSpeechClient')
+    @patch('os.makedirs', return_value=None)
+    @patch('builtins.open', new_callable=mock_open)
+    def test_forge_voice_valid_params_not_clamped(self, mock_file_open_builtin, mock_os_makedirs, mock_tts_client_constructor):
+        mock_tts_client_instance = mock_tts_client_constructor.return_value
+        mock_tts_client_instance.synthesize_speech.return_value = MagicMock(audio_content=b"mock audio")
+
+        script_input = {"script_id": "s_clamp5", "topic": "Clamping", "title": "Valid Params", "segments": [{"content": "Long enough content for test."}]}
+        voice_params = {"speaking_rate": 1.5, "pitch": 5.0} # Valid values
+
+        with patch.dict(vfa_main.vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            vfa_main.forge_voice(script_input, voice_params_input=voice_params)
+
+        mock_tts_client_instance.synthesize_speech.assert_called_once()
+        called_audio_config = mock_tts_client_instance.synthesize_speech.call_args[1]['request']['audio_config']
+        self.assertEqual(called_audio_config.speaking_rate, 1.5) # Unchanged
+        self.assertEqual(called_audio_config.pitch, 5.0) # Unchanged
+
 
 class TestForgeVoiceEndpoint(unittest.TestCase):
     def setUp(self):

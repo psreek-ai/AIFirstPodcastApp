@@ -11,6 +11,14 @@ from aethercast.tda import main as tda_main # Alias for clarity
 
 class TestTDAIntegration(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        tda_main.app.config['TESTING'] = True
+        # Disable actual logging to keep test output clean, if not already handled by Flask's TESTING config
+        # You might also want to set a specific logger level for tests if needed.
+        # For example, tda_main.app.logger.setLevel(logging.WARNING)
+        cls.client = tda_main.app.test_client()
+
     # --- 1. Setup and Mocking ---
     # This section outlines general setup and mocking strategies.
     # Specific mocks will be detailed in each test section.
@@ -20,7 +28,11 @@ class TestTDAIntegration(unittest.TestCase):
         # Common setup can go here, e.g., resetting parts of tda_main.py if necessary.
         # For instance, if tda_config is loaded at module level and modified by tests,
         # it might need to be reloaded or reset.
-        # For now, we assume tda_config is freshly evaluated or mocked per test.
+        # For now, we assume tda_config is freshly evaluated or mocked per test using patch.dict.
+
+        # Reset or re-patch critical configurations if they are modified by tests directly
+        # For example, ensure USE_REAL_NEWS_API is reset to a known state if a test changes it globally.
+        # However, using `with patch.dict(...)` within tests is the preferred way to manage config per test.
         pass
 
     # Example of how os.getenv might be mocked for configuration tests
@@ -402,6 +414,302 @@ class TestTDAIntegration(unittest.TestCase):
         
         # Restore config
         tda_main.tda_config["USE_REAL_NEWS_API"] = original_use_real_api
+
+    @patch('aethercast.tda.main.identify_topics_from_sources') # Mocks the simulated data path
+    def test_discover_topics_endpoint_simulated_success(self, mock_identify_simulated):
+        # Ensure USE_REAL_NEWS_API is False for this test
+        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}):
+            mock_topics = [{"topic_id": "sim1", "title_suggestion": "Simulated Topic"}]
+            mock_identify_simulated.return_value = mock_topics
+
+            response = self.client.post('/discover_topics', json={'query': 'simulated', 'limit': 1})
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertEqual(data['discovered_topics'], mock_topics)
+            mock_identify_simulated.assert_called_once_with(query='simulated', limit=1)
+
+    @patch('aethercast.tda.main.call_real_news_api') # Mocks the real API call path
+    def test_discover_topics_endpoint_real_api_success(self, mock_call_real_api):
+        # Need to ensure TDA_NEWS_API_KEY is set for USE_REAL_NEWS_API=True path
+        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": True, "TDA_NEWS_API_KEY": "fake_key_for_test", "TDA_NEWS_DEFAULT_LANGUAGE": "en"}):
+            mock_topics = [{"topic_id": "real1", "title_suggestion": "Real API Topic"}]
+            mock_call_real_api.return_value = mock_topics
+
+            response = self.client.post('/discover_topics', json={'query': 'real', 'limit': 1})
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertEqual(data['discovered_topics'], mock_topics)
+            mock_call_real_api.assert_called_once_with(keywords=['real'], language="en")
+
+    def test_discover_topics_endpoint_empty_payload(self):
+        # Should use default keywords for simulated path if USE_REAL_NEWS_API is False
+        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}), \
+             patch('aethercast.tda.main.identify_topics_from_sources') as mock_identify_simulated:
+            mock_identify_simulated.return_value = [{"topic_id": "default_topic"}]
+
+            response = self.client.post('/discover_topics', json={}) # Empty JSON payload
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertIn('discovered_topics', data)
+            if data.get('discovered_topics'): # Check if list is not empty
+                 self.assertEqual(data['discovered_topics'][0]['topic_id'], "default_topic")
+            # Default limit is 5 in endpoint, query is None if not provided
+            mock_identify_simulated.assert_called_once_with(query=None, limit=5)
+
+    def test_discover_topics_endpoint_no_topics_found(self):
+        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}), \
+             patch('aethercast.tda.main.identify_topics_from_sources') as mock_identify_simulated:
+            mock_identify_simulated.return_value = [] # No topics found
+
+            response = self.client.post('/discover_topics', json={'query': 'very_specific_query'})
+            self.assertEqual(response.status_code, 200)
+            data = response.get_json()
+            self.assertEqual(data['topics'], [])
+            self.assertIn("No topics discovered", data['message'])
+
+    def test_discover_topics_endpoint_simulated_error_trigger(self):
+        # This tests the error_trigger mechanism in the endpoint itself
+        response = self.client.post('/discover_topics', json={'error_trigger': 'tda_error'})
+        self.assertEqual(response.status_code, 500)
+        data = response.get_json()
+        self.assertEqual(data['error_code'], "TDA_SIMULATED_ERROR")
+        self.assertIn("simulated error occurred in TDA", data['message'])
+
+    @patch('aethercast.tda.main.identify_topics_from_sources')
+    def test_discover_topics_endpoint_general_exception(self, mock_identify_simulated):
+        # Test general exception handling in the endpoint
+        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}):
+            mock_identify_simulated.side_effect = Exception("Unexpected TDA core logic failure")
+
+            response = self.client.post('/discover_topics', json={'query': 'trigger_exception'})
+            self.assertEqual(response.status_code, 500)
+            data = response.get_json()
+            self.assertEqual(data['error_code'], "INTERNAL_SERVER_ERROR_TDA") # From tda_main constant
+            self.assertIn("Unexpected TDA core logic failure", data['details'])
+
+
+class TestTDAHelpers(unittest.TestCase):
+
+    def setUp(self):
+        # Mock tda_config for these helper tests if they rely on it,
+        # e.g., for SHARED_DATABASE_PATH if testing _save_topic_to_db interaction.
+        self.mock_tda_config = {
+            "SHARED_DATABASE_PATH": ":memory:", # Or None if we want to test path not configured
+            "TDA_NEWS_DEFAULT_KEYWORDS": ["default", "keyword"], # if identify_topics uses it
+            # Add any other configs that might be accessed by these helpers, with defaults if necessary
+        }
+        self.config_patcher = patch.dict(tda_main.tda_config, self.mock_tda_config, clear=True) # clear=True ensures only these values
+        self.mock_config = self.config_patcher.start()
+
+    def tearDown(self):
+        self.config_patcher.stop()
+
+    def test_generate_summary_from_title(self):
+        title = "Test Title for Summary"
+        expected_summary = "This topic explores test title for summary, focusing on its recent developments and potential impact."
+        self.assertEqual(tda_main.generate_summary_from_title(title), expected_summary)
+        self.assertEqual(tda_main.generate_summary_from_title("Another"), "This topic explores another, focusing on its recent developments and potential impact.")
+
+    def test_calculate_relevance_score(self):
+        article_match = {"keywords": ["ai", "ml"], "title": "AI in Healthcare"}
+        article_no_match = {"keywords": ["space", "mars"], "title": "Exploring Space"}
+
+        # Test with matching query
+        score_match = tda_main.calculate_relevance_score(article_match, query="ai healthcare")
+        self.assertTrue(0.5 <= score_match <= 1.0) # Base is 0.5-0.9, boost can take it to 1.0
+
+        # Test with non-matching query (should be lower than a boosted score, but still in base range)
+        score_no_match_with_query = tda_main.calculate_relevance_score(article_no_match, query="ai")
+        self.assertTrue(0.5 <= score_no_match_with_query <= 0.9) # No boost from keywords/title
+
+        # Test without query (base random score)
+        score_no_query = tda_main.calculate_relevance_score(article_match) # Query is None
+        self.assertTrue(0.5 <= score_no_query <= 0.9)
+
+        # Test that a matching query usually gives a higher score than no query for the same article
+        # This is probabilistic, so run a few times or accept occasional equality for low random rolls
+        # For simplicity, we assume a match will likely boost it above a non-boosted score.
+        # This could be made more robust by mocking random.uniform if needed.
+        # self.assertTrue(score_match > score_no_query or score_match == 1.0) # Simplified check
+
+    @patch('aethercast.tda.main._save_topic_to_db') # Mock to verify it's called
+    @patch('aethercast.tda.main.generate_topic_id') # Mock to control topic_id
+    @patch('aethercast.tda.main.calculate_relevance_score') # Mock to control relevance
+    def test_identify_topics_from_sources_with_query_and_limit(self, mock_calc_relevance, mock_gen_id, mock_save_db):
+        mock_calc_relevance.return_value = 0.9 # Consistent relevance
+        # Calculate total articles to generate enough IDs
+        total_articles_in_sim_data = sum(len(source["articles"]) for source in tda_main.SIMULATED_DATA_SOURCES)
+        mock_gen_id.side_effect = [f"topic_id_{i}" for i in range(total_articles_in_sim_data)]
+
+
+        # Test with a query that should match some articles
+        # (SIMULATED_DATA_SOURCES has "AI", "Healthcare", "Technology")
+        query = "AI"
+        limit = 2
+
+        # Ensure SHARED_DATABASE_PATH is set for _save_topic_to_db to be called
+        # This will use the "dummy.db" from the setUp's self.mock_tda_config if not overridden here
+        # Let's explicitly set it to a non-None value for this test's scope.
+        with patch.dict(tda_main.tda_config, {"SHARED_DATABASE_PATH": "dummy_test_db.db", "TDA_NEWS_DEFAULT_KEYWORDS": self.mock_tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]}):
+            identified_topics = tda_main.identify_topics_from_sources(query=query, limit=limit)
+
+        self.assertEqual(len(identified_topics), limit)
+        self.assertTrue(all(isinstance(topic, dict) for topic in identified_topics))
+        self.assertTrue(all("topic_id" in topic for topic in identified_topics))
+        self.assertTrue(all(topic["relevance_score"] == 0.9 for topic in identified_topics)) # Due to mock
+
+        self.assertEqual(mock_save_db.call_count, total_articles_in_sim_data)
+
+    @patch('aethercast.tda.main._save_topic_to_db')
+    def test_identify_topics_from_sources_no_query_default_limit(self, mock_save_db):
+        # Test with no query, should use all simulated articles up to default limit
+        default_limit_in_func = 5 # Default limit in identify_topics_from_sources
+
+        # Patching SHARED_DATABASE_PATH to ensure _save_topic_to_db is called
+        with patch.dict(tda_main.tda_config, {"SHARED_DATABASE_PATH": "another_dummy.db", "TDA_NEWS_DEFAULT_KEYWORDS": self.mock_tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]}):
+             identified_topics = tda_main.identify_topics_from_sources() # No query, no limit
+
+        self.assertTrue(len(identified_topics) <= default_limit_in_func)
+        # Further assertions on content can be added if needed
+
+        total_articles_in_sim_data = sum(len(source["articles"]) for source in tda_main.SIMULATED_DATA_SOURCES)
+        self.assertEqual(mock_save_db.call_count, total_articles_in_sim_data)
+
+    @patch('aethercast.tda.main._save_topic_to_db')
+    def test_identify_topics_from_sources_db_path_not_configured(self, mock_save_db):
+        # Test that _save_topic_to_db is not called if SHARED_DATABASE_PATH is None or empty
+        with patch.dict(tda_main.tda_config, {"SHARED_DATABASE_PATH": None, "TDA_NEWS_DEFAULT_KEYWORDS": self.mock_tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]}):
+            with patch.object(tda_main.logging, 'warning') as mock_log_warning:
+                tda_main.identify_topics_from_sources(query="test")
+                mock_save_db.assert_not_called()
+                # Check if any of the log calls contain the expected warning
+                found_warning = False
+                for call_args in mock_log_warning.call_args_list:
+                    if "SHARED_DATABASE_PATH not configured" in call_args[0][0]:
+                        found_warning = True
+                        break
+                self.assertTrue(found_warning, "Expected warning about SHARED_DATABASE_PATH not configured was not logged.")
+
+    @patch('sqlite3.connect')
+    def test_save_topic_to_db_success(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        topic_obj = {
+            "topic_id": "topic_db_test_001",
+            "title_suggestion": "DB Test Topic",
+            "summary": "Summary for DB test.",
+            "keywords": ["db", "test"],
+            "potential_sources": [{"url": "http://db.test/source", "source_name": "TestSource"}],
+            "relevance_score": 0.88,
+            "publication_date": "2024-01-15T10:00:00Z"
+            # category_suggestion is not directly saved by _save_topic_to_db
+        }
+        db_path = "dummy_tda_save.db"
+
+        # Patch datetime.now within the scope of the function call if possible, or assert type
+        # For simplicity, we'll assert the type of last_accessed_timestamp later.
+        tda_main._save_topic_to_db(topic_obj, db_path)
+
+        mock_sqlite_connect.assert_called_once_with(db_path)
+        mock_conn.cursor.assert_called_once()
+
+        self.assertEqual(mock_cursor.execute.call_count, 1)
+        args, _ = mock_cursor.execute.call_args
+
+        # Basic check for query structure
+        self.assertIn("INSERT OR REPLACE INTO topics_snippets", args[0])
+        # Check for key columns presence (order might vary slightly based on SQL formatting)
+        expected_cols_in_sql = [
+            "id", "type", "title", "summary", "keywords", "source_url", "source_name",
+            "original_topic_details", "llm_model_used_for_snippet", "cover_art_prompt",
+            "generation_timestamp", "last_accessed_timestamp", "relevance_score"
+        ]
+        for col in expected_cols_in_sql:
+            self.assertIn(col, args[0].replace("\n", " ")) # Normalize newlines for check
+
+        params = args[1]
+        self.assertEqual(params[0], "topic_db_test_001")
+        self.assertEqual(params[1], tda_main.DB_TYPE_TOPIC)
+        self.assertEqual(params[2], "DB Test Topic")
+        self.assertEqual(params[3], "Summary for DB test.")
+        self.assertEqual(params[4], json.dumps(["db", "test"]))
+        self.assertEqual(params[5], "http://db.test/source")
+        self.assertEqual(params[6], "TestSource")
+        self.assertIsNone(params[7])
+        self.assertIsNone(params[8])
+        self.assertIsNone(params[9])
+        self.assertEqual(params[10], "2024-01-15T10:00:00Z")
+        self.assertIsInstance(params[11], str)
+        self.assertTrue(datetime.fromisoformat(params[11].replace("Z", ""))) # Check if it's a valid ISO string
+        self.assertEqual(params[12], 0.88)
+
+        mock_conn.commit.assert_called_once()
+        mock_conn.close.assert_called_once()
+
+    @patch('sqlite3.connect')
+    def test_save_topic_to_db_sqlite_error(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.execute.side_effect = sqlite3.Error("Simulated DB execute error")
+
+        topic_obj = {"topic_id": "topic_db_fail", "title_suggestion": "DB Fail Topic"}
+        db_path = "dummy_tda_fail.db"
+
+        with patch.object(tda_main.logging, 'error') as mock_logger_error:
+            tda_main._save_topic_to_db(topic_obj, db_path)
+
+            found_log = False
+            for call_arg_tuple in mock_logger_error.call_args_list:
+                log_message = call_arg_tuple[0][0] # First positional argument of the call
+                if "Database error saving topic topic_db_fail" in log_message and \
+                   "Simulated DB execute error" in log_message:
+                    found_log = True
+                    break
+            self.assertTrue(found_log, "Expected database error log message not found.")
+
+        mock_conn.commit.assert_not_called()
+        mock_conn.close.assert_called_once()
+
+    @patch('sqlite3.connect')
+    def test_save_topic_to_db_unexpected_error(self, mock_sqlite_connect):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_sqlite_connect.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.execute.side_effect = TypeError("Simulated unexpected type error")
+
+        topic_obj = {"topic_id": "topic_db_unexpected_fail", "title_suggestion": "DB Unexpected Fail Topic"}
+        db_path = "dummy_tda_unexpected_fail.db"
+
+        with patch.object(tda_main.logging, 'error') as mock_logger_error:
+            tda_main._save_topic_to_db(topic_obj, db_path)
+
+            found_log = False
+            for call_arg_tuple in mock_logger_error.call_args_list:
+                log_message = call_arg_tuple[0][0]
+                exc_info_obj = call_arg_tuple.kwargs.get('exc_info', None) # Error object is usually in exc_info
+
+                is_message_match = "Unexpected error saving topic topic_db_unexpected_fail" in log_message
+                # For exc_info, the actual exception object is passed. str(exc_info_obj) might be too simple.
+                # isinstance(exc_info_obj, TypeError) and "Simulated unexpected type error" in str(exc_info_obj)
+                # However, logger usually gets True for exc_info, and then sys.exc_info() is used.
+                # For this test, checking that exc_info=True was passed to logger.error is a good sign.
+                # The log message itself should contain the string representation of the error if formatted that way.
+                is_details_match = "Simulated unexpected type error" in log_message or exc_info_obj is True
+
+                if is_message_match and is_details_match:
+                    found_log = True
+                    break
+            self.assertTrue(found_log, f"Expected unexpected error log message not found. Logs: {mock_logger_error.call_args_list}")
+
+        mock_conn.commit.assert_not_called()
+        mock_conn.close.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

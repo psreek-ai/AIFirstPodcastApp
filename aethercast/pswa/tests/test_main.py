@@ -313,6 +313,49 @@ class TestWeaveScriptLogic(unittest.TestCase):
             self.assertEqual(result_2["segments"][0]["segment_title"], "INTRO")
             self.assertEqual(result_2["segments"][1]["segment_title"], "OUTRO")
 
+    @patch('openai.ChatCompletion.create') # To ensure it's NOT called
+    @patch('aethercast.pswa.main._save_script_to_cache') # To ensure it's NOT called for a cache hit
+    @patch('aethercast.pswa.main._get_cached_script')
+    def test_weave_script_cache_hit(self, mock_get_cached_script, mock_save_script_to_cache, mock_openai_create):
+        # Ensure caching is enabled in the mocked config for this test
+        self.current_test_config['PSWA_SCRIPT_CACHE_ENABLED'] = True
+        # Re-patch the config if setUp doesn't re-apply it or if it's complex
+        # For this structure, modifying self.current_test_config which is used by
+        # self.config_patcher.start() in setUp should be sufficient if tests are isolated.
+        # However, to be absolutely safe for this specific test's config needs:
+        with patch.dict(pswa_main.pswa_config, self.current_test_config, clear=True): # clear=True ensures only our values are used
+            topic = "Cache Hit Topic"
+            content = "Content that should result in a cache hit."
+
+            # This hash calculation needs to match the one in pswa_main.py
+            # For testing, we can either replicate it or mock _calculate_content_hash if it's complex.
+            # For now, assume _get_cached_script is called with a hash, we don't need to assert the hash value itself here.
+
+            mock_cached_script_data = {
+                "script_id": "cached_script_id_789",
+                "topic": topic,
+                "title": "Cached Title",
+                "full_raw_script": "This is cached script content.",
+                "segments": [{"segment_title": "INTRO", "content": "Cached intro"}],
+                "llm_model_used": "gpt-cached-model",
+                "source": "cache" # Crucially, _get_cached_script adds this
+            }
+            mock_get_cached_script.return_value = mock_cached_script_data
+
+            result = pswa_main.weave_script(content, topic)
+
+            mock_get_cached_script.assert_called_once()
+            # Assert call args for _get_cached_script if we want to be very specific about the hash
+            # For example: mock_get_cached_script.assert_called_once_with(ANY, pswa_main._calculate_content_hash(topic, content), ANY)
+
+            # Key assertions: LLM and save_to_cache should NOT be called
+            mock_openai_create.assert_not_called()
+            mock_save_script_to_cache.assert_not_called()
+
+            self.assertEqual(result, mock_cached_script_data)
+            self.assertEqual(result["source"], "cache")
+            self.assertEqual(result["title"], "Cached Title")
+
 
 class TestParseLlmScriptOutput(unittest.TestCase):
     # Test the parser directly. This class primarily tests the TAG-BASED parser.

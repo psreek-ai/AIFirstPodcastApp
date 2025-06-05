@@ -114,9 +114,11 @@ SCENARIO_DEFAULT_SCRIPT_CONTENT = {
 }
 
 SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT = {
-    KEY_ERROR: "Insufficient content",
-    KEY_MESSAGE: "Test scenario: Insufficient content for the provided topic."
-    # Topic name will be appended dynamically in weave_script
+    KEY_TITLE: "Error: Test Scenario Insufficient Content", # Will be updated with topic
+    KEY_SEGMENTS: [{
+        KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, # "ERROR"
+        KEY_CONTENT: "[ERROR] Insufficient content for test topic." # Will be updated with topic
+    }],
 }
 
 SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT = {
@@ -462,9 +464,12 @@ def weave_script(content: str, topic: str) -> dict: # Return type changed to dic
 
         if scenario == 'insufficient_content':
             script_content_to_return = SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT.copy()
-            # Append topic to message if message field exists
-            if KEY_MESSAGE in script_content_to_return:
-                 script_content_to_return[KEY_MESSAGE] = f"{script_content_to_return[KEY_MESSAGE]} Topic: {topic}"
+            script_content_to_return[KEY_TITLE] = f"Error: Test Scenario Insufficient Content for topic: {topic}"
+            # Ensure the segments list itself is copied if it's going to be modified
+            script_content_to_return[KEY_SEGMENTS] = [script_content_to_return[KEY_SEGMENTS][0].copy()]
+            script_content_to_return[KEY_SEGMENTS][0][KEY_CONTENT] = f"[ERROR] Insufficient content for test topic: {topic}"
+            # This structure above is what the endpoint's 400 logic expects for insufficient content.
+            # The full_raw_script below should simulate what an LLM might have returned to lead to this.
         elif scenario == 'empty_segments':
             script_content_to_return = SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT.copy()
         elif scenario == 'pswa_internal_error_valid_json':
@@ -491,11 +496,20 @@ def weave_script(content: str, topic: str) -> dict: # Return type changed to dic
         final_test_script.update(script_content_to_return)
 
         # Ensure 'segments' key exists if not an error structure that omits it.
-        if KEY_ERROR not in final_test_script and KEY_SEGMENTS not in final_test_script:
+        # For 'insufficient_content', SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT already defines KEY_SEGMENTS.
+        if KEY_ERROR not in final_test_script and KEY_SEGMENTS not in final_test_script and scenario != 'insufficient_content':
             final_test_script[KEY_SEGMENTS] = []
 
         # 'full_raw_script' should be the JSON string of the content itself for test mode.
-        final_test_script["full_raw_script"] = json.dumps(script_content_to_return)
+        # For insufficient_content, simulate what an LLM in JSON mode might return.
+        if scenario == 'insufficient_content':
+            raw_llm_error_sim = {
+                "error": "Insufficient content", # This matches KEY_ERROR used by parse_llm_script_output
+                "message": f"The provided content was not sufficient to generate a full podcast script for the topic: {topic}"
+            }
+            final_test_script["full_raw_script"] = json.dumps(raw_llm_error_sim)
+        else:
+            final_test_script["full_raw_script"] = json.dumps(script_content_to_return)
 
         return final_test_script
 

@@ -294,8 +294,21 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         }
 
     try:
-        os.makedirs(shared_audio_dir, exist_ok=True)
-        logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}: Ensured shared audio directory exists: {shared_audio_dir}")
+        # Specific try-except for os.makedirs
+        try:
+            os.makedirs(shared_audio_dir, exist_ok=True)
+            logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}: Ensured shared audio directory exists: {shared_audio_dir}")
+        except IOError as e_mkdir:
+            error_msg = f"VFA failed to create output directory {shared_audio_dir}: {str(e_mkdir)}"
+            logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: {error_msg}", exc_info=True)
+            return {
+                "error_code": "VFA_FILE_SYSTEM_ERROR_MKDIR",
+                "message": "VFA failed to create output directory.",
+                "details": str(e_mkdir),
+                "audio_filepath": None, "stream_id": stream_id,
+                "script_char_count": script_char_count, "engine_used": "google_cloud_tts", # Assuming this path is for google_cloud_tts
+                "tts_settings_used": used_tts_settings
+            }
 
         client = texttospeech.TextToSpeechClient()
         synthesis_input = texttospeech.SynthesisInput(text=text_to_synthesize)
@@ -338,11 +351,24 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
         filename = f"aethercast_audio_{stream_id}_{uuid.uuid4().hex}{file_extension}"
         filepath = os.path.join(shared_audio_dir, filename)
 
-        with open(filepath, "wb") as out_file:
-            out_file.write(response.audio_content)
+        # Specific try-except for file open/write
+        try:
+            with open(filepath, "wb") as out_file:
+                out_file.write(response.audio_content)
+            logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}: Audio content written to file: {filepath}")
+        except IOError as e_write:
+            error_msg = f"VFA failed to write synthesized audio to file {filepath}: {str(e_write)}"
+            logger.error(f"[VFA_TTS_LOGIC] Stream {stream_id}: {error_msg}", exc_info=True)
+            return {
+                "error_code": "VFA_FILE_SYSTEM_ERROR_WRITE_AUDIO",
+                "message": "VFA failed to write synthesized audio to file.",
+                "details": str(e_write),
+                "audio_filepath": filepath, # Filepath was determined, but write failed
+                "stream_id": stream_id,
+                "script_char_count": script_char_count, "engine_used": "google_cloud_tts",
+                "tts_settings_used": used_tts_settings
+            }
         
-        logger.info(f"[VFA_TTS_LOGIC] Stream {stream_id}: Audio content written to file: {filepath}")
-
         return {
             "status": "success",
             "message": "Audio successfully synthesized and saved to shared directory.",
