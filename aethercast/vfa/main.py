@@ -162,6 +162,17 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
                 "script_char_count": len(str(script_input)), "engine_used": "test_mode_tts_api_error",
                 "tts_settings_used": used_tts_settings
             }
+        elif scenario == 'vfa_logical_error_response': # New scenario
+            return {
+                "error_code": "VFA_TEST_LOGICAL_ERROR",
+                "message": "Simulated VFA logical error from test scenario",
+                "details": "This is a logical error simulated via X-Test-Scenario.",
+                "audio_filepath": None,
+                "stream_id": stream_id,
+                "script_char_count": len(str(script_input)),
+                "engine_used": "test_mode_vfa_logical_error",
+                "tts_settings_used": used_tts_settings
+            }
 
         # For default success and file_save_error, we attempt to create the directory and dummy file.
         try:

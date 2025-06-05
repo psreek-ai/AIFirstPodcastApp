@@ -250,6 +250,79 @@ class TestFullPodcastFlow(unittest.TestCase):
                       "Original VFA error message not found in CPOA's error message")
         print(f"[INFO] Test test_podcast_generation_vfa_tts_error for {podcast_id} PASSED.")
 
+    def test_podcast_generation_vfa_logical_error(self):
+        """
+        Tests podcast generation where VFA is instructed (via test_scenarios)
+        to return a logical error (HTTP 200 OK, but error in JSON body).
+        CPOA should detect this and mark the task as failed due to VFA.
+        """
+        client_id = f"test_client_vfa_logical_err_{uuid.uuid4().hex}"
+        topic = "VFA Logical Error Scenario"
+        print(f"\n[INFO] Starting test_podcast_generation_vfa_logical_error for topic: '{topic}' with client_id: {client_id}")
+
+        initiate_payload = {
+            "topic": topic,
+            "client_id": client_id,
+            "test_scenarios": {"vfa": "vfa_logical_error_response"}
+        }
+        print(f"[INFO] POST {API_GATEWAY_BASE_URL}/podcasts with payload: {initiate_payload}")
+        initiate_response = requests.post(f"{API_GATEWAY_BASE_URL}/podcasts", json=initiate_payload, timeout=30)
+
+        self.assertIn(initiate_response.status_code, [200, 201],
+                      f"Initiate request failed: {initiate_response.status_code} - {initiate_response.text}")
+
+        init_data = initiate_response.json()
+        podcast_id = init_data["podcast_id"]
+        print(f"[INFO] Podcast task initiated for VFA logical error test. Podcast ID: {podcast_id}")
+
+        max_polls = 20
+        poll_interval_seconds = 3
+        failed_as_expected = False
+        final_status_data = None
+        current_status = "unknown"
+
+        for i in range(max_polls):
+            print(f"[INFO] Polling VFA logical error test ({i+1}/{max_polls}) for {podcast_id}...")
+            poll_response = requests.get(f"{API_GATEWAY_BASE_URL}/podcasts/{podcast_id}", timeout=10)
+            self.assertEqual(poll_response.status_code, 200)
+            poll_data = poll_response.json()
+            current_status = poll_data.get("status")
+            print(f"[INFO] Current status: {current_status}")
+
+            if current_status == "failed_vfa_reported_error": # CPOA status for VFA JSON error
+                failed_as_expected = True
+                final_status_data = poll_data
+                print(f"[INFO] VFA logical error correctly processed by CPOA for {podcast_id}.")
+                break
+            elif current_status == "completed" or (current_status and "failed" in current_status and current_status != "failed_vfa_reported_error"):
+                self.fail(f"Podcast generation reached unexpected status: {current_status}. Error: {poll_data.get('error_message')}")
+            time.sleep(poll_interval_seconds)
+
+        self.assertTrue(failed_as_expected, f"Podcast did not fail as expected for VFA logical error. Last status: {current_status}")
+        self.assertIsNotNone(final_status_data)
+
+        # Check the error message from CPOA, which should incorporate VFA's error message and code
+        cpoa_error_message = final_status_data.get("error_message", "")
+        self.assertIn("VFA service reported an internal error", cpoa_error_message,
+                      "Error message from CPOA not as expected for VFA logical error.")
+        self.assertIn("VFA_TEST_LOGICAL_ERROR", cpoa_error_message, # Check for VFA's error_code
+                      "VFA's error_code not found in CPOA's error message.")
+        self.assertIn("Simulated VFA logical error from test scenario", cpoa_error_message, # Check for VFA's message
+                      "VFA's original message not found in CPOA's error message.")
+
+        # Optionally check tts_settings_used in the final_status_data if CPOA populates it from VFA's error response
+        vfa_result_in_log = None
+        for log_entry in final_status_data.get("orchestration_log", []):
+            if log_entry.get("stage") == "vfa_audio_generation" and log_entry.get("status") == "error":
+                vfa_result_in_log = log_entry.get("structured_data", {}).get("vfa_response", {})
+                break
+        self.assertIsNotNone(vfa_result_in_log, "VFA error response not found in orchestration log.")
+        if vfa_result_in_log: # Check only if found
+            self.assertEqual(vfa_result_in_log.get("error_code"), "VFA_TEST_LOGICAL_ERROR")
+            self.assertIn("test_voice", vfa_result_in_log.get("tts_settings_used", {}).get("voice_name", ""), "TTS settings used not logged as expected.")
+
+        print(f"[INFO] Test test_podcast_generation_vfa_logical_error for {podcast_id} PASSED.")
+
     def test_podcast_generation_pswa_internal_error_valid_json(self):
         """
         Test full podcast generation flow when PSWA returns a 200 OK with a JSON payload
