@@ -39,6 +39,22 @@ services:
       - aethercast_network
     restart: unless-stopped
 
+  aims_tts_service:
+    build:
+      context: ./aethercast/aims_tts_service
+      dockerfile: Dockerfile
+    container_name: aims_tts_service
+    ports:
+      - "9009:9000" # Host:Container
+    env_file:
+      - ./aethercast/aims_tts_service/.env # Users must create this from .env.example
+    volumes:
+      - ./aethercast/aims_tts_service:/app # For live development
+      - aethercast_audio_data:/shared_audio # Shared volume for TTS output
+    networks:
+      - aethercast_network
+    restart: unless-stopped
+
   tda:
     build:
       context: .
@@ -95,10 +111,14 @@ services:
       - "5005:5005" # Assuming VFA runs on 5005
     volumes:
       - ./aethercast:/app/aethercast
-      - aethercast_audio_data:/srv/aethercast/generated_audio # Shared volume for audio files
+      # VFA now primarily consumes paths from AIMS_TTS, which are on /shared_audio
+      # It might still write test dummy files to a subdir if VFA_SHARED_AUDIO_DIR is set that way.
+      - aethercast_audio_data:/shared_audio
     env_file:
       - common.env
       - ./aethercast/vfa/.env
+    depends_on:
+      - aims_tts_service
     networks:
       - aethercast_network
 
@@ -110,7 +130,7 @@ services:
       - "5006:5006" # Assuming ASF runs on 5006
     volumes:
       - ./aethercast:/app/aethercast
-      - aethercast_audio_data:/srv/aethercast/generated_audio # ASF needs to read audio files
+      - aethercast_audio_data:/shared_audio # ASF needs to read audio files from the shared volume
     env_file:
       - common.env
       - ./aethercast/asf/.env
