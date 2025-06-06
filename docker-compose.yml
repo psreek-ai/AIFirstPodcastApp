@@ -20,6 +20,24 @@ services:
     # depends_on: # Example, can be added if strict startup order is needed
       # - tda
       # - cpoa (though cpoa is part of api_gateway image)
+      # - aims_service # If API Gateway directly called AIMS
+    networks: # Example: assuming a custom network for all backend services
+      - aethercast_network
+
+  aims_service:
+    build:
+      context: ./aethercast/aims_service
+      dockerfile: Dockerfile
+    container_name: aims_service
+    ports:
+      - "8008:8000" # Host:Container
+    env_file:
+      - ./aethercast/aims_service/.env # Users must create this from .env.example
+    volumes:
+      - ./aethercast/aims_service:/app # For live development of aims_service code
+    networks:
+      - aethercast_network
+    restart: unless-stopped
 
   tda:
     build:
@@ -33,6 +51,8 @@ services:
     env_file:
       - common.env
       - ./aethercast/tda/.env
+    networks:
+      - aethercast_network
 
   sca:
     build:
@@ -42,13 +62,13 @@ services:
       - "5002:5002" # Assuming SCA runs on 5002
     volumes:
       - ./aethercast:/app/aethercast
-      # SCA might need DB access if it writes directly, or if it reads topics/snippets
-      # For now, assuming it doesn't directly write to the shared DB discussed for PSWA/TDA/API-GW
-      # If it does, add:
-      # - aethercast_db_data:/app/database
     env_file:
       - common.env
       - ./aethercast/sca/.env
+    depends_on:
+      - aims_service
+    networks:
+      - aethercast_network
 
   pswa:
     build:
@@ -62,6 +82,10 @@ services:
     env_file:
       - common.env
       - ./aethercast/pswa/.env
+    depends_on:
+      - aims_service
+    networks:
+      - aethercast_network
 
   vfa:
     build:
@@ -75,6 +99,8 @@ services:
     env_file:
       - common.env
       - ./aethercast/vfa/.env
+    networks:
+      - aethercast_network
 
   asf:
     build:
@@ -88,6 +114,8 @@ services:
     env_file:
       - common.env
       - ./aethercast/asf/.env
+    networks:
+      - aethercast_network
 
   iga:
     build:
@@ -96,19 +124,25 @@ services:
     ports:
       - "5007:5007" # Expose port 5007 for IGA
     env_file:
-      - ./aethercast/iga/.env.example # Base config
-      # - ./aethercast/iga/.env # Optional local overrides - keep commented if .env not committed
+      # - ./aethercast/iga/.env # Users must create this from .env.example
+      # For now, directly using .env.example to ensure it runs out of the box
+      # In a real setup, users would copy .env.example to .env and customize
+      - ./aethercast/iga/.env.example
     environment:
       PYTHONUNBUFFERED: 1
-      # FLASK_DEBUG: 'false' # Example override if needed
     volumes:
       - ./aethercast/iga:/app # For live development
-    # networks: # Add if using a custom network
-    #   - aethercast_network
+    networks:
+      - aethercast_network
     restart: unless-stopped
 
+# Define the custom network
+networks:
+  aethercast_network:
+    driver: bridge
+
 # Note on .env files for services:
-# Each service's .env file (e.g., aethercast/api_gateway/.env) will need to be updated.
+# Each service's .env file (e.g., aethercast/api_gateway/.env) will need to be updated/created by the user.
 # It should source common.env variables and then define its specific ones.
 # Example for aethercast/api_gateway/.env:
 #   DATABASE_FILE=${DATABASE_FILE_PATH_CONTAINER}

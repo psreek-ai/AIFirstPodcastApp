@@ -1,10 +1,18 @@
 import logging
 import os
-from dotenv import load_dotenv # Added
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+import uuid
+import re
+import sqlite3
+import hashlib
+from datetime import datetime, timedelta
+import json
+import requests # Added for AIMS service call
+import time # Added for retry logic with AIMS
 
 # --- Load Environment Variables ---
-load_dotenv() # Added
+load_dotenv()
 
 # --- PSWA Configuration ---
 pswa_config = {}
@@ -12,11 +20,14 @@ pswa_config = {}
 def load_pswa_configuration():
     """Loads PSWA configurations from environment variables with defaults."""
     global pswa_config
-    pswa_config['OPENAI_API_KEY'] = os.getenv("OPENAI_API_KEY")
-    pswa_config['PSWA_LLM_MODEL'] = os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo")
+    # OPENAI_API_KEY is removed, PSWA will call AIMS
+    pswa_config['AIMS_SERVICE_URL'] = os.getenv("AIMS_SERVICE_URL", "http://aims_service:8000/v1/generate")
+    pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS'] = int(os.getenv("AIMS_REQUEST_TIMEOUT_SECONDS", "180"))
+
+    pswa_config['PSWA_LLM_MODEL'] = os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo") # This is now a request to AIMS
     pswa_config['PSWA_LLM_TEMPERATURE'] = float(os.getenv("PSWA_LLM_TEMPERATURE", "0.7"))
     pswa_config['PSWA_LLM_MAX_TOKENS'] = int(os.getenv("PSWA_LLM_MAX_TOKENS", "1500"))
-    pswa_config['PSWA_LLM_JSON_MODE'] = os.getenv("PSWA_LLM_JSON_MODE", "true").lower() == 'true' # Added
+    pswa_config['PSWA_LLM_JSON_MODE'] = os.getenv("PSWA_LLM_JSON_MODE", "true").lower() == 'true'
 
     default_system_message_json = """You are a podcast scriptwriter. Your output MUST be a single, valid JSON object.
 Do not include any text outside of this JSON object, not even markdown tags like ```json.
@@ -53,739 +64,393 @@ Remember, your entire response must be a single JSON object conforming to the sc
     pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
     pswa_config['PSWA_DEBUG_MODE'] = os.getenv("PSWA_DEBUG_MODE", "True").lower() == "true"
 
-    # Script Caching Configuration
     pswa_config['SHARED_DATABASE_PATH'] = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db")
     pswa_config['PSWA_SCRIPT_CACHE_ENABLED'] = os.getenv("PSWA_SCRIPT_CACHE_ENABLED", "True").lower() == 'true'
-    pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'] = int(os.getenv("PSWA_SCRIPT_CACHE_MAX_AGE_HOURS", "720")) # 30 days
-    pswa_config['PSWA_TEST_MODE_ENABLED'] = os.getenv("PSWA_TEST_MODE_ENABLED", "False").lower() == 'true' # Added Test Mode
+    pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'] = int(os.getenv("PSWA_SCRIPT_CACHE_MAX_AGE_HOURS", "720"))
+    pswa_config['PSWA_TEST_MODE_ENABLED'] = os.getenv("PSWA_TEST_MODE_ENABLED", "False").lower() == 'true'
 
     logger.info("--- PSWA Configuration ---")
+    logger.info(f"  AIMS_SERVICE_URL: {pswa_config['AIMS_SERVICE_URL']}")
+    logger.info(f"  AIMS_REQUEST_TIMEOUT_SECONDS: {pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS']}")
+    logger.info(f"  PSWA_LLM_MODEL (request to AIMS): {pswa_config['PSWA_LLM_MODEL']}")
+    logger.info(f"  PSWA_LLM_TEMPERATURE (request to AIMS): {pswa_config['PSWA_LLM_TEMPERATURE']}")
+    logger.info(f"  PSWA_LLM_MAX_TOKENS (request to AIMS): {pswa_config['PSWA_LLM_MAX_TOKENS']}")
+    logger.info(f"  PSWA_LLM_JSON_MODE (request to AIMS): {pswa_config['PSWA_LLM_JSON_MODE']}")
+    # Log other configs as before, API_KEY related logging is removed
     for key, value in pswa_config.items():
-        if "API_KEY" in key and value:
-            logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
-        elif key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
-            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{value[:50].replace('\n', ' ')}...')")
-        else:
-            logger.info(f"  {key}: {value}")
-    logger.info(f"  PSWA_LLM_JSON_MODE: {pswa_config['PSWA_LLM_JSON_MODE']}") # Added logging for new mode
+        if key not in ["AIMS_SERVICE_URL", "AIMS_REQUEST_TIMEOUT_SECONDS", "PSWA_LLM_MODEL", "PSWA_LLM_TEMPERATURE", "PSWA_LLM_MAX_TOKENS", "PSWA_LLM_JSON_MODE"]:
+            if key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
+                logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{value[:50].replace('\n', ' ')}...')")
+            else:
+                logger.info(f"  {key}: {value}")
     logger.info("--- End PSWA Configuration ---")
 
-    # Startup check for critical configurations
-    if not pswa_config['OPENAI_API_KEY']:
-        error_msg = "CRITICAL: OPENAI_API_KEY is not set. PSWA will not be able to function. Please set this environment variable."
+    if not pswa_config.get('AIMS_SERVICE_URL'):
+        error_msg = "CRITICAL: AIMS_SERVICE_URL is not set. PSWA cannot function."
         logger.error(error_msg)
         raise ValueError(error_msg)
 
 # --- Constants ---
-# For JSON structure expected from LLM and used internally
 KEY_TITLE = "title"
 KEY_INTRO = "intro"
 KEY_SEGMENTS = "segments"
 KEY_SEGMENT_TITLE = "segment_title"
 KEY_CONTENT = "content"
 KEY_OUTRO = "outro"
-# KEY_ERROR = "error" # No longer used directly in endpoint responses, error_code is now the standard
-KEY_MESSAGE = "message" # Used by LLM for error messages
+KEY_ERROR = "error" # Used for LLM error structure within JSON
+KEY_MESSAGE = "message"
 
-# For segment titles generated by parsing logic (can also be tags)
 SEGMENT_TITLE_INTRO = "INTRO"
 SEGMENT_TITLE_OUTRO = "OUTRO"
-SEGMENT_TITLE_ERROR = "ERROR" # Used when LLM reports insufficient content
+SEGMENT_TITLE_ERROR = "ERROR"
+TAG_TITLE = "TITLE"
 
-# For tag-based parsing (fallback)
-TAG_TITLE = "TITLE" # Used if [TITLE] tag is present
-
-# Endpoint specific error types (Old constants, replaced by specific error_code strings)
-# ENDPOINT_ERROR_INVALID_PAYLOAD = "INVALID_PAYLOAD"
-# ENDPOINT_ERROR_MISSING_PARAMETERS = "MISSING_PARAMETERS"
-# Internal processing errors (already defined by weave_script return or OpenAI)
-# PSWA_IMPORT_ERROR, PSWA_CONFIG_ERROR_API_KEY, PSWA_OPENAI_API_ERROR,
-# PSWA_UNEXPECTED_LLM_ERROR, PSWA_PROCESSING_ERROR, PSWA_SCRIPT_PARSING_FAILURE
-
-# --- Test Mode Scenario Constants ---
-SCENARIO_DEFAULT_SCRIPT_CONTENT = {
-    KEY_TITLE: "Test Mode Default Title",
-    KEY_INTRO: "This is the default intro for test mode.",
-    KEY_SEGMENTS: [
-        {KEY_SEGMENT_TITLE: "Test Segment 1", KEY_CONTENT: "Content of test segment 1."},
-        {KEY_SEGMENT_TITLE: "Test Segment 2", KEY_CONTENT: "Content of test segment 2."}
-    ],
-    KEY_OUTRO: "This is the default outro for test mode."
-}
-
-SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT = {
-    KEY_TITLE: "Error: Test Scenario Insufficient Content", # Will be updated with topic
-    KEY_SEGMENTS: [{
-        KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, # "ERROR"
-        KEY_CONTENT: "[ERROR] Insufficient content for test topic." # Will be updated with topic
-    }],
-}
-
-SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT = {
-    KEY_TITLE: "Test Mode Title - Empty Segments",
-    KEY_INTRO: "This intro leads to no actual content segments.",
-    KEY_SEGMENTS: [], # Empty segments list
-    KEY_OUTRO: "This outro follows no actual content segments."
-}
-# Note: SCENARIO_ERROR_PARSING_SCRIPT is less about PSWA returning bad JSON (it should always return valid JSON),
-# and more about returning a JSON whose *content values* might represent an edge case for consumers.
-# For example, a script with extremely long title or segment content, or unusual characters.
-# For now, the above scenarios cover structural variations and LLM error simulation.
-
-
-# --- Attempt to import OpenAI library ---
-try:
-    import openai
-    PSWA_IMPORTS_SUCCESSFUL = True
-    PSWA_MISSING_IMPORT_ERROR = None
-except ImportError as e:
-    PSWA_IMPORTS_SUCCESSFUL = False
-    PSWA_MISSING_IMPORT_ERROR = e
-    # Define placeholder for openai.error.OpenAIError if openai itself failed to import
-    # This allows the try-except block in weave_script to still reference it.
-    class OpenAIErrorPlaceholder(Exception): pass
-    if 'openai' not in globals(): # If openai module itself is not loaded
-        # Create a dummy openai object with a dummy error attribute
-        class DummyOpenAI:
-            error = type('error', (object,), {'OpenAIError': OpenAIErrorPlaceholder})()
-        openai = DummyOpenAI()
-    elif not hasattr(openai, 'error'): # If openai is loaded but has no 'error' attribute (unlikely for real lib)
-        openai.error = type('error', (object,), {'OpenAIError': OpenAIErrorPlaceholder})()
-    elif not hasattr(openai.error, 'OpenAIError'): # If openai.error exists but no OpenAIError (very unlikely)
-        openai.error.OpenAIError = OpenAIErrorPlaceholder
+# --- Test Mode Scenario Constants (remain largely the same) ---
+SCENARIO_DEFAULT_SCRIPT_CONTENT = { KEY_TITLE: "Test Mode Default Title", KEY_INTRO: "This is the default intro for test mode.", KEY_SEGMENTS: [{KEY_SEGMENT_TITLE: "Test Segment 1", KEY_CONTENT: "Content of test segment 1."},{KEY_SEGMENT_TITLE: "Test Segment 2", KEY_CONTENT: "Content of test segment 2."}], KEY_OUTRO: "This is the default outro for test mode."}
+SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT = { KEY_TITLE: "Error: Test Scenario Insufficient Content", KEY_SEGMENTS: [{KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, KEY_CONTENT: "[ERROR] Insufficient content for test topic."}],}
+SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT = { KEY_TITLE: "Test Mode Title - Empty Segments", KEY_INTRO: "This intro leads to no actual content segments.", KEY_SEGMENTS: [], KEY_OUTRO: "This outro follows no actual content segments."}
 
 
 # --- Flask App Setup ---
 app = Flask(__name__)
 
 # --- Logging Configuration ---
-# Ensure logger name is distinct if other modules also configure root logger
-# Use Flask's logger if available and not the root logger to avoid duplicate messages when running with Flask.
 if app.logger and app.logger.name != 'root':
     logger = app.logger
 else:
-    logger = logging.getLogger(__name__) # Use module-specific logger
-    if not logger.hasHandlers(): # Avoid adding multiple handlers if script re-run in some contexts
+    logger = logging.getLogger(__name__)
+    if not logger.hasHandlers():
         logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
-    # Ensure load_pswa_configuration is called after logger is configured if it uses logger.
-    # If logger was just configured, and pswa_config is empty, reload.
-    if not pswa_config: # Check if it's empty
-        load_pswa_configuration()
 
-if not pswa_config: # Ensure configuration is loaded at startup
+if not pswa_config:
     load_pswa_configuration()
 
-import uuid
-import re
-import sqlite3
-import hashlib
-from datetime import datetime, timedelta # Added timedelta for cache age
-import json # Already imported if used by logger, but good to ensure for DB operations
-
-# --- Database Helper Functions for Script Caching ---
+# --- Database Helper Functions for Script Caching (remain the same) ---
 def _get_db_connection(db_path: str):
-    """Establishes a SQLite database connection."""
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         return conn
     except sqlite3.Error as e:
         logger.error(f"[PSWA_CACHE_DB] Error connecting to database at {db_path}: {e}")
-        raise # Re-raise to be handled by caller, or return None if preferred to not halt all operations
+        raise
 
 def _calculate_content_hash(topic: str, content: str) -> str:
-    """Calculates a SHA256 hash for the given topic and content."""
-    # Normalize: lowercase and strip whitespace
     normalized_topic = topic.lower().strip()
-    # Use a summary of content to avoid hashing very large strings, e.g., first 1000 chars
     normalized_content_summary = content.lower().strip()[:1000]
-
     input_string = f"topic:{normalized_topic}|content_summary:{normalized_content_summary}"
     return hashlib.sha256(input_string.encode('utf-8')).hexdigest()
 
 def _get_cached_script(db_path: str, topic_hash: str, max_age_hours: int) -> Optional[dict]:
-    """Retrieves a script from cache if it exists and is not stale."""
     if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
         return None
-
     logger.info(f"[PSWA_CACHE_DB] Attempting to fetch script from cache for hash: {topic_hash}")
     conn = None
     try:
         conn = _get_db_connection(db_path)
         cursor = conn.cursor()
-
         cutoff_timestamp = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
-
         cursor.execute(
             "SELECT script_id, structured_script_json, llm_model_used, generation_timestamp FROM generated_scripts WHERE topic_hash = ? AND generation_timestamp >= ?",
             (topic_hash, cutoff_timestamp)
         )
         row = cursor.fetchone()
-
         if row:
             logger.info(f"[PSWA_CACHE_DB] Cache hit for hash {topic_hash}. Script ID: {row['script_id']}")
             structured_script = json.loads(row['structured_script_json'])
-
-            # Update last_accessed_timestamp (best effort)
             try:
                 cursor.execute("UPDATE generated_scripts SET last_accessed_timestamp = ? WHERE script_id = ?",
                                (datetime.utcnow().isoformat(), row['script_id']))
                 conn.commit()
             except sqlite3.Error as e_update:
                 logger.warning(f"[PSWA_CACHE_DB] Failed to update last_accessed_timestamp for script {row['script_id']}: {e_update}")
-
-            # Add source field for clarity if it's not already part of the stored script
             if 'source' not in structured_script:
                  structured_script['source'] = "cache"
-            structured_script['script_id'] = row['script_id'] # Ensure script_id from DB is used
-            structured_script['llm_model_used'] = row['llm_model_used'] # Ensure model from DB is used
-            structured_script['generation_timestamp_from_cache'] = row['generation_timestamp'] # For context
+            structured_script['script_id'] = row['script_id']
+            structured_script['llm_model_used'] = row['llm_model_used']
+            structured_script['generation_timestamp_from_cache'] = row['generation_timestamp']
             return structured_script
         else:
             logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash} (max_age_hours: {max_age_hours})")
             return None
-    except sqlite3.Error as e:
-        logger.error(f"[PSWA_CACHE_DB] Database error getting cached script for hash {topic_hash}: {e}")
-        return None # On DB error, proceed as if cache miss
-    except json.JSONDecodeError as e_json:
-        logger.error(f"[PSWA_CACHE_DB] Error decoding cached script JSON for hash {topic_hash}: {e_json}. Treating as cache miss.")
-        # Optionally, consider deleting the malformed cache entry here.
+    except (sqlite3.Error, json.JSONDecodeError) as e:
+        logger.error(f"[PSWA_CACHE_DB] Error accessing/decoding cache for hash {topic_hash}: {e}")
         return None
     finally:
         if conn:
             conn.close()
 
 def _save_script_to_cache(db_path: str, script_id: str, topic_hash: str, structured_script: dict, llm_model_used: str):
-    """Saves a generated script to the cache."""
     if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
         return
-
     logger.info(f"[PSWA_CACHE_DB] Saving script {script_id} to cache with hash: {topic_hash}")
     conn = None
     try:
-        # Ensure the script itself doesn't have the temporary 'source' field before saving
         script_to_save = structured_script.copy()
         if 'source' in script_to_save : del script_to_save['source']
         if 'generation_timestamp_from_cache' in script_to_save: del script_to_save['generation_timestamp_from_cache']
-
         structured_script_json = json.dumps(script_to_save)
         generation_timestamp = datetime.utcnow().isoformat()
-
         conn = _get_db_connection(db_path)
         cursor = conn.cursor()
         cursor.execute(
-            """
-            INSERT OR REPLACE INTO generated_scripts
-            (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
+            "INSERT OR REPLACE INTO generated_scripts (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp) VALUES (?, ?, ?, ?, ?, ?)",
             (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, generation_timestamp)
         )
         conn.commit()
         logger.info(f"[PSWA_CACHE_DB] Successfully saved script {script_id} to cache.")
-    except sqlite3.Error as e:
-        logger.error(f"[PSWA_CACHE_DB] Database error saving script {script_id} to cache: {e}")
-    except json.JSONEncodeError as e_json:
-        logger.error(f"[PSWA_CACHE_DB] Error encoding script {script_id} to JSON for cache: {e_json}")
-    except Exception as e_unexp: # Catch any other unexpected error
+    except (sqlite3.Error, json.JSONEncodeError) as e:
+        logger.error(f"[PSWA_CACHE_DB] Error saving script {script_id} to cache: {e}")
+    except Exception as e_unexp:
         logger.error(f"[PSWA_CACHE_DB] Unexpected error saving script {script_id} to cache: {e_unexp}", exc_info=True)
     finally:
         if conn:
             conn.close()
 
-
+# --- LLM Output Parsing (parse_llm_script_output - remains largely the same) ---
 def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
-    """
-    Parses the raw text output from the LLM into a structured script dictionary.
-    """
     script_id = f"pswa_script_{uuid.uuid4().hex}"
-
-    # Default values
     parsed_script = {
-        "script_id": script_id,
-        "topic": topic,
-        "title": f"Podcast on {topic}",
-        "full_raw_script": raw_script_text, # Store the original LLM output
-        "segments": [],
-        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo")
+        "script_id": script_id, "topic": topic, "title": f"Podcast on {topic}",
+        "full_raw_script": raw_script_text, "segments": [],
+        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo") # Default, will be updated by actual model from AIMS
     }
-
-    # Attempt to parse as JSON first
     try:
         llm_json_data = json.loads(raw_script_text)
         logger.info(f"[PSWA_PARSING] Successfully parsed LLM output as JSON for topic '{topic}'.")
-
-        # Check for LLM-reported error within the JSON
         if KEY_ERROR in llm_json_data and llm_json_data[KEY_ERROR] == "Insufficient content":
             logger.warning(f"[PSWA_PARSING] LLM returned 'Insufficient content' error in JSON for topic '{topic}'.")
             parsed_script[KEY_TITLE] = llm_json_data.get(KEY_MESSAGE, f"Error: Insufficient Content for {topic}")
             parsed_script[KEY_SEGMENTS] = [{KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, KEY_CONTENT: llm_json_data.get(KEY_MESSAGE, raw_script_text)}]
             return parsed_script
-
-        # Validate and map JSON fields to our structure
         parsed_script[KEY_TITLE] = llm_json_data.get(KEY_TITLE, f"Podcast on {topic}")
-
-        # Intro
         intro_content = llm_json_data.get(KEY_INTRO)
-        if intro_content is not None: # Allow empty string for intro
-             parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: SEGMENT_TITLE_INTRO, KEY_CONTENT: str(intro_content)})
-        else:
-            logger.warning(f"[PSWA_PARSING] JSON from LLM missing '{KEY_INTRO}' for topic '{topic}'.")
-
-
-        # Segments
+        if intro_content is not None: parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: SEGMENT_TITLE_INTRO, KEY_CONTENT: str(intro_content)})
+        else: logger.warning(f"[PSWA_PARSING] JSON from LLM missing '{KEY_INTRO}' for topic '{topic}'.")
         llm_segments = llm_json_data.get(KEY_SEGMENTS, [])
         if isinstance(llm_segments, list):
             for seg in llm_segments:
                 if isinstance(seg, dict) and KEY_SEGMENT_TITLE in seg and KEY_CONTENT in seg:
-                    parsed_script[KEY_SEGMENTS].append({
-                        KEY_SEGMENT_TITLE: str(seg[KEY_SEGMENT_TITLE]),
-                        KEY_CONTENT: str(seg[KEY_CONTENT])
-                    })
-                else:
-                    logger.warning(f"[PSWA_PARSING] Invalid segment structure in JSON from LLM for topic '{topic}': {seg}")
-        else:
-            logger.warning(f"[PSWA_PARSING] JSON from LLM '{KEY_SEGMENTS}' is not a list for topic '{topic}'.")
-
-        # Outro
+                    parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: str(seg[KEY_SEGMENT_TITLE]), KEY_CONTENT: str(seg[KEY_CONTENT])})
+                else: logger.warning(f"[PSWA_PARSING] Invalid segment structure in JSON from LLM for topic '{topic}': {seg}")
+        else: logger.warning(f"[PSWA_PARSING] JSON from LLM '{KEY_SEGMENTS}' is not a list for topic '{topic}'.")
         outro_content = llm_json_data.get(KEY_OUTRO)
-        if outro_content is not None: # Allow empty string for outro
-            parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: SEGMENT_TITLE_OUTRO, KEY_CONTENT: str(outro_content)})
-        else:
-            logger.warning(f"[PSWA_PARSING] JSON from LLM missing '{KEY_OUTRO}' for topic '{topic}'.")
-
-        if not parsed_script[KEY_SEGMENTS]: # If after all this, segments are empty
-             logger.warning(f"[PSWA_PARSING] No valid segments (intro, content segments, outro) found in JSON for topic '{topic}'.")
-             # This might be an issue, could lead to an empty podcast.
-
+        if outro_content is not None: parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: SEGMENT_TITLE_OUTRO, KEY_CONTENT: str(outro_content)})
+        else: logger.warning(f"[PSWA_PARSING] JSON from LLM missing '{KEY_OUTRO}' for topic '{topic}'.")
+        if not parsed_script[KEY_SEGMENTS]: logger.warning(f"[PSWA_PARSING] No valid segments found in JSON for topic '{topic}'.")
         return parsed_script
-
     except json.JSONDecodeError:
-        logger.warning(f"[PSWA_PARSING] LLM output was not valid JSON for topic '{topic}'. Raw output preview: '{raw_script_text[:200]}...' Attempting fallback tag-based parsing.")
-        # Fallback to tag-based parsing (existing logic)
-        # The existing tag-based parser is already here, so we just let the code flow into it.
-        # Reset title to default as it might have been partially set by failed JSON attempt.
-        parsed_script[KEY_TITLE] = f"Podcast on {topic}" # Reset for tag parser
-        parsed_script[KEY_SEGMENTS] = [] # Reset for tag parser
-
-    # Fallback Tag-based parsing (adapted from previous version)
-    if raw_script_text.startswith("[ERROR] Insufficient content"): # Check again for fallback
+        logger.warning(f"[PSWA_PARSING] LLM output was not valid JSON for topic '{topic}'. Raw output: '{raw_script_text[:200]}...' Attempting fallback.")
+        parsed_script[KEY_TITLE] = f"Podcast on {topic}"; parsed_script[KEY_SEGMENTS] = [] # Reset for fallback
+    if raw_script_text.startswith("[ERROR] Insufficient content"):
         logger.warning(f"[PSWA_PARSING_FALLBACK] LLM indicated insufficient content for topic '{topic}'.")
         parsed_script[KEY_TITLE] = f"Error: Insufficient Content for {topic}"
         parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, KEY_CONTENT: raw_script_text})
         return parsed_script
-
-    title_match = re.search(r"\[TITLE\](.*?)\n", raw_script_text, re.IGNORECASE) # TAG_TITLE could be used here if we define it like `\\[TITLE\\]` for regex
-    if title_match:
-        parsed_script[KEY_TITLE] = title_match.group(1).strip()
-
-    lines = raw_script_text.splitlines()
-    current_tag_content = []
-    active_tag = None
-
+    title_match = re.search(r"\[TITLE\](.*?)\n", raw_script_text, re.IGNORECASE)
+    if title_match: parsed_script[KEY_TITLE] = title_match.group(1).strip()
+    lines = raw_script_text.splitlines(); current_tag_content = []; active_tag = None
     for line in lines:
-        line = line.strip()
-        # Regex to match tags like [TAG_NAME]
-        match = re.fullmatch(r"\[([A-Z0-9_]+)\]", line, re.IGNORECASE)
+        line = line.strip(); match = re.fullmatch(r"\[([A-Z0-9_]+)\]", line, re.IGNORECASE)
         if match:
             if active_tag and current_tag_content:
-                # Special handling for title if it wasn't caught by initial regex and is default
-                if active_tag.upper() == TAG_TITLE and parsed_script[KEY_TITLE] == f"Podcast on {topic}":
-                    parsed_script[KEY_TITLE] = "\n".join(current_tag_content).strip()
-                else:
-                    parsed_script[KEY_SEGMENTS].append({
-                        KEY_SEGMENT_TITLE: active_tag,
-                        KEY_CONTENT: "\n".join(current_tag_content).strip()
-                    })
-            active_tag = match.group(1).upper()
-            current_tag_content = []
-            # Avoid re-processing TITLE if already extracted by initial regex search
-            if active_tag == TAG_TITLE and parsed_script[KEY_TITLE] != f"Podcast on {topic}":
-                active_tag = None # Effectively ignore this [TITLE] content as main title is already set
-        elif active_tag:
-            current_tag_content.append(line)
-
-    if active_tag and current_tag_content: # Add the last segment
-        if active_tag.upper() == TAG_TITLE and parsed_script[KEY_TITLE] == f"Podcast on {topic}":
-             parsed_script[KEY_TITLE] = "\n".join(current_tag_content).strip()
-        else:
-            parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: active_tag, KEY_CONTENT: "\n".join(current_tag_content).strip()})
-
-    processed_segments = []
-    i = 0
-    temp_segments_for_processing = parsed_script[KEY_SEGMENTS] # Use the segments populated by tag parser
-    parsed_script[KEY_SEGMENTS] = [] # Clear it to repopulate with processed ones
-
+                if active_tag.upper() == TAG_TITLE and parsed_script[KEY_TITLE] == f"Podcast on {topic}": parsed_script[KEY_TITLE] = "\n".join(current_tag_content).strip()
+                else: parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: active_tag, KEY_CONTENT: "\n".join(current_tag_content).strip()})
+            active_tag = match.group(1).upper(); current_tag_content = []
+            if active_tag == TAG_TITLE and parsed_script[KEY_TITLE] != f"Podcast on {topic}": active_tag = None
+        elif active_tag: current_tag_content.append(line)
+    if active_tag and current_tag_content:
+        if active_tag.upper() == TAG_TITLE and parsed_script[KEY_TITLE] == f"Podcast on {topic}": parsed_script[KEY_TITLE] = "\n".join(current_tag_content).strip()
+        else: parsed_script[KEY_SEGMENTS].append({KEY_SEGMENT_TITLE: active_tag, KEY_CONTENT: "\n".join(current_tag_content).strip()})
+    processed_segments = []; i = 0; temp_segments_for_processing = parsed_script[KEY_SEGMENTS]; parsed_script[KEY_SEGMENTS] = []
     while i < len(temp_segments_for_processing):
-        segment = temp_segments_for_processing[i]
-        title_tag = segment[KEY_SEGMENT_TITLE]
-        text_content = segment[KEY_CONTENT]
-
+        segment = temp_segments_for_processing[i]; title_tag = segment[KEY_SEGMENT_TITLE]; text_content = segment[KEY_CONTENT]
         if title_tag.endswith("_TITLE") and (i + 1 < len(temp_segments_for_processing)):
             next_segment = temp_segments_for_processing[i+1]
             if next_segment[KEY_SEGMENT_TITLE] == title_tag.replace("_TITLE", "_CONTENT"):
-                processed_segments.append({
-                    KEY_SEGMENT_TITLE: text_content,
-                    KEY_CONTENT: next_segment[KEY_CONTENT]
-                })
-                i += 1
-            else:
-                processed_segments.append({KEY_SEGMENT_TITLE: title_tag, KEY_CONTENT: text_content})
-        elif title_tag in [SEGMENT_TITLE_INTRO, SEGMENT_TITLE_OUTRO]: # Using constants
-             processed_segments.append({KEY_SEGMENT_TITLE: title_tag, KEY_CONTENT: text_content})
-        elif not title_tag.endswith("_CONTENT"):
-            processed_segments.append({KEY_SEGMENT_TITLE: title_tag, KEY_CONTENT: text_content})
+                processed_segments.append({KEY_SEGMENT_TITLE: text_content, KEY_CONTENT: next_segment[KEY_CONTENT]}); i += 1
+            else: processed_segments.append({KEY_SEGMENT_TITLE: title_tag, KEY_CONTENT: text_content})
+        elif title_tag in [SEGMENT_TITLE_INTRO, SEGMENT_TITLE_OUTRO]: processed_segments.append({KEY_SEGMENT_TITLE: title_tag, KEY_CONTENT: text_content})
+        elif not title_tag.endswith("_CONTENT"): processed_segments.append({KEY_SEGMENT_TITLE: title_tag, KEY_CONTENT: text_content})
         i += 1
     parsed_script[KEY_SEGMENTS] = processed_segments
-
-    if (not parsed_script[KEY_TITLE] or parsed_script[KEY_TITLE] == f"Podcast on {topic}") and \
-       not any(s[KEY_SEGMENT_TITLE] == SEGMENT_TITLE_INTRO for s in parsed_script[KEY_SEGMENTS]):
+    if (not parsed_script[KEY_TITLE] or parsed_script[KEY_TITLE] == f"Podcast on {topic}") and not any(s[KEY_SEGMENT_TITLE] == SEGMENT_TITLE_INTRO for s in parsed_script[KEY_SEGMENTS]):
         logger.warning(f"[PSWA_PARSING_FALLBACK] Critical tags missing after fallback for topic '{topic}'. Output: '{raw_script_text[:200]}...'")
-
     return parsed_script
 
-
-def weave_script(content: str, topic: str) -> dict: # Return type changed to dict
-    """
-    Generates a podcast script using the configured LLM and parses it into a structured dict.
-    Implements caching logic to avoid redundant LLM calls.
-    Returns a dictionary, which will include an 'error' key if something went wrong,
-    or the structured script data on success (with a 'source' field indicating 'cache' or 'generation').
-    """
+# --- Main Script Weaving Logic ---
+def weave_script(content: str, topic: str) -> dict:
     logger.info(f"[PSWA_MAIN_LOGIC] weave_script called for topic: '{topic}'")
-    script_id_base = f"pswa_script_{uuid.uuid4().hex[:8]}" # Common base for script_id
+    script_id_base = f"pswa_script_{uuid.uuid4().hex[:8]}"
 
     if pswa_config.get('PSWA_TEST_MODE_ENABLED'):
+        # Test mode logic remains the same as it bypasses LLM calls
         scenario = request.headers.get('X-Test-Scenario', 'default')
         logger.info(f"[PSWA_MAIN_LOGIC] Test mode enabled. Scenario: '{scenario}' for topic '{topic}'.")
-
-        script_content_to_return = None
+        script_content_to_return = SCENARIO_DEFAULT_SCRIPT_CONTENT.copy()
         source_info = f"test_mode_scenario_{scenario}"
-
         if scenario == 'insufficient_content':
             script_content_to_return = SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT.copy()
             script_content_to_return[KEY_TITLE] = f"Error: Test Scenario Insufficient Content for topic: {topic}"
-            # Ensure the segments list itself is copied if it's going to be modified
             script_content_to_return[KEY_SEGMENTS] = [script_content_to_return[KEY_SEGMENTS][0].copy()]
             script_content_to_return[KEY_SEGMENTS][0][KEY_CONTENT] = f"[ERROR] Insufficient content for test topic: {topic}"
-            # This structure above is what the endpoint's 400 logic expects for insufficient content.
-            # The full_raw_script below should simulate what an LLM might have returned to lead to this.
         elif scenario == 'empty_segments':
             script_content_to_return = SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT.copy()
-        elif scenario == 'pswa_internal_error_valid_json':
-            script_content_to_return = {KEY_ERROR: "PSWA_UNEXPECTED_PROCESSING_ERROR", KEY_MESSAGE: "Test scenario: PSWA encountered an unexpected internal processing error, but returned valid JSON."}
-            source_info = "test_mode_scenario_pswa_internal_error_valid_json"
-        else: # Default scenario
-            script_content_to_return = SCENARIO_DEFAULT_SCRIPT_CONTENT.copy()
-            # Dynamically insert topic into default script for some relevance
+        else: # Default
             script_content_to_return[KEY_TITLE] = f"Test Mode: {topic}"
             if script_content_to_return.get(KEY_INTRO):
                  script_content_to_return[KEY_INTRO] = f"This is the intro for the test mode topic: {topic}."
-            source_info = "test_mode_scenario_default"
 
-
-        # Common structure for test mode scripts
-        final_test_script = {
-            "script_id": f"{script_id_base}_test_{scenario}",
-            "topic": topic,
-            "llm_model_used": "test-mode-model",
-            "source": source_info
-        }
-        # Merge the scenario-specific content.
-        # If it's an error structure, it will overwrite/set title/segments appropriately.
+        final_test_script = {"script_id": f"{script_id_base}_test_{scenario}", "topic": topic, "llm_model_used": "test-mode-model", "source": source_info}
         final_test_script.update(script_content_to_return)
-
-        # Ensure 'segments' key exists if not an error structure that omits it.
-        # For 'insufficient_content', SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT already defines KEY_SEGMENTS.
-        if KEY_ERROR not in final_test_script and KEY_SEGMENTS not in final_test_script and scenario != 'insufficient_content':
-            final_test_script[KEY_SEGMENTS] = []
-
-        # 'full_raw_script' should be the JSON string of the content itself for test mode.
-        # For insufficient_content, simulate what an LLM in JSON mode might return.
+        if KEY_SEGMENTS not in final_test_script: final_test_script[KEY_SEGMENTS] = []
         if scenario == 'insufficient_content':
-            raw_llm_error_sim = {
-                "error": "Insufficient content", # This matches KEY_ERROR used by parse_llm_script_output
-                "message": f"The provided content was not sufficient to generate a full podcast script for the topic: {topic}"
-            }
+            raw_llm_error_sim = {"error": "Insufficient content", "message": f"The provided content was not sufficient... topic: {topic}"}
             final_test_script["full_raw_script"] = json.dumps(raw_llm_error_sim)
         else:
             final_test_script["full_raw_script"] = json.dumps(script_content_to_return)
-
         return final_test_script
 
-    # Calculate hash for caching
     topic_hash = _calculate_content_hash(topic, content)
     logger.info(f"[PSWA_MAIN_LOGIC] Topic hash for caching: {topic_hash}")
-
-    # Cache lookup if enabled
     if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        cached_script = _get_cached_script(
-            pswa_config['SHARED_DATABASE_PATH'],
-            topic_hash,
-            pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS']
-        )
+        cached_script = _get_cached_script(pswa_config['SHARED_DATABASE_PATH'], topic_hash, pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'])
         if cached_script:
             logger.info(f"[PSWA_MAIN_LOGIC] Returning cached script for topic '{topic}', hash {topic_hash}")
-            # Ensure 'source' field is set, default to 'cache' if not present from DB (older entries)
-            if 'source' not in cached_script:
-                cached_script['source'] = "cache"
+            if 'source' not in cached_script: cached_script['source'] = "cache"
             return cached_script
-
-    # Proceed with LLM generation if no cache hit or caching disabled
-    logger.info(f"[PSWA_MAIN_LOGIC] No suitable cache entry found or caching disabled for topic '{topic}'. Proceeding with LLM generation.")
-
-    if not PSWA_IMPORTS_SUCCESSFUL:
-        error_msg = f"OpenAI library not available. Import error: {PSWA_MISSING_IMPORT_ERROR}"
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        return {
-            "error_code": "PSWA_IMPORT_ERROR",
-            "message": "PSWA dependency import error. OpenAI library not available.",
-            "details": error_msg,
-            "source": "error"
-        }
-
-    api_key = pswa_config.get("OPENAI_API_KEY")
-    if not api_key:
-        error_msg = "Error: OPENAI_API_KEY is not configured."
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        return {
-            "error_code": "PSWA_CONFIG_ERROR_API_KEY",
-            "message": "OpenAI API Key is not configured for PSWA.",
-            "details": error_msg,
-            "source": "error"
-        }
-    openai.api_key = api_key
+    logger.info(f"[PSWA_MAIN_LOGIC] No suitable cache entry or caching disabled for topic '{topic}'. Calling AIMS service.")
 
     current_topic = topic if topic else "an interesting subject"
     current_content = content if content else "No specific content was provided. Please generate a general script based on the topic."
-        
     user_prompt_template = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE')
     try:
         user_prompt = user_prompt_template.format(topic=current_topic, content=current_content)
     except KeyError as e:
-        logger.error(f"[PSWA_MAIN_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt structure.")
-        user_prompt = f"Topic: {current_topic}\nContent: {current_content}\n\nPlease generate a podcast script with [TITLE], [INTRO], [SEGMENT_1_TITLE], [SEGMENT_1_CONTENT], and [OUTRO]."
+        logger.error(f"[PSWA_MAIN_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt.")
+        user_prompt = f"Topic: {current_topic}\nContent: {current_content}\nPlease generate a podcast script."
 
     system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE')
-    llm_model = pswa_config.get('PSWA_LLM_MODEL')
-    temperature = pswa_config.get('PSWA_LLM_TEMPERATURE')
-    max_tokens = pswa_config.get('PSWA_LLM_MAX_TOKENS')
-    use_json_mode = pswa_config.get('PSWA_LLM_JSON_MODE', False) # Get from config
+    full_prompt_for_aims = f"{system_message}\n\nUser Request:\n{user_prompt}" # Combine for AIMS
 
-    openai_call_params = {
-        "model": llm_model,
-        "messages": [
-            {"role": "system", "content": system_message},
-            {"role": "user", "content": user_prompt}
-        ],
-        "temperature": temperature,
-        "max_tokens": max_tokens
+    aims_payload = {
+        "prompt": full_prompt_for_aims,
+        "model_id_override": pswa_config.get('PSWA_LLM_MODEL'),
+        "max_tokens": pswa_config.get('PSWA_LLM_MAX_TOKENS'),
+        "temperature": pswa_config.get('PSWA_LLM_TEMPERATURE'),
     }
+    if pswa_config.get('PSWA_LLM_JSON_MODE'):
+        aims_payload["response_format"] = {"type": "json_object"}
 
-    if use_json_mode:
-        # Basic check for models known to support JSON mode.
-        # More sophisticated checks or library version checks might be needed for robustness.
-        if "1106" in llm_model or "gpt-4" in llm_model or "turbo" in llm_model or "gpt-3.5-turbo-0125" in llm_model:
-            openai_call_params["response_format"] = {"type": "json_object"}
-            logger.info(f"[PSWA_MAIN_LOGIC] Attempting to use JSON mode with OpenAI model {llm_model}.")
-        else:
-            logger.warning(f"[PSWA_MAIN_LOGIC] PSWA_LLM_JSON_MODE is true, but model {llm_model} might not explicitly support it via API flag. Will rely on prompt for JSON structure.")
+    aims_url = pswa_config.get('AIMS_SERVICE_URL')
+    aims_timeout = pswa_config.get('AIMS_REQUEST_TIMEOUT_SECONDS')
 
-    logger.info(f"[PSWA_MAIN_LOGIC] Sending request to OpenAI API. Params: {json.dumps(openai_call_params)}")
-    raw_script_text = None
-    llm_model_used = llm_model
+    logger.info(f"[PSWA_MAIN_LOGIC] Sending request to AIMS Service. URL: {aims_url}, Payload: {json.dumps(aims_payload)}")
+    raw_script_text_from_aims = None
+    llm_model_reported_by_aims = pswa_config.get('PSWA_LLM_MODEL') # Default, will be updated
 
     try:
-        response = openai.ChatCompletion.create(**openai_call_params)
-        raw_script_text = response.choices[0].message['content'].strip()
-        llm_model_used = response.model
-        logger.info(f"[PSWA_MAIN_LOGIC] Successfully received script from OpenAI API (model: {llm_model_used}). Length: {len(raw_script_text)}")
+        response = requests.post(aims_url, json=aims_payload, timeout=aims_timeout)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
-        parsed_script = parse_llm_script_output(raw_script_text, current_topic) # This populates script_id
-        parsed_script["llm_model_used"] = llm_model_used
-        parsed_script["source"] = "generation"
+        aims_response_data = response.json()
 
-        # Save to cache if enabled and parsing was successful (not an error structure)
+        if not aims_response_data.get("choices") or not aims_response_data["choices"][0].get("text"):
+            error_msg = "AIMS service response missing expected 'choices[0].text' field."
+            logger.error(f"[PSWA_MAIN_LOGIC] {error_msg} Response: {aims_response_data}")
+            return {"error_code": "PSWA_AIMS_BAD_RESPONSE", "message": error_msg, "details": aims_response_data, "source": "error"}
+
+        raw_script_text_from_aims = aims_response_data["choices"][0]["text"].strip()
+        llm_model_reported_by_aims = aims_response_data.get("model_id", llm_model_reported_by_aims)
+        # Log usage if AIMS provides it, though PSWA doesn't directly use it now
+        if "usage" in aims_response_data:
+            logger.info(f"[PSWA_MAIN_LOGIC] AIMS reported usage: {aims_response_data['usage']}")
+
+        logger.info(f"[PSWA_MAIN_LOGIC] Successfully received script from AIMS (model: {llm_model_reported_by_aims}). Length: {len(raw_script_text_from_aims)}")
+
+        parsed_script = parse_llm_script_output(raw_script_text_from_aims, current_topic)
+        parsed_script["llm_model_used"] = llm_model_reported_by_aims # Store model reported by AIMS
+        parsed_script["source"] = "generation_via_aims"
+
         if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED') and not (parsed_script.get("segments") and parsed_script["segments"][0]["segment_title"] == "ERROR"):
-            _save_script_to_cache(
-                pswa_config['SHARED_DATABASE_PATH'],
-                parsed_script["script_id"], # Use the ID generated by parse_llm_script_output
-                topic_hash,
-                parsed_script, # Pass the full structured script
-                llm_model_used
-            )
+            _save_script_to_cache(pswa_config['SHARED_DATABASE_PATH'], parsed_script["script_id"], topic_hash, parsed_script, llm_model_reported_by_aims)
         return parsed_script
 
-    except openai.error.OpenAIError as e:
-        error_msg = f"OpenAI API Error: {type(e).__name__} - {str(e)}"
+    except requests.exceptions.Timeout as e_timeout:
+        error_msg = f"AIMS service request timed out after {aims_timeout}s: {str(e_timeout)}"
         logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        return {
-            "error_code": "PSWA_OPENAI_API_ERROR",
-            "message": "An error occurred with the OpenAI API call.",
-            "details": error_msg,
-            "raw_script_text_if_any": raw_script_text,
-            "source": "error"
-        }
+        return {"error_code": "PSWA_AIMS_TIMEOUT", "message": "Request to AIMS service timed out.", "details": error_msg, "source": "error"}
+    except requests.exceptions.HTTPError as e_http:
+        error_msg = f"AIMS service returned HTTP error {e_http.response.status_code}: {e_http.response.text}"
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
+        aims_error_details = e_http.response.text
+        try: aims_error_details = e_http.response.json() # If AIMS returns JSON error
+        except ValueError: pass
+        return {"error_code": "PSWA_AIMS_HTTP_ERROR", "message": f"AIMS service returned HTTP {e_http.response.status_code}.", "details": aims_error_details, "source": "error"}
+    except requests.exceptions.RequestException as e_req:
+        error_msg = f"Error calling AIMS service: {type(e_req).__name__} - {str(e_req)}"
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
+        return {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "Failed to communicate with AIMS service.", "details": error_msg, "source": "error"}
+    except json.JSONDecodeError as e_json: # If AIMS response is not JSON
+        error_msg = f"Could not decode JSON response from AIMS: {str(e_json)}. Response text: {response.text[:200] if 'response' in locals() else 'N/A'}"
+        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
+        return {"error_code": "PSWA_AIMS_BAD_RESPONSE_JSON", "message": "AIMS service response was not valid JSON.", "details": error_msg, "source": "error"}
     except Exception as e:
-        error_msg = f"An unexpected error occurred during LLM call: {type(e).__name__} - {str(e)}"
+        error_msg = f"An unexpected error occurred while interacting with AIMS: {type(e).__name__} - {str(e)}"
         logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}", exc_info=True)
-        return {
-            "error_code": "PSWA_UNEXPECTED_LLM_ERROR",
-            "message": "An unexpected error occurred during LLM interaction.",
-            "details": error_msg,
-            "raw_script_text_if_any": raw_script_text,
-            "source": "error"
-        }
+        return {"error_code": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "An unexpected error occurred while processing via AIMS.", "details": error_msg, "source": "error"}
 
-# --- Flask Endpoint ---
+
+# --- Flask Endpoint (remains largely the same, but error handling might adapt based on weave_script's new error_codes) ---
 @app.route('/weave_script', methods=['POST'])
 def handle_weave_script():
     logger.info("[PSWA_FLASK_ENDPOINT] Received request for /weave_script")
     data = request.get_json()
-
     if not data:
         logger.error("[PSWA_FLASK_ENDPOINT] No JSON payload received.")
-        return jsonify({
-            "error_code": "PSWA_INVALID_PAYLOAD",
-            "message": "Invalid or missing JSON payload.",
-            "details": "No JSON payload received."
-        }), 400
-
-    content = data.get(KEY_CONTENT)
-    topic = data.get(KEY_TOPIC) # Assuming 'topic' is the key used in request
-
+        return jsonify({"error_code": "PSWA_INVALID_PAYLOAD", "message": "Invalid or missing JSON payload.", "details": "No JSON payload received."}), 400
+    content = data.get(KEY_CONTENT); topic = data.get(KEY_TOPIC)
     if not content or not topic:
-        missing_params = []
-        if not content:
-            missing_params.append(KEY_CONTENT)
-        if not topic:
-            missing_params.append(KEY_TOPIC) # Assuming 'topic'
+        missing_params = [p for p, v in [(KEY_CONTENT, content), (KEY_TOPIC, topic)] if not v]
         logger.error(f"[PSWA_FLASK_ENDPOINT] Missing parameters: {', '.join(missing_params)}")
-        return jsonify({
-            "error_code": "PSWA_MISSING_PARAMETERS",
-            "message": "Content and topic are required.",
-            "details": f"Missing required parameters: {', '.join(missing_params)}"
-        }), 400
+        return jsonify({"error_code": "PSWA_MISSING_PARAMETERS", "message": "Content and topic are required.", "details": f"Missing required parameters: {', '.join(missing_params)}"}), 400
 
     logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script with topic: '{topic}'")
-    result_data = weave_script(content, topic) # This now returns a dictionary
+    result_data = weave_script(content, topic)
 
-    if "error_code" in result_data: # Changed from KEY_ERROR to "error_code"
+    if "error_code" in result_data:
         error_code = result_data.get("error_code")
-        # Use the message from weave_script if available, otherwise a generic one
         error_message = result_data.get("message", f"Error processing script for {topic}.")
         error_details = result_data.get("details", "No additional details provided.")
         logger.error(f"[PSWA_FLASK_ENDPOINT] Error from weave_script: {error_code} - {error_message} - {error_details}")
+        http_status_code = 500 # Default for internal/AIMS errors
+        if error_code == "PSWA_AIMS_TIMEOUT": http_status_code = 504 # Gateway Timeout
+        elif error_code == "PSWA_AIMS_HTTP_ERROR": # Could refine based on AIMS's actual status if available in details
+            if isinstance(error_details, dict) and error_details.get("status_code"): # Hypothetical if AIMS error includes original status
+                 pass # http_status_code = error_details.get("status_code")
+            else: # Generic for now
+                 http_status_code = 502 # Bad Gateway
+        elif error_code == "PSWA_AIMS_BAD_RESPONSE" or error_code == "PSWA_AIMS_BAD_RESPONSE_JSON":
+             http_status_code = 502 # Bad Gateway
+        return jsonify({"error_code": error_code, "message": error_message, "details": error_details}), http_status_code
 
-        # Determine appropriate HTTP status code based on error type
-        # For now, most errors from weave_script are 500 (internal issues)
-        http_status_code = 500
-        if error_code == "PSWA_CONFIG_ERROR_API_KEY":
-            http_status_code = 503 # Service Unavailable might be more apt if config is bad
-
-        return jsonify({
-            "error_code": error_code,
-            "message": error_message,
-            "details": error_details
-        }), http_status_code
-
-    # Special handling for LLM-indicated insufficient content error
-    # The parser now uses KEY_SEGMENT_TITLE and SEGMENT_TITLE_ERROR constants
     if result_data.get(KEY_SEGMENTS) and result_data[KEY_SEGMENTS][0][KEY_SEGMENT_TITLE] == SEGMENT_TITLE_ERROR:
-        # Check if the content of the error segment indicates insufficient content,
-        # using the message from the parsed script which might originate from the LLM.
         error_detail_from_script = result_data[KEY_SEGMENTS][0][KEY_CONTENT]
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] Insufficient content indicated by LLM for topic '{topic}'. Details: {error_detail_from_script}")
-        return jsonify({
-            "error_code": "PSWA_INSUFFICIENT_CONTENT",
-            "message": "Content provided was insufficient for script generation.",
-            "details": error_detail_from_script # This contains the LLM's message about insufficiency
-        }), 400
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] Insufficient content indicated by LLM (via AIMS) for topic '{topic}'. Details: {error_detail_from_script}")
+        return jsonify({"error_code": "PSWA_INSUFFICIENT_CONTENT", "message": "Content provided was insufficient for script generation (reported by LLM).", "details": error_detail_from_script }), 400
 
-    # Check if parsing itself failed to find critical elements, even if LLM call succeeded
     if not result_data.get(KEY_TITLE) or not any(s[KEY_SEGMENT_TITLE] == SEGMENT_TITLE_INTRO for s in result_data.get(KEY_SEGMENTS,[])):
-         logger.error(f"[PSWA_FLASK_ENDPOINT] Failed to parse essential script structure (TITLE/INTRO) from LLM output for topic '{topic}'.")
-         return jsonify({
-             "error_code": "PSWA_SCRIPT_PARSING_FAILURE",
-             "message": "Failed to parse essential script structure from LLM output.",
-             "details": "The LLM output did not conform to the expected script structure (e.g., missing title or intro).",
-             "raw_output_preview": result_data.get("full_raw_script","")[:200] + "..."
-         }), 500
+         logger.error(f"[PSWA_FLASK_ENDPOINT] Failed to parse essential script structure from AIMS output for topic '{topic}'.")
+         return jsonify({ "error_code": "PSWA_SCRIPT_PARSING_FAILURE", "message": "Failed to parse essential script structure from AIMS output.", "details": "The AIMS output did not conform to the expected script structure.", "raw_output_preview": result_data.get("full_raw_script","")[:200] + "..."}), 500
 
-
-    logger.info("[PSWA_FLASK_ENDPOINT] Successfully generated and structured script.")
-    # The main 'script_text' key is still useful for CPOA if it expects the full raw script.
-    # The structured version is now also available under 'structured_script'.
-    # For now, let's return the structured script as the primary payload.
-    # CPOA will need to be updated to expect this.
-    # For now, to maintain compatibility with CPOA expecting "script_text", we send that.
-    # The structured data can be added alongside.
-    # Decision: Send the raw script text in "script_text" and the new structure in "structured_script_details"
-
-    # Per requirements, the endpoint should return the structured script.
-    # CPOA will be updated to handle this structured response.
+    logger.info("[PSWA_FLASK_ENDPOINT] Successfully generated and structured script via AIMS.")
     return jsonify(result_data)
 
-
 if __name__ == "__main__":
-    # The original CLI test logic can be kept for direct script testing if needed,
-    # but the primary execution mode will now be the Flask app.
-
-    # Start Flask app using configured values
     host = pswa_config.get("PSWA_HOST", "0.0.0.0")
     port = pswa_config.get("PSWA_PORT", 5004)
     debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
-
-    print(f"\n--- PSWA LLM Service starting on {host}:{port} (Debug: {debug_mode}) ---")
-    # Check if API key is present before trying to run, as it's critical
-    if not pswa_config.get("OPENAI_API_KEY"):
-        print("CRITICAL ERROR: OPENAI_API_KEY is not set. The application will not function correctly.")
-        print("Please set the OPENAI_API_KEY environment variable.")
-        # Depending on desired behavior, could exit here:
-        # import sys
-        # sys.exit(1)
-
+    print(f"\n--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}) ---")
+    if not pswa_config.get("AIMS_SERVICE_URL"):
+        print("CRITICAL ERROR: AIMS_SERVICE_URL is not set. PSWA will not function.")
     app.run(host=host, port=port, debug=debug_mode)
-
-    # Original CLI test (can be commented out or removed if Flask is the sole interface)
-    # print("\n--- PSWA LLM Test (CLI - for direct script testing) ---")
-    # sample_topic = "The Impact of AI on Daily Life"
-    # sample_content = (
-    #     "Artificial intelligence is increasingly prevalent. From voice assistants like Siri and Alexa "
-    #     "to recommendation algorithms on Netflix and Spotify, AI shapes our interactions with technology. "
-    #     "It's also making inroads in healthcare for diagnostics and in transportation with self-driving car development."
-    # )
-    # print(f"Attempting to weave script for topic: '{sample_topic}'")
-
-    # # Check for import success
-    # if not PSWA_IMPORTS_SUCCESSFUL:
-    #      print(f"Cannot run weave_script: OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}")
-    # else:
-    #     # Check for API key to give user context if it will run
-    #     if os.getenv("OPENAI_API_KEY"):
-    #         print("OPENAI_API_KEY found, will attempt real API call.")
-    #     else:
-    #         print("OPENAI_API_KEY not found or empty. Expecting error message from weave_script.")
-        
-    #     generated_script = weave_script(sample_content, sample_topic)
-    #     print("\nGenerated Script or Error Message:")
-    #     print(generated_script)
-    
-    # # Test with empty content to see if LLM follows instruction
-    # print("\n--- PSWA LLM Test (Empty Content) ---")
-    # sample_topic_empty_content = "The Mysteries of the Deep Sea"
-    # sample_content_empty = "" # Or very minimal like "Not much is known."
-    
-    # print(f"Attempting to weave script for topic: '{sample_topic_empty_content}' with empty content.")
-    # if not PSWA_IMPORTS_SUCCESSFUL:
-    #      print(f"Cannot run weave_script: OpenAI library not available. {PSWA_MISSING_IMPORT_ERROR}")
-    # else:
-    #     if os.getenv("OPENAI_API_KEY"):
-    #         print("OPENAI_API_KEY found, will attempt real API call.")
-    #     else:
-    #         print("OPENAI_API_KEY not found or empty. Expecting error message from weave_script.")
-    #     generated_script_empty = weave_script(sample_content_empty, sample_topic_empty_content)
-    #     print("\nGenerated Script or Error Message (for empty content):")
-    #     print(generated_script_empty)
-        
-    # print("\n--- End PSWA LLM Test (CLI) ---")

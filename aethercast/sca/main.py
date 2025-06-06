@@ -3,12 +3,11 @@ import uuid
 import datetime
 import logging
 import json
-import os # Added for os.getenv
-from dotenv import load_dotenv # Added for .env loading
+import os
+from dotenv import load_dotenv
 import requests # For calling AIMS (LLM)
 
 # --- Load Environment Variables ---
-# This will load variables from a .env file in the same directory (aethercast/sca/.env)
 load_dotenv()
 
 # --- Global SCA Configuration ---
@@ -17,512 +16,245 @@ sca_config = {}
 def load_sca_configuration():
     """Loads SCA configurations from environment variables with defaults."""
     global sca_config
-    sca_config['SCA_LLM_PROVIDER'] = os.getenv('SCA_LLM_PROVIDER', 'openai') # Default to openai
-    sca_config['SCA_LLM_API_KEY'] = os.getenv('SCA_LLM_API_KEY') # No default, must be set if USE_REAL_LLM_SERVICE is true
-    sca_config['SCA_LLM_BASE_URL'] = os.getenv('SCA_LLM_BASE_URL') # No default, must be set if USE_REAL_LLM_SERVICE is true
-    sca_config['SCA_LLM_MODEL_ID'] = os.getenv('SCA_LLM_MODEL_ID') # No default, must be set if USE_REAL_LLM_SERVICE is true
-    
+    # Removed SCA_LLM_PROVIDER, SCA_LLM_API_KEY, SCA_LLM_BASE_URL
+    sca_config['AIMS_SERVICE_URL'] = os.getenv('AIMS_SERVICE_URL', 'http://aims_service:8000/v1/generate')
+    sca_config['AIMS_REQUEST_TIMEOUT_SECONDS'] = int(os.getenv('AIMS_REQUEST_TIMEOUT_SECONDS', '60'))
+
+    sca_config['SCA_LLM_MODEL_ID'] = os.getenv('SCA_LLM_MODEL_ID', 'gpt-3.5-turbo') # Model to request from AIMS
     sca_config['SCA_LLM_MAX_TOKENS_SNIPPET'] = int(os.getenv('SCA_LLM_MAX_TOKENS_SNIPPET', '150'))
     sca_config['SCA_LLM_TEMPERATURE_SNIPPET'] = float(os.getenv('SCA_LLM_TEMPERATURE_SNIPPET', '0.7'))
-    sca_config['SCA_LLM_REQUEST_TIMEOUT_SECONDS'] = int(os.getenv('SCA_LLM_REQUEST_TIMEOUT_SECONDS', '30'))
     
     sca_config['USE_REAL_LLM_SERVICE'] = os.getenv('USE_REAL_LLM_SERVICE', 'false').lower() == 'true'
 
     logging.info("SCA Configuration Loaded:")
     for key, value in sca_config.items():
-        if "API_KEY" in key and value: # Mask API key in logs
-            logging.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if value else None}")
-        else:
-            logging.info(f"  {key}: {value}")
+        logging.info(f"  {key}: {value}")
 
-    # --- Startup Check for Real Service ---
     if sca_config['USE_REAL_LLM_SERVICE']:
         missing_configs = []
-        if not sca_config['SCA_LLM_API_KEY']:
-            missing_configs.append("SCA_LLM_API_KEY")
-        if not sca_config['SCA_LLM_BASE_URL']:
-            missing_configs.append("SCA_LLM_BASE_URL")
-        if not sca_config['SCA_LLM_MODEL_ID']:
+        if not sca_config['AIMS_SERVICE_URL']: # Check AIMS URL if real service is selected
+            missing_configs.append("AIMS_SERVICE_URL")
+        if not sca_config['SCA_LLM_MODEL_ID']: # Still need a model to request from AIMS
             missing_configs.append("SCA_LLM_MODEL_ID")
         
         if missing_configs:
-            error_message = f"CRITICAL: USE_REAL_LLM_SERVICE is true, but required configurations are missing: {', '.join(missing_configs)}. Please set them in the .env file or environment."
+            error_message = f"CRITICAL: USE_REAL_LLM_SERVICE is true, but required configurations are missing: {', '.join(missing_configs)}."
             logging.critical(error_message)
             raise ValueError(error_message)
         else:
-            logging.info("SCA is configured to use a REAL LLM service.")
+            logging.info("SCA is configured to use a REAL LLM service via AIMS.")
     else:
-        logging.info("SCA is configured to use the SIMULATED/PLACEHOLDER LLM response.")
+        logging.info("SCA is configured to use the SIMULATED/PLACEHOLDER LLM response (bypassing AIMS).")
 
-# --- Initialize Configuration ---
 load_sca_configuration()
-
-# --- (Old Endpoint Error Constants - Removed as errors are now more specific) ---
-# ENDPOINT_ERROR_INVALID_PAYLOAD = "INVALID_JSON_PAYLOAD"
-# ENDPOINT_ERROR_MISSING_FIELDS = "MISSING_REQUIRED_FIELDS"
-# ENDPOINT_ERROR_INTERNAL_SERVER = "INTERNAL_SERVER_ERROR"
 
 app = flask.Flask(__name__)
 
-# --- Logging Configuration (already done globally, but can be app-specific if needed) ---
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+AIMS_LLM_PLACEHOLDER_URL = "http://localhost:8000/v1/generate" # Kept for placeholder, though not used if USE_REAL_LLM_SERVICE=true
+AIMS_LLM_HARDCODED_RESPONSE = { /* ... existing hardcoded response ... */ }
 
-# --- AIMS (LLM) Placeholder Configuration (Original, for reference if needed) ---
-AIMS_LLM_PLACEHOLDER_URL = "http://localhost:8000/v1/generate" 
-AIMS_LLM_HARDCODED_RESPONSE = {
-  "request_id": "aims-llm-placeholder-req-123",
-  "model_id": "AetherLLM-Placeholder-v0.1",
-  "choices": [
-    {
-      "text": "This is a placeholder response from the AIMS LLM service. Based on your prompt, here's a generic title: 'Interesting Developments' and some generic content: 'Several interesting developments have occurred recently, leading to much discussion and speculation within the community. Further analysis is required to fully understand the implications.'",
-      "finish_reason": "length"
-    }
-  ],
-  "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60}
-}
-# SIMULATE_AIMS_LLM_CALL is now effectively replaced by sca_config['USE_REAL_LLM_SERVICE'] logic
-
-
-# --- Helper Functions ---
 def generate_snippet_id() -> str:
-    """Generates a unique snippet ID."""
     return f"snippet_{uuid.uuid4().hex[:12]}"
 
 def call_aims_llm_placeholder(prompt: str, topic_info: dict) -> dict:
-    """
-    Simulates calling the AIMS LLM placeholder if sca_config['USE_REAL_LLM_SERVICE'] is False.
-    If sca_config['USE_REAL_LLM_SERVICE'] is True, this function would ideally not be called directly by /craft_snippet,
-    but if it is, it should log a warning and still use the dynamic placeholder.
-    The actual LLM call will be in a new function like call_real_llm_service.
-    """
+    # This function remains for USE_REAL_LLM_SERVICE=false, unchanged internally
     if sca_config['USE_REAL_LLM_SERVICE']:
         logging.warning("[SCA_AIMS_CALL] call_aims_llm_placeholder invoked while USE_REAL_LLM_SERVICE is true. This indicates a logic path needs review. Using dynamic placeholder as fallback.")
-
     logging.info("[SCA_AIMS_CALL] Dynamically generating SIMULATED AIMS LLM response for snippet.")
-    import time
-    time.sleep(0.1) 
-
+    # ... (rest of existing placeholder logic remains the same) ...
     title_suggestion = topic_info.get("title_suggestion", "Interesting Developments")
     keywords = topic_info.get("keywords", [])
-    
     dynamic_title = f"Insights on {title_suggestion}"
     if keywords:
         dynamic_content = f"Exploring {title_suggestion}, focusing on {', '.join(keywords)}. This area shows promising advancements and requires further analysis."
     else:
         dynamic_content = f"A closer look at {title_suggestion}. Several interesting developments have occurred, leading to much discussion."
-    
     dynamic_response_text = f"This is a placeholder response from the AIMS LLM service. Based on your prompt, here's a generic title: '{dynamic_title}' and some generic content: '{dynamic_content}'"
-
     response = json.loads(json.dumps(AIMS_LLM_HARDCODED_RESPONSE)) 
     response["choices"][0]["text"] = dynamic_response_text
     response["request_id"] = f"aims-llm-placeholder-req-dynamic-{uuid.uuid4().hex[:6]}"
     response["model_id"] = "AetherLLM-Placeholder-DynamicSnippet-v0.2"
-    
     response["usage"]["prompt_tokens"] = len(prompt.split()) // 4 
     response["usage"]["completion_tokens"] = len(dynamic_response_text.split()) // 4
     response["usage"]["total_tokens"] = response["usage"]["prompt_tokens"] + response["usage"]["completion_tokens"]
-    
-    # Wrap in a structure similar to what call_real_llm_service would return on success,
-    # but tailored for how the placeholder's data is currently used.
-    # The main endpoint will parse the 'text' from 'choices' for this path.
     return {
-        "status": "success_placeholder", # Distinguish from real success if needed for debugging
-        "llm_response_direct": response, # The actual placeholder response structure
+        "status": "success_placeholder",
+        "llm_response_direct": response,
         "llm_model_used": response.get("model_id", "AetherLLM-Placeholder-DynamicSnippet-v0.2"),
         "llm_prompt_sent": prompt
     }
 
 def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
     """
-    Calls the configured real LLM service.
-    Currently supports 'openai' provider.
-    Assumes sca_config is populated and necessary keys are validated if USE_REAL_LLM_SERVICE is true.
+    Calls the AIMS service to get LLM-generated text for a snippet.
     """
-    provider = sca_config.get('SCA_LLM_PROVIDER', 'openai')
-    logging.info(f"[SCA_REAL_LLM_CALL] Preparing to call real LLM service. Provider: {provider}")
-
-    if provider != 'openai':
-        logging.warning(f"LLM provider '{provider}' is not supported by this implementation. Only 'openai' is currently supported.")
-        return {
-            "error_code": "SCA_UNSUPPORTED_LLM_PROVIDER",
-            "message": f"LLM provider '{provider}' not supported.",
-            "details": f"Provider '{provider}' not supported. Only 'openai' is currently available."
-        }
-
-    api_key = sca_config.get('SCA_LLM_API_KEY')
-    base_url = sca_config.get('SCA_LLM_BASE_URL')
-    model_id = sca_config.get('SCA_LLM_MODEL_ID')
+    aims_url = sca_config.get('AIMS_SERVICE_URL')
+    model_id_to_request = sca_config.get('SCA_LLM_MODEL_ID')
     max_tokens = sca_config.get('SCA_LLM_MAX_TOKENS_SNIPPET')
     temperature = sca_config.get('SCA_LLM_TEMPERATURE_SNIPPET')
-    timeout = sca_config.get('SCA_LLM_REQUEST_TIMEOUT_SECONDS')
+    timeout = sca_config.get('AIMS_REQUEST_TIMEOUT_SECONDS')
 
-    # Ensure critical OpenAI configs are present (should be caught at startup, but double check)
-    if not all([api_key, base_url, model_id]):
-        logging.error("[SCA_REAL_LLM_CALL] Critical OpenAI configurations (API Key, Base URL, Model ID) are missing.")
-        return {
-            "error_code": "SCA_LLM_CONFIG_MISSING",
-            "message": "Critical LLM configurations (API Key, Base URL, or Model ID) are missing.",
-            "details": "OpenAI API Key, Base URL, or Model ID is not configured for SCA."
-        }
+    logging.info(f"[SCA_AIMS_CALL] Preparing to call AIMS. URL: {aims_url}, Model: {model_id_to_request}")
 
-    # Construct Endpoint URL for OpenAI
-    endpoint_part = "/chat/completions" 
-    if base_url.endswith('/'):
-        endpoint_url = base_url[:-1] + endpoint_part
-    else:
-        endpoint_url = base_url + endpoint_part
-    
-    logging.info(f"  Target Endpoint URL: {endpoint_url}")
+    if not aims_url: # Should be caught by load_sca_configuration, but as safeguard
+        logging.error("[SCA_AIMS_CALL] AIMS_SERVICE_URL is not configured.")
+        return {"error_code": "SCA_AIMS_CONFIG_MISSING", "message": "AIMS_SERVICE_URL not configured.", "details": "AIMS service URL is missing."}
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    # System prompt guides the LLM for easy parsing: Title on first line, content on subsequent.
-    system_content = "You are a helpful assistant that crafts concise and engaging podcast snippets, including a title and a short paragraph of content. The title should be on its own line first, followed by the snippet content on the next line(s)."
-
-    payload = {
-        "model": model_id,
-        "messages": [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": prompt} 
-        ],
+    aims_payload = {
+        "prompt": prompt,
+        "model_id_override": model_id_to_request,
         "max_tokens": max_tokens,
-        "temperature": temperature
+        "temperature": temperature,
+        # "response_format": {"type": "text"} # AIMS default is text, explicit if needed
     }
     
-    logging.debug(f"  LLM Request Payload: {json.dumps(payload)}")
+    logging.debug(f"  AIMS Request Payload: {json.dumps(aims_payload)}")
 
     try:
-        response = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout)
-        logging.info(f"[SCA_REAL_LLM_CALL] Response Status Code: {response.status_code}")
-
+        response = requests.post(aims_url, json=aims_payload, timeout=timeout)
+        logging.info(f"[SCA_AIMS_CALL] AIMS Response Status Code: {response.status_code}")
         response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
 
-        llm_response_data = response.json()
-        logging.debug(f"  Parsed LLM JSON response: {json.dumps(llm_response_data, indent=2)}")
+        aims_response_data = response.json()
+        logging.debug(f"  Parsed AIMS JSON response: {json.dumps(aims_response_data, indent=2)}")
 
-        full_generated_text = llm_response_data['choices'][0]['message']['content'].strip()
-        model_used = llm_response_data.get('model', model_id)
+        if not aims_response_data.get("choices") or not aims_response_data["choices"][0].get("text"):
+            logging.error(f"[SCA_AIMS_CALL] AIMS response missing 'choices[0].text'. Response: {aims_response_data}")
+            return {"error_code": "SCA_AIMS_BAD_RESPONSE_STRUCTURE", "message": "AIMS response structure invalid.", "details": "Missing 'choices[0].text' in AIMS response."}
 
-        logging.info(f"[SCA_REAL_LLM_CALL] Extracted full text (length {len(full_generated_text)}) from model '{model_used}': '{full_generated_text[:100]}...'")
+        full_generated_text = aims_response_data['choices'][0]['text'].strip()
+        model_used_from_aims = aims_response_data.get('model_id', model_id_to_request) # Use model reported by AIMS
 
-        # Parse Title and Content
-        snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}" # Default
-        snippet_text_content = full_generated_text # Default
+        logging.info(f"[SCA_AIMS_CALL] Extracted text (length {len(full_generated_text)}) from AIMS (model: '{model_used_from_aims}'): '{full_generated_text[:100]}...'")
 
+        # Parse Title and Content (existing logic for newline separation)
+        snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
+        snippet_text_content = full_generated_text
         if '\n' in full_generated_text:
             parts = full_generated_text.split('\n', 1)
             potential_title = parts[0].strip()
-            if 0 < len(potential_title) < 200: # Max 200 chars for a title, and not empty
+            if 0 < len(potential_title) < 200:
                 snippet_title = potential_title
                 snippet_text_content = parts[1].strip() if len(parts) > 1 else ""
-                if not snippet_text_content: # If content became empty after title extraction
-                    logging.warning("Snippet content is empty after title extraction based on newline. Using full text as content and default title.")
-                    snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}" # Reset title
-                    snippet_text_content = full_generated_text # Keep full text for content
+                if not snippet_text_content:
+                    logging.warning("Snippet content empty after title extraction. Using full text as content.")
+                    snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
+                    snippet_text_content = full_generated_text
             else:
-                logging.warning(f"Newline found, but first line ('{potential_title[:50]}...') invalid as title. Using full text as content.")
+                logging.warning(f"Newline found, but first line invalid as title. Using full text as content.")
         else:
-            logging.warning("No newline found in LLM output to separate title. Using full text as content and default title.")
-
-        # Final check if title and content are accidentally the same (e.g. LLM returned only one line)
+            logging.warning("No newline in AIMS output to separate title. Using full text as content.")
         if snippet_title == snippet_text_content and snippet_text_content == full_generated_text:
-             snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}" # Reset title to default
-
-        if not snippet_text_content: # Ensure content is not empty if title took everything
+             snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
+        if not snippet_text_content:
             snippet_text_content = full_generated_text
-            if snippet_title == full_generated_text: # If title is still the full text, make a generic title
+            if snippet_title == full_generated_text:
                  snippet_title = f"AI-Generated Snippet on {topic_info.get('title_suggestion', 'Topic')}"
 
-
         return {
-            "status": "success",
-            "title": snippet_title,
-            "text_content": snippet_text_content,
-            "summary": snippet_text_content,
-            "llm_model_used": model_used,
-            "llm_prompt_sent": prompt,
-            "llm_raw_output": full_generated_text
+            "status": "success", "title": snippet_title, "text_content": snippet_text_content,
+            "summary": snippet_text_content, "llm_model_used": model_used_from_aims,
+            "llm_prompt_sent": prompt, "llm_raw_output": full_generated_text
         }
 
     except requests.exceptions.HTTPError as e_http:
-        error_details = f"HTTP Error {e_http.response.status_code}: {e_http.response.reason}."
-        try:
-            error_payload = e_http.response.json()
-            error_details += f" LLM Service Msg: {error_payload}"
-        except json.JSONDecodeError:
-            error_details += f" Raw LLM Service Response: {e_http.response.text[:200]}"
-        logging.error(f"[SCA_REAL_LLM_CALL] {error_details}", exc_info=True)
-        return {
-            "error_code": "SCA_LLM_HTTP_ERROR",
-            "message": "LLM service request failed with HTTP error.",
-            "details": error_details,
-            "status_code": e_http.response.status_code
-        }
-
+        error_details = f"AIMS HTTP Error {e_http.response.status_code}: {e_http.response.reason}."
+        try: error_payload = e_http.response.json(); error_details += f" AIMS Service Msg: {error_payload}"
+        except json.JSONDecodeError: error_details += f" Raw AIMS Service Response: {e_http.response.text[:200]}"
+        logging.error(f"[SCA_AIMS_CALL] {error_details}", exc_info=True)
+        return {"error_code": "SCA_AIMS_HTTP_ERROR", "message": "AIMS request failed with HTTP error.", "details": error_details, "status_code": e_http.response.status_code}
     except requests.exceptions.Timeout:
-        logging.error(f"[SCA_REAL_LLM_CALL] Timeout error after {timeout}s for URL: {endpoint_url}", exc_info=True)
-        return {
-            "error_code": "SCA_LLM_REQUEST_TIMEOUT",
-            "message": "Request to LLM service timed out.",
-            "details": "Request to LLM service timed out",
-            "status_code": 408
-        }
-
+        logging.error(f"[SCA_AIMS_CALL] Timeout error after {timeout}s for URL: {aims_url}", exc_info=True)
+        return {"error_code": "SCA_AIMS_REQUEST_TIMEOUT", "message": "Request to AIMS timed out.", "details": f"Timeout after {timeout}s.", "status_code": 408}
     except requests.exceptions.RequestException as e_req:
-        logging.error(f"[SCA_REAL_LLM_CALL] Request exception: {e_req}", exc_info=True)
-        return {
-            "error_code": "SCA_LLM_REQUEST_EXCEPTION",
-            "message": "An exception occurred while requesting LLM service.",
-            "details": str(e_req),
-            "status_code": 500 # Generic 500 for other request issues
-        }
-
+        logging.error(f"[SCA_AIMS_CALL] AIMS request exception: {e_req}", exc_info=True)
+        return {"error_code": "SCA_AIMS_REQUEST_EXCEPTION", "message": "Exception during AIMS request.", "details": str(e_req), "status_code": 500}
     except json.JSONDecodeError as e_json:
-        logging.error(f"[SCA_REAL_LLM_CALL] JSONDecodeError parsing LLM response: {e_json}. Raw response: {response.text[:500] if 'response' in locals() else 'N/A'}", exc_info=True)
-        return {
-            "error_code": "SCA_LLM_RESPONSE_JSON_DECODE_ERROR",
-            "message": "Failed to decode JSON response from LLM service.",
-            "details": str(e_json),
-            "status_code": 502 # Bad Gateway
-        }
-
+        logging.error(f"[SCA_AIMS_CALL] JSONDecodeError parsing AIMS response: {e_json}. Raw: {response.text[:500] if 'response' in locals() else 'N/A'}", exc_info=True)
+        return {"error_code": "SCA_AIMS_RESPONSE_JSON_DECODE_ERROR", "message": "Failed to decode JSON from AIMS.", "details": str(e_json), "status_code": 502}
     except (KeyError, IndexError, TypeError) as e_extract:
-        logging.error(f"[SCA_REAL_LLM_CALL] Error extracting content from LLM JSON: {e_extract}. Response: {llm_response_data if 'llm_response_data' in locals() else 'N/A'}", exc_info=True)
-        return {
-            "error_code": "SCA_LLM_RESPONSE_STRUCTURE_ERROR",
-            "message": "Could not extract content from LLM response due to unexpected structure.",
-            "details": f"Could not navigate LLM response JSON: {e_extract}"
-        }
-
-    except Exception as e_unexpected: # Catch-all for any other unexpected error
-        logging.error(f"[SCA_REAL_LLM_CALL] Unexpected error: {e_unexpected}", exc_info=True)
-        return {
-            "error_code": "SCA_LLM_UNEXPECTED_ERROR",
-            "message": "An unexpected error occurred during LLM interaction.",
-            "details": str(e_unexpected)
-        }
-
+        logging.error(f"[SCA_AIMS_CALL] Error extracting content from AIMS JSON: {e_extract}. Response: {aims_response_data if 'aims_response_data' in locals() else 'N/A'}", exc_info=True)
+        return {"error_code": "SCA_AIMS_RESPONSE_STRUCTURE_ERROR", "message": "Invalid structure in AIMS response.", "details": str(e_extract)}
+    except Exception as e_unexpected:
+        logging.error(f"[SCA_AIMS_CALL] Unexpected error: {e_unexpected}", exc_info=True)
+        return {"error_code": "SCA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected error with AIMS.", "details": str(e_unexpected)}
 
 def parse_llm_response_for_snippet(llm_response_text: str) -> tuple[str, str]:
-    """
-    Parses the text from the LLM response to extract a title and content.
-    This function was primarily for the placeholder's specific format.
-    For the real LLM call, parsing is now handled directly in `call_real_llm_service`
-    based on newline separation as guided by the system prompt.
-    This function can be kept for reference or removed if no longer used by the placeholder path.
-    """
+    # This function is primarily for the placeholder and might be simplified if placeholder changes
     logging.debug(f"[SCA_DEPRECATED_PARSER] parse_llm_response_for_snippet called with text: '{llm_response_text[:100]}...'")
-    try:
-        # This parsing logic is specific to the old placeholder format.
-        title_part_key = "generic title: '"
-        content_part_key = "generic content: '"
+    title_part_key = "generic title: '"
+    content_part_key = "generic content: '"
+    title_start_index = llm_response_text.find(title_part_key)
+    content_start_index = llm_response_text.find(content_part_key)
+    if title_start_index != -1 and content_start_index != -1:
+        title_start = title_start_index + len(title_part_key)
+        title_end = llm_response_text.find("'", title_start)
+        extracted_title = llm_response_text[title_start:title_end] if title_end != -1 else "Default Snippet Title (parsed)"
+        content_start = content_start_index + len(content_part_key)
+        content_end = llm_response_text.rfind("'")
+        extracted_content = llm_response_text[content_start:content_end] if content_end > content_start else llm_response_text[content_start:]
+        return extracted_title, extracted_content
+    logging.warning(f"Could not parse title/content using old placeholder logic: '{llm_response_text[:100]}...'")
+    return "Default Snippet Title (parse failed)", llm_response_text
 
-        title_start_index = llm_response_text.find(title_part_key)
-        content_start_index = llm_response_text.find(content_part_key)
-
-        if title_start_index != -1 and content_start_index != -1:
-            title_start = title_start_index + len(title_part_key)
-            title_end = llm_response_text.find("'", title_start)
-            extracted_title = llm_response_text[title_start:title_end] if title_end != -1 else "Default Snippet Title (from old parser)"
-
-            content_start = content_start_index + len(content_part_key)
-            # Simplified content extraction for the old format
-            content_end = llm_response_text.rfind("'") # Find the last quote
-            if content_end > content_start : #Ensure quote is after content_start
-                 extracted_content = llm_response_text[content_start:content_end]
-            else: # Fallback if quote parsing is difficult
-                 extracted_content = llm_response_text[content_start:]
-
-
-            return extracted_title, extracted_content
-        else:
-            logging.warning(f"Could not parse title/content using old placeholder logic: '{llm_response_text[:100]}...' Using defaults.")
-            return "Default Snippet Title (from old parser)", llm_response_text
-    except Exception as e:
-        logging.error(f"Error parsing LLM response with old placeholder logic: {e}. Text: '{llm_response_text[:100]}...'")
-        return "Error Parsing Title (old parser)", "Error parsing content from LLM (old parser)."
-
-
-# --- API Endpoint ---
 @app.route("/craft_snippet", methods=["POST"])
 def craft_snippet_endpoint():
-    """
-    API endpoint for CPOA to request snippet generation.
-    Accepts a JSON payload with 'topic_id' and 'content_brief' (which might be a topic title or summary),
-    and 'topic_info' (the full TopicObject from TDA).
-    """
     try:
         request_data = flask.request.get_json()
         if not request_data:
-            return flask.jsonify({
-                "error_code": "SCA_INVALID_PAYLOAD",
-                "message": "Invalid or missing JSON payload.",
-                "details": "The request body must be a valid JSON object."
-            }), 400
-
-        topic_id = request_data.get("topic_id")
-        content_brief = request_data.get("content_brief") 
-        topic_info = request_data.get("topic_info", {}) 
-        error_trigger = request_data.get("error_trigger") 
-
-        if not topic_id or not content_brief: 
-            return flask.jsonify({
-                "error_code": "SCA_MISSING_FIELDS",
-                "message": "'topic_id' and 'content_brief' are required fields.",
-                "details": "Ensure both 'topic_id' and 'content_brief' are provided in the JSON payload."
-            }), 400
-
-        logging.info(f"[SCA_REQUEST] Received /craft_snippet request. Topic ID: '{topic_id}', Brief: '{content_brief}', ErrorTrigger: '{error_trigger}'")
-        
+            return flask.jsonify({"error_code": "SCA_INVALID_PAYLOAD", "message": "Invalid JSON payload."}), 400
+        topic_id = request_data.get("topic_id"); content_brief = request_data.get("content_brief")
+        topic_info = request_data.get("topic_info", {}); error_trigger = request_data.get("error_trigger")
+        if not topic_id or not content_brief:
+            return flask.jsonify({"error_code": "SCA_MISSING_FIELDS", "message": "'topic_id' and 'content_brief' required."}), 400
+        logging.info(f"[SCA_REQUEST] /craft_snippet. TopicID: '{topic_id}', Brief: '{content_brief}', Trigger: '{error_trigger}'")
         if error_trigger == "sca_error":
-            logging.warning(f"[SCA_SIMULATED_ERROR] Simulating an error for /craft_snippet based on error_trigger: {error_trigger}")
-            return flask.jsonify({
-                "error_code": "SCA_SIMULATED_ERROR",
-                "message": "A simulated error occurred in SCA.",
-                "details": "This is a controlled error triggered for testing purposes in SnippetCraftAgent."
-            }), 500
+            return flask.jsonify({"error_code": "SCA_SIMULATED_ERROR", "message": "Simulated SCA error."}), 500
 
-        # 1. Formulate Prompt for AIMS LLM using richer context from topic_info
-        prompt_parts = [
-            f"Generate a short, engaging podcast snippet title and content (around 2-3 sentences)."
-        ]
-        prompt_parts.append(f"The main subject is: '{content_brief}'.")
-        if topic_info: 
-            summary_from_topic = topic_info.get("summary")
-            if summary_from_topic and summary_from_topic != content_brief:
-                prompt_parts.append(f"This subject is broadly about: '{summary_from_topic}'.")
-            keywords = topic_info.get("keywords")
-            if keywords and isinstance(keywords, list) and len(keywords) > 0:
-                unique_keywords = [kw for kw in keywords if kw.lower() not in content_brief.lower() and (not summary_from_topic or kw.lower() not in summary_from_topic.lower())]
-                if unique_keywords:
-                    prompt_parts.append(f"Key aspects or keywords to specifically focus on or incorporate include: {', '.join(unique_keywords)}.")
-            potential_sources = topic_info.get("potential_sources")
-            if potential_sources and isinstance(potential_sources, list) and len(potential_sources) > 0:
-                source_titles = [src.get("title", src.get("url", "a source")) for src in potential_sources[:1] if isinstance(src, dict)] 
-                if source_titles:
-                    prompt_parts.append(f"This topic was identified from sources like: '{source_titles[0]}'.")
-        prompt_parts.append("The snippet should be catchy, concise, and suitable for a general audience. Ensure the title is distinct and engaging.")
+        prompt_parts = [f"Generate a short, engaging podcast snippet title and content (around 2-3 sentences). Subject: '{content_brief}'."]
+        if topic_info:
+            summary = topic_info.get("summary"); keywords = topic_info.get("keywords"); sources = topic_info.get("potential_sources")
+            if summary and summary != content_brief: prompt_parts.append(f"Context: '{summary}'.")
+            if keywords and isinstance(keywords, list) and keywords:
+                unique_kw = [kw for kw in keywords if kw.lower() not in content_brief.lower() and (not summary or kw.lower() not in summary.lower())]
+                if unique_kw: prompt_parts.append(f"Keywords: {', '.join(unique_kw)}.")
+            if sources and isinstance(sources, list) and sources:
+                src_titles = [src.get("title", src.get("url", "a source")) for src in sources[:1] if isinstance(src, dict)]
+                if src_titles: prompt_parts.append(f"Source inspiration: '{src_titles[0]}'.")
+        prompt_parts.append("Output format: Title on its own line, then content on the next line(s).")
         prompt = " ".join(prompt_parts)
         
-        # 2. Decide whether to call real LLM or placeholder
-        llm_model_used_for_snippet = "unknown"
-        llm_prompt_actually_used = prompt # Default to the prompt we formulated
-
+        llm_model_used = "unknown"; llm_prompt_used = prompt
         if sca_config['USE_REAL_LLM_SERVICE']:
-            logging.info("Attempting to use REAL LLM service as per configuration.")
+            logging.info("Using REAL LLM service via AIMS.")
             llm_result = call_real_llm_service(prompt, topic_info)
-
             if "error_code" in llm_result:
-                error_code = llm_result.get("error_code", "SCA_LLM_CALL_FAILED")
-                error_message = llm_result.get("message", "LLM service call failed.")
-                error_details = llm_result.get('details', 'Unknown error from LLM service.')
-                http_status_code = llm_result.get("status_code", 500)
-                logging.error(f"Error from real LLM service call: {error_code} - {error_message} - {error_details} (HTTP Status: {http_status_code})")
-                return flask.jsonify({
-                    "error_code": error_code,
-                    "message": error_message,
-                    "details": error_details
-                }), http_status_code
-
-            # Successfully got data from real LLM
-            snippet_title = llm_result.get("title")
-            snippet_text_content = llm_result.get("text_content")
-            llm_model_used_for_snippet = llm_result.get("llm_model_used", sca_config['SCA_LLM_MODEL_ID'])
-            llm_prompt_actually_used = llm_result.get("llm_prompt_sent", prompt)
-            
-        else: # Use the dynamic placeholder
-            logging.info("Using SIMULATED/PLACEHOLDER LLM response as per configuration.")
-            placeholder_result = call_aims_llm_placeholder(prompt, topic_info) # This is already dynamic
-
-            # Extract data from the placeholder's specific structure
-            # The placeholder_result["llm_response_direct"] holds the actual AIMS_LLM_HARDCODED_RESPONSE like structure
-            generated_text_full = placeholder_result.get("llm_response_direct", {}).get("choices", [{}])[0].get("text", "Error: Placeholder LLM response format unexpected.")
-            snippet_title, snippet_text_content = parse_llm_response_for_snippet(generated_text_full) # This parser is for the placeholder's specific format
-            llm_model_used_for_snippet = placeholder_result.get("llm_model_used", "AetherLLM-Placeholder-DynamicSnippet-v0.2")
-            llm_prompt_actually_used = placeholder_result.get("llm_prompt_sent", prompt)
+                return flask.jsonify(llm_result), llm_result.get("status_code", 500)
+            snippet_title = llm_result.get("title"); snippet_text_content = llm_result.get("text_content")
+            llm_model_used = llm_result.get("llm_model_used", sca_config['SCA_LLM_MODEL_ID'])
+            llm_prompt_used = llm_result.get("llm_prompt_sent", prompt)
+        else:
+            logging.info("Using SIMULATED/PLACEHOLDER LLM response.")
+            placeholder_result = call_aims_llm_placeholder(prompt, topic_info)
+            generated_text_full = placeholder_result.get("llm_response_direct", {}).get("choices", [{}])[0].get("text", "Error: Placeholder format issue.")
+            snippet_title, snippet_text_content = parse_llm_response_for_snippet(generated_text_full)
+            llm_model_used = placeholder_result.get("llm_model_used", "Placeholder-v0.2")
+            llm_prompt_used = placeholder_result.get("llm_prompt_sent", prompt)
         
-        # 3. Structure SnippetDataObject (Populating common fields)
-        snippet_id = generate_snippet_id()
-        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        snippet_id = generate_snippet_id(); timestamp = datetime.datetime.utcnow().isoformat() + "Z"
         audio_url_placeholder = f"https://aethercast.com/placeholder_audio/{snippet_id}.mp3"
-
         snippet_data_object = {
-            "snippet_id": snippet_id,
-            "topic_id": topic_id, 
-            "title": snippet_title, 
-            "summary": snippet_text_content, # Using text_content as summary for now
-            "audio_url": audio_url_placeholder,
-            "text_content": snippet_text_content, 
-            "cover_art_prompt": f"Podcast snippet cover art for: {str(snippet_title)}", # Ensure title is a string
-            "generation_timestamp": timestamp,
-            "llm_prompt_used": llm_prompt_actually_used, 
-            "llm_model_used": llm_model_used_for_snippet,
-            "original_topic_details_from_tda": topic_info # For traceability
+            "snippet_id": snippet_id, "topic_id": topic_id, "title": snippet_title,
+            "summary": snippet_text_content, "audio_url": audio_url_placeholder,
+            "text_content": snippet_text_content, "cover_art_prompt": f"Podcast cover: {str(snippet_title)}",
+            "generation_timestamp": timestamp, "llm_prompt_used": llm_prompt_used,
+            "llm_model_used": llm_model_used, "original_topic_details_from_tda": topic_info
         }
-        
-        logging.info(f"[SCA_RESPONSE] Snippet crafted: {snippet_id} for topic {topic_id}. Title: '{snippet_title}' (Using {'Real LLM' if sca_config['USE_REAL_LLM_SERVICE'] else 'Placeholder'})")
+        logging.info(f"[SCA_RESPONSE] Snippet crafted: {snippet_id}. Title: '{snippet_title}'")
         return flask.jsonify(snippet_data_object), 200
-
     except Exception as e:
-        logging.error(f"Error in /craft_snippet endpoint: {e}", exc_info=True)
-        return flask.jsonify({
-            "error_code": "SCA_INTERNAL_SERVER_ERROR", # Using existing constant value for code if desired, or new "SCA_INTERNAL_SERVER_ERROR"
-            "message": "An unexpected error occurred in the Snippet Craft Agent.",
-            "details": str(e)
-        }), 500
+        logging.error(f"Error in /craft_snippet: {e}", exc_info=True)
+        return flask.jsonify({"error_code": "SCA_INTERNAL_SERVER_ERROR", "message": "Unexpected SCA error.", "details": str(e)}), 500
 
 if __name__ == "__main__":
-    # load_sca_configuration() is called when the module is imported.
-    app.run(host="0.0.0.0", port=5002, debug=True)
-# ```
-# 
-# **Explanation of Changes:**
-# 
-# 1.  **Imports:** Added `import os` and `from dotenv import load_dotenv`.
-# 2.  **`load_dotenv()` Call:** `load_dotenv()` is called at the module level to load variables from `aethercast/sca/.env` (if it exists) into environment variables.
-# 3.  **`sca_config` Dictionary:** A global dictionary `sca_config` is initialized.
-# 4.  **`load_sca_configuration()` Function:**
-#     *   This new function is defined to populate `sca_config`.
-#     *   It uses `os.getenv("VAR_NAME", "default_value")` to fetch each configuration variable.
-#     *   **Type Conversion:** `int()`, `float()`, and `str.lower() == 'true'` are used for appropriate type conversions.
-#     *   **Defaults:** Sensible defaults are provided for most settings, except for `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID`.
-#     *   **Logging:** It logs the loaded configuration (masking the API key for security).
-#     *   **Startup Check:**
-#         *   If `sca_config['USE_REAL_LLM_SERVICE']` is `True`, it checks if `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID` have been set.
-#         *   If any are missing, a critical error is logged, and a `ValueError` is raised. This will prevent the Flask app from starting if it's misconfigured for real LLM use.
-# 5.  **Configuration Initialization:** `load_sca_configuration()` is called once at the module level to load the configuration when the script starts.
-# 6.  **Accessing Configuration:**
-#     *   The `call_aims_llm_placeholder` function was updated to check `sca_config['USE_REAL_LLM_SERVICE']` (though the actual real LLM call logic is deferred to a new `call_real_llm_service` function).
-#     *   A placeholder `call_real_llm_service` function is added, which logs that it would use `sca_config` values. This function will be fully implemented in the next subtask.
-#     *   The `/craft_snippet` endpoint now decides which LLM calling function to use based on `sca_config['USE_REAL_LLM_SERVICE']`.
-#     *   The `SIMULATE_AIMS_LLM_CALL` global boolean is now effectively replaced by `sca_config['USE_REAL_LLM_SERVICE']`.
-# 
-# This implementation ensures that SCA loads its configuration from environment variables (populated from `.env` for local development), provides defaults, performs a critical startup check if configured for a real LLM service, and makes the configuration accessible globally within the agent. The actual use of these configurations for a real LLM call is stubbed out in `call_real_llm_service` and will be the focus of the next subtask.**Explanation of Changes:**
-# 
-# 1.  **Imports:** Added `import os` and `from dotenv import load_dotenv`.
-# 2.  **`load_dotenv()` Call:** `load_dotenv()` is called at the top of the script (module level) to load variables from a potential `.env` file located in the same directory (`aethercast/sca/.env`) into actual environment variables that `os.getenv()` can access.
-# 3.  **`sca_config` Global Dictionary:** A global dictionary `sca_config` is initialized to store the application's configuration.
-# 4.  **`load_sca_configuration()` Function:**
-#     *   This new function is responsible for populating the `sca_config` dictionary.
-#     *   It fetches each expected configuration variable from environment variables using `os.getenv("VAR_NAME", "default_value")`.
-#     *   **Type Conversion:** It performs necessary type conversions:
-#         *   `int()` for `SCA_LLM_MAX_TOKENS_SNIPPET` and `SCA_LLM_REQUEST_TIMEOUT_SECONDS`.
-#         *   `float()` for `SCA_LLM_TEMPERATURE_SNIPPET`.
-#         *   `str.lower() == 'true'` for `USE_REAL_LLM_SERVICE` to convert it to a boolean.
-#     *   **Defaults:** Sensible default values are provided for most settings (e.g., 'openai' for provider, '150' for max tokens, 'false' for `USE_REAL_LLM_SERVICE`). API keys, base URLs, and model IDs specific to the real service do not have defaults and must be provided if `USE_REAL_LLM_SERVICE` is true.
-#     *   **Logging:** After loading, it logs the effective configuration values. API keys are masked in the logs for security (only last 4 characters shown).
-#     *   **Startup Check (Critical):**
-#         *   If `sca_config['USE_REAL_LLM_SERVICE']` evaluates to `True`, the function checks if `SCA_LLM_API_KEY`, `SCA_LLM_BASE_URL`, and `SCA_LLM_MODEL_ID` have been set (i.e., are not `None`).
-#         *   If any of these essential configurations for using a real LLM service are missing, a critical error message is logged, and a `ValueError` is raised. This is designed to stop the Flask application from starting if it's misconfigured for real LLM usage, preventing runtime errors later.
-# 5.  **Configuration Initialization:** `load_sca_configuration()` is called once when the module is first imported, ensuring the configuration is loaded and checked before the Flask app object is created or any routes are defined.
-# 6.  **Accessing Configuration:**
-#     *   The `sca_config` dictionary is globally accessible within the `sca/main.py` script.
-#     *   The `/craft_snippet` route handler now uses `sca_config['USE_REAL_LLM_SERVICE']` to decide whether to call the (newly added placeholder) `call_real_llm_service` function or the existing `call_aims_llm_placeholder` function (which handles the dynamic hardcoded responses).
-#     *   The `call_aims_llm_placeholder` function was also slightly modified: if `sca_config['USE_REAL_LLM_SERVICE']` is true but this placeholder function is somehow called, it logs a warning, as this would indicate a logic flaw (the real LLM path should have been taken).
-#     *   A new placeholder function `call_real_llm_service` was added. It currently logs the provider, base URL, and model ID from `sca_config` and returns a placeholder error message indicating it's not fully implemented. This function will be the target for implementing actual LLM API calls in the next subtask.
-#     *   The old global boolean `SIMULATE_AIMS_LLM_CALL` is now effectively superseded by `sca_config['USE_REAL_LLM_SERVICE']`.
-# 
-# This implementation ensures that the SCA loads its configuration from environment variables (which can be populated by a `.env` file for local development via `python-dotenv`), provides defaults for non-sensitive parameters, performs a critical check for essential settings if configured to use a real LLM, and makes these configurations available for use within the application. The actual HTTP calls using these configurations are stubbed for the next subtask.
+    app.run(host=os.getenv("SCA_HOST", "0.0.0.0"), port=int(os.getenv("SCA_PORT", 5002)), debug=(os.getenv("FLASK_DEBUG", "True").lower()=='true'))

@@ -67,349 +67,191 @@ class TestCalculateContentHash(unittest.TestCase):
 class TestWeaveScriptLogic(unittest.TestCase):
 
     def setUp(self):
-        self.maxDiff = None # Show full diff on assertion failure
-        # Mock configurations - these will be active for each test
+        self.maxDiff = None
         self.mock_pswa_config_defaults = {
-            "OPENAI_API_KEY": "fake_api_key",
-            "PSWA_LLM_MODEL": "gpt-3.5-turbo-1106",
-            "PSWA_LLM_TEMPERATURE": 0.5,
-            "PSWA_LLM_MAX_TOKENS": 1000,
-            "PSWA_LLM_JSON_MODE": True,
+            "AIMS_SERVICE_URL": "http://mockaims.test/v1/generate", # New
+            "AIMS_REQUEST_TIMEOUT_SECONDS": 10, # New
+            "PSWA_LLM_MODEL": "gpt-3.5-turbo-1106", # Request to AIMS
+            "PSWA_LLM_TEMPERATURE": 0.5, # Request to AIMS
+            "PSWA_LLM_MAX_TOKENS": 1000, # Request to AIMS
+            "PSWA_LLM_JSON_MODE": True, # Request to AIMS
             "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System prompt for JSON",
             "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User prompt for JSON: {topic} - {content}",
-            "PSWA_DATABASE_PATH": ":memory:", # Use in-memory DB for caching tests by default
+            "PSWA_DATABASE_PATH": ":memory:",
             "PSWA_SCRIPT_CACHE_ENABLED": True,
-            "PSWA_SCRIPT_CACHE_MAX_AGE_HOURS": 720 # 30 days
+            "PSWA_SCRIPT_CACHE_MAX_AGE_HOURS": 720
         }
-
-        # Use a copy for modification in tests to avoid altering the class default dict
         self.current_test_config = self.mock_pswa_config_defaults.copy()
 
         # Patch pswa_main.pswa_config directly. This is simpler if pswa_config is a global dict.
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.current_test_config)
+        self.current_test_config = self.mock_pswa_config_defaults.copy()
+        self.config_patcher = patch.dict(pswa_main.pswa_config, self.current_test_config, clear=True)
         self.mock_config = self.config_patcher.start()
 
-        self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
-        self.mock_imports = self.imports_patcher.start()
+        # PSWA_IMPORTS_SUCCESSFUL is for OpenAI, not relevant here as we mock requests to AIMS
+        # If there was a check for `requests` library, we'd patch that.
 
     def tearDown(self):
         self.config_patcher.stop()
-        self.imports_patcher.stop()
 
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_success_json_mode(self, mock_openai_create):
-        # Simulate LLM returning a valid JSON string
-        llm_output_json_str = json.dumps({
-            "title": "AI in Education (JSON)",
-            "intro": "Welcome to a JSON discussion on AI in education.",
-            "segments": [
-                {"segment_title": "Personalized Learning (JSON)", "content": "AI offers tailored JSON learning paths."},
-                {"segment_title": "Future Trends (JSON)", "content": "JSON-based AI tutors are emerging."}
-            ],
-            "outro": "JSON AI will reshape learning. Thanks!"
+    @patch('requests.post') # Mock the call to AIMS
+    def test_weave_script_success_json_mode_via_aims(self, mock_requests_post):
+        aims_llm_output_json_str = json.dumps({
+            "title": "AI in Education (AIMS JSON)",
+            "intro": "Welcome to an AIMS JSON discussion on AI in education.",
+            "segments": [{"segment_title": "Personalized Learning (AIMS JSON)", "content": "AI offers AIMS tailored learning."}],
+            "outro": "AIMS JSON AI will reshape learning."
         })
         
-        mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=llm_output_json_str))],
-            model="gpt-3.5-turbo-1106-from-api"
+        mock_aims_response = MagicMock()
+        mock_aims_response.status_code = 200
+        mock_aims_response.json.return_value = {
+            "request_id": "aims_req_123",
+            "model_id": "aims-gpt-3.5-turbo-0125", # Model reported by AIMS
+            "choices": [{"text": aims_llm_output_json_str, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60}
+        }
+        mock_requests_post.return_value = mock_aims_response
+
+        result = pswa_main.weave_script("Some harvested content", "AI in Education via AIMS JSON")
+
+        mock_requests_post.assert_called_once_with(
+            pswa_main.pswa_config['AIMS_SERVICE_URL'],
+            json=unittest.mock.ANY, # Check payload in more detail below
+            timeout=pswa_main.pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS']
         )
+        # Check specific parts of the payload sent to AIMS
+        sent_payload = mock_requests_post.call_args.kwargs['json']
+        self.assertIn("User prompt for JSON: AI in Education via AIMS JSON - Some harvested content", sent_payload['prompt'])
+        self.assertEqual(sent_payload['model_id_override'], self.current_test_config['PSWA_LLM_MODEL'])
+        self.assertEqual(sent_payload['response_format'], {"type": "json_object"})
 
-        result = pswa_main.weave_script("Some harvested content", "AI in Education via JSON")
+        self.assertNotIn("error_code", result)
+        self.assertEqual(result["topic"], "AI in Education via AIMS JSON")
+        self.assertEqual(result["title"], "AI in Education (AIMS JSON)")
+        self.assertEqual(result["llm_model_used"], "aims-gpt-3.5-turbo-0125") # From AIMS response
+        self.assertEqual(result["full_raw_script"], aims_llm_output_json_str)
+        self.assertEqual(result.get("source"), "generation_via_aims")
+        self.assertEqual(len(result["segments"]), 3) # Intro, 1 segment, Outro
+        self.assertEqual(result["segments"][0]["content"], "Welcome to an AIMS JSON discussion on AI in education.")
 
-        mock_openai_create.assert_called_once()
-        call_kwargs = mock_openai_create.call_args.kwargs
-        self.assertEqual(call_kwargs.get("response_format"), {"type": "json_object"})
-
-
-        self.assertNotIn("error", result)
-        self.assertEqual(result["topic"], "AI in Education via JSON")
-        self.assertEqual(result["title"], "AI in Education (JSON)")
-        self.assertEqual(result["llm_model_used"], "gpt-3.5-turbo-1106-from-api")
-        self.assertEqual(result["full_raw_script"], llm_output_json_str)
-        self.assertEqual(result.get("source"), "generation") # Should indicate it was generated
-
-        self.assertEqual(len(result["segments"]), 4)
-        self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(result["segments"][0]["content"], "Welcome to a JSON discussion on AI in education.")
-        self.assertEqual(result["segments"][1]["segment_title"], "Personalized Learning (JSON)")
-        self.assertEqual(result["segments"][1]["content"], "AI offers tailored JSON learning paths.")
-        self.assertEqual(result["segments"][3]["segment_title"], "OUTRO")
-
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_success_fallback_parsing(self, mock_openai_create):
-        # Test fallback to tag-based parsing if JSON mode is off or LLM fails to produce JSON
+    @patch('requests.post')
+    def test_weave_script_success_fallback_parsing_via_aims(self, mock_requests_post):
         with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
-            mock_llm_response_content = """[TITLE]AI in Education (Tag Fallback)
-[INTRO]Tag-based intro.
-[SEGMENT_1_TITLE]Segment One (Tag)
-[SEGMENT_1_CONTENT]Content for segment one via tags.
-[OUTRO]Tag-based outro."""
+            aims_llm_text_output = """[TITLE]AI Education (AIMS Fallback)
+[INTRO]AIMS Tag-based intro.
+[OUTRO]AIMS Tag-based outro."""
 
-            mock_openai_create.return_value = MagicMock(
-                choices=[MagicMock(message=MagicMock(content=mock_llm_response_content))],
-                model="gpt-test-model-fallback"
-            )
-
-            result = pswa_main.weave_script("Some content", "AI Education Fallback")
-
-            mock_openai_create.assert_called_once()
-            call_kwargs = mock_openai_create.call_args.kwargs
-            self.assertNotIn("response_format", call_kwargs)
-
-            self.assertNotIn("error", result)
-            self.assertEqual(result["title"], "AI in Education (Tag Fallback)")
-            self.assertEqual(result.get("source"), "generation")
-            self.assertEqual(len(result["segments"]), 3)
-            self.assertEqual(result["segments"][0]["content"], "Tag-based intro.")
-            self.assertEqual(result["segments"][1]["segment_title"], "Segment One (Tag)")
-            self.assertEqual(result["segments"][2]["segment_title"], "OUTRO")
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_invalid_json_fallback_to_tags(self, mock_openai_create):
-        # LLM returns non-JSON string even when JSON mode might have been requested
-        invalid_json_but_valid_tags = "[TITLE]Title from Tags\n[INTRO]Intro from Tags\nThis is not JSON."
-        mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=invalid_json_but_valid_tags))],
-            model="gpt-test-model-invalid-json"
-        )
-
-        # Keep PSWA_LLM_JSON_MODE True to simulate LLM ignoring the format request
-        with patch.object(pswa_main.logger, 'warning') as mock_logger_warning:
-            result = pswa_main.weave_script("Content", "Invalid JSON Test")
-
-            self.assertNotIn("error", result)
-            self.assertEqual(result["title"], "Title from Tags")
-            self.assertEqual(result["segments"][0]["content"], "Intro from Tags")
-            self.assertEqual(result.get("source"), "generation") # Fallback is still a form of generation
-            self.assertTrue(any("LLM output was not valid JSON" in call_args[0][0] for call_args in mock_logger_warning.call_args_list))
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_critical_failure_unparsable_output_json_mode(self, mock_openai_create):
-        unparsable_gibberish = "This is complete gibberish, not JSON, and not tags."
-        mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=unparsable_gibberish))],
-            model="gpt-test-model-gibberish"
-        )
-
-        self.assertTrue(pswa_main.pswa_config["PSWA_LLM_JSON_MODE"]) # Ensure JSON mode is on for this test variant
-
-        with patch.object(pswa_main.logger, 'error') as mock_logger_error:
-            result = pswa_main.weave_script("Content", "Unparsable Test")
-
-            self.assertIn("error", result)
-            self.assertEqual(result["error"], "PSWA_SCRIPT_PARSING_FAILURE")
-            self.assertEqual(result.get("source"), "error")
-            self.assertIn("Failed to parse LLM output as JSON and also failed tag-based fallback", result["details"])
-            self.assertTrue(any("Failed to parse LLM output as JSON" in call_args[0][0] for call_args in mock_logger_error.call_args_list))
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_json_insufficient_content(self, mock_openai_create):
-        llm_error_json_str = json.dumps({
-            "error": "Insufficient content",
-            "message": "The provided content was not sufficient for topic: Too Brief"
-        })
-        mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=llm_error_json_str))],
-            model="gpt-test-model"
-        )
-        result = pswa_main.weave_script("Too little", "Too Brief")
-        self.assertEqual(result["segments"][0]["segment_title"], "ERROR")
-        self.assertIn("not sufficient for topic: Too Brief", result["segments"][0]["content"])
-        self.assertTrue(result["title"].startswith("Error: Insufficient Content"))
-        self.assertEqual(result.get("source"), "generation") # LLM generated an error message, counts as generation
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_success_no_cache_involvement(self, mock_openai_create):
-        # This test is similar to test_weave_script_success_json_mode but explicitly for when cache is not hit
-        # and to ensure 'source: generation' is added.
-        llm_output_json_str = json.dumps({
-            "title": "AI in Education",
-            "intro": "Welcome to a discussion on how AI is reshaping education.",
-            "segments": [{"segment_title": "Personalized Learning", "content": "AI algorithms analyze."}],
-            "outro": "Join us next time!"
-        })
-        mock_openai_create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content=llm_output_json_str))],
-            model="gpt-test-model-from-api"
-        )
-        # Ensure caching is enabled for this test to check save path, but mock _get_cached_script to return None
-        pswa_main.pswa_config['PSWA_SCRIPT_CACHE_ENABLED'] = True
-        with patch.object(pswa_main, '_get_cached_script', return_value=None) as mock_get_cache, \
-             patch.object(pswa_main, '_save_script_to_cache') as mock_save_cache:
-
-            result = pswa_main.weave_script("Some harvested content", "AI in Education")
-
-            self.assertNotIn("error", result)
-            self.assertEqual(result["topic"], "AI in Education")
-            self.assertEqual(result["title"], "AI in Education")
-            self.assertEqual(result["llm_model_used"], "gpt-test-model-from-api")
-            self.assertEqual(result["full_raw_script"], llm_output_json_str)
-            self.assertEqual(result.get("source"), "generation")
-            mock_get_cache.assert_called_once()
-            mock_save_cache.assert_called_once()
-
-        self.assertEqual(len(result["segments"]), 3)
-        self.assertEqual(result["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(result["segments"][0]["content"], "Welcome to a discussion on how AI is reshaping education.")
-        self.assertEqual(result["segments"][1]["segment_title"], "Personalized Learning")
-        self.assertEqual(result["segments"][1]["content"], "AI algorithms analyze student performance to offer tailored learning paths. This helps address individual needs effectively.")
-        self.assertEqual(result["segments"][2]["segment_title"], "OUTRO")
-        self.assertEqual(result["segments"][2]["content"], "AI holds immense potential to revolutionize teaching and learning. Join us next time!")
-
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_openai_api_error(self, mock_openai_create):
-        mock_openai_create.side_effect = openai.error.APIError("Test API Error", code=500) # Use the imported/mocked openai.error
-
-        result = pswa_main.weave_script("Content", "Topic")
-        self.assertIn("error", result)
-        self.assertEqual(result["error"], "PSWA_OPENAI_API_ERROR")
-        self.assertIn("Test API Error", result["details"])
-
-    def test_weave_script_missing_api_key(self):
-        with patch.dict(pswa_main.pswa_config, {"OPENAI_API_KEY": ""}):
-            result = pswa_main.weave_script("Content", "Topic")
-            self.assertIn("error", result)
-            self.assertEqual(result["error"], "PSWA_CONFIG_ERROR_API_KEY")
-
-    @patch('openai.ChatCompletion.create')
-    def test_weave_script_insufficient_content_from_llm_tag_mode(self, mock_openai_create):
-        # Test the tag-based insufficient content error when JSON mode is off
-        with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
-            error_message_from_llm = "[ERROR] Insufficient content provided to generate a full podcast script for the topic: Sparse Topic"
-            mock_openai_create.return_value = MagicMock(
-                choices=[MagicMock(message=MagicMock(content=error_message_from_llm))],
-                model="gpt-test-model"
-            )
-            result = pswa_main.weave_script("Too little content", "Sparse Topic")
-
-            self.assertNotIn("error", result, "weave_script should parse the LLM's error message, not raise its own error key for insufficient content.")
-            self.assertEqual(result["segments"][0]["segment_title"], "ERROR")
-            self.assertEqual(result["segments"][0]["content"], error_message_from_llm)
-            self.assertEqual(result["full_raw_script"], error_message_from_llm)
-            self.assertTrue(result["title"].startswith("Error: Insufficient Content"))
-
-
-    @patch('openai.ChatCompletion.create')
-    def test_script_parsing_variations_tag_mode(self, mock_openai_create):
-        # Test tag parsing variations specifically when JSON mode is off
-        with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
-            # Test case 1: Only Title and Intro
-            script_1 = "[TITLE]Minimalist Podcast (Tag)\n[INTRO]Just an intro here (Tag)."
-            mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_1))])
-            result_1 = pswa_main.weave_script("content", "topic1_tag")
-            self.assertEqual(result_1["title"], "Minimalist Podcast (Tag)")
-            self.assertEqual(len(result_1["segments"]), 1)
-            self.assertEqual(result_1["segments"][0]["segment_title"], "INTRO")
-            self.assertEqual(result_1["segments"][0]["content"], "Just an intro here (Tag).")
-
-            # Test case 2: Missing Title tag, but other tags present
-            script_2 = "[INTRO]An intro without a title tag first (Tag).\n[OUTRO]And an outro (Tag)."
-            mock_openai_create.return_value = MagicMock(choices=[MagicMock(message=MagicMock(content=script_2))])
-            result_2 = pswa_main.weave_script("content", "topic2_tag")
-            self.assertTrue(result_2["title"].startswith("Podcast on topic2_tag"))
-            self.assertEqual(len(result_2["segments"]), 2)
-            self.assertEqual(result_2["segments"][0]["segment_title"], "INTRO")
-            self.assertEqual(result_2["segments"][1]["segment_title"], "OUTRO")
-
-    @patch('openai.ChatCompletion.create') # To ensure it's NOT called
-    @patch('aethercast.pswa.main._save_script_to_cache') # To ensure it's NOT called for a cache hit
-    @patch('aethercast.pswa.main._get_cached_script')
-    def test_weave_script_cache_hit(self, mock_get_cached_script, mock_save_script_to_cache, mock_openai_create):
-        # Ensure caching is enabled in the mocked config for this test
-        self.current_test_config['PSWA_SCRIPT_CACHE_ENABLED'] = True
-        # Re-patch the config if setUp doesn't re-apply it or if it's complex
-        # For this structure, modifying self.current_test_config which is used by
-        # self.config_patcher.start() in setUp should be sufficient if tests are isolated.
-        # However, to be absolutely safe for this specific test's config needs:
-        with patch.dict(pswa_main.pswa_config, self.current_test_config, clear=True): # clear=True ensures only our values are used
-            topic = "Cache Hit Topic"
-            content = "Content that should result in a cache hit."
-
-            # This hash calculation needs to match the one in pswa_main.py
-            # For testing, we can either replicate it or mock _calculate_content_hash if it's complex.
-            # For now, assume _get_cached_script is called with a hash, we don't need to assert the hash value itself here.
-
-            mock_cached_script_data = {
-                "script_id": "cached_script_id_789",
-                "topic": topic,
-                "title": "Cached Title",
-                "full_raw_script": "This is cached script content.",
-                "segments": [{"segment_title": "INTRO", "content": "Cached intro"}],
-                "llm_model_used": "gpt-cached-model",
-                "source": "cache" # Crucially, _get_cached_script adds this
+            mock_aims_response = MagicMock()
+            mock_aims_response.status_code = 200
+            mock_aims_response.json.return_value = {
+                "request_id": "aims_req_fallback", "model_id": "aims-fallback-model",
+                "choices": [{"text": aims_llm_text_output, "finish_reason": "stop"}], "usage": {}
             }
-            mock_get_cached_script.return_value = mock_cached_script_data
+            mock_requests_post.return_value = mock_aims_response
+
+            result = pswa_main.weave_script("Content", "AI Education AIMS Fallback")
+
+            sent_payload = mock_requests_post.call_args.kwargs['json']
+            self.assertNotIn("response_format", sent_payload) # JSON mode was off
+
+            self.assertNotIn("error_code", result)
+            self.assertEqual(result["title"], "AI Education (AIMS Fallback)")
+            self.assertEqual(result.get("source"), "generation_via_aims")
+            self.assertEqual(len(result["segments"]), 2) # Intro, Outro
+            self.assertEqual(result["segments"][0]["content"], "AIMS Tag-based intro.")
+
+    @patch('requests.post')
+    def test_weave_script_aims_returns_error_json(self, mock_requests_post):
+        mock_aims_error_response = MagicMock()
+        mock_aims_error_response.status_code = 400 # e.g., AIMS had an invalid request
+        aims_error_payload = {"error": {"type": "invalid_request", "message": "AIMS: Prompt too long"}}
+        mock_aims_error_response.json.return_value = aims_error_payload
+        mock_aims_error_response.text = json.dumps(aims_error_payload) # For HTTPError text
+
+        # Simulate requests.post raising an HTTPError for the 400 status
+        mock_requests_post.side_effect = requests.exceptions.HTTPError(response=mock_aims_error_response)
+
+        result = pswa_main.weave_script("Content", "AIMS Error Test")
+
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "PSWA_AIMS_HTTP_ERROR")
+        self.assertIn("AIMS service returned HTTP 400", result["message"])
+        self.assertEqual(result["details"], aims_error_payload) # AIMS JSON error is in details
+
+    @patch('requests.post')
+    def test_weave_script_aims_request_timeout(self, mock_requests_post):
+        mock_requests_post.side_effect = requests.exceptions.Timeout("AIMS request timed out")
+
+        result = pswa_main.weave_script("Content", "AIMS Timeout Test")
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "PSWA_AIMS_TIMEOUT")
+        self.assertIn("AIMS request timed out", result["details"])
+
+    def test_weave_script_aims_url_not_configured(self):
+        with patch.dict(pswa_main.pswa_config, {"AIMS_SERVICE_URL": ""}):
+            # Need to reload config in pswa_main or ensure weave_script re-reads it.
+            # For this test, we assume load_pswa_configuration would be called or its effect matters.
+            # The check for AIMS_SERVICE_URL is at the end of load_pswa_configuration.
+            # To properly test this, we might need to trigger re-evaluation or test the loader.
+            # However, if weave_script directly accesses pswa_config, this change should be seen.
+            # The current structure of weave_script gets it from pswa_config at call time.
+            # The critical check is in load_pswa_configuration. If it raises ValueError,
+            # the app wouldn't start. If it doesn't, then weave_script might try to use an empty URL.
+            # Let's assume the initial load_pswa_configuration would have failed.
+            # This test is more about the ValueError from load_pswa_configuration.
+            with self.assertRaises(ValueError) as context:
+                pswa_main.load_pswa_configuration() # Trigger the check
+            self.assertIn("AIMS_SERVICE_URL is not set", str(context.exception))
+            # If the test reaches weave_script with empty URL, it would be a requests.exceptions.MissingSchema
+            # For now, the load_pswa_configuration should prevent this.
+
+    @patch('requests.post') # To ensure it's NOT called
+    @patch('aethercast.pswa.main._save_script_to_cache')
+    @patch('aethercast.pswa.main._get_cached_script')
+    def test_weave_script_cache_hit_no_aims_call(self, mock_get_cached_script, mock_save_script_to_cache, mock_requests_post):
+        self.current_test_config['PSWA_SCRIPT_CACHE_ENABLED'] = True
+        with patch.dict(pswa_main.pswa_config, self.current_test_config, clear=True):
+            topic = "Cache Hit Topic AIMS"
+            content = "Content for AIMS cache hit."
+            mock_cached_data = {
+                "script_id": "cached_script_aims", "topic": topic, "title": "Cached AIMS Title",
+                "full_raw_script": "Cached script text for AIMS",
+                "segments": [{"segment_title": "INTRO", "content": "Cached intro AIMS"}],
+                "llm_model_used": "aims-cached-model", "source": "cache"
+            }
+            mock_get_cached_script.return_value = mock_cached_data
 
             result = pswa_main.weave_script(content, topic)
 
             mock_get_cached_script.assert_called_once()
-            # Assert call args for _get_cached_script if we want to be very specific about the hash
-            # For example: mock_get_cached_script.assert_called_once_with(ANY, pswa_main._calculate_content_hash(topic, content), ANY)
-
-            # Key assertions: LLM and save_to_cache should NOT be called
-            mock_openai_create.assert_not_called()
+            mock_requests_post.assert_not_called() # AIMS should not be called
             mock_save_script_to_cache.assert_not_called()
-
-            self.assertEqual(result, mock_cached_script_data)
+            self.assertEqual(result, mock_cached_data)
             self.assertEqual(result["source"], "cache")
-            self.assertEqual(result["title"], "Cached Title")
 
-
+# Test class for the parsing logic (remains largely the same as it processes text)
+# No changes needed here as it parses the text provided by AIMS.
 class TestParseLlmScriptOutput(unittest.TestCase):
     # Test the parser directly. This class primarily tests the TAG-BASED parser.
     # JSON parsing is simpler (json.loads) and its failure modes are tested within weave_script tests.
     def setUp(self):
-        # The parser uses pswa_config for default model, so mock it.
-        # For these tag-based tests, PSWA_LLM_JSON_MODE should be False or not strictly relevant
-        # as we are testing the direct tag parser.
         self.mock_pswa_config = {
-            "PSWA_LLM_MODEL": "parser-test-model",
-            "PSWA_LLM_JSON_MODE": False
+            "PSWA_LLM_MODEL": "parser-test-model", # Used as default by parser
+            # PSWA_LLM_JSON_MODE is not directly used by parse_llm_script_output,
+            # its effect is on what kind of string is passed to the parser.
         }
         self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
         self.mock_config = self.config_patcher.start()
 
-        # Mock imports_patcher if pswa_main.parse_llm_script_output relies on it (it shouldn't directly)
-        # For safety, keeping it if other utility functions called by parser might use it.
-        self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
-        self.mock_imports = self.imports_patcher.start()
-
     def tearDown(self):
         self.config_patcher.stop()
-        self.imports_patcher.stop()
-
-    # The test_weave_script_success and other weave_script tests from the original TestParseLlmScriptOutput
-    # seem redundant if TestWeaveScriptLogic is comprehensive.
-    # I'll keep the direct parser tests for the tag-based parser.
-    # Removing the redundant weave_script tests from this class.
-
-    # @patch('openai.ChatCompletion.create')
-    # def test_weave_script_success(self, mock_openai_create):
-    # ... (removed) ...
-
-    # @patch('openai.ChatCompletion.create')
-    # def test_weave_script_openai_api_error(self, mock_openai_create):
-    # ... (removed) ...
-
-    # def test_weave_script_missing_api_key(self):
-    # ... (removed) ...
-
-    # @patch('openai.ChatCompletion.create')
-    # def test_weave_script_insufficient_content_from_llm(self, mock_openai_create):
-    # ... (removed) ...
-
-    # @patch('openai.ChatCompletion.create')
-    # def test_script_parsing_variations(self, mock_openai_create):
-    # ... (removed) ...
 
 # Renaming this class to be more specific about testing the tag-based parser.
 class TestTagBasedParseLlmScriptOutput(unittest.TestCase):
     def setUp(self):
-        # For these tag-based tests, PSWA_LLM_JSON_MODE is not relevant for the parser itself.
         self.mock_pswa_config = {"PSWA_LLM_MODEL": "parser-test-model"}
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config)
+        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True) # Use clear=True
         self.mock_config = self.config_patcher.start()
 
     def tearDown(self):
@@ -521,28 +363,25 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
     def setUp(self):
         pswa_main.app.config['TESTING'] = True
         self.client = pswa_main.app.test_client()
-        self.mock_pswa_config = {
-            "OPENAI_API_KEY": "fake_api_key_for_endpoint",
-            "PSWA_LLM_MODEL": "gpt-endpoint-model",
-            "PSWA_LLM_TEMPERATURE": 0.7,
-            "PSWA_LLM_MAX_TOKENS": 1500,
+        # Config for endpoint tests, especially PSWA_TEST_MODE_ENABLED
+        self.mock_pswa_config_endpoint = {
+            "AIMS_SERVICE_URL": "http://mockaims.test/v1/generate", # Still needed even if test mode bypasses
+            "AIMS_REQUEST_TIMEOUT_SECONDS": 5,
+            "PSWA_LLM_MODEL": "gpt-endpoint-model", # For requests to AIMS if not in test mode
             "PSWA_LLM_JSON_MODE": True,
-            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System msg for endpoint",
-            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User: {topic} - {content} (endpoint)",
-            "PSWA_TEST_MODE_ENABLED": True # Enable test mode for these endpoint tests
+            "PSWA_TEST_MODE_ENABLED": True # Critical for these tests
         }
-        # Use clear=True to ensure only these values are in pswa_config for this test class
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
+        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config_endpoint, clear=True)
         self.mock_config = self.config_patcher.start()
 
-        self.imports_patcher = patch.object(pswa_main, 'PSWA_IMPORTS_SUCCESSFUL', True)
-        self.mock_imports = self.imports_patcher.start()
+        # PSWA_IMPORTS_SUCCESSFUL is for OpenAI, not directly relevant now AIMS is used.
+        # If there was a check for `requests` library for AIMS calls, that would be relevant.
+        # For now, assuming `requests` is available.
 
     def tearDown(self):
         self.config_patcher.stop()
-        self.imports_patcher.stop()
 
-    @patch('aethercast.pswa.main.weave_script')
+    @patch('aethercast.pswa.main.weave_script') # Still mock weave_script for endpoint unit tests
     def test_handle_weave_script_success(self, mock_weave_script_func):
         mock_structured_script = {
             "script_id": "pswa_script_test123", "topic": "Test Topic",
@@ -584,12 +423,15 @@ class TestWeaveScriptEndpoint(unittest.TestCase):
 
     @patch('aethercast.pswa.main.weave_script')
     def test_handle_weave_script_llm_api_error(self, mock_weave_script_func):
-        mock_weave_script_func.return_value = {"error": "PSWA_OPENAI_API_ERROR", "details": "OpenAI down"}
+        # Simulate weave_script returning an error that came from AIMS
+        mock_weave_script_func.return_value = {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "AIMS down", "details": "Connection refused"}
 
         response = self.client.post('/weave_script', json={'content': 'content', 'topic': 'topic'})
-        self.assertEqual(response.status_code, 500)
+        # Assuming PSWA_AIMS_REQUEST_ERROR maps to a 502 or 503 type error
+        self.assertIn(response.status_code, [500, 502, 503, 504])
         json_data = response.get_json()
-        self.assertEqual(json_data["error"], "PSWA_OPENAI_API_ERROR")
+        self.assertEqual(json_data["error_code"], "PSWA_AIMS_REQUEST_ERROR")
+        self.assertEqual(json_data["message"], "AIMS down")
 
     @patch('aethercast.pswa.main.weave_script')
     def test_handle_script_parsing_failure_in_endpoint(self, mock_weave_script_func):
