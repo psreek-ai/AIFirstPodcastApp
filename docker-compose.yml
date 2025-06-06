@@ -35,6 +35,10 @@ services:
       - ./aethercast/aims_service/.env # Users must create this from .env.example
     volumes:
       - ./aethercast/aims_service:/app # For live development of aims_service code
+      # Mount the GCP credentials file into the container (read-only)
+      # The user must place their gcp-credentials.json in ./aethercast/aims_service/
+      # and set GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json in aims_service/.env
+      - ./aethercast/aims_service/gcp-credentials.json:/app/gcp-credentials.json:ro
     networks:
       - aethercast_network
     restart: unless-stopped
