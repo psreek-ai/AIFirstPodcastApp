@@ -484,13 +484,37 @@ class TestForgeVoiceEndpoint(unittest.TestCase):
         response = self.client.post('/forge_voice', json={})
         self.assertEqual(response.status_code, 400)
         json_data = response.get_json()
-        self.assertIn("Missing 'script' parameter", json_data["message"])
+        self.assertEqual(json_data.get("error_code"), "VFA_VALIDATION_ERROR")
+        self.assertEqual(json_data.get("message"), "Invalid input")
+        self.assertEqual(json_data.get("details"), "Missing 'script' parameter")
 
     def test_handle_forge_voice_script_not_dict(self):
         response = self.client.post('/forge_voice', json={"script": "this is a string, not a dict"})
         self.assertEqual(response.status_code, 400)
         json_data = response.get_json()
-        self.assertIn("'script' parameter must be a valid JSON object", json_data["message"])
+        self.assertEqual(json_data.get("error_code"), "VFA_VALIDATION_ERROR")
+        self.assertEqual(json_data.get("message"), "Invalid input")
+        self.assertEqual(json_data.get("details"), "'script' parameter must be a valid JSON object (dictionary).")
+
+    def test_handle_forge_voice_no_json_payload(self):
+        response = self.client.post('/forge_voice', data="not a json payload", content_type="text/plain")
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data.get("error_code"), "VFA_PAYLOAD_ERROR")
+        self.assertEqual(json_data.get("message"), "Invalid payload")
+        self.assertEqual(json_data.get("details"), "No JSON payload received")
+
+    def test_handle_forge_voice_voice_params_not_dict(self):
+        payload = {
+            "script": {"script_id": "s_vp_err", "topic": "VP Error", "full_raw_script": "Test script"},
+            "voice_params": "this is a string, not a dict"
+        }
+        response = self.client.post('/forge_voice', json=payload)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data.get("error_code"), "VFA_VALIDATION_ERROR")
+        self.assertEqual(json_data.get("message"), "Invalid input")
+        self.assertEqual(json_data.get("details"), "'voice_params' parameter must be a valid JSON object if provided.")
 
     @patch('aethercast.vfa.main.forge_voice')
     def test_handle_forge_voice_skipped(self, mock_forge_voice_func):

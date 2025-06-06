@@ -369,19 +369,36 @@ def orchestrate_podcast_generation(
             _update_task_status_in_db(db_path, task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, error_msg=None)
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Fetching and processing web content...", "stage": current_orchestration_stage})
             log_step("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
-            wcha_output = get_content_for_topic(topic=topic)
 
-            wcha_data_log = {"output_length": len(wcha_output)}
-            if any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
-                 wcha_data_log["wcha_error_content"] = wcha_output # Capture full error if it's an error string
-            log_step("WCHA finished.", data=wcha_data_log)
-            # Enhanced logging for WCHA output preview
-            wcha_data_log["wcha_output_preview"] = wcha_output[:200] + "..." if wcha_output and not any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS) else "N/A"
+            # WCHA's get_content_for_topic now returns a dictionary
+            wcha_result_dict = get_content_for_topic(topic=topic)
+            wcha_content = None # Initialize wcha_content
 
+            if isinstance(wcha_result_dict, dict) and wcha_result_dict.get("status") == "success":
+                wcha_content = wcha_result_dict.get("content")
+                source_urls = wcha_result_dict.get("source_urls", [])
+                wcha_message = wcha_result_dict.get("message", "WCHA success.")
+                log_step("WCHA finished successfully.", data={
+                    "content_length": len(wcha_content) if wcha_content else 0,
+                    "source_urls": source_urls,
+                    "message": wcha_message,
+                    "content_preview": wcha_content[:200] + "..." if wcha_content else "N/A"
+                })
+                if not wcha_content: # Success status but no content means all sources failed or were too short
+                    final_error_message = wcha_message or "WCHA returned success but no usable content."
+                    log_step(f"WCHA content retrieval warning: No content aggregated.", data={"wcha_result": wcha_result_dict}, is_error_payload=True)
+                    # This might not be a critical failure if partial content is acceptable or if PSWA can handle empty.
+                    # For now, let's treat it as a failure to proceed if no content.
+                    final_cpoa_status = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
+                    raise Exception(f"WCHA critical failure: {final_error_message}")
+            else: # WCHA failed or returned unexpected structure
+                final_error_message = "WCHA content retrieval failed."
+                if isinstance(wcha_result_dict, dict):
+                    final_error_message = wcha_result_dict.get("message", "WCHA returned failure status or unexpected structure.")
+                elif isinstance(wcha_result_dict, str): # Fallback if old string error message is returned
+                    final_error_message = wcha_result_dict
 
-            if not wcha_output or any(str(wcha_output).startswith(prefix) for prefix in WCHA_ERROR_INDICATORS):
-                final_error_message = str(wcha_output) if wcha_output else "WCHA returned no content or an error string."
-                log_step(f"WCHA content retrieval failure.", data={"error_message": final_error_message, "wcha_output_preview": wcha_output[:100]}, is_error_payload=True) # Keep existing error log
+                log_step(f"WCHA content retrieval failure.", data={"error_details": final_error_message, "wcha_raw_output": wcha_result_dict}, is_error_payload=True)
                 final_cpoa_status = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
                 raise Exception(f"WCHA critical failure: {final_error_message}")
 
@@ -389,16 +406,17 @@ def orchestrate_podcast_generation(
             _update_task_status_in_db(db_path, task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, error_msg=None)
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting podcast script with AI...", "stage": current_orchestration_stage})
 
-            pswa_payload_for_log = {"content_preview": wcha_output[:100] + "..." if wcha_output else "N/A", "topic": topic} # Avoid logging full content
+            # Use wcha_content (extracted from wcha_result_dict) for PSWA
+            pswa_payload_for_log = {"content_preview": wcha_content[:100] + "..." if wcha_content else "N/A", "topic": topic}
             pswa_headers_for_log = {}
             if test_scenarios and test_scenarios.get("pswa"):
                 pswa_headers_for_log['X-Test-Scenario'] = test_scenarios["pswa"]
 
             log_step("Calling PSWA Service (weave_script)...",
-                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_output),
+                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_content) if wcha_content else 0,
                            "payload_preview": pswa_payload_for_log, "headers": pswa_headers_for_log})
             try:
-                pswa_payload = {"content": wcha_output, "topic": topic}
+                pswa_payload = {"content": wcha_content, "topic": topic} # Use extracted wcha_content
                 pswa_headers = {} # Actual headers for request
                 if test_scenarios and test_scenarios.get("pswa"):
                     pswa_headers['X-Test-Scenario'] = test_scenarios["pswa"]

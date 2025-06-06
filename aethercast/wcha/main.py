@@ -219,26 +219,25 @@ def harvest_from_url(url: str, min_length: int = 150) -> dict: # min_length defa
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_EXTRACTION, "error_message": error_msg}
 
 # --- Refactored get_content_for_topic function ---
-def get_content_for_topic(topic: str, max_results_override: Optional[int] = None) -> str: # Return type remains string (aggregated content or error message)
+def get_content_for_topic(topic: str, max_results_override: Optional[int] = None) -> dict:
     """
     Performs a web search for the given topic, harvests content from multiple URLs,
-    and consolidates the text.
+    and consolidates the text. Returns a dictionary with status, content, source_urls, and message.
     Uses WCHA_SEARCH_MAX_RESULTS from config, but can be overridden by max_results_override.
     """
-    if not IMPORTS_SUCCESSFUL: # This checks all required libs including Trafilatura now
+    if not IMPORTS_SUCCESSFUL:
         error_msg = f"{ERROR_WCHA_LIB_MISSING} {MISSING_IMPORT_ERROR}"
         logger.error(error_msg)
-        return error_msg
+        return {"status": "failure", "content": None, "source_urls": [], "message": error_msg}
 
-    # Determine max_search_results: use override if provided, else use config, else default to 3.
     if max_results_override is not None:
         actual_max_search_results = max_results_override
     else:
         actual_max_search_results = wcha_config.get('WCHA_SEARCH_MAX_RESULTS', 3)
 
     logger.info(f"[WCHA_SEARCH_HARVEST] Starting content search and harvest for topic: '{topic}' (max_results: {actual_max_search_results})")
-    
-    urls = []
+
+    search_urls = []
     try:
         with DDGS() as ddgs:
             ddgs_results = list(ddgs.text(
@@ -248,50 +247,61 @@ def get_content_for_topic(topic: str, max_results_override: Optional[int] = None
                 max_results=actual_max_search_results
             ))
             if ddgs_results:
-                urls = [r['href'] for r in ddgs_results if r.get('href')]
-        logger.info(f"[WCHA_SEARCH_HARVEST] Found {len(urls)} URLs for topic '{topic}': {urls}")
+                search_urls = [r['href'] for r in ddgs_results if r.get('href')]
+        logger.info(f"[WCHA_SEARCH_HARVEST] Found {len(search_urls)} URLs for topic '{topic}': {search_urls}")
     except Exception as e:
-        logger.error(f"[WCHA_SEARCH_HARVEST] Error during duckduckgo_search for '{topic}': {type(e).__name__} - {e}")
-        return f"{ERROR_WCHA_SEARCH_FAILED} '{topic}': {type(e).__name__}." # Appended topic for clarity
+        error_msg = f"{ERROR_WCHA_SEARCH_FAILED} '{topic}': {type(e).__name__} - {e}."
+        logger.error(f"[WCHA_SEARCH_HARVEST] {error_msg}")
+        return {"status": "failure", "content": None, "source_urls": [], "message": error_msg}
 
-    if not urls:
-        logger.warning(f"[WCHA_SEARCH_HARVEST] No search results found for topic: {topic}")
-        return f"{ERROR_WCHA_NO_SEARCH_RESULTS}: {topic}"
+    if not search_urls:
+        message = f"{ERROR_WCHA_NO_SEARCH_RESULTS}: {topic}"
+        logger.warning(f"[WCHA_SEARCH_HARVEST] {message}")
+        return {"status": "failure", "content": None, "source_urls": [], "message": message}
 
-    all_harvested_text = []
-    successful_harvest_count = 0
-    last_harvest_error_details = "No specific harvest error recorded." # For overall error reporting
-    min_content_length_for_aggregation = 150 # Define or get from config if needed
+    all_harvested_content_parts = []
+    successfully_harvested_urls = []
+    failed_harvest_details = []
+    min_content_length_for_aggregation = wcha_config.get('WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION', 150) # Example config
 
-    for i, url in enumerate(urls):
-        logger.info(f"[WCHA_SEARCH_HARVEST] Attempting to harvest from URL ({i+1}/{len(urls)}): {url}")
-        # Pass min_length to harvest_from_url; it will log if content is too short but still return it.
-        # Here, we can decide if short content should be part of aggregation.
+    for i, url in enumerate(search_urls):
+        logger.info(f"[WCHA_SEARCH_HARVEST] Attempting to harvest from URL ({i+1}/{len(search_urls)}): {url}")
         harvest_result = harvest_from_url(url, min_length=min_content_length_for_aggregation)
-        
+
         if harvest_result.get("content"):
-            # Optional: Add a check here if truly short content should be skipped for aggregation
-            # if len(harvest_result["content"]) < min_content_length_for_aggregation:
-            #     logger.warning(f"[WCHA_SEARCH_HARVEST] Content from {url} was too short ({len(harvest_result['content'])} chars) and will be skipped for aggregation.")
-            #     last_harvest_error_details = f"URL: {url}, Type: {WCHA_ERROR_TYPE_CONTENT_TOO_SHORT}, Message: Content too short."
-            # else:
-            all_harvested_text.append(f"Source: {harvest_result['url']}\n{harvest_result['content']}")
-            successful_harvest_count += 1
-            logger.info(f"[WCHA_SEARCH_HARVEST] Successfully harvested and validated content from: {url}")
+            # Content is returned even if short, decision to aggregate is here
+            if len(harvest_result["content"]) >= min_content_length_for_aggregation:
+                all_harvested_content_parts.append(f"Source: {harvest_result['url']}\n{harvest_result['content']}")
+                successfully_harvested_urls.append(harvest_result['url'])
+                logger.info(f"[WCHA_SEARCH_HARVEST] Successfully harvested and validated content from: {url}")
+            else:
+                # Content was harvested but deemed too short for aggregation based on WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION
+                short_content_message = f"Content from {url} was too short ({len(harvest_result['content'])} chars, min: {min_content_length_for_aggregation}) and was not aggregated."
+                logger.warning(f"[WCHA_SEARCH_HARVEST] {short_content_message}")
+                failed_harvest_details.append(f"URL: {url}, Status: Skipped (too short), Message: {short_content_message}")
         else:
             error_type = harvest_result.get("error_type", WCHA_ERROR_TYPE_UNKNOWN)
             error_message = harvest_result.get("error_message", "Unknown error during harvest.")
-            last_harvest_error_details = f"URL: {url}, Type: {error_type}, Message: {error_message}"
-            logger.warning(f"[WCHA_SEARCH_HARVEST] Failed to harvest valid content from URL: {url}. Type: {error_type}, Reason: {error_message}")
+            failed_harvest_details.append(f"URL: {url}, Status: Failed, Type: {error_type}, Message: {error_message}")
+            logger.warning(f"[WCHA_SEARCH_HARVEST] Failed to harvest content from URL: {url}. Type: {error_type}, Reason: {error_message}")
 
-    if successful_harvest_count == 0:
-        message = f"{ERROR_WCHA_HARVEST_ALL_FAILED} {len(urls)} search results for topic: {topic}. Last error: {last_harvest_error_details}"
-        logger.warning(f"[WCHA_SEARCH_HARVEST] {message}")
-        return message # Return the detailed error message
+    if not successfully_harvested_urls:
+        failure_message = f"{ERROR_WCHA_HARVEST_ALL_FAILED} {len(search_urls)} search results for topic: {topic}. Failures: {'; '.join(failed_harvest_details)}"
+        logger.warning(f"[WCHA_SEARCH_HARVEST] {failure_message}")
+        return {"status": "failure", "content": None, "source_urls": [], "message": failure_message}
+
+    final_content = "\n\n---\n\n".join(all_harvested_content_parts)
+    success_message = f"Successfully consolidated content from {len(successfully_harvested_urls)} out of {len(search_urls)} URLs for topic '{topic}'."
+    if failed_harvest_details:
+        success_message += f" Failures: {'; '.join(failed_harvest_details)}"
     
-    final_content = "\n\n---\n\n".join(all_harvested_text)
-    logger.info(f"[WCHA_SEARCH_HARVEST] Consolidated content from {successful_harvest_count} sources for topic '{topic}'. Total length: {len(final_content)} chars.")
-    return final_content
+    logger.info(f"[WCHA_SEARCH_HARVEST] {success_message} Total length: {len(final_content)} chars.")
+    return {
+        "status": "success",
+        "content": final_content,
+        "source_urls": successfully_harvested_urls,
+        "message": success_message
+    }
 
 
 # --- API Endpoint (Preserved) ---
@@ -299,16 +309,18 @@ try:
     import flask
     app = flask.Flask(__name__) 
 
-    @app.route("/harvest_content_endpoint", methods=["POST"])
-    def harvest_content_api_endpoint():
+    @app.route("/harvest", methods=["POST"]) # Renamed endpoint
+    def harvest_api_endpoint():
         try:
             request_data = flask.request.get_json()
             if not request_data:
-                return flask.jsonify({"error": ENDPOINT_ERROR_INVALID_PAYLOAD, "details": "Invalid or missing JSON payload."}), 400
+                return flask.jsonify({"error_code": "WCHA_INVALID_PAYLOAD", "message": "Invalid or missing JSON payload."}), 400 # Standardized error
 
             topic = request_data.get("topic")
             url_to_harvest = request_data.get("url")
-            use_search = request_data.get("use_search", False) # For get_content_for_topic
+            use_search = request_data.get("use_search", False)
+            max_results_override = request_data.get("max_results") # For get_content_for_topic
+
             # Optional: allow overriding timeout and min_length via request for direct URL harvest
             timeout_override = request_data.get("timeout")
             min_length_override = request_data.get("min_length")
@@ -316,62 +328,97 @@ try:
 
             if use_search and topic:
                 logger.info(f"[WCHA_API] Received API request to search and harvest for topic: '{topic}'")
-                # get_content_for_topic still returns a string (content or error message)
-                content_result_str = get_content_for_topic(topic)
-                # Check if the returned string indicates an error based on its prefixes
-                # (This part remains similar as get_content_for_topic's return signature wasn't changed to dict for this subtask)
-                if any(content_result_str.startswith(prefix) for prefix in [ERROR_WCHA_LIB_MISSING, ERROR_WCHA_SEARCH_FAILED, ERROR_WCHA_NO_SEARCH_RESULTS, ERROR_WCHA_HARVEST_ALL_FAILED]):
-                    return flask.jsonify({"topic": topic, "error": content_result_str, "content": None}), 400 # Or 500 depending on error
-                return flask.jsonify({"topic": topic, "source": "web_search_ddg", "content": content_result_str}), 200
+
+                harvest_params_for_search = {}
+                if max_results_override is not None:
+                    try:
+                        harvest_params_for_search["max_results_override"] = int(max_results_override)
+                    except ValueError:
+                        logger.warning(f"[WCHA_API] Invalid max_results value '{max_results_override}'. Using default.")
+
+                result_dict = get_content_for_topic(topic, **harvest_params_for_search)
+
+                status_code = 500 # Default for failure
+                if result_dict["status"] == "success":
+                    status_code = 200
+                elif result_dict["message"].startswith(ERROR_WCHA_LIB_MISSING):
+                    status_code = 503 # Service unavailable
+                elif result_dict["message"].startswith(ERROR_WCHA_NO_SEARCH_RESULTS):
+                    status_code = 404 # Not found (for the topic)
+                elif result_dict["message"].startswith(ERROR_WCHA_SEARCH_FAILED):
+                    status_code = 502 # Bad Gateway (search provider failed)
+                # ERROR_WCHA_HARVEST_ALL_FAILED can remain 500 or be more specific e.g. 207 Multi-Status if some info is there
+
+                return flask.jsonify(result_dict), status_code
 
             elif url_to_harvest:
                 logger.info(f"[WCHA_API] Received API request for direct URL harvest: '{url_to_harvest}'")
                 harvest_params = {}
-                if timeout_override is not None: harvest_params["timeout"] = timeout_override
-                if min_length_override is not None: harvest_params["min_length"] = min_length_override
+                if timeout_override is not None:
+                    try: harvest_params["timeout"] = int(timeout_override)
+                    except ValueError: logger.warning(f"Invalid timeout override: {timeout_override}")
+                if min_length_override is not None:
+                    try: harvest_params["min_length"] = int(min_length_override)
+                    except ValueError: logger.warning(f"Invalid min_length override: {min_length_override}")
 
-                harvest_result_dict = harvest_from_url(url_to_harvest, **harvest_params)
+                # harvest_from_url already returns a dict, but we need to ensure it aligns with the new overall structure.
+                # For now, we'll adapt its output slightly to fit the status/content/source_urls/message pattern.
+                # Ideally, harvest_from_url would also be refactored to this standard.
+                direct_harvest_result = harvest_from_url(url_to_harvest, **harvest_params)
 
-                if harvest_result_dict.get("content"):
-                    return flask.jsonify({
-                        "url": url_to_harvest,
-                        "source": "direct_url",
-                        "content": harvest_result_dict["content"]
-                    }), 200
+                if direct_harvest_result.get("content"):
+                    # Successfully got content from the single URL
+                    api_response = {
+                        "status": "success",
+                        "content": direct_harvest_result["content"],
+                        "source_urls": [url_to_harvest], # Only one URL in this case
+                        "message": f"Successfully harvested content from URL: {url_to_harvest}"
+                    }
+                    return flask.jsonify(api_response), 200
                 else:
-                    error_type = harvest_result_dict.get("error_type", WCHA_ERROR_TYPE_UNKNOWN)
-                    error_message = harvest_result_dict.get("error_message", "Unknown error during harvest.")
+                    # Failed to get content from the single URL
+                    error_message_detail = direct_harvest_result.get("error_message", "Unknown error during direct URL harvest.")
+                    api_response = {
+                        "status": "failure",
+                        "content": None,
+                        "source_urls": [],
+                        "message": f"Failed to harvest content from URL: {url_to_harvest}. Reason: {error_message_detail}"
+                    }
+                    # Determine status code based on error_type from harvest_from_url
+                    error_type = direct_harvest_result.get("error_type")
                     status_code = 500 # Default
                     if error_type == WCHA_ERROR_TYPE_LIB_MISSING: status_code = 503
-                    elif error_type == WCHA_ERROR_TYPE_FETCH: status_code = 502
-                    elif error_type == WCHA_ERROR_TYPE_NO_CONTENT: status_code = 404
-                    # WCHA_ERROR_TYPE_EXTRACTION or WCHA_ERROR_TYPE_UNKNOWN remains 500
-
-                    return flask.jsonify({
-                        "url": url_to_harvest,
-                        "error": error_message,
-                        "error_type": error_type,
-                        "content": None
-                    }), status_code
+                    elif error_type == WCHA_ERROR_TYPE_FETCH: status_code = 502 # Or 404 if specific like "Not Found"
+                    elif error_type == WCHA_ERROR_TYPE_NO_CONTENT: status_code = 404 # Or 200 with empty content if preferred
+                    return flask.jsonify(api_response), status_code
 
             elif topic: # Fallback to mock data if no use_search and no url, but topic is present
                 logger.info(f"[WCHA_API] Received API request for mock topic (no use_search or url): '{topic}'")
-                content_result_mock = harvest_content(topic) # Mock function
-                if content_result_mock.startswith("No pre-defined content found"):
-                     return flask.jsonify({"topic": topic, "message": content_result_mock, "content": None}), 200 # Or 404
-                return flask.jsonify({"topic": topic, "source": "mock_data", "content": content_result_mock}), 200
-
+                content_result_mock_str = harvest_content(topic) # Mock function returns string
+                if content_result_mock_str.startswith("No pre-defined content found"):
+                    return flask.jsonify({
+                        "status": "success", # Or "failure" if no mock data is considered an error
+                        "content": None,
+                        "source_urls": ["mock_data_source"], # Placeholder source
+                        "message": content_result_mock_str
+                        }), 200 # Or 404 if "not found"
+                return flask.jsonify({
+                    "status": "success",
+                    "content": content_result_mock_str,
+                    "source_urls": ["mock_data_source"],
+                    "message": f"Mock content provided for topic: {topic}"
+                    }), 200
             else:
                 logger.warning("[WCHA_API] Invalid API request. 'url' or 'topic' (with use_search=true for web search, or alone for mock) must be provided.")
-                return flask.jsonify({"error": ENDPOINT_ERROR_MISSING_FIELDS, "details": "'topic' (with use_search=true) or 'url' must be provided."}), 400
+                return flask.jsonify({"error_code": "WCHA_MISSING_PARAMETERS", "message": "Invalid input", "details": "'topic' (with use_search=true) or 'url' must be provided."}), 400
 
         except Exception as e:
-            logger.error(f"Unexpected error in /harvest_content_endpoint: {e}", exc_info=True)
-            return flask.jsonify({"error": ENDPOINT_ERROR_INTERNAL_SERVER, "details": str(e)}), 500
+            logger.error(f"Unexpected error in /harvest: {e}", exc_info=True) # Updated endpoint name in log
+            return flask.jsonify({"error_code": "WCHA_INTERNAL_SERVER_ERROR", "message": "Internal server error", "details": str(e)}), 500
 
 except ImportError:
     app = None 
-    logger.info("Flask not installed. API endpoint /harvest_content_endpoint will not be available.")
+    logger.info("Flask not installed. API endpoint /harvest will not be available.") # Updated endpoint name
 
 
 # --- Example Usage (Updated) ---
@@ -383,52 +430,57 @@ if __name__ == "__main__":
         print(f"\nWARNING: Some required libraries are missing: {MISSING_IMPORT_ERROR}")
         print("Functionality of 'harvest_from_url' and 'get_content_for_topic' will be limited or fail.\n")
 
-    # 1. Test harvest_content (mock data)
+    # 1. Test harvest_content (mock data) - this is the old simple mock, kept for basic check
     print("\n--- Testing harvest_content (mock data) ---")
-    existing_topic = "ai in healthcare"
-    print(f"Requesting mock content for topic: '{existing_topic}'")
-    mock_data_content = harvest_content(existing_topic)
-    print(f"Content for '{existing_topic}' (first 100 chars): {mock_data_content[:100]}...\n")
+    existing_topic_mock = "ai in healthcare"
+    print(f"Requesting mock content for topic: '{existing_topic_mock}'")
+    mock_data_content_str = harvest_content(existing_topic_mock) # Original mock function
+    print(f"Content for '{existing_topic_mock}' (first 100 chars): {mock_data_content_str[:100]}...\n")
 
-    # 2. Test harvest_from_url (if imports allow)
+    # 2. Test harvest_from_url (if imports allow) - this returns a dict now
     print("\n--- Testing harvest_from_url (single URL) ---")
-    if not _IMPORTS_SUCCESSFUL_BASE: # Specifically requests/bs4
-        print(f"Skipping harvest_from_url test as requests/bs4 are missing: {_MISSING_IMPORT_ERROR_BASE}\n")
+    if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4 or not _IMPORTS_SUCCESSFUL_TRAFILATURA:
+        missing_libs_harvest_url = []
+        if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4: missing_libs_harvest_url.append("requests/bs4")
+        if not _IMPORTS_SUCCESSFUL_TRAFILATURA: missing_libs_harvest_url.append("trafilatura")
+        print(f"Skipping harvest_from_url test as libraries are missing: {', '.join(missing_libs_harvest_url)}\n")
     else:
-        # Test with a known URL, e.g., Wikipedia page on "Python (programming language)"
         python_wiki_url = "https://en.wikipedia.org/wiki/Python_(programming_language)"
         print(f"Requesting content from URL: '{python_wiki_url}'")
-        url_content = harvest_from_url(python_wiki_url)
-        if any(url_content.startswith(prefix) for prefix in ("Error fetching URL", "Failed to fetch URL", "No paragraph text found", "Content at URL")):
-            print(f"Error/Warning from harvest_from_url: {url_content}\n")
+        url_harvest_result = harvest_from_url(python_wiki_url) # Returns dict
+        if url_harvest_result.get("content"):
+            print(f"Content from '{python_wiki_url}' (first 200 chars): {url_harvest_result['content'][:200]}...\n")
         else:
-            print(f"Content from '{python_wiki_url}' (first 200 chars): {url_content[:200]}...\n")
+            print(f"Error/Warning from harvest_from_url: {url_harvest_result.get('error_message')}\n")
             
-    # 3. Test get_content_for_topic (if all imports allow)
+    # 3. Test get_content_for_topic (if all imports allow) - this now returns a dict
     print("\n--- Testing get_content_for_topic (web search & consolidation) ---")
-    if not IMPORTS_SUCCESSFUL: # Checks all: requests, bs4, duckduckgo_search
+    if not IMPORTS_SUCCESSFUL: # Checks all: requests, bs4, duckduckgo_search, trafilatura
         print(f"Skipping get_content_for_topic test as libraries are missing: {MISSING_IMPORT_ERROR}\n")
     else:
-        search_topic = "benefits of regular exercise"
-        # Test with override for max_results
-        test_max_results = 2
-        print(f"Requesting consolidated content for topic: '{search_topic}' (max {test_max_results} results for test)")
-        consolidated_content = get_content_for_topic(search_topic, max_results_override=test_max_results)
+        search_topic_exercise = "benefits of regular exercise"
+        test_max_results_exercise = 2 # Test with override for max_results
+        print(f"Requesting consolidated content for topic: '{search_topic_exercise}' (max {test_max_results_exercise} results for test)")
         
-        # Check if the result is an error message from the function itself
-        if any(consolidated_content.startswith(prefix) for prefix in ("WCHA: Cannot 'get_content_for_topic'", "Error during web search", "WCHA: No search results", "WCHA: Failed to harvest usable content")):
-            print(f"Error/Warning from get_content_for_topic: {consolidated_content}\n")
-        else:
-            print(f"Consolidated content for '{search_topic}' (first 500 chars):\n{consolidated_content[:500]}...\n")
-            if len(consolidated_content) > 500:
-                print(f"... (Total length: {len(consolidated_content)} characters)")
+        consolidated_result_dict = get_content_for_topic(search_topic_exercise, max_results_override=test_max_results_exercise)
+
+        print(f"Status: {consolidated_result_dict['status']}")
+        print(f"Message: {consolidated_result_dict['message']}")
+        if consolidated_result_dict["status"] == "success" and consolidated_result_dict["content"]:
+            print(f"Source URLs: {consolidated_result_dict['source_urls']}")
+            print(f"Consolidated content for '{search_topic_exercise}' (first 500 chars):\n{consolidated_result_dict['content'][:500]}...\n")
+            if len(consolidated_result_dict["content"]) > 500:
+                print(f"... (Total length: {len(consolidated_result_dict['content'])} characters)")
+        elif consolidated_result_dict["content"]: # Might be success but empty content if all sources were too short
+             print(f"Content was returned but might be empty or partial. Length: {len(consolidated_result_dict['content'])}")
+        # Error or no content already covered by message
 
     print("\n--- WCHA functionality testing in __main__ complete ---")
     
     if app:
-        print("\n--- Flask app /harvest_content_endpoint is defined (run separately if needed) ---")
+        print("\n--- Flask app /harvest is defined (run separately if needed) ---") # Updated endpoint name
         # To run: FLASK_APP=aethercast.wcha.main flask run -p 5003
         # Example POST request (using curl or a tool like Postman):
-        # curl -X POST -H "Content-Type: application/json" -d '{"topic":"ai in healthcare", "use_search":true}' http://localhost:5003/harvest_content_endpoint
-        # curl -X POST -H "Content-Type: application/json" -d '{"url":"https://en.wikipedia.org/wiki/Python_(programming_language)"}' http://localhost:5003/harvest_content_endpoint
-        # curl -X POST -H "Content-Type: application/json" -d '{"topic":"climate change"}' http://localhost:5003/harvest_content_endpoint
+        # curl -X POST -H "Content-Type: application/json" -d '{"topic":"ai in healthcare", "use_search":true}' http://localhost:5003/harvest
+        # curl -X POST -H "Content-Type: application/json" -d '{"url":"https://en.wikipedia.org/wiki/Python_(programming_language)"}' http://localhost:5003/harvest
+        # curl -X POST -H "Content-Type: application/json" -d '{"topic":"climate change"}' http://localhost:5003/harvest

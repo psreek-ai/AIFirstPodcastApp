@@ -138,7 +138,13 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_successful_run(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Detailed content about a fascinating topic."
+        # WCHA now returns a dictionary
+        mock_get_content.return_value = {
+            "status": "success",
+            "content": "Detailed content about a fascinating topic.",
+            "source_urls": ["http://example.com/wcha_source1"],
+            "message": "WCHA successfully fetched content."
+        }
 
         mock_pswa_structured_script = {
             "script_id": "pswa_script_123", "topic": "Test Topic", "title": "A Brilliant Podcast Title",
@@ -243,27 +249,25 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_wcha_failure_returns_error_string(self, mock_get_content, mock_update_db, mock_send_ui_update):
         mock_get_content.return_value = f"{cpoa_main.ERROR_WCHA_NO_SEARCH_RESULTS}: Obscure Topic" # Use constant from wcha via cpoa import if available, or define in cpoa
-        # For this test, assuming CPOA itself might have or relay specific prefixes it checks from WCHA
-        # Let's assume cpoa_main.WCHA_ERROR_INDICATORS includes the base string "WCHA: No search results"
-        # For a more robust test, we'd mock WCHA_ERROR_INDICATORS or ensure `cpoa_main.ERROR_WCHA_NO_SEARCH_RESULTS` is defined and used.
-        # For now, I'll use a direct string that matches CPOA's current logic.
-        # If CPOA's WCHA_ERROR_INDICATORS tuple is accessible, use that.
-        # Rechecking cpoa_main.py, WCHA_ERROR_INDICATORS is global there.
-        # So, we can use one of its elements if it's specific enough.
-        # "WCHA: No search results" is a specific string.
-        mock_get_content.return_value = "WCHA: No search results found for topic: Obscure Topic"
+        # WCHA returns a dict, simulate failure
+        mock_get_content.return_value = {
+            "status": "failure",
+            "content": None,
+            "source_urls": [],
+            "message": "WCHA: No search results found for topic: Obscure Topic"
+        }
         client_id_wcha_fail = "client_wcha_fail"
         result = cpoa_main.orchestrate_podcast_generation("Obscure Topic", "task_wcha_fail_001", "dummy.db", client_id=client_id_wcha_fail, user_preferences=None)
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST) # Use constant
-        self.assertIn("WCHA: No search results", result['error_message'])
+        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST)
+        self.assertEqual(result['error_message'], "WCHA: No search results found for topic: Obscure Topic")
         # Check UI update for error
         mock_send_ui_update.assert_any_call(client_id_wcha_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_WCHA})
 
         last_call_args = mock_update_db.call_args_list[-1][0]
         self.assertEqual(last_call_args[1], "task_wcha_fail_001")
         self.assertEqual(last_call_args[2], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST)
-        self.assertIn("WCHA: No search results", last_call_args[3])
+        self.assertEqual(last_call_args[3], "WCHA: No search results found for topic: Obscure Topic")
 
 
     @patch.object(cpoa_main, '_send_ui_update')
@@ -271,7 +275,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_pswa_http_error(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Some content"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Some content",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         mock_pswa_error_response = MagicMock()
         mock_pswa_error_response.status_code = 503 # Simulate a server error from PSWA
@@ -309,7 +316,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_pswa_returns_malformed_script(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Some content"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Some content",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         mock_pswa_malformed_response = MagicMock(status_code=200)
         # Missing 'segments' key, which is essential for VFA processing later
@@ -333,7 +343,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_pswa_returns_malformed_script_missing_id(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Some content"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Some content",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         mock_pswa_malformed_response_missing_id = MagicMock(status_code=200)
         # Missing 'script_id'
@@ -355,7 +368,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_vfa_failure_http_error(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Some content for VFA test"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Some content for VFA test",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         # PSWA returns valid structured script
         mock_pswa_structured_script = {
@@ -399,10 +415,15 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_asf_notification_failure(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for ASF test"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for ASF test",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         mock_pswa_response = MagicMock(status_code=200)
-        mock_pswa_response.json.return_value = {"script_text": "Script for ASF test"}
+        # Ensure PSWA returns a script_id, as VFA call depends on it.
+        mock_pswa_response.json.return_value = {"script_id": "s_asf_test", "title": "ASF Test", "segments": [{"content": "Script for ASF test"}]}
+
 
         mock_vfa_response = MagicMock(status_code=200)
         mock_vfa_response.json.return_value = {
@@ -460,7 +481,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestration_when_send_ui_update_fails(self, mock_get_content, mock_requests_retry_services, mock_update_db, mock_direct_send_ui_update_call):
         # This test is to ensure that if _send_ui_update itself has an issue (e.g., ASF down), CPOA doesn't crash.
-        mock_get_content.return_value = "Content for UI update failure test"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for UI update failure test",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         # Mock successful PSWA, VFA, ASF calls
         mock_pswa_response = MagicMock(status_code=200)
@@ -501,7 +525,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestration_with_no_client_id(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for no client ID test"
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for no client ID test",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = {"script_id": "s_no_client", "title": "No Client ID Title", "segments": [{"content":"test"}]}
         mock_vfa_response = MagicMock(status_code=200)
@@ -531,7 +558,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestration_uses_voice_preference_from_user_prefs(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for voice preference test."
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for voice preference test.",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
         mock_pswa_script = {"script_id": "s_voice_pref", "title": "Voice Pref Test", "segments": [{"content":"test"}]}
         mock_pswa_response = MagicMock(status_code=200, json=lambda: mock_pswa_script)
 
@@ -572,7 +602,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestration_direct_voice_params_override_user_prefs(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for voice param override test."
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for voice param override test.",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
         mock_pswa_script = {"script_id": "s_override", "title": "Override Test", "segments": [{"content":"test"}]}
         mock_pswa_response = MagicMock(status_code=200, json=lambda: mock_pswa_script)
 
@@ -607,7 +640,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestration_passes_test_scenario_headers(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for test scenario header test."
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for test scenario header test.",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
         mock_pswa_script = {"script_id": "s_scenario", "title": "Scenario Test", "segments": [{"content":"test"}]}
         mock_pswa_response = MagicMock(status_code=200, json=lambda: mock_pswa_script)
 
@@ -645,7 +681,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry') # Mock all service calls
     @patch.object(cpoa_main, 'get_content_for_topic') # Mock WCHA
     def test_orchestrate_podcast_pswa_cache_hit(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Some content for caching test."
+        mock_get_content.return_value = {
+            "status": "success", "content": "Some content for caching test.",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
 
         # Simulate PSWA service returning a cached script
         mock_cached_pswa_script = {
@@ -730,7 +769,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestrate_podcast_vfa_returns_status_skipped_in_json(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for VFA skipped test."
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for VFA skipped test.",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
         mock_pswa_script = {"script_id": "s_vfa_skip", "title": "VFA Skip Test", "segments": [{"content":"test"}]}
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = mock_pswa_script
@@ -777,7 +819,10 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
     @patch.object(cpoa_main, 'requests_with_retry')
     @patch.object(cpoa_main, 'get_content_for_topic')
     def test_orchestrate_podcast_vfa_returns_status_error_in_json(self, mock_get_content, mock_requests_retry, mock_update_db, mock_send_ui_update):
-        mock_get_content.return_value = "Content for VFA error in JSON test."
+        mock_get_content.return_value = {
+            "status": "success", "content": "Content for VFA error in JSON test.",
+            "source_urls": ["http://example.com/source"], "message": "WCHA success"
+        }
         mock_pswa_script = {"script_id": "s_vfa_err_json", "title": "VFA Error JSON Test", "segments": [{"content":"test"}]}
         mock_pswa_response = MagicMock(status_code=200)
         mock_pswa_response.json.return_value = mock_pswa_script

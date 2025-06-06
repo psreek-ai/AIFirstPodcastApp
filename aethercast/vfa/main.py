@@ -422,22 +422,22 @@ def handle_forge_voice():
 
     if not data:
         logger.error("[VFA_FLASK_ENDPOINT] No JSON payload received.")
-        return jsonify({"status": "error", "message": "No JSON payload received"}), 400
+        return jsonify({"error_code": "VFA_PAYLOAD_ERROR", "message": "Invalid payload", "details": "No JSON payload received"}), 400
 
     script_payload = data.get('script')
     voice_params_payload = data.get('voice_params') # Optional
 
     if script_payload is None:
         logger.error("[VFA_FLASK_ENDPOINT] 'script' parameter missing from JSON payload.")
-        return jsonify({"status": "error", "message": "Missing 'script' parameter"}), 400
+        return jsonify({"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "Missing 'script' parameter"}), 400
 
     if not isinstance(script_payload, dict):
         logger.error(f"[VFA_FLASK_ENDPOINT] 'script' parameter is not a dictionary (type: {type(script_payload)}). Payload: {str(script_payload)[:200]}")
-        return jsonify({"status": "error", "message": "'script' parameter must be a valid JSON object (dictionary)."}), 400
+        return jsonify({"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "'script' parameter must be a valid JSON object (dictionary)."}), 400
 
     if voice_params_payload is not None and not isinstance(voice_params_payload, dict):
         logger.error(f"[VFA_FLASK_ENDPOINT] 'voice_params' parameter, if provided, must be a dictionary. Type: {type(voice_params_payload)}")
-        return jsonify({"status": "error", "message": "'voice_params' parameter must be a valid JSON object if provided."}), 400
+        return jsonify({"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "'voice_params' parameter must be a valid JSON object if provided."}), 400
 
     logger.info(f"[VFA_FLASK_ENDPOINT] Calling forge_voice with script data for topic: '{script_payload.get('topic', 'N/A')}' and voice_params: {voice_params_payload}")
     result = forge_voice(script_payload, voice_params_input=voice_params_payload)

@@ -301,7 +301,7 @@ document.addEventListener('DOMContentLoaded', () => {
         console.log('MediaSource opened. Stream ID:', streamId);
         updateStreamingStatus('MediaSource ready. Waiting for audio data...', false);
         try {
-            sourceBuffer = mediaSource.addSourceBuffer('audio/mpeg');
+            sourceBuffer = mediaSource.addSourceBuffer('audio/ogg; codecs=opus');
             sourceBuffer.addEventListener('updateend', () => { /* ... */ });
             sourceBuffer.addEventListener('error', (ev) => { /* ... */ });
         } catch (e) { /* ... */ }
