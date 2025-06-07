@@ -1,0 +1,44 @@
+# Aethercast: How It Works - An Overview
+
+This document provides a high-level overview of how the Aethercast system functions to dynamically generate AI-powered podcasts. For more detailed technical information, please refer to the documents in the `docs/architecture/` directory.
+
+## Core Idea
+
+Aethercast is designed to create unique audio experiences on demand. Instead of relying on pre-recorded content, it generates everything from scratch – from the topics and scripts to the spoken audio itself – using a suite of specialized AI agents working in concert.
+
+## The Journey of a Podcast
+
+Here's a simplified step-by-step look at how a podcast comes to life in Aethercast:
+
+1.  **Finding Something to Talk About (Topic Discovery):**
+    *   The system can proactively identify interesting and current topics using the **Topic Discovery Agent (TDA)**. The TDA scans various sources (like news feeds and web trends) to find suitable subjects.
+    *   Alternatively, a user might initiate a request for a specific topic through the user interface.
+
+2.  **Crafting Teasers (Snippet Generation):**
+    *   For discovered topics, the **Snippet Craft Agent (SCA)** generates short, engaging text snippets. These are like mini-previews or titles that you might see on the Aethercast landing page to pique your interest.
+    *   The SCA uses AI language models to write these snippets.
+    *   (Optional) The **Image Generation Agent (IGA)** might also create a relevant cover image for the snippet based on its content.
+
+3.  **Developing the Full Story (Podcast Generation):**
+    Once a user decides to listen to a full podcast on a chosen topic:
+    *   **Gathering Information (Content Harvesting):** The **WebContent Harvester Agent (WCHA)** springs into action. It searches the web for relevant and up-to-date information about the topic from various sources. This raw information forms the factual basis of the podcast.
+    *   **Writing the Script (Script Weaving):** The **Podcast Script Weaver Agent (PSWA)** takes the harvested content and, using advanced AI language models, writes a full podcast script. This includes structuring the episode, writing the narrative, and ensuring it flows well and sounds engaging, potentially adopting a specific persona or style.
+    *   **Giving it a Voice (Voice Synthesis):** The **Voice Forge Agent (VFA)** takes the finalized script. It uses Text-to-Speech (TTS) technology, provided by the **AIMS TTS Service**, to convert the text script into natural-sounding audio. This service is responsible for generating the actual voice you hear.
+
+4.  **Delivering the Audio (Streaming):**
+    *   As the VFA generates the audio, the **Audio Stream Feeder (ASF)** makes it available to the user in real-time. Instead of waiting for the entire podcast to be created, audio is streamed chunk by chunk, allowing the user to start listening almost immediately.
+    *   The **API Gateway** manages the user's connection and ensures smooth delivery of this audio stream to the frontend application.
+
+## The Orchestrator: Keeping it All Together
+
+*   The **Central Podcast Orchestrator (CPOA)** (currently part of the API Gateway) is the brain behind the scenes. It manages the entire workflow, coordinating the tasks of all the specialized agents mentioned above. It ensures that each step happens in the right order and that data flows correctly between the agents.
+
+## Supporting AI Services
+
+*   The **AIMS Service** (AI Model Service) provides the underlying AI model capabilities (primarily Large Language Models) that agents like SCA and PSWA use for tasks like text generation, summarization, and content understanding.
+
+## The Big Picture
+
+Aethercast combines these specialized agents and services to create a flexible and dynamic podcast generation system. By generating content in real-time, it aims to offer fresh, relevant, and personalized audio experiences.
+
+---

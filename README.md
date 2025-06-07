@@ -14,6 +14,12 @@ The system consists of several microservices that work together:
 -   **Voice Forge Agent (VFA):** Synthesizes audio from the script using a Text-to-Speech (TTS) service.
 -   **Audio Stream Feeder (ASF):** Streams the generated audio to clients in real-time via WebSockets.
 
+### Backend/Supporting Services
+
+-   **AIMS Service (`aims_service`):** Provides access to general-purpose AI models (e.g., Large Language Models) used by other agents like SCA and PSWA.
+-   **AIMS TTS Service (`aims_tts_service`):** Handles Text-to-Speech synthesis, converting scripts from VFA into audio. It's used by the VFA.
+-   **Image Generation Agent (IGA):** Responsible for dynamically generating cover art or accompanying images for podcasts, typically based on prompts from SCA or PSWA.
+
 ## Features (Conceptual)
 
 -   Automated topic discovery and suggestion.
@@ -89,6 +95,11 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   PSWA: `http://localhost:5004`
     *   VFA: `http://localhost:5005`
     *   ASF: `ws://localhost:5006` (for WebSocket connections)
+    *   AIMS Service: `http://localhost:PORT` (Replace `PORT` with actual, if directly accessible for debugging)
+    *   AIMS TTS Service: `http://localhost:PORT` (Replace `PORT` with actual, if directly accessible for debugging)
+    *   IGA: `http://localhost:PORT` (Replace `PORT` with actual, if directly accessible for debugging)
+
+    Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes. The main interaction point for users is the API Gateway.
 
 4.  **Shared Volumes:**
     *   `aethercast_db_data`: A named volume that stores the shared SQLite database (`aethercast_podcasts.db`). This ensures data persistence across container restarts and allows all services to access the same DB instance.
