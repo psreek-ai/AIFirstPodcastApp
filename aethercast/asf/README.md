@@ -2,181 +2,182 @@
 
 ## Purpose
 
-The Audio Stream Feeder (ASF) service is responsible for streaming generated podcast audio to connected clients (e.g., the Aethercast web frontend) in real-time using WebSockets. It allows clients to start receiving audio data as it's being processed or as soon as it's fully available, without needing to download the entire file first.
+The Audio Stream Feeder (ASF) service is responsible for two main functions:
+1.  Streaming generated podcast audio to connected clients (e.g., the Aethercast web frontend) in real-time using WebSockets.
+2.  Relaying real-time UI updates from backend services (like CPOA) to specific clients, also via WebSockets.
+
+This allows clients to start receiving audio data as it's being processed or as soon as it's fully available, and to receive timely updates about ongoing processes or new information relevant to their session.
 
 Key Responsibilities:
 
-1.  **WebSocket Server:** Provides a WebSocket endpoint (`/api/v1/podcasts/stream`) for clients to connect to.
-2.  **Stream Management:**
-    *   Allows clients to `join_stream` using a unique `stream_id` (provided by VFA via CPOA and API Gateway).
-    *   Maintains a mapping from `stream_id` to the actual audio file path on the server. This map is populated via an internal HTTP endpoint.
+1.  **WebSocket Server:** Provides WebSocket endpoints for audio streaming (`/api/v1/podcasts/stream`) and UI updates (`/ui_updates`).
+2.  **Audio Stream Management:**
+    *   Allows clients to `join_stream` using a unique `stream_id`.
+    *   Maintains a mapping from `stream_id` to the actual audio file path.
 3.  **Audio Chunk Streaming:**
-    *   When a client joins a stream, ASF retrieves the associated audio file.
-    *   It reads the audio file in chunks of a configurable size (`ASF_CHUNK_SIZE`).
-    *   Each chunk is sent as a binary WebSocket message (`audio_chunk` event) to the client(s) in that stream's room.
-    *   A small configurable delay (`ASF_STREAM_SLEEP_INTERVAL`) is introduced between chunks to manage flow.
-4.  **Stream Lifecycle & Control:**
-    *   Sends `audio_control` messages to clients to indicate the `start_of_stream` and `end_of_stream`.
-    *   Handles client connections, disconnections, and potential errors during streaming, emitting `stream_error` messages if issues occur.
+    *   Reads audio files in chunks and sends them as binary WebSocket messages (`audio_chunk`).
+    *   Sends `audio_control` messages for `start_of_stream` and `end_of_stream`.
+4.  **UI Update Relaying:**
+    *   Allows clients to `subscribe_to_ui_updates` for a specific `client_id`.
+    *   Receives UI update messages from other services (like CPOA) via an internal HTTP endpoint.
+    *   Emits these updates to the relevant client(s) over the UI updates WebSocket namespace.
+5.  **Stream & Update Lifecycle & Control:**
+    *   Handles client connections, disconnections, subscriptions, and potential errors, emitting status or error messages (e.g., `stream_error`, `ui_error`).
 
 ## Configuration
 
-ASF is configured via environment variables, typically managed in a `.env` file within the `aethercast/asf/` directory. Create one by copying the example:
+ASF is configured via environment variables, typically managed in a `.env` file within the `aethercast/asf/` directory.
 
-```bash
-cp .env.example .env
-```
+Key variables include:
 
-Then, edit the `.env` file. Key variables include:
-
--   `ASF_SECRET_KEY`: Secret key for Flask session management and signing. **Important: Change this in production!** If not set, a temporary UUID will be generated at startup (check logs for the value if needed for external session verification, though not typical for ASF's primary role).
-    -   *Example:* `your_very_secret_key_here_for_asf`
--   `ASF_CORS_ALLOWED_ORIGINS`: Specifies which origins are allowed for Cross-Origin Resource Sharing with SocketIO. Use `*` for all origins (less secure, suitable for development) or a comma-separated list of specific origins for production.
+-   `ASF_SECRET_KEY`: Secret key for Flask session management. **Important: Change this in production!**
+-   `ASF_CORS_ALLOWED_ORIGINS`: Origins allowed for CORS with SocketIO (e.g., `*` for dev, specific origins for prod).
     -   *Default:* `*`
--   `ASF_CHUNK_SIZE`: The size of audio data (in bytes) to read from the file and send in each WebSocket message.
-    -   *Default:* `4096` (4KB)
--   `ASF_STREAM_SLEEP_INTERVAL`: The small delay (in seconds) between sending audio chunks. This helps in pacing the stream.
-    -   *Default:* `0.01` (10 milliseconds)
--   `ASF_HOST`: The host address for the ASF Flask-SocketIO server to bind to.
-    -   *Default:* `0.0.0.0` (listens on all available network interfaces)
--   `ASF_PORT`: The port number for the ASF server.
+-   `ASF_CHUNK_SIZE`: Size of audio data (bytes) for each WebSocket audio message.
+    -   *Default:* `4096`
+-   `ASF_STREAM_SLEEP_INTERVAL`: Delay (seconds) between sending audio chunks.
+    -   *Default:* `0.01`
+-   `ASF_HOST`: Host address for the ASF Flask-SocketIO server.
+    -   *Default:* `0.0.0.0`
+-   `ASF_PORT`: Port number for the ASF server.
     -   *Default:* `5006`
--   `ASF_DEBUG_MODE`: Enables or disables Flask debug mode (and SocketIO debug features).
+-   `ASF_DEBUG_MODE`: Enables/disables Flask debug mode.
     -   *Default:* `True`
--   `ASF_UI_UPDATES_NAMESPACE`: The Socket.IO namespace dedicated to UI status updates.
+-   `ASF_UI_UPDATES_NAMESPACE`: The Socket.IO namespace dedicated to UI status updates and real-time event relay.
     -   *Default:* `/ui_updates`
 
 ## Dependencies
 
-Project dependencies are listed in `requirements.txt`. Install them using pip:
-
-```bash
-pip install -r requirements.txt
-```
-This includes `Flask`, `Flask-SocketIO`, `python-dotenv`, and `eventlet` (as the recommended WebSocket server for Flask-SocketIO in production, though the dev server is used if `eventlet` isn't explicitly run).
+Project dependencies are listed in `requirements.txt` (includes `Flask`, `Flask-SocketIO`, `python-dotenv`, `eventlet`). Install with `pip install -r requirements.txt`.
 
 ## Running the Service
 
-1.  Ensure environment variables are correctly set (e.g., in a `.env` file).
-2.  The shared audio directory (used by VFA to save files, and ASF to read them) must be accessible to ASF at the path configured in VFA (e.g., `/srv/aethercast/generated_audio/`).
-3.  Run the Flask-SocketIO server:
-    ```bash
-    python aethercast/asf/main.py
-    ```
-    This will start the service, typically on `http://0.0.0.0:5006` (WebSocket will be `ws://0.0.0.0:5006`).
-
-For a more production-like setup using `eventlet`:
-```bash
-# Ensure eventlet is installed (it's in requirements.txt)
-# The python script itself is set up to use socketio.run which can use eventlet if available.
-# Alternatively, a gunicorn setup with eventlet worker would be:
-# gunicorn --worker-class eventlet -w 1 aethercast.asf.main:app --bind 0.0.0.0:5006
-```
+1.  Set environment variables.
+2.  Ensure shared audio directory is accessible.
+3.  Run: `python aethercast/asf/main.py`.
+    Service typically starts on `http://0.0.0.0:5006`.
 
 ## WebSocket API
 
-Clients connect to the ASF service via WebSockets.
+Clients connect to ASF via WebSockets for audio streaming and UI updates using different namespaces.
+
+### Audio Streaming Namespace
 
 -   **Namespace:** `/api/v1/podcasts/stream`
-    -   The client should connect to `your_asf_host:your_asf_port/api/v1/podcasts/stream`.
-    -   Example (JavaScript): `const socket = io('ws://localhost:5006/api/v1/podcasts/stream');` (if `asf_websocket_url` from API GW already includes the namespace) or construct from base URL.
+    -   Connect to: `your_asf_host:your_asf_port/api/v1/podcasts/stream`.
 
-### Client-to-Server Events:
+#### Client-to-Server Events (Audio Streaming):
 
 -   **`join_stream`**
-    -   **Description:** Sent by the client after connecting, to subscribe to a specific audio stream.
+    -   **Description:** Client subscribes to a specific audio stream.
+    -   **Payload Example (JSON):** `{"stream_id": "strm_abcdef12345"}`
+
+#### Server-to-Client Events (Audio Streaming):
+
+-   **`connection_ack`**: Confirms connection to audio namespace. Payload: `{"message": "Connected to ASF. Please send join_stream..."}`.
+-   **`stream_status`**: Confirms joining a stream room. Payload: `{"status": "joined", "stream_id": "...", "message": "..."}`.
+-   **`audio_control`**: Signals stream start/end. Payload: `{"event": "start_of_stream" | "end_of_stream", "stream_id": "...", "timestamp": ...}`.
+-   **`audio_chunk`**: Transmits a binary chunk of audio data (raw binary).
+-   **`stream_error`**: Error related to a specific stream (e.g., file not found). Payload: `{"message": "..."}`.
+-   **`error`**: Generic error for issues like missing `stream_id`. Payload: `{"message": "..."}`.
+
+### UI Updates Namespace
+
+-   **Namespace:** `/ui_updates` (default, configurable via `ASF_UI_UPDATES_NAMESPACE`)
+    -   Connect to: `your_asf_host:your_asf_port/ui_updates`.
+
+#### Client-to-Server Events (UI Updates):
+
+-   **`subscribe_to_ui_updates`**
+    -   **Description:** Client subscribes to receive UI updates for a specific session/client ID. This allows ASF to route messages sent by CPOA (via the internal HTTP API) to this particular client.
     -   **Payload Example (JSON):**
         ```json
         {
-            "stream_id": "strm_abcdef12345"
+            "client_id": "your_client_session_id"
         }
         ```
 
-### Server-to-Client Events:
+#### Server-to-Client Events (UI Updates):
 
--   **`connection_ack`**
-    -   **Description:** Sent by the server upon successful WebSocket connection to the namespace.
+-   **`ui_connection_ack`**
+    -   **Description:** Sent by the server upon successful WebSocket connection to the UI updates namespace.
     -   **Payload Example (JSON):**
         ```json
         {
-            "message": "Connected to ASF. Please send join_stream with your stream_id."
+            "message": "Connected to ASF UI updates on namespace /ui_updates."
         }
         ```
--   **`stream_status`**
-    -   **Description:** Confirms the client has successfully joined the stream room.
+-   **`subscribed_ui_updates`**
+    -   **Description:** Confirms that the client has successfully subscribed to UI updates for the given `client_id` by joining the corresponding room.
     -   **Payload Example (JSON):**
         ```json
         {
-            "status": "joined",
-            "stream_id": "strm_abcdef12345",
-            "message": "Successfully joined stream strm_abcdef12345. Preparing to stream audio."
+            "status": "success",
+            "client_id": "your_client_session_id",
+            "subscribed_to_room": "your_client_session_id"
         }
         ```
--   **`audio_control`**
-    -   **Description:** Signals the start or end of the audio stream.
-    -   **Payload Example (JSON for start_of_stream):**
-        ```json
-        {
-            "event": "start_of_stream",
-            "stream_id": "strm_abcdef12345",
-            "timestamp": 1678886400.123
-        }
-        ```
-    -   **Payload Example (JSON for end_of_stream):**
-        ```json
-        {
-            "event": "end_of_stream",
-            "stream_id": "strm_abcdef12345",
-            "timestamp": 1678886430.456
-        }
-        ```
--   **`audio_chunk`**
-    -   **Description:** Transmits a binary chunk of audio data.
-    -   **Payload:** Raw binary data (`ArrayBuffer` on the JavaScript client).
--   **`stream_error`**
-    -   **Description:** Sent if an error occurs related to the stream (e.g., file not found, error during streaming).
+-   **`ui_error`**
+    -   **Description:** Sent if there's an issue with a UI update request from the client (e.g., `subscribe_to_ui_updates` without a `client_id`).
     -   **Payload Example (JSON):**
         ```json
         {
-            "message": "Audio file unavailable for this stream."
+            "message": "client_id is required for UI update subscription."
         }
         ```
--   **`error`** (Generic SocketIO error from ASF)
-    -   **Description:** Sent if there's an issue with the request not specific to streaming (e.g., `join_stream` without `stream_id`).
-    -   **Payload Example (JSON):**
+-   **Dynamic Events (Relayed from CPOA):**
+    -   **Description:** This namespace is also used by ASF to relay dynamic events to the client. These events are sent from CPOA (or other backend services) to ASF via the `/asf/internal/send_ui_update` HTTP endpoint. The `event_name` and `data` payload are defined by CPOA.
+    -   **Example Event Name (from CPOA):** `generation_progress`
+    -   **Example Payload (from CPOA for `generation_progress` event):**
         ```json
         {
-            "message": "stream_id is required for join_stream."
+            // Custom data structure defined by CPOA for this event
+            "percentage": 50,
+            "current_step": "script_generation",
+            "podcast_id": "task_uuid_123"
         }
         ```
+    -   Another example event from CPOA could be `task_completed` with details of the completed task.
 
 ## Internal HTTP API
 
-ASF also exposes an internal HTTP endpoint for other services to notify it about newly available audio files.
+ASF exposes internal HTTP endpoints for other services.
 
 ### Notify New Audio
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/asf/internal/notify_new_audio`
--   **Description:** Used by CPOA (after VFA successfully generates an audio file) to inform ASF about the `stream_id` and the `filepath` where the audio file is stored. ASF uses this information to serve the correct file when a client joins that stream.
+-   **Description:** Used by CPOA (after VFA generates audio) to inform ASF about the `stream_id` and `filepath` of the new audio file.
+-   **Request Payload Example (JSON):** `{"stream_id": "strm_abcdef12345", "filepath": "/path/to/audio.mp3"}`
+-   **Success Response (200 OK - JSON):** `{"message": "Notification received successfully", "stream_id": "..."}`.
+-   **Error Response (400 Bad Request - JSON):** If `stream_id` or `filepath` missing.
+
+### Send UI Update
+
+-   **HTTP Method:** `POST`
+-   **URL Path:** `/asf/internal/send_ui_update`
+-   **Description:** Used by backend services like CPOA to send real-time UI updates to specific clients (identified by `client_id`) connected to the UI updates WebSocket namespace. ASF relays this message to the target client via WebSockets.
 -   **Request Payload Example (JSON):**
     ```json
     {
-        "stream_id": "strm_abcdef12345",
-        "filepath": "/srv/aethercast/generated_audio/aethercast_audio_strm_abcdef12345_uuid.mp3"
+        "client_id": "your_client_session_id",
+        "event_name": "generation_progress", // Dynamically defined by the sending service (e.g., CPOA)
+        "data": { // Custom data payload for the event
+            "percentage": 50,
+            "current_step": "script_generation",
+            "message": "Script generation is 50% complete."
+        }
     }
     ```
 -   **Success Response (200 OK - JSON):**
     ```json
     {
-        "message": "Notification received successfully",
-        "stream_id": "strm_abcdef12345"
+        "status": "success",
+        "message": "UI update sent to client."
     }
     ```
--   **Error Response (400 Bad Request - JSON):**
-    If `stream_id` or `filepath` are missing.
-    ```json
-    {
-        "error": "Missing required parameters: stream_id"
-    }
-    ```
+-   **Error Responses (JSON):**
+    -   `400 Bad Request`: If `client_id`, `event_name`, or `data` are missing in the request.
+        Example: `{"error_code": "ASF_SENDUI_MISSING_PARAMETERS", "message": "...", "details": "..."}`
+    -   `500 Internal Server Error`: If ASF server configuration is missing (e.g., UI namespace not loaded) or if the SocketIO emit fails internally.
+        Example: `{"error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE", "message": "...", "details": "..."}` or `{"error_code": "ASF_SOCKETIO_EMIT_FAILED", "message": "...", "details": "..."}`

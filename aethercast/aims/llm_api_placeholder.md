@@ -10,29 +10,27 @@ POST
 ### Request Body
 ```json
 {
-  "model_id": "string", // Identifier for the specific LLM to use (e.g., "AetherLLM-Snippet-v1", "AetherLLM-PodcastScript-v1")
+  "model_id_override": "string", // Optional: Identifier for a specific LLM to use (e.g., "gemini-1.5-pro-latest"). Also accepts "model" as an alias. If not provided, a service default is used.
   "prompt": "string", // The input prompt for the LLM
-  "max_tokens": "integer", // Maximum number of tokens to generate
-  "temperature": "float", // Sampling temperature
-  "context": { // Optional: for providing broader context if needed
-    "topic_keywords": ["string"],
-    "previous_text": "string"
-  },
-  "response_format": "string" // "text" or "json" (if structured output is needed)
+  "max_tokens": "integer", // Optional: Maximum number of tokens to generate
+  "temperature": "float", // Optional: Sampling temperature
+  "response_format": { // Optional: Specifies the desired output format.
+    "type": "string" // Use "text" for plain text (default if field is omitted), or "json_object" for structured JSON output (if supported by the model).
+  }
 }
 ```
 
 ### Success Response (Status Code: 200 OK)
 
-#### For `response_format: "text"`
+#### For `response_format: {"type": "text"}` (or when `response_format` is omitted)
 ```json
 {
   "request_id": "string", // Unique ID for this generation request
-  "model_id": "string", // Model used
+  "model_id": "string", // Identifier of the model actually used for generation (e.g., "gemini-1.0-pro").
   "choices": [
     {
       "text": "string", // The generated text
-      "finish_reason": "string" // e.g., "length", "stop_sequence"
+      "finish_reason": "string" // e.g., "MAX_TOKENS", "STOP", "SAFETY"
     }
   ],
   "usage": {
@@ -42,35 +40,24 @@ POST
   }
 }
 ```
-**Hardcoded Placeholder Response (for text generation):**
-```json
-{
-  "request_id": "aims-llm-placeholder-req-123",
-  "model_id": "AetherLLM-Placeholder-v0.1",
-  "choices": [
-    {
-      "text": "This is a placeholder response from the AIMS LLM service. Based on your prompt, here's a generic title: 'Interesting Developments' and some generic content: 'Several interesting developments have occurred recently, leading to much discussion and speculation within the community. Further analysis is required to fully understand the implications.'",
-      "finish_reason": "length"
-    }
-  ],
-  "usage": {
-    "prompt_tokens": 10, // Placeholder
-    "completion_tokens": 50, // Placeholder
-    "total_tokens": 60 // Placeholder
-  }
-}
-```
 
-#### For `response_format: "json"`
-(Schema would depend on the specific structured output required by the agent)
+#### For `response_format: {"type": "json_object"}`
+(The structure of `choices[0].text` would be a JSON string, or the response might directly embed a JSON object depending on final implementation alignment with specific LLM provider capabilities. The schema below assumes the `text` field contains the JSON string.)
 ```json
 {
   "request_id": "string",
-  "model_id": "string",
-  "structured_output": {
-    // Agent-specific JSON structure
-  },
-  "usage": { ... }
+  "model_id": "string", // Identifier of the model actually used for generation.
+  "choices": [
+    {
+      "text": "string", // A string representation of the JSON object. Some LLMs might place the object directly here.
+      "finish_reason": "string"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": "integer",
+    "completion_tokens": "integer",
+    "total_tokens": "integer"
+  }
 }
 ```
 
