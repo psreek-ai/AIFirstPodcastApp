@@ -1,6 +1,8 @@
 # Use an official Python runtime as a parent image
 FROM python:3.10-slim
 
+ENV PYTHONUNBUFFERED=1
+
 # Set the working directory in the container
 WORKDIR /app
 
@@ -22,5 +24,9 @@ ENV AIMS_HOST=0.0.0.0
 ENV AIMS_PORT=8000
 ENV FLASK_DEBUG=True
 
-# Run main.py when the container launches
+# For production, use a production-ready WSGI server like Gunicorn.
+# Example (ensure gunicorn is in requirements.txt):
+# CMD ["gunicorn", "--bind", "0.0.0.0:8000", "main:app"]
+
+# Run main.py when the container launches (Flask development server)
 CMD ["python", "main.py"]

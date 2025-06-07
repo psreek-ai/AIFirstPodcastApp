@@ -1,31 +1,27 @@
 FROM python:3.9-slim
-
 ENV PYTHONUNBUFFERED=1
-
 WORKDIR /app
 
-# Copy the entire aethercast directory to /app in the image
-# This makes all submodules like cpoa, common, etc., available
-# The paths in the application code (e.g., from aethercast.cpoa.main)
-# should then work correctly provided /app is in PYTHONPATH (which it typically is when WORKDIR is /app)
-COPY ./aethercast /app/aethercast
-
-# Install requirements for API Gateway
-# Ensure this path is correct relative to the build context defined in docker-compose.yml
-# If build context is ./aethercast/api_gateway, then requirements.txt should be at the root of that context.
-# For simplicity, let's assume the build context for each service will be its own directory.
-# So, this Dockerfile will be in ./aethercast/api_gateway/
+# Copy requirements first for better layer caching
 COPY ./aethercast/api_gateway/requirements.txt /app/requirements_api_gw.txt
 RUN pip install --no-cache-dir -r /app/requirements_api_gw.txt
 
-# Install requirements for CPOA (as it's bundled with API Gateway)
-# Ensure this path is correct.
+# API_GW also bundles CPOA, and CPOA uses WCHA. Install their requirements.
 COPY ./aethercast/cpoa/requirements.txt /app/requirements_cpoa.txt
 RUN pip install --no-cache-dir -r /app/requirements_cpoa.txt
+COPY ./aethercast/wcha/requirements.txt /app/requirements_wcha.txt
+RUN pip install --no-cache-dir -r /app/requirements_wcha.txt
 
-# Set PYTHONPATH if necessary, though WORKDIR /app usually adds /app to it.
-# Explicitly adding /app ensures modules within aethercast can be found.
+# Then copy the application code
+# This assumes the build context in docker-compose.yml is the project root (where the top-level 'aethercast' directory resides)
+COPY ./aethercast /app/aethercast
 ENV PYTHONPATH /app
 
-# Command to run the API Gateway application
+EXPOSE 5001
+
+# For production, use a production-ready WSGI server like Gunicorn.
+# Example (ensure gunicorn is in requirements_api_gw.txt):
+# CMD ["gunicorn", "--bind", "0.0.0.0:5001", "aethercast.api_gateway.main:app"]
+
+# Run main.py when the container launches (Flask development server)
 CMD ["python", "aethercast/api_gateway/main.py"]
