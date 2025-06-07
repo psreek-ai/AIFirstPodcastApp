@@ -1,3 +1,7 @@
+**Note:** This document describes a **conceptual NoSQL collection (e.g., for MongoDB/DynamoDB)** designed for granular tracking of individual AI agent task states. While the Aethercast system orchestrates multiple agents, the current implementation primarily tracks the overall podcast generation task lifecycle and status within the **`podcasts` table in SQLite**. Detailed orchestration steps are logged in the `cpoa_full_orchestration_log` column of the `podcasts` table.
+
+This document outlines a more detailed, potential future approach for distributed task state management. Refer to the main `aethercast/data_stores/README.md` and the schema definition in `aethercast/api_gateway/main.py` for details on the current SQLite-based implementation.
+---
 # NoSQL Data Store: AgentTaskState Collection
 
 ## Purpose

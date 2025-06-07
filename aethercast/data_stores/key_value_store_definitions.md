@@ -1,3 +1,10 @@
+**Note:** This document describes a **conceptual Key-Value store (e.g., Redis)** for caching and session management. The Aethercast system currently implements similar functionalities using its primary **SQLite database**. Specifically:
+- User session state and preferences are managed in the `user_sessions` table.
+- Podcast generation status is tracked in the `podcasts` table.
+- Caching for topics and snippets primarily relies on the `topics_snippets` table and on-demand generation logic in CPOA.
+
+Refer to the main `aethercast/data_stores/README.md` and the schema definition in `aethercast/api_gateway/main.py` for details on the current SQLite-based implementation. This document outlines potential future enhancements or alternative data storage strategies.
+---
 # Key-Value Store (e.g., Redis) Definitions
 
 ## Purpose

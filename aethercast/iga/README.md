@@ -38,22 +38,29 @@ It is called by the Central Podcast Orchestrator Agent (CPOA) when a `cover_art_
     -   **`400 Bad Request`**: If the `prompt` field is missing or invalid.
         ```json
         {
-            "error": "BAD_REQUEST",
-            "message": "Missing 'prompt' in request body."
+            "error_code": "IGA_BAD_REQUEST_PROMPT_MISSING",
+            "message": "Prompt is required for image generation.",
+            "details": "Missing or empty 'prompt' in request body."
         }
         ```
     -   **`500 Internal Server Error`**: For any unexpected internal errors within the placeholder service.
         ```json
         {
-            "error": "INTERNAL_SERVER_ERROR",
-            "message": "IGA placeholder encountered an unexpected error."
+            "error_code": "IGA_INTERNAL_SERVER_ERROR",
+            "message": "IGA placeholder encountered an unexpected error.",
+            "details": "<specific error string from exception>"
         }
         ```
 
 ## Configuration
 
-The IGA placeholder service might have minimal configuration, primarily for setting its host and port. See `aethercast/iga/.env.example` (once created).
+IGA is configured via environment variables. If an `.env` file is present in the `aethercast/iga/` directory when `main.py` is run, it will be loaded.
+
+Key environment variables:
+-   `IGA_HOST`: Host address for the Flask server. Defaults to `0.0.0.0`.
+-   `IGA_PORT`: Port for the IGA service. Defaults to `5007`.
+-   `IGA_DEBUG_MODE`: Enables or disables Flask's debug mode (e.g., "True" or "False"). Defaults to `True` (for development).
 
 ## Running (as part of Docker Compose)
 
-The IGA service will be included in the main `docker-compose.yml` file and will be started along with other Aethercast services.
+The IGA service will be included in the main `docker-compose.yml` file and will be started along with other Aethercast services. It can also be run standalone using `python aethercast/iga/main.py` after setting up the environment variables.
