@@ -60,12 +60,48 @@ else:
         logging.info("TDA is configured to use SIMULATED data sources.")
 
 # --- Constants ---
+DB_SCHEMA_TDA_TABLES = """
+CREATE TABLE IF NOT EXISTS topics_snippets (
+    id TEXT PRIMARY KEY,
+    type TEXT NOT NULL CHECK(type IN ('topic', 'snippet')),
+    title TEXT NOT NULL,
+    summary TEXT,
+    keywords TEXT,
+    source_url TEXT,
+    source_name TEXT,
+    original_topic_details TEXT,
+    llm_model_used_for_snippet TEXT,
+    cover_art_prompt TEXT,
+    generation_timestamp TEXT NOT NULL,
+    last_accessed_timestamp TEXT,
+    relevance_score REAL
+);
+"""
 DB_TYPE_TOPIC = "topic"
 SOURCE_FEED_NEWS_API = "news_api_org"
 ENDPOINT_ERROR_INTERNAL_SERVER_TDA = "INTERNAL_SERVER_ERROR_TDA"
 NEWS_API_STATUS_OK = "ok"
 
 app = flask.Flask(__name__)
+
+# --- Database Initialization ---
+def init_tda_db(db_path: str):
+    """Initializes the TDA database table if it doesn't exist."""
+    logger.info(f"[TDA_DB_INIT] Ensuring TDA database schema exists at {db_path}...")
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path) # Direct connect, or add _get_db_connection if preferred
+        cursor = conn.cursor()
+        cursor.executescript(DB_SCHEMA_TDA_TABLES)
+        conn.commit()
+        logger.info("[TDA_DB_INIT] TDA: Database table 'topics_snippets' ensured.")
+    except sqlite3.Error as e:
+        logger.error(f"[TDA_DB_INIT] TDA: Database error during schema initialization: {e}", exc_info=True)
+    except Exception as e_unexp:
+        logger.error(f"[TDA_DB_INIT] TDA: Unexpected error during schema initialization: {e_unexp}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
 
 # --- Placeholder Data Sources ---
 # Simulates data fetched from various news APIs, RSS feeds, etc.
@@ -75,7 +111,7 @@ def _save_topic_to_db(topic_object: dict, db_path: str):
     """Saves a single topic object to the topics_snippets table."""
     conn = None
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path) # Direct connect
         cursor = conn.cursor()
 
         # Map TopicObject fields to topics_snippets table columns
@@ -444,4 +480,11 @@ if __name__ == "__main__":
     host = tda_config.get("TDA_HOST")
     port = tda_config.get("TDA_PORT")
     debug_mode = tda_config.get("TDA_DEBUG_MODE")
+
+    # Initialize the database for TDA
+    if tda_config.get('SHARED_DATABASE_PATH'):
+        init_tda_db(tda_config['SHARED_DATABASE_PATH'])
+    else:
+        logging.warning("SHARED_DATABASE_PATH not configured for TDA. Topic saving to DB will fail.")
+
     app.run(host=host, port=port, debug=debug_mode)

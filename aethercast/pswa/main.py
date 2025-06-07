@@ -90,6 +90,19 @@ Remember, your entire response must be a single JSON object conforming to the sc
         logger.error(error_msg)
         raise ValueError(error_msg)
 
+# --- Database Schema for Cache ---
+DB_SCHEMA_PSWA_CACHE_TABLE = """
+CREATE TABLE IF NOT EXISTS generated_scripts (
+    script_id TEXT PRIMARY KEY,
+    topic_hash TEXT NOT NULL UNIQUE,
+    structured_script_json TEXT NOT NULL,
+    generation_timestamp TEXT NOT NULL,
+    llm_model_used TEXT,
+    last_accessed_timestamp TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
+"""
+
 # --- Constants ---
 KEY_TITLE = "title"
 KEY_INTRO = "intro"
@@ -124,6 +137,27 @@ else:
 
 if not pswa_config:
     load_pswa_configuration()
+
+# --- Database Initialization ---
+def init_pswa_db(db_path: str):
+    """Initializes the PSWA script cache database table and index if they don't exist."""
+    logger.info(f"[PSWA_DB_INIT] Ensuring PSWA database schema exists at {db_path}...")
+    conn = None
+    try:
+        conn = _get_db_connection(db_path) # Uses existing helper that raises error on connection fail
+        cursor = conn.cursor()
+        cursor.executescript(DB_SCHEMA_PSWA_CACHE_TABLE)
+        conn.commit()
+        logger.info("[PSWA_DB_INIT] PSWA: Database table 'generated_scripts' and index 'idx_topic_hash' ensured.")
+    except sqlite3.Error as e:
+        logger.error(f"[PSWA_DB_INIT] PSWA: Database error during schema initialization: {e}", exc_info=True)
+        # Depending on policy, might re-raise to halt startup if DB is critical even for non-cached operations.
+        # For now, logging the error and allowing service to continue (caching might fail).
+    except Exception as e_unexp:
+        logger.error(f"[PSWA_DB_INIT] PSWA: Unexpected error during schema initialization: {e_unexp}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
 
 # --- Database Helper Functions for Script Caching (remain the same) ---
 def _get_db_connection(db_path: str):
@@ -452,5 +486,13 @@ if __name__ == "__main__":
     debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
     print(f"\n--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}) ---")
     if not pswa_config.get("AIMS_SERVICE_URL"):
+        # This case should ideally be prevented by load_pswa_configuration raising an error
         print("CRITICAL ERROR: AIMS_SERVICE_URL is not set. PSWA will not function.")
+
+    # Initialize the database for PSWA script caching
+    if pswa_config.get('SHARED_DATABASE_PATH'):
+        init_pswa_db(pswa_config['SHARED_DATABASE_PATH'])
+    else:
+        print("WARNING: SHARED_DATABASE_PATH not configured for PSWA. Script caching will be disabled or use a default path if any.")
+
     app.run(host=host, port=port, debug=debug_mode)

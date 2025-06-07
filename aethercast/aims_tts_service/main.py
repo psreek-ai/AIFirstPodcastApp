@@ -48,8 +48,8 @@ logger.info(f"  SHARED_AUDIO_DIR_CONTAINER: {SHARED_AUDIO_DIR_CONTAINER}")
 logger.info("--- End AIMS_TTS Service Configuration ---")
 
 if not GOOGLE_APPLICATION_CREDENTIALS:
-    logger.critical("CRITICAL: GOOGLE_APPLICATION_CREDENTIALS is not set. Real TTS calls will fail.")
-    # Depending on policy, could raise ValueError here to stop app startup.
+    logger.critical("CRITICAL: GOOGLE_APPLICATION_CREDENTIALS is not set. Real TTS calls will fail. Application cannot start.")
+    raise ValueError("AIMS_TTS Critical Error: GOOGLE_APPLICATION_CREDENTIALS environment variable not set.")
 
 # --- Audio Encoding Mapping ---
 AUDIO_ENCODING_MAP = {

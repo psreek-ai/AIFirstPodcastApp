@@ -68,15 +68,15 @@ WCHA also contains a simple Flask app with an endpoint for testing harvesting. I
     ```
     *Note: The `if __name__ == "__main__":` block in the current `wcha/main.py` primarily runs test functions, not the Flask app directly. To run the Flask app, you would typically use `flask run` as shown above or modify the `__main__` block to call `app.run()`.*
 
-## API Endpoints (Test Endpoint)
+## API Endpoint
 
 WCHA provides a single Flask endpoint primarily for testing its harvesting functions.
 
-### Harvest Content (Test Endpoint)
+### Harvest Content
 
 -   **HTTP Method:** `POST`
--   **URL Path:** `/harvest_content_endpoint`
--   **Description:** Allows testing of content harvesting. Can either use `get_content_for_topic` based on a topic string (uses web search) or `harvest_from_url` for a specific URL. It can also return mock data for specific topics.
+-   **URL Path:** `/harvest`
+-   **Description:** Allows testing of content harvesting. Can either use `get_content_for_topic` based on a topic string (uses web search) or `harvest_from_url` for a specific URL. It can also return mock data for specific topics (legacy).
 -   **Request Payload Example (JSON) - For Search & Harvest:**
     ```json
     {
@@ -96,35 +96,57 @@ WCHA provides a single Flask endpoint primarily for testing its harvesting funct
         "topic": "ai in healthcare"
     }
     ```
--   **Success Response (200 OK) Example (JSON - Search/URL):**
+-   **Success Response (200 OK) Example (JSON - Search & Harvest, `use_search=true`):**
     ```json
     {
-        "topic": "benefits of regular exercise", // or "url": "..."
-        "source": "web_search_ddg", // or "direct_url"
-        "content": "Regular exercise offers numerous physical and mental health benefits..."
+        "status": "success",
+        "content": "Source: http://example.com/article1\nText from article 1...\n\n---\n\nSource: http://example.com/article2\nText from article 2...",
+        "source_urls": ["http://example.com/article1", "http://example.com/article2"],
+        "message": "Successfully consolidated content from 2 out of 2 URLs for topic 'benefits of regular exercise'."
+    }
+    ```
+-   **Success Response (200 OK) Example (JSON - Direct URL Harvest):**
+    ```json
+    {
+        "status": "success",
+        "content": "Text from the harvested URL...",
+        "source_urls": ["http://example.com/specific_page"],
+        "message": "Successfully harvested content from URL: http://example.com/specific_page"
     }
     ```
 -   **Error Response Examples (JSON):**
-    -   **400 Bad Request (Invalid Payload):**
+    -   **400 Bad Request (Invalid Payload - e.g. missing `topic` and `url`):**
         ```json
         {
-            "error": "Invalid request, 'topic' or 'url' must be provided."
+            "error_code": "WCHA_MISSING_PARAMETERS",
+            "message": "Invalid input",
+            "details": "'topic' (with use_search=true) or 'url' must be provided."
         }
         ```
-    -   **400 Bad Request (Harvesting Failed):**
-        If `get_content_for_topic` or `harvest_from_url` returns one of its error strings (e.g., due to search failure, Trafilatura failure, network issues).
+    -   **404 Not Found (Search yields no results for `use_search=true`):**
         ```json
         {
-            "topic": "some very obscure topic", // or "url": "http://nonexistenturl123.invalid/"
-            "error": "WCHA: Failed to harvest usable content from any of the 0 search results for topic: some very obscure topic",
-            "content": null
+            "status": "failure",
+            "content": null,
+            "source_urls": [],
+            "message": "WCHA: No search results found for topic: some very obscure topic"
         }
         ```
-        Or for a direct URL failure:
+    -   **500 Internal Server Error (All harvest attempts fail for `use_search=true`):**
         ```json
         {
-            "url": "http://nonexistenturl123.invalid/",
-            "error": "Error fetching URL 'http://nonexistenturl123.invalid/': RequestException - ConnectionError - ...",
-            "content": null
+            "status": "failure",
+            "content": null,
+            "source_urls": [],
+            "message": "WCHA: Failed to harvest usable content from any of the 2 search results for topic: some topic. Failures: URL: http://badurl1..., Status: Failed, Type: fetch_error, Message: HTTP Status 404..."
+        }
+        ```
+    -   **502 Bad Gateway (Direct URL harvest fails due to fetch error):**
+        ```json
+        {
+            "status": "failure",
+            "content": null,
+            "source_urls": [],
+            "message": "Failed to harvest content from URL: http://nonexistenturl123.invalid/. Reason: Error fetching URL 'http://nonexistenturl123.invalid/': RequestException - ConnectionError - ..."
         }
         ```
