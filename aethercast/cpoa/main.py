@@ -3,12 +3,14 @@ import sys
 import os
 from dotenv import load_dotenv # Added
 import json
-import sqlite3
+import sqlite3 # Will be conditionally used or removed later
 from datetime import datetime
 import uuid
 from typing import Optional, Dict, Any, List
 import requests # Added for service calls
 import time # Added for retry logic
+import psycopg2 # Added for PostgreSQL
+from psycopg2.extras import RealDictCursor # Added for PostgreSQL
 import random # Added for landing page snippet keyword randomization
 
 # Ensure the 'aethercast' directory is in the Python path.
@@ -90,29 +92,42 @@ VFA_SERVICE_URL = os.getenv("VFA_SERVICE_URL", "http://localhost:5005/forge_voic
 ASF_NOTIFICATION_URL = os.getenv("ASF_NOTIFICATION_URL", "http://localhost:5006/asf/internal/notify_new_audio")
 ASF_WEBSOCKET_BASE_URL = os.getenv("ASF_WEBSOCKET_BASE_URL", "ws://localhost:5006/api/v1/podcasts/stream")
 SCA_SERVICE_URL = os.getenv("SCA_SERVICE_URL", "http://localhost:5002/craft_snippet")
-CPOA_DATABASE_PATH = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db")
-CPOA_ASF_SEND_UI_UPDATE_URL = os.getenv("CPOA_ASF_SEND_UI_UPDATE_URL", "http://localhost:5006/asf/internal/send_ui_update") # Added
-IGA_SERVICE_URL = os.getenv("IGA_SERVICE_URL", "http://localhost:5007") # Added IGA
-CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3" ))
+CPOA_ASF_SEND_UI_UPDATE_URL = os.getenv("CPOA_ASF_SEND_UI_UPDATE_URL", "http://localhost:5006/asf/internal/send_ui_update")
+IGA_SERVICE_URL = os.getenv("IGA_SERVICE_URL", "http://localhost:5007")
+TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
+
+# Retry Configuration
+CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3"))
 CPOA_SERVICE_RETRY_BACKOFF_FACTOR = float(os.getenv("CPOA_SERVICE_RETRY_BACKOFF_FACTOR", "0.5"))
-# Moved TDA_SERVICE_URL to be loaded in load_cpoa_configuration was a comment, now adding actual global
+
+# Database Configuration
+DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite") # Default to sqlite
+CPOA_DATABASE_PATH = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db") # SQLite path
+
+POSTGRES_HOST = os.getenv("POSTGRES_HOST")
+POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
+POSTGRES_USER = os.getenv("POSTGRES_USER")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
+POSTGRES_DB = os.getenv("POSTGRES_DB")
+
 
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(message)s')
 
-# Load CPOA configurations (this will now include TDA_SERVICE_URL)
-# Ensure this is called early, but after logger basicConfig if logger is used within.
-# Note: Global `pswa_config` style might be better if config is only loaded once.
-# For now, assuming this structure from existing file.
-# It seems CPOA_ASF_SEND_UI_UPDATE_URL etc. are module-level globals set from os.getenv directly.
-# To be consistent, TDA_SERVICE_URL should also be a module-level global for now.
-TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
-
-
 # Log loaded configuration
 logger.info("--- CPOA Configuration ---")
+logger.info(f"DATABASE_TYPE: {DATABASE_TYPE}")
+if DATABASE_TYPE == "sqlite":
+    logger.info(f"SHARED_DATABASE_PATH (SQLite): {CPOA_DATABASE_PATH}")
+elif DATABASE_TYPE == "postgres":
+    logger.info(f"POSTGRES_HOST: {POSTGRES_HOST}")
+    logger.info(f"POSTGRES_PORT: {POSTGRES_PORT}")
+    logger.info(f"POSTGRES_USER: {POSTGRES_USER}")
+    # Do not log password
+    logger.info(f"POSTGRES_DB: {POSTGRES_DB}")
+
 logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}")
 logger.info(f"PSWA_SERVICE_URL: {PSWA_SERVICE_URL}")
 logger.info(f"VFA_SERVICE_URL: {VFA_SERVICE_URL}")
@@ -120,12 +135,47 @@ logger.info(f"ASF_NOTIFICATION_URL: {ASF_NOTIFICATION_URL}")
 logger.info(f"ASF_WEBSOCKET_BASE_URL: {ASF_WEBSOCKET_BASE_URL}")
 logger.info(f"SCA_SERVICE_URL: {SCA_SERVICE_URL}")
 logger.info(f"IGA_SERVICE_URL: {IGA_SERVICE_URL}")
-logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}") # Added TDA logging
-logger.info(f"SHARED_DATABASE_PATH: {CPOA_DATABASE_PATH}")
 logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}")
 logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}")
 logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}")
 logger.info("--- End CPOA Configuration ---")
+
+
+# --- Database Connection Helper (New for PostgreSQL, adaptable) ---
+def _get_cpoa_db_connection():
+    db_type = DATABASE_TYPE # Use the global config
+    if db_type == "postgres":
+        required_pg_vars = {"POSTGRES_HOST": POSTGRES_HOST,
+                            "POSTGRES_USER": POSTGRES_USER,
+                            "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
+                            "POSTGRES_DB": POSTGRES_DB}
+        missing_vars = [key for key, value in required_pg_vars.items() if not value]
+        if missing_vars:
+            logger.error(f"CPOA: PostgreSQL connection variables not fully set: Missing {', '.join(missing_vars)}")
+            raise ConnectionError(f"CPOA: PostgreSQL environment variables not fully configured: Missing {', '.join(missing_vars)}")
+        try:
+            conn = psycopg2.connect(
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                user=POSTGRES_USER,
+                password=POSTGRES_PASSWORD,
+                dbname=POSTGRES_DB,
+                cursor_factory=RealDictCursor
+            )
+            logger.info("CPOA successfully connected to PostgreSQL.")
+            return conn
+        except psycopg2.Error as e:
+            logger.error(f"CPOA: Unable to connect to PostgreSQL: {e}")
+            raise ConnectionError(f"CPOA: PostgreSQL connection failed: {e}") from e
+    elif db_type == "sqlite":
+        # This function is now primarily for PG. SQLite connections will be handled by existing logic
+        # that uses CPOA_DATABASE_PATH directly. Or, refactor that logic to call a similar helper.
+        # For now, returning None indicates to use the old SQLite path.
+        logger.debug("CPOA DB type is SQLite. Connection handled by individual functions using CPOA_DATABASE_PATH.")
+        return None
+    else:
+        logger.error(f"CPOA: Unsupported DATABASE_TYPE: {db_type}")
+        raise ValueError(f"CPOA: Unsupported DATABASE_TYPE: {db_type}")
 
 
 # Try to import WCHA. PSWA and VFA are now services.
@@ -209,33 +259,66 @@ def requests_with_retry(method: str, url: str, max_retries: int, backoff_factor:
     raise Exception(f"Requests with retry failed for {url} after {max_retries} attempts without specific exception.")
 
 
-def _update_task_status_in_db(db_path: str, task_id: str, new_cpoa_status: str, error_msg: Optional[str] = None) -> None:
+def _update_task_status_in_db(task_id: str, new_cpoa_status: str, error_msg: Optional[str] = None, db_path_sqlite: Optional[str] = None) -> None:
     """
     Updates the cpoa_status, cpoa_error_message, and last_updated_timestamp for a task in the database.
-    This function is called by CPOA during its orchestration process.
+    Uses PostgreSQL if configured, otherwise falls back to SQLite with db_path_sqlite.
     """
-    logger.info(f"Task {task_id}: Attempting to update CPOA status in DB to '{new_cpoa_status}'. Error msg: '{error_msg if error_msg else 'None'}'")
-    timestamp = datetime.now().isoformat()
+    logger.info(f"Task {task_id}: Updating CPOA status to '{new_cpoa_status}'. Error: '{error_msg or 'None'}'")
+    timestamp = datetime.now() # Use datetime object for PG, format for SQLite
+
     conn = None
+    cursor = None
+    db_type_used = DATABASE_TYPE
+
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        cursor.execute(
+        conn = _get_cpoa_db_connection() # This will return PG conn or None (for SQLite)
+
+        if conn: # PostgreSQL path
+            cursor = conn.cursor()
+            # Ensure task_id is a string for UUID compatibility if it isn't already
+            task_id_str = str(task_id) if not isinstance(task_id, str) else task_id
+
+            sql = """
+                UPDATE podcasts
+                SET cpoa_status = %s, cpoa_error_message = %s, last_updated_timestamp = %s
+                WHERE podcast_id = %s;
             """
-            UPDATE podcasts
-            SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ?
-            WHERE podcast_id = ?
-            """,
-            (new_cpoa_status, error_msg, timestamp, task_id)
-        )
-        conn.commit()
-        logger.info(f"Task {task_id}: Successfully updated CPOA status in DB to '{new_cpoa_status}'.")
-    except sqlite3.Error as e:
-        logger.error(f"CPOA: Database error for task {task_id} updating to status {new_cpoa_status}: {type(e).__name__} - {e}", exc_info=True)
-    except Exception as e: # Catch any other unexpected error during DB update
-        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id} (status: {new_cpoa_status}): {type(e).__name__} - {e}", exc_info=True)
+            cursor.execute(sql, (new_cpoa_status, error_msg, timestamp, task_id_str))
+            conn.commit()
+            logger.info(f"Task {task_id}: Successfully updated CPOA status in PostgreSQL DB to '{new_cpoa_status}'.")
+
+        else: # SQLite path (using db_path_sqlite which defaults to CPOA_DATABASE_PATH)
+            db_type_used = "sqlite" # For logging
+            sqlite_path = db_path_sqlite or CPOA_DATABASE_PATH
+            if not sqlite_path:
+                logger.error(f"Task {task_id}: SQLite DB path not available for status update.")
+                return
+
+            conn_sqlite = sqlite3.connect(sqlite_path)
+            cursor_sqlite = conn_sqlite.cursor()
+            cursor_sqlite.execute(
+                """
+                UPDATE podcasts
+                SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ?
+                WHERE podcast_id = ?
+                """,
+                (new_cpoa_status, error_msg, timestamp.isoformat(), task_id)
+            )
+            conn_sqlite.commit()
+            conn_sqlite.close() # Close SQLite connection
+            logger.info(f"Task {task_id}: Successfully updated CPOA status in SQLite DB to '{new_cpoa_status}'.")
+
+    except (psycopg2.Error, sqlite3.Error) as e:
+        logger.error(f"CPOA: DB error for task {task_id} (DB: {db_type_used}, Status: {new_cpoa_status}): {e}", exc_info=True)
+        if conn and db_type_used == "postgres": conn.rollback() # Rollback PG transaction
+    except Exception as e_unexp:
+        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id} (DB: {db_type_used}, Status: {new_cpoa_status}): {e_unexp}", exc_info=True)
+        if conn and db_type_used == "postgres": conn.rollback()
     finally:
-        if conn:
+        if cursor and db_type_used == "postgres": # Only close PG cursor if it was used
+            cursor.close()
+        if conn and db_type_used == "postgres": # Only close PG conn if it was used
             conn.close()
 
 # --- Helper function to send UI updates to ASF ---
@@ -281,7 +364,7 @@ def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, A
 def orchestrate_podcast_generation(
     topic: str,
     task_id: str,
-    db_path: str,
+    # db_path: str, # Removed, CPOA will use its configured DB settings
     voice_params_input: Optional[dict] = None,
     client_id: Optional[str] = None,
     user_preferences: Optional[dict] = None,
@@ -339,7 +422,7 @@ def orchestrate_podcast_generation(
 
     # Log initial parameters
     log_step("Orchestration process started.", data={
-        "task_id": task_id, "topic": topic, "db_path": db_path,
+        "task_id": task_id, "topic": topic, # db_path removed from log
         "voice_params_input": voice_params_input, "client_id": client_id,
         "user_preferences": user_preferences,
         "test_scenarios": test_scenarios # Log received test_scenarios
@@ -364,7 +447,7 @@ def orchestrate_podcast_generation(
     else: # Proceed with orchestration
         try:
             current_orchestration_stage = ORCHESTRATION_STAGE_WCHA
-            _update_task_status_in_db(db_path, task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, error_msg=None)
+            _update_task_status_in_db(task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, error_msg=None) # db_path removed
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Fetching and processing web content...", "stage": current_orchestration_stage})
             log_step("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
 
@@ -401,7 +484,7 @@ def orchestrate_podcast_generation(
                 raise Exception(f"WCHA critical failure: {final_error_message}")
 
             current_orchestration_stage = ORCHESTRATION_STAGE_PSWA
-            _update_task_status_in_db(db_path, task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, error_msg=None)
+            _update_task_status_in_db(task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, error_msg=None) # db_path removed
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting podcast script with AI...", "stage": current_orchestration_stage})
 
             # Use wcha_content (extracted from wcha_result_dict) for PSWA
@@ -462,7 +545,7 @@ def orchestrate_podcast_generation(
                 raise Exception(final_error_message)
 
             current_orchestration_stage = ORCHESTRATION_STAGE_VFA
-            _update_task_status_in_db(db_path, task_id, CPOA_STATUS_VFA_AUDIO_GENERATION, error_msg=None)
+            _update_task_status_in_db(task_id, CPOA_STATUS_VFA_AUDIO_GENERATION, error_msg=None) # db_path removed
             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Synthesizing audio...", "stage": current_orchestration_stage})
 
             # --- VFA Voice Parameter Handling with User Preferences ---
@@ -544,7 +627,7 @@ def orchestrate_podcast_generation(
 
                 if audio_filepath and stream_id:
                     current_orchestration_stage = ORCHESTRATION_STAGE_ASF_NOTIFICATION
-                    _update_task_status_in_db(db_path, task_id, CPOA_STATUS_ASF_NOTIFICATION, error_msg=None) # Intermediate status
+                    _update_task_status_in_db(task_id, CPOA_STATUS_ASF_NOTIFICATION, error_msg=None) # db_path removed
                     _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Preparing audio stream...", "stage": current_orchestration_stage})
                     asf_call_data = {"url": ASF_NOTIFICATION_URL, "stream_id": stream_id, "filepath": audio_filepath}
                     log_step("Notifying ASF about new audio...", data=asf_call_data)
@@ -623,7 +706,7 @@ def orchestrate_podcast_generation(
                  vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": final_error_message, "audio_filepath": None, "stream_id": None}
 
     # Final DB update for CPOA's status
-    _update_task_status_in_db(db_path, task_id, final_cpoa_status, error_msg=final_error_message)
+    _update_task_status_in_db(task_id, final_cpoa_status, error_msg=final_error_message) # db_path removed
 
     current_orchestration_stage = ORCHESTRATION_STAGE_FINALIZATION # For the final log step
     final_log_data = {
@@ -675,86 +758,180 @@ def orchestrate_podcast_generation(
 
 
 # --- Snippet DB Interaction ---
-def _save_snippet_to_db(snippet_object: dict, db_path: str):
+def _save_snippet_to_db(snippet_object: dict, db_path_sqlite: Optional[str] = None): # db_path_sqlite for SQLite fallback
     """Saves a single snippet object to the topics_snippets table."""
     conn = None
+    cursor = None
+    db_type_used = DATABASE_TYPE
+    # Ensure snippet_id is a UUID string for PG, generate if missing
+    snippet_id = str(snippet_object.get("snippet_id") or uuid.uuid4())
+
+
     try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
+        conn = _get_cpoa_db_connection()
 
-        keywords_json = json.dumps(snippet_object.get("keywords", []))
-        # original_topic_details might be complex; ensure it's stored as JSON string
-        original_topic_details_json = json.dumps(snippet_object.get("original_topic_details_from_tda")) \
-            if snippet_object.get("original_topic_details_from_tda") else None
+        keywords_data = snippet_object.get("keywords", [])
+        original_topic_details_data = snippet_object.get("original_topic_details_from_tda")
 
-        current_ts = datetime.now().isoformat()
+        current_ts = datetime.now() # Use datetime obj for PG
+        generation_timestamp_input = snippet_object.get("generation_timestamp", current_ts.isoformat())
 
-        # Relevance score for snippets might not be directly applicable or could be defaulted
-        relevance_score = snippet_object.get("relevance_score", 0.5) # Default if not present
+        # Ensure generation_timestamp is a datetime object for PG
+        if isinstance(generation_timestamp_input, str):
+            try:
+                generation_timestamp_to_save = datetime.fromisoformat(generation_timestamp_input.replace("Z", "+00:00"))
+            except ValueError:
+                logger.warning(f"Could not parse generation_timestamp string '{generation_timestamp_input}', using current time.")
+                generation_timestamp_to_save = current_ts
+        elif isinstance(generation_timestamp_input, datetime):
+            generation_timestamp_to_save = generation_timestamp_input
+        else: # Fallback for unexpected types
+            logger.warning(f"Unexpected type for generation_timestamp '{type(generation_timestamp_input)}', using current time.")
+            generation_timestamp_to_save = current_ts
 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO topics_snippets (
+
+        if conn: # PostgreSQL Path
+            cursor = conn.cursor()
+
+            sql = """
+            INSERT INTO topics_snippets (
                 id, type, title, summary, keywords,
                 source_url, source_name, original_topic_details,
                 llm_model_used_for_snippet, cover_art_prompt, image_url,
                 generation_timestamp, last_accessed_timestamp, relevance_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                snippet_object.get("snippet_id"),
-                DB_TYPE_SNIPPET, # type
-                snippet_object.get("title"),
-                snippet_object.get("summary"), # Using summary for snippet's main text content
-                keywords_json,
-                None, # source_url (can be null for snippets, or link to original topic if available)
-                None, # source_name (can be null for snippets)
-                original_topic_details_json,
-                snippet_object.get("llm_model_used"),
-                snippet_object.get("cover_art_prompt"),
-                snippet_object.get("image_url"), # Added image_url
-                snippet_object.get("generation_timestamp", current_ts),
-                current_ts, # last_accessed_timestamp
-                relevance_score
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                type = EXCLUDED.type,
+                title = EXCLUDED.title,
+                summary = EXCLUDED.summary,
+                keywords = EXCLUDED.keywords,
+                source_url = EXCLUDED.source_url,
+                source_name = EXCLUDED.source_name,
+                original_topic_details = EXCLUDED.original_topic_details,
+                llm_model_used_for_snippet = EXCLUDED.llm_model_used_for_snippet,
+                cover_art_prompt = EXCLUDED.cover_art_prompt,
+                image_url = EXCLUDED.image_url,
+                generation_timestamp = EXCLUDED.generation_timestamp,
+                last_accessed_timestamp = EXCLUDED.last_accessed_timestamp,
+                relevance_score = EXCLUDED.relevance_score;
+            """
+            params = (
+                snippet_id, DB_TYPE_SNIPPET, snippet_object.get("title"),
+                snippet_object.get("summary"), keywords_data, # Pass list/dict directly for JSONB
+                snippet_object.get("source_url"), snippet_object.get("source_name"),
+                original_topic_details_data, # Pass dict/list directly for JSONB
+                snippet_object.get("llm_model_used"), snippet_object.get("cover_art_prompt"),
+                snippet_object.get("image_url"), generation_timestamp_to_save, # datetime object
+                current_ts, # datetime object for last_accessed
+                snippet_object.get("relevance_score", 0.5)
             )
-        )
-        conn.commit()
-        logger.info(f"Saved/Replaced snippet {snippet_object.get('snippet_id')} to DB: {snippet_object.get('title')}")
-    except sqlite3.Error as e:
-        logger.error(f"Database error saving snippet {snippet_object.get('snippet_id')}: {e}", exc_info=True)
-    except Exception as e:
-        logger.error(f"Unexpected error saving snippet {snippet_object.get('snippet_id')} to DB: {e}", exc_info=True)
+            cursor.execute(sql, params)
+            conn.commit()
+            logger.info(f"Saved/Replaced snippet {snippet_id} to PostgreSQL DB: {snippet_object.get('title')}")
+
+        else: # SQLite Path
+            db_type_used = "sqlite"
+            sqlite_path = db_path_sqlite or CPOA_DATABASE_PATH
+            if not sqlite_path:
+                logger.error(f"SQLite DB path not available for saving snippet {snippet_id}.")
+                return
+
+            keywords_json = json.dumps(keywords_data)
+            original_topic_details_json = json.dumps(original_topic_details_data) if original_topic_details_data else None
+            gen_ts_iso = generation_timestamp_to_save.isoformat()
+            last_acc_ts_iso = current_ts.isoformat()
+
+            conn_sqlite = sqlite3.connect(sqlite_path)
+            cursor_sqlite = conn_sqlite.cursor()
+            cursor_sqlite.execute(
+                """
+                INSERT OR REPLACE INTO topics_snippets (
+                    id, type, title, summary, keywords,
+                    source_url, source_name, original_topic_details,
+                    llm_model_used_for_snippet, cover_art_prompt, image_url,
+                    generation_timestamp, last_accessed_timestamp, relevance_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    snippet_id, DB_TYPE_SNIPPET, snippet_object.get("title"),
+                    snippet_object.get("summary"), keywords_json,
+                    snippet_object.get("source_url"), snippet_object.get("source_name"),
+                    original_topic_details_json, snippet_object.get("llm_model_used"),
+                    snippet_object.get("cover_art_prompt"), snippet_object.get("image_url"),
+                    gen_ts_iso, last_acc_ts_iso, snippet_object.get("relevance_score", 0.5)
+                )
+            )
+            conn_sqlite.commit()
+            conn_sqlite.close()
+            logger.info(f"Saved/Replaced snippet {snippet_id} to SQLite DB: {snippet_object.get('title')}")
+
+    except (psycopg2.Error, sqlite3.Error) as e:
+        logger.error(f"Database error saving snippet {snippet_id} (DB: {db_type_used}): {e}", exc_info=True)
+        if conn and db_type_used == "postgres": conn.rollback()
+    except Exception as e_unexp:
+        logger.error(f"Unexpected error saving snippet {snippet_id} (DB: {db_type_used}): {e_unexp}", exc_info=True)
+        if conn and db_type_used == "postgres": conn.rollback()
     finally:
-        if conn:
-            conn.close()
+        if cursor and db_type_used == "postgres": cursor.close()
+        if conn and db_type_used == "postgres": conn.close()
 
 # --- Topic Exploration DB Helper ---
-def _get_topic_details_from_db(db_path: str, topic_id: str) -> Optional[Dict[str, Any]]:
+def _get_topic_details_from_db(topic_id: str, db_path_sqlite: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Fetches details for a specific topic_id from the topics_snippets table."""
     conn = None
+    cursor = None
+    db_type_used = DATABASE_TYPE
+    # Ensure topic_id is a string for UUID compatibility if it isn't already
+    topic_id_str = str(topic_id) if not isinstance(topic_id, str) else topic_id
+
     try:
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM topics_snippets WHERE id = ? AND type = ?", (topic_id, DB_TYPE_TOPIC))
-        row = cursor.fetchone()
-        if row:
-            topic_details = dict(row)
-            # Deserialize keywords if stored as JSON string
-            if isinstance(topic_details.get('keywords'), str):
-                try:
-                    topic_details['keywords'] = json.loads(topic_details['keywords'])
-                except json.JSONDecodeError:
-                    logger.warning(f"Failed to decode keywords JSON for topic {topic_id} from DB: {topic_details['keywords']}")
-                    topic_details['keywords'] = [] # Default to empty list on error
-            return topic_details
+        conn = _get_cpoa_db_connection()
+
+        if conn: # PostgreSQL Path
+            cursor = conn.cursor()
+            sql = "SELECT * FROM topics_snippets WHERE id = %s AND type = %s;"
+            cursor.execute(sql, (topic_id_str, DB_TYPE_TOPIC))
+            row = cursor.fetchone()
+            if row:
+                # RealDictCursor already returns a dict-like object
+                # Keywords are already JSONB, psycopg2 handles them as dict/list
+                return dict(row)
+            return None
+
+        else: # SQLite Path
+            db_type_used = "sqlite"
+            sqlite_path = db_path_sqlite or CPOA_DATABASE_PATH
+            if not sqlite_path:
+                logger.error(f"SQLite DB path not available for fetching topic {topic_id_str}.")
+                return None
+
+            conn_sqlite = sqlite3.connect(sqlite_path)
+            conn_sqlite.row_factory = sqlite3.Row
+            cursor_sqlite = conn_sqlite.cursor()
+            cursor_sqlite.execute("SELECT * FROM topics_snippets WHERE id = ? AND type = ?", (topic_id_str, DB_TYPE_TOPIC))
+            row_sqlite = cursor_sqlite.fetchone()
+            conn_sqlite.close()
+
+            if row_sqlite:
+                topic_details = dict(row_sqlite)
+                if isinstance(topic_details.get('keywords'), str): # SQLite stores JSON as TEXT
+                    try:
+                        topic_details['keywords'] = json.loads(topic_details['keywords'])
+                    except json.JSONDecodeError:
+                        logger.warning(f"Failed to decode keywords JSON (SQLite) for topic {topic_id_str}")
+                        topic_details['keywords'] = []
+                return topic_details
+            return None
+
+    except (psycopg2.Error, sqlite3.Error) as e:
+        logger.error(f"Database error fetching topic {topic_id_str} (DB: {db_type_used}): {e}", exc_info=True)
         return None
-    except sqlite3.Error as e:
-        logger.error(f"Database error fetching topic {topic_id}: {e}")
+    except Exception as e_unexp:
+        logger.error(f"Unexpected error fetching topic {topic_id_str} (DB: {db_type_used}): {e_unexp}", exc_info=True)
         return None
     finally:
-        if conn:
-            conn.close()
+        if cursor and db_type_used == "postgres": cursor.close()
+        if conn and db_type_used == "postgres": conn.close()
 
 
 def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
@@ -808,11 +985,10 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
         logger.info(f"CPOA: {function_name} - SCA Service call successful for topic_id {topic_id}. Snippet data received: {snippet_data.get('snippet_id')}")
 
         # Save the generated snippet to the database
-        db_path = CPOA_DATABASE_PATH # Use configured DB path
-        if not db_path:
-            logger.error(f"CPOA: {function_name} - CPOA_DATABASE_PATH not configured. Cannot save snippet to DB.")
-        # else: # Saving to DB is now after IGA call
-            # _save_snippet_to_db(snippet_data, db_path) # Moved after IGA call
+        # db_path argument is removed from _save_snippet_to_db
+        # It will use CPOA_DATABASE_PATH for SQLite if DATABASE_TYPE is sqlite
+        # or _get_cpoa_db_connection for PostgreSQL.
+        # No explicit db_path needed here anymore.
 
         # --- IGA Call for Cover Art ---
         cover_art_prompt = snippet_data.get("cover_art_prompt")
@@ -850,11 +1026,10 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
         else: # No cover_art_prompt
              snippet_data["image_url"] = None
 
-        # Now save to DB (it won't save image_url yet as schema not updated)
-        if db_path:
-            _save_snippet_to_db(snippet_data, db_path)
-        else:
-            logger.error(f"CPOA: {function_name} - CPOA_DATABASE_PATH not configured. Snippet (with/without image_url) not saved to DB.")
+        # Now save to DB. _save_snippet_to_db will handle DB type.
+        # If DATABASE_TYPE is "sqlite", it will use CPOA_DATABASE_PATH.
+        _save_snippet_to_db(snippet_data)
+
 
         return snippet_data
 
@@ -916,91 +1091,64 @@ if __name__ == "__main__":
     # The main function for testing will require PSWA and VFA services to be running.
     # For local testing, you would run pswa/main.py and vfa/main.py in separate terminals.
     
-    # Use configured database path
-    db_path_main = CPOA_DATABASE_PATH
-    logger.info(f"Using database path from environment for __main__: {db_path_main}")
+    # Use configured database path (relevant if testing SQLite path for __main__)
+    # db_path_main = CPOA_DATABASE_PATH
+    # logger.info(f"Using database path from environment for __main__: {db_path_main}")
 
-    # Create a dummy podcasts table if it doesn't exist for the db_path_main
-    try:
-        conn = sqlite3.connect(db_path_main)
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS podcasts (
-                podcast_id TEXT PRIMARY KEY,
-                topic TEXT NOT NULL,
-                cpoa_status TEXT,
-                cpoa_error_message TEXT,
-                final_audio_filepath TEXT,
-                stream_id TEXT,
-                asf_websocket_url TEXT,
-                asf_notification_status TEXT,
-                task_created_timestamp TEXT NOT NULL,
-                last_updated_timestamp TEXT,
-                cpoa_full_orchestration_log TEXT
-            )
-        """)
-        conn.commit()
-        logger.info(f"Database '{db_path_main}' initialized for testing in __main__ (using new schema).")
-    except sqlite3.Error as e:
-        logger.error(f"Error creating DB table in __main__ with new schema: {e}")
-    finally:
-        if conn:
-            conn.close()
+    # __main__ block testing with SQLite directly might become less relevant
+    # as primary DB moves to PostgreSQL. For now, keeping it minimal.
+    # If DATABASE_TYPE is postgres, these direct SQLite connection in __main__ will not work
+    # unless specifically handled or if CPOA functions are called which then use the new DB logic.
+
+    # To test orchestrate_podcast_generation, it no longer takes db_path directly.
+    # It uses the globally configured DATABASE_TYPE and associated paths/credentials.
+    # So, ensure your .env for CPOA points to a test DB (SQLite or PG) for this block.
+
+    # Example for testing (assuming DATABASE_TYPE and related vars are set in .env for CPOA):
+    if DATABASE_TYPE == "sqlite" and CPOA_DATABASE_PATH:
+        logger.info(f"__main__ testing with SQLite DB: {CPOA_DATABASE_PATH}")
+        try:
+            conn = sqlite3.connect(CPOA_DATABASE_PATH)
+            cursor = conn.cursor()
+            # Minimal schema for testing orchestrate_podcast_generation's _update_task_status_in_db
+            cursor.execute("CREATE TABLE IF NOT EXISTS podcasts (podcast_id TEXT PRIMARY KEY, topic TEXT, cpoa_status TEXT, cpoa_error_message TEXT, last_updated_timestamp TEXT)")
+            # Minimal schema for _save_snippet_to_db and _get_topic_details_from_db
+            cursor.execute("CREATE TABLE IF NOT EXISTS topics_snippets (id TEXT PRIMARY KEY, type TEXT, title TEXT, summary TEXT, keywords TEXT, original_topic_details TEXT, llm_model_used_for_snippet TEXT, cover_art_prompt TEXT, image_url TEXT, generation_timestamp TEXT, last_accessed_timestamp TEXT, relevance_score REAL, source_url TEXT, source_name TEXT)")
+
+            conn.commit()
+        except sqlite3.Error as e: logger.error(f"Error creating test DB tables: {e}")
+        finally:
+            if conn: conn.close()
 
     sample_topic_1 = "AI in Healthcare"
-    sample_task_id_1 = "task_" + uuid.uuid4().hex
+    sample_task_id_1 = str(uuid.uuid4()) # Ensure UUID for PG path
     print(f"\nTest 1: Orchestrating for topic '{sample_topic_1}' (Task ID: {sample_task_id_1})")
-    try:
-        conn = sqlite3.connect(db_path_main)
-        cursor = conn.cursor()
-        # Simulate initial record creation by API Gateway (simplified for test)
-        cursor.execute(
-            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
-            (sample_task_id_1, sample_topic_1, "pending_api_gateway", datetime.now().isoformat(), datetime.now().isoformat())
-        )
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Error inserting initial task {sample_task_id_1} in __main__: {e}")
-    finally:
-        if conn:
-            conn.close()
+    # Simulate initial record creation if needed for testing _update_task_status_in_db
+    # This would now also depend on DATABASE_TYPE
+    # For simplicity, this step is omitted here; assume task_id exists or test the creation path.
 
-    result1 = orchestrate_podcast_generation(topic=sample_topic_1, task_id=sample_task_id_1, db_path=db_path_main)
+    # orchestrate_podcast_generation no longer takes db_path
+    result1 = orchestrate_podcast_generation(topic=sample_topic_1, task_id=sample_task_id_1)
     print(f"\n--- Result for '{sample_topic_1}' ---")
     pretty_print_orchestration_result(result1)
 
-    sample_topic_2 = "The Future of Space Travel"
-    sample_task_id_2 = "task_" + uuid.uuid4().hex
-    print(f"\nTest 2: Orchestrating for topic '{sample_topic_2}' (Task ID: {sample_task_id_2})")
-    try:
-        conn = sqlite3.connect(db_path_main)
-        cursor = conn.cursor()
-        # Simulate initial record creation by API Gateway
-        cursor.execute(
-            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp) VALUES (?, ?, ?, ?, ?)",
-            (sample_task_id_2, sample_topic_2, "pending_api_gateway", datetime.now().isoformat(), datetime.now().isoformat())
-        )
-        conn.commit()
-    except sqlite3.Error as e:
-        logger.error(f"Error inserting initial task {sample_task_id_2} in __main__: {e}")
-    finally:
-        if conn:
-            conn.close()
+    # sample_topic_2 = "The Future of Space Travel"
+    # sample_task_id_2 = str(uuid.uuid4())
+    # print(f"\nTest 2: Orchestrating for topic '{sample_topic_2}' (Task ID: {sample_task_id_2})")
+    # result2 = orchestrate_podcast_generation(topic=sample_topic_2, task_id=sample_task_id_2)
+    # print(f"\n--- Result for '{sample_topic_2}' ---")
+    # pretty_print_orchestration_result(result2)
 
-    result2 = orchestrate_podcast_generation(topic=sample_topic_2, task_id=sample_task_id_2, db_path=db_path_main)
-    print(f"\n--- Result for '{sample_topic_2}' ---")
-    pretty_print_orchestration_result(result2)
-
-    # You might want to keep the db_path_main for inspection after tests, or remove it.
     # try:
-    #     os.remove(db_path_main)
-    #     logger.info(f"Cleaned up database: {db_path_main}")
+    #     if DATABASE_TYPE == "sqlite" and CPOA_DATABASE_PATH and os.path.exists(CPOA_DATABASE_PATH):
+    #         os.remove(CPOA_DATABASE_PATH) # Clean up SQLite test DB
+    #         logger.info(f"Cleaned up SQLite test database: {CPOA_DATABASE_PATH}")
     # except OSError as e:
-    #     logger.error(f"Error removing database {db_path_main}: {e}")
+    #     logger.error(f"Error removing SQLite test database {CPOA_DATABASE_PATH}: {e}")
 
     print("\n--- CPOA orchestration testing with service calls complete ---")
-    print(f"NOTE: Ensure PSWA (URL: {PSWA_SERVICE_URL}), VFA (URL: {VFA_SERVICE_URL}), ASF (Notification URL: {ASF_NOTIFICATION_URL}), and SCA (URL: {SCA_SERVICE_URL}) services are running for these tests to fully succeed.")
-    print(f"Database used in __main__: {db_path_main}")
+    print(f"NOTE: Ensure PSWA, VFA, ASF, SCA services are running. DB used: {DATABASE_TYPE}")
+
 
     print("\n--- CPOA: Testing Snippet Generation ---")
     sample_topic_info_for_snippet = {
@@ -1081,12 +1229,8 @@ def orchestrate_topic_exploration(
     original_topic_title = "original topic"
 
     if current_topic_id:
-        if not CPOA_DATABASE_PATH:
-            logger.error("CPOA_DATABASE_PATH not configured. Cannot fetch topic details for exploration.")
-            # Depending on desired strictness, could raise error or return empty
-            return []
-
-        original_topic = _get_topic_details_from_db(CPOA_DATABASE_PATH, current_topic_id)
+        # _get_topic_details_from_db no longer takes db_path directly
+        original_topic = _get_topic_details_from_db(current_topic_id)
         if original_topic:
             original_topic_title = original_topic.get('title', current_topic_id)
             # For "deeper", let's refine the query. Could be more sophisticated.

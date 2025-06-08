@@ -1,10 +1,31 @@
 version: '3.8'
 
 volumes:
-  aethercast_db_data:
+  aethercast_db_data: # This might become unused if all services switch to Postgres
   aethercast_audio_data:
+  postgres_data: # New volume for PostgreSQL data
 
 services:
+  postgres_db:
+    image: postgres:15-alpine
+    container_name: aethercast_postgres_db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aethercastuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aethercastpass}
+      POSTGRES_DB: ${POSTGRES_DB:-aethercast_db}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-aethercastuser} -d $${POSTGRES_DB:-aethercast_db}"] # Escaped $ for docker-compose
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - aethercast_network
+    restart: unless-stopped
+
   api_gateway:
     build:
       context: . # Build context is the project root
@@ -13,12 +34,22 @@ services:
       - "5001:5001"
     volumes:
       - ./aethercast:/app/aethercast # For live code changes in dev
-      - aethercast_db_data:/app/database # Named volume for DB
+      # - aethercast_db_data:/app/database # SQLite volume, may be removed later
     env_file:
       - common.env # Shared environment variables
       - ./aethercast/api_gateway/.env # Service-specific vars
-    # depends_on: # Example, can be added if strict startup order is needed
-      # - tda
+    environment:
+      # PostgreSQL connection details
+      - DATABASE_TYPE=postgres
+      - POSTGRES_HOST=postgres_db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-aethercastuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aethercastpass}
+      - POSTGRES_DB=${POSTGRES_DB:-aethercast_db}
+    depends_on:
+      postgres_db:
+        condition: service_healthy # Wait for Postgres to be healthy
+      # - tda # Example, can be added if strict startup order is needed
       # - cpoa (though cpoa is part of api_gateway image)
       # - aims_service # If API Gateway directly called AIMS
     networks: # Example: assuming a custom network for all backend services
@@ -51,10 +82,30 @@ services:
     ports:
       - "9009:9000" # Host:Container
     env_file:
+      - common.env # For GCS_BUCKET_NAME, FLASK_DEBUG_MODE
       - ./aethercast/aims_tts_service/.env # Users must create this from .env.example
+    environment:
+      # Ensure GOOGLE_APPLICATION_CREDENTIALS is set for GCS and TTS
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      # GCS_BUCKET_NAME can be sourced from common.env or overridden in service .env
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME}
+      AIMS_TTS_GCS_AUDIO_PREFIX: audio/aims_tts/ # Default prefix, can be overridden
+      # Flask runtime settings
+      AIMS_TTS_HOST: 0.0.0.0
+      AIMS_TTS_PORT: 9000
+      FLASK_DEBUG: ${FLASK_DEBUG_MODE:-False} # Default to False for TTS if not in common.env
     volumes:
       - ./aethercast/aims_tts_service:/app # For live development
-      - aethercast_audio_data:/shared_audio # Shared volume for TTS output
+      # Mount GCP credentials, similar to aims_service and iga
+      - ./aethercast/aims_tts_service/gcp-credentials.json:/app/gcp-credentials.json:ro
+      - aethercast_audio_data:/shared_audio
+      # SHARED_AUDIO_DIR_CONTAINER in main.py is now /tmp/aims_tts_temp_audio,
+      # so it does not strictly need aethercast_audio_data for its *own* temp files unless
+      # that /tmp path is also intended to be on the shared volume (which is unusual).
+      # However, VFA *might* still expect the final output path (now a GCS URI) to be relatable
+      # to /shared_audio if it tries to access it before CPOA passes the GCS URI.
+      # Keeping /shared_audio mounted for now for broader compatibility during transition,
+      # though AIMS_TTS itself primarily writes to GCS.
     networks:
       - aethercast_network
     restart: unless-stopped
@@ -67,10 +118,21 @@ services:
       - "5000:5000" # Assuming TDA runs on 5000
     volumes:
       - ./aethercast:/app/aethercast
-      - aethercast_db_data:/app/database
+      # - aethercast_db_data:/app/database # SQLite volume, to be removed or conditional
     env_file:
       - common.env
       - ./aethercast/tda/.env
+    environment:
+      # PostgreSQL connection details for TDA
+      - DATABASE_TYPE=postgres
+      - POSTGRES_HOST=postgres_db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-aethercastuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aethercastpass}
+      - POSTGRES_DB=${POSTGRES_DB:-aethercast_db}
+    depends_on:
+      postgres_db:
+        condition: service_healthy
     networks:
       - aethercast_network
 
@@ -98,12 +160,22 @@ services:
       - "5004:5004" # Assuming PSWA runs on 5004
     volumes:
       - ./aethercast:/app/aethercast
-      - aethercast_db_data:/app/database # For script caching
+      # - aethercast_db_data:/app/database # SQLite volume for script caching, to be removed or conditional
     env_file:
       - common.env
       - ./aethercast/pswa/.env
+    environment:
+      # PostgreSQL connection details for PSWA script cache
+      - DATABASE_TYPE=postgres
+      - POSTGRES_HOST=postgres_db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-aethercastuser}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aethercastpass}
+      - POSTGRES_DB=${POSTGRES_DB:-aethercast_db}
     depends_on:
       - aims_service
+      postgres_db:
+        condition: service_healthy
     networks:
       - aethercast_network
 
@@ -158,7 +230,10 @@ services:
       IGA_VERTEXAI_PROJECT_ID: ${GCP_PROJECT_ID} # From common.env
       IGA_VERTEXAI_LOCATION: ${GCP_LOCATION} # From common.env
       IGA_VERTEXAI_IMAGE_MODEL_ID: imagegeneration@006 # Default model
-      IGA_GENERATED_IMAGE_DIR: /shared_audio/iga_images # Path on shared volume
+      # IGA_GENERATED_IMAGE_DIR is now less critical as output is GCS URI. Still used for local temp if ever needed.
+      IGA_GENERATED_IMAGE_DIR: /shared_audio/iga_images
+      GCS_BUCKET_NAME: ${GCS_BUCKET_NAME} # Sourced from common.env
+      IGA_GCS_IMAGE_PREFIX: images/iga/ # Default prefix, can be overridden in iga/.env
       IGA_DEFAULT_ASPECT_RATIO: "1:1"
       IGA_ADD_WATERMARK: "True"
       # Flask server settings for IGA

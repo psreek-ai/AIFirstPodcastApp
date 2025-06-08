@@ -6,6 +6,9 @@ import json
 import os
 from dotenv import load_dotenv
 import requests
+import psycopg2 # Added
+from psycopg2.extras import RealDictCursor # Added
+from datetime import datetime
 
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -22,24 +25,32 @@ tda_config = {
     "TDA_NEWS_PAGE_SIZE": int(os.getenv("TDA_NEWS_PAGE_SIZE", "25")),
     "TDA_NEWS_REQUEST_TIMEOUT": int(os.getenv("TDA_NEWS_REQUEST_TIMEOUT", "15")),
     "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"),
-    "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db"),
+
+    # Database Configuration
+    "DATABASE_TYPE": os.getenv("DATABASE_TYPE", "sqlite"), # Default to sqlite if not set
+    "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db"), # SQLite path
+    "POSTGRES_HOST": os.getenv("POSTGRES_HOST"),
+    "POSTGRES_PORT": os.getenv("POSTGRES_PORT", "5432"),
+    "POSTGRES_USER": os.getenv("POSTGRES_USER"),
+    "POSTGRES_PASSWORD": os.getenv("POSTGRES_PASSWORD"),
+    "POSTGRES_DB": os.getenv("POSTGRES_DB"),
+
     "TDA_HOST": os.getenv("TDA_HOST", os.getenv("FLASK_RUN_HOST", "0.0.0.0")),
     "TDA_PORT": int(os.getenv("TDA_PORT", os.getenv("FLASK_RUN_PORT", "5000"))),
     "TDA_DEBUG_MODE": os.getenv("TDA_DEBUG_MODE", "True").lower() == "true"
 }
 
-# --- Additional Imports ---
-import sqlite3
-from datetime import datetime
 
 # --- Configuration & Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - TDA - %(message)s') # Changed logger name
 
 # Log loaded configuration
 logging.info("--- TDA Configuration ---")
 for key, value in tda_config.items():
     if "API_KEY" in key and value:
         logging.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
+    elif "PASSWORD" in key and value:
+        logging.info(f"  {key}: ********")
     else:
         logging.info(f"  {key}: {value}")
 logging.info("--- End TDA Configuration ---")
@@ -47,34 +58,44 @@ logging.info("--- End TDA Configuration ---")
 # Startup Check for API Key
 if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
     error_message = "CRITICAL: USE_REAL_NEWS_API is True, but TDA_NEWS_API_KEY is not set. Real News API calls will fail. Please set TDA_NEWS_API_KEY."
-    logging.error(error_message)
+    logging.critical(error_message) # Use critical for startup failures
     raise ValueError(error_message)
+
+# Startup check for DB config
+if tda_config["DATABASE_TYPE"] == "postgres":
+    required_pg_vars = ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]
+    missing_pg_vars = [var for var in required_pg_vars if not tda_config.get(var)]
+    if missing_pg_vars:
+        error_msg = f"CRITICAL: DATABASE_TYPE is 'postgres' but required PostgreSQL config is missing: {', '.join(missing_pg_vars)}"
+        logging.critical(error_msg)
+        raise ValueError(error_msg)
+elif tda_config["DATABASE_TYPE"] == "sqlite":
+    if not tda_config.get("SHARED_DATABASE_PATH"):
+        error_msg = "CRITICAL: DATABASE_TYPE is 'sqlite' but SHARED_DATABASE_PATH is not set."
+        logging.critical(error_msg)
+        raise ValueError(error_msg)
 else:
-    # This specific logging about API usage is fine here, complements the general config log.
-    if tda_config["USE_REAL_NEWS_API"] and tda_config["TDA_NEWS_API_KEY"]:
-        logging.info("TDA is configured to use the REAL News API.")
-    elif tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
-        # This case is already covered by the critical error log above, but good for clarity if not raising error.
-        logging.warning("TDA is configured to use REAL News API but KEY IS MISSING.")
-    else:
-        logging.info("TDA is configured to use SIMULATED data sources.")
+    error_msg = f"CRITICAL: Invalid DATABASE_TYPE: {tda_config['DATABASE_TYPE']}. Must be 'sqlite' or 'postgres'."
+    logging.critical(error_msg)
+    raise ValueError(error_msg)
+
 
 # --- Constants ---
 DB_SCHEMA_TDA_TABLES = """
 CREATE TABLE IF NOT EXISTS topics_snippets (
-    id TEXT PRIMARY KEY,
-    type TEXT NOT NULL CHECK(type IN ('topic', 'snippet')),
+    id UUID PRIMARY KEY,
+    type VARCHAR(50) NOT NULL CHECK(type IN ('topic', 'snippet')),
     title TEXT NOT NULL,
     summary TEXT,
-    keywords TEXT,
+    keywords JSONB,
     source_url TEXT,
     source_name TEXT,
-    original_topic_details TEXT,
-    llm_model_used_for_snippet TEXT,
+    original_topic_details JSONB,
+    llm_model_used_for_snippet VARCHAR(255),
     cover_art_prompt TEXT,
     image_url TEXT,
-    generation_timestamp TEXT NOT NULL,
-    last_accessed_timestamp TEXT,
+    generation_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+    last_accessed_timestamp TIMESTAMPTZ,
     relevance_score REAL
 );
 """
@@ -85,79 +106,184 @@ NEWS_API_STATUS_OK = "ok"
 
 app = flask.Flask(__name__)
 
-# --- Database Initialization ---
-def init_tda_db(db_path: str):
+# --- Database Helper Functions ---
+def _get_db_connection():
+    """Establishes a database connection based on DATABASE_TYPE."""
+    db_type = tda_config.get("DATABASE_TYPE")
+    if db_type == "postgres":
+        try:
+            conn = psycopg2.connect(
+                host=tda_config["POSTGRES_HOST"],
+                port=tda_config["POSTGRES_PORT"],
+                user=tda_config["POSTGRES_USER"],
+                password=tda_config["POSTGRES_PASSWORD"],
+                dbname=tda_config["POSTGRES_DB"],
+                cursor_factory=RealDictCursor
+            )
+            return conn
+        except psycopg2.Error as e:
+            logging.error(f"Error connecting to PostgreSQL database: {e}")
+            raise
+    elif db_type == "sqlite":
+        # This part will become obsolete once fully migrated and SQLite code is removed
+        # For now, keeping it for potential phased rollout or testing.
+        db_path = tda_config.get("SHARED_DATABASE_PATH")
+        if not db_path:
+            logging.error("SHARED_DATABASE_PATH not configured for SQLite.")
+            raise ValueError("SHARED_DATABASE_PATH not configured for SQLite.")
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row # For dict-like access if needed by other SQLite parts
+        return conn
+    else:
+        logging.error(f"Unsupported DATABASE_TYPE: {db_type}")
+        raise ValueError(f"Unsupported DATABASE_TYPE: {db_type}")
+
+def init_tda_db():
     """Initializes the TDA database table if it doesn't exist."""
-    logger.info(f"[TDA_DB_INIT] Ensuring TDA database schema exists at {db_path}...")
+    logging.info(f"[TDA_DB_INIT] Ensuring TDA database schema exists (DB Type: {tda_config.get('DATABASE_TYPE')})...")
     conn = None
+    cursor = None
     try:
-        conn = sqlite3.connect(db_path) # Direct connect, or add _get_db_connection if preferred
+        conn = _get_db_connection()
         cursor = conn.cursor()
-        cursor.executescript(DB_SCHEMA_TDA_TABLES)
-        conn.commit()
-        logger.info("[TDA_DB_INIT] TDA: Database table 'topics_snippets' ensured.")
-    except sqlite3.Error as e:
-        logger.error(f"[TDA_DB_INIT] TDA: Database error during schema initialization: {e}", exc_info=True)
+        if tda_config.get("DATABASE_TYPE") == "postgres":
+            # Check if table exists for PostgreSQL
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    AND table_name = 'topics_snippets'
+                );
+            """)
+            table_exists = cursor.fetchone()['exists']
+            if not table_exists:
+                logging.info("Table 'topics_snippets' not found in PostgreSQL. Creating now...")
+                cursor.execute(DB_SCHEMA_TDA_TABLES)
+                conn.commit()
+                logging.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' created.")
+            else:
+                logging.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' already exists.")
+        elif tda_config.get("DATABASE_TYPE") == "sqlite":
+            # SQLite table check (less critical now but kept for completeness if needed)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='topics_snippets';")
+            if not cursor.fetchone():
+                 logging.info("Table 'topics_snippets' not found in SQLite. Creating now...")
+                 cursor.executescript(DB_SCHEMA_TDA_TABLES) # executescript for SQLite
+                 conn.commit()
+                 logging.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' ensured.")
+            else:
+                logging.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' already exists.")
+
+    except (psycopg2.Error, sqlite3.Error) as e: # Catch both error types
+        logging.error(f"[TDA_DB_INIT] Database error during schema initialization: {e}", exc_info=True)
     except Exception as e_unexp:
-        logger.error(f"[TDA_DB_INIT] TDA: Unexpected error during schema initialization: {e_unexp}", exc_info=True)
+        logging.error(f"[TDA_DB_INIT] Unexpected error during schema initialization: {e_unexp}", exc_info=True)
     finally:
+        if cursor:
+            cursor.close()
         if conn:
             conn.close()
 
-# --- Placeholder Data Sources ---
-# Simulates data fetched from various news APIs, RSS feeds, etc.
 
 # --- Database Interaction for Topics ---
-def _save_topic_to_db(topic_object: dict, db_path: str):
-    """Saves a single topic object to the topics_snippets table."""
+def _save_topic_to_db(topic_object: dict): # Removed db_path argument
+    """Saves a single topic object to the configured database."""
     conn = None
+    cursor = None
     try:
-        conn = sqlite3.connect(db_path) # Direct connect
+        conn = _get_db_connection()
         cursor = conn.cursor()
 
-        # Map TopicObject fields to topics_snippets table columns
-        # Ensure keywords is stored as a JSON string
-        keywords_json = json.dumps(topic_object.get("keywords", []))
+        keywords_data = topic_object.get("keywords", [])
+        # For PostgreSQL JSONB, psycopg2 handles dict/list to JSON conversion
+        # For SQLite, we need to json.dumps it if the column is TEXT
+        keywords_to_save = json.dumps(keywords_data) if tda_config.get("DATABASE_TYPE") == "sqlite" else keywords_data
 
-        # Extract source_url and source_name safely
         potential_sources = topic_object.get("potential_sources", [])
-        source_url = potential_sources[0].get("url") if potential_sources and isinstance(potential_sources, list) and len(potential_sources) > 0 and isinstance(potential_sources[0], dict) else None
-        source_name = potential_sources[0].get("source_name") if potential_sources and isinstance(potential_sources, list) and len(potential_sources) > 0 and isinstance(potential_sources[0], dict) else None
+        source_url = potential_sources[0].get("url") if potential_sources and len(potential_sources) > 0 else None
+        source_name = potential_sources[0].get("source_name") if potential_sources and len(potential_sources) > 0 else None
 
-        current_ts = datetime.now().isoformat()
+        current_ts_iso = datetime.utcnow().isoformat()
+        # For PostgreSQL, TIMESTAMPTZ will handle ISO format string correctly.
+        # SQLite TEXT also handles ISO format string.
+        publication_date_to_save = topic_object.get("publication_date", current_ts_iso)
+        last_accessed_ts_to_save = current_ts_iso
 
-        cursor.execute(
-            """
-            INSERT OR REPLACE INTO topics_snippets (
+        # Generate UUID if topic_id is not already a valid UUID string
+        topic_id_str = topic_object.get("topic_id")
+        try:
+            uuid.UUID(topic_id_str) # Validate if it's a UUID
+        except (ValueError, TypeError, AttributeError):
+            topic_id_str = str(uuid.uuid4()) # Generate new if not valid
+
+
+        sql_insert = """
+            INSERT INTO topics_snippets (
                 id, type, title, summary, keywords,
                 source_url, source_name, original_topic_details,
-                llm_model_used_for_snippet, cover_art_prompt,
+                llm_model_used_for_snippet, cover_art_prompt, image_url,
                 generation_timestamp, last_accessed_timestamp, relevance_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                topic_object.get("topic_id"),
-                DB_TYPE_TOPIC, # type
-                topic_object.get("title_suggestion"),
-                topic_object.get("summary"),
-                keywords_json,
-                source_url,
-                source_name,
-                None, # original_topic_details (N/A for topics from TDA)
-                None, # llm_model_used_for_snippet (N/A for topics)
-                None, # cover_art_prompt (N/A for topics)
-                topic_object.get("publication_date", current_ts), # generation_timestamp (use publication if available)
-                current_ts, # last_accessed_timestamp (set to now on creation/update)
-                topic_object.get("relevance_score")
-            )
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (id) DO UPDATE SET
+                type = EXCLUDED.type,
+                title = EXCLUDED.title,
+                summary = EXCLUDED.summary,
+                keywords = EXCLUDED.keywords,
+                source_url = EXCLUDED.source_url,
+                source_name = EXCLUDED.source_name,
+                original_topic_details = EXCLUDED.original_topic_details,
+                llm_model_used_for_snippet = EXCLUDED.llm_model_used_for_snippet,
+                cover_art_prompt = EXCLUDED.cover_art_prompt,
+                image_url = EXCLUDED.image_url,
+                generation_timestamp = EXCLUDED.generation_timestamp,
+                last_accessed_timestamp = EXCLUDED.last_accessed_timestamp,
+                relevance_score = EXCLUDED.relevance_score;
+        """
+        # Using %s for psycopg2, original_topic_details is expected to be JSONB compatible (dict/list)
+        # For SQLite, this would need ? and json.dumps for JSON fields.
+        # Assuming for now this function is primarily for PostgreSQL path.
+        # If SQLite path is still needed, conditional SQL and param formatting would be required.
+
+        params = (
+            topic_id_str,
+            DB_TYPE_TOPIC,
+            topic_object.get("title_suggestion"),
+            topic_object.get("summary"),
+            keywords_to_save, # Already formatted for PG or SQLite
+            source_url,
+            source_name,
+            topic_object.get("original_topic_details"), # Directly pass dict for JSONB
+            None, # llm_model_used_for_snippet
+            None, # cover_art_prompt
+            topic_object.get("image_url"), # image_url
+            publication_date_to_save,
+            last_accessed_ts_to_save,
+            topic_object.get("relevance_score")
         )
+
+        if tda_config.get("DATABASE_TYPE") == "sqlite":
+            # Convert SQL for SQLite
+            sql_insert_sqlite = sql_insert.replace("%s", "?")
+            # Ensure JSON fields are dumped to strings for SQLite
+            params_sqlite = list(params)
+            params_sqlite[4] = json.dumps(params[4]) if not isinstance(params[4], str) else params[4] # keywords
+            params_sqlite[7] = json.dumps(params[7]) if not isinstance(params[7], str) else params[7] # original_topic_details
+            cursor.execute(sql_insert_sqlite, tuple(params_sqlite))
+        else: # PostgreSQL
+            cursor.execute(sql_insert, params)
+
         conn.commit()
-        logging.info(f"Saved/Replaced topic {topic_object.get('topic_id')} to DB: {topic_object.get('title_suggestion')}")
-    except sqlite3.Error as e:
+        logging.info(f"Saved/Replaced topic {topic_id_str} to DB: {topic_object.get('title_suggestion')}")
+
+    except (psycopg2.Error, sqlite3.Error) as e:
         logging.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
-    except Exception as e: # Catch any other unexpected error during DB interaction
-        logging.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e}", exc_info=True)
+        if conn: conn.rollback() # Rollback on error for PG
+    except Exception as e_unexp:
+        logging.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e_unexp}", exc_info=True)
+        if conn and tda_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
     finally:
+        if cursor:
+            cursor.close()
         if conn:
             conn.close()
 
@@ -166,7 +292,7 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
     Calls the NewsAPI.org to fetch articles, parses them, transforms into TopicObjects,
     saves them to the database, and returns the list of TopicObjects.
     """
-    if not tda_config.get("USE_REAL_NEWS_API"): # Should be checked by caller, but good safeguard
+    if not tda_config.get("USE_REAL_NEWS_API"):
         return []
     if not tda_config.get("TDA_NEWS_API_KEY"):
         logging.error("call_real_news_api: TDA_NEWS_API_KEY not configured. Cannot make request.")
@@ -175,351 +301,182 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
     base_url = tda_config["TDA_NEWS_API_BASE_URL"]
     endpoint = tda_config["TDA_NEWS_API_ENDPOINT"]
     api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
-
     params = {}
-    # query_keywords will be used for both API call and TopicObject keywords
     query_keywords_list = keywords if keywords else tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]
     if query_keywords_list:
-        # Ensure query_keywords_list is a list of strings
-        if isinstance(query_keywords_list, str): # Should not happen if default is already a list
+        if isinstance(query_keywords_list, str):
             query_keywords_list = [kw.strip() for kw in query_keywords_list.split(',')]
-        # For NewsAPI 'q' parameter, join with " OR " for multiple keywords for broader search,
-        # or " AND " for more specific. Using " OR " for discovery.
         params["q"] = " OR ".join(query_keywords_list)
-
-    if endpoint == "top-headlines": # Specific params for 'top-headlines'
-        if categories: # NewsAPI expects a single category for 'top-headlines'
+    if endpoint == "top-headlines":
+        if categories:
             params["category"] = categories[0] if isinstance(categories, list) else categories
-        if country: # Add country if provided and using top-headlines
+        if country:
             params["country"] = country
-        # 'q' is also usable with top-headlines, but country/category are more common.
-    
     current_language = language if language else tda_config["TDA_NEWS_DEFAULT_LANGUAGE"]
     if current_language:
         params["language"] = current_language
-    
     params["pageSize"] = tda_config.get("TDA_NEWS_PAGE_SIZE", 25)
-
     headers = {
         "X-Api-Key": tda_config["TDA_NEWS_API_KEY"],
         "User-Agent": tda_config.get("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1")
     }
-
     request_timeout = tda_config.get("TDA_NEWS_REQUEST_TIMEOUT", 15)
     logging.info(f"Calling NewsAPI: URL={api_url}, Params={params}, Timeout={request_timeout}s")
     topic_objects = []
-
     try:
         response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
-        response.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
-        
+        response.raise_for_status()
         response_json = response.json()
-
         if response_json.get("status") != NEWS_API_STATUS_OK:
             logging.error(f"NewsAPI returned error status: {response_json.get('status')}. Message: {response_json.get('message')}")
-            return []
-
+            return [] # Return empty list on API error status
         articles = response_json.get("articles", [])
-        db_path = tda_config.get("SHARED_DATABASE_PATH")
-        if not db_path:
-            logging.error("SHARED_DATABASE_PATH not configured. Cannot save topics to DB.")
+
+        # DB saving logic is now centralized in _save_topic_to_db which uses configured DB type
+        # No need for db_path here directly.
         
         for article in articles:
             title = article.get('title')
             if not title or title == "[Removed]":
                 continue
-
             description = article.get('description')
             content = article.get('content')
             summary_text = description if description else content if content else "No summary available."
             if summary_text.endswith(" chars]") and summary_text[-10:].startswith("[+"):
                 summary_text = summary_text[:summary_text.rfind("[+")].strip()
-            if not summary_text:
-                summary_text = "Content details not available."
-
+            if not summary_text: summary_text = "Content details not available."
             article_url = article.get('url')
             source_name = article.get('source', {}).get('name', 'Unknown Source')
             published_at = article.get('publishedAt')
-            topic_keywords = query_keywords_list
-
             topic_object = {
-                "topic_id": generate_topic_id(), # This will be 'id' in DB
+                "topic_id": str(uuid.uuid4()), # Generate UUID for new topics
                 "source_feed_name": SOURCE_FEED_NEWS_API,
-                "title_suggestion": title, # This will be 'title' in DB
+                "title_suggestion": title,
                 "summary": summary_text,
-                "keywords": topic_keywords,
-                "potential_sources": [{
-                    "url": article_url, # This will be 'source_url' in DB
-                    "title": title,
-                    "source_name": source_name # This will be 'source_name' in DB
-                }],
-                "relevance_score": round(random.uniform(0.6, 0.9), 2),
-                "publication_date": published_at, # This will be 'generation_timestamp' in DB
-                "category_suggestion": "News"
+                "keywords": query_keywords_list, # Use the search keywords
+                "potential_sources": [{"url": article_url, "title": title, "source_name": source_name}],
+                "relevance_score": round(random.uniform(0.6, 0.9), 2), # Placeholder score
+                "publication_date": published_at,
+                "category_suggestion": "News", # Default category for news items
+                "original_topic_details": article # Store the full article for potential future use
             }
             topic_objects.append(topic_object)
-            if db_path: # Save to DB if path is configured
-                _save_topic_to_db(topic_object, db_path)
+            _save_topic_to_db(topic_object) # Call updated save function
         
-        logging.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI. Saved to DB: {bool(db_path)}")
+        logging.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI.")
         return topic_objects
-
-    except requests.exceptions.JSONDecodeError as json_err:
-        logging.error(f"Failed to decode JSON from NewsAPI: {json_err}. Response text: {response.text if 'response' in locals() and response else 'N/A'}", exc_info=True)
-        return None # Indicate error
-    except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error occurred: {http_err} - {http_err.response.text if http_err.response else 'No response text'}", exc_info=True)
-        return None # Indicate error
-    except requests.exceptions.ConnectionError as conn_err:
-        logging.error(f"Connection error occurred: {conn_err}", exc_info=True)
-        return None # Indicate error
-    except requests.exceptions.Timeout as timeout_err:
-        logging.error(f"Timeout error occurred: {timeout_err}", exc_info=True)
-        return None # Indicate error
-    except requests.exceptions.RequestException as req_err: # Catch any other request-related errors
-        logging.error(f"An unexpected error occurred with the NewsAPI request: {req_err}", exc_info=True)
-        return None # Indicate error
-    # Default return for any other unhandled issues within this function, though try/except should cover most.
-    return None # Indicate error if reached unexpectedly
+    except requests.exceptions.RequestException as req_err:
+        logging.error(f"NewsAPI request error: {req_err}", exc_info=True)
+        return [] # Return empty list on request failure, CPOA/caller handles "no topics"
 
 SIMULATED_DATA_SOURCES = [
     {
         "source_name": "Tech Chronicle",
         "articles": [
-            {"title": "The Future of AI in Personalized Medicine", "url": "http://example.com/ai-medicine", "keywords": ["AI", "Healthcare", "Personalized Medicine"], "publish_date": "2024-03-10"},
-            {"title": "Quantum Computing: Beyond the Hype", "url": "http://example.com/quantum-beyond-hype", "keywords": ["Quantum Computing", "Technology", "Innovation"], "publish_date": "2024-03-11"},
-            {"title": "Sustainable Tech: Innovations for a Greener Planet", "url": "http://example.com/sustainable-tech", "keywords": ["Sustainability", "Green Tech", "Environment"], "publish_date": "2024-03-08"},
+            {"title": "The Future of AI in Personalized Medicine", "url": "http://example.com/ai-medicine", "keywords": ["AI", "Healthcare", "Personalized Medicine"], "publish_date": "2024-03-10T10:00:00Z"},
+            {"title": "Quantum Computing: Beyond the Hype", "url": "http://example.com/quantum-beyond-hype", "keywords": ["Quantum Computing", "Technology", "Innovation"], "publish_date": "2024-03-11T11:00:00Z"},
         ]
     },
-    {
-        "source_name": "Global News Network",
-        "articles": [
-            {"title": "Geopolitical Shifts and Their Economic Impact", "url": "http://example.com/geopolitics-economy", "keywords": ["Geopolitics", "Economy", "Global Affairs"], "publish_date": "2024-03-12"},
-            {"title": "Advances in Space Exploration: The Artemis Program", "url": "http://example.com/artemis-program", "keywords": ["Space Exploration", "NASA", "Moon Mission"], "publish_date": "2024-03-09"},
-        ]
-    },
-    {
-        "source_name": "Science Today Journal",
-        "articles": [
-            {"title": "Breakthrough in Fusion Energy Research", "url": "http://example.com/fusion-breakthrough", "keywords": ["Fusion Energy", "Physics", "Clean Energy"], "publish_date": "2024-03-11"},
-            {"title": "Understanding Dark Matter: New Theories Emerge", "url": "http://example.com/dark-matter-theories", "keywords": ["Cosmology", "Dark Matter", "Astrophysics"], "publish_date": "2024-03-07"},
-        ]
-    }
 ]
 
-# --- Topic Identification & Ranking Logic ---
-
-def generate_topic_id() -> str:
-    """Generates a unique topic ID."""
-    return f"topic_{uuid.uuid4().hex[:10]}"
-
-def generate_summary_from_title(title: str) -> str:
-    """Generates a placeholder summary based on the title."""
-    return f"This topic explores {title.lower()}, focusing on its recent developments and potential impact."
-
-def calculate_relevance_score(article: dict, query: str = None) -> float:
-    """
-    Calculates a basic relevance score.
-    If a query is provided, boosts score if query keywords are in article keywords.
-    Otherwise, scores based on recency or other heuristics.
-    """
-    score = random.uniform(0.5, 0.9) # Base random score
-
-    # Boost score for keywords (simple matching)
-    if query:
-        query_keywords = [q.strip().lower() for q in query.split()]
-        for qk in query_keywords:
-            if qk in [kw.lower() for kw in article.get("keywords", [])]:
-                score = min(1.0, score + 0.2) # Boost score
-            if qk in article.get("title", "").lower():
-                score = min(1.0, score + 0.1)
-
-
-    # Placeholder: Add a small boost for more recent articles (days_old < 7)
-    # In a real system, `publish_date` would be parsed properly.
-    # For now, we assume all are recent enough.
-    # Example: if "2024-03-12" in article.get("publish_date", ""): score = min(1.0, score + 0.05)
-
-    return round(score, 2)
-
-
 def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
-    """
-    Processes simulated data sources to identify and rank potential topics.
-    """
     identified_topics = []
     all_articles = []
-    db_path = tda_config.get("SHARED_DATABASE_PATH")
-    if not db_path:
-        logging.warning("SHARED_DATABASE_PATH not configured. Simulated topics will not be saved to DB.")
-
     logging.info(f"[TDA_LOGIC] Scanning simulated data sources. Query: '{query}', Limit: {limit}")
-
     for data_source in SIMULATED_DATA_SOURCES:
         for article in data_source["articles"]:
             all_articles.append({
-                "title": article["title"],
-                "url": article["url"],
-                "source_name": data_source["source_name"],
-                "keywords": article.get("keywords", []),
-                "publish_date": article.get("publish_date", datetime.now().isoformat()) # Ensure a date
+                "title": article["title"], "url": article["url"],
+                "source_name": data_source["source_name"], "keywords": article.get("keywords", []),
+                "publish_date": article.get("publish_date", datetime.utcnow().isoformat())
             })
-
     for article in all_articles:
         relevance = calculate_relevance_score(article, query)
-        # Combine query keywords with article keywords if query exists
         combined_keywords = list(set(article.get("keywords", []) + ([kw.strip() for kw in query.split(',')] if query else [])))
-
         topic_object = {
-            "topic_id": generate_topic_id(),
-            "title_suggestion": article["title"],
-            "summary": generate_summary_from_title(article["title"]),
-            "keywords": combined_keywords,
+            "topic_id": str(uuid.uuid4()), "title_suggestion": article["title"],
+            "summary": generate_summary_from_title(article["title"]), "keywords": combined_keywords,
             "potential_sources": [{"url": article["url"], "title": article["title"], "source_name": article["source_name"]}],
-            "relevance_score": relevance,
-            "publication_date": article.get("publish_date"),
-            "category_suggestion": "General"
+            "relevance_score": relevance, "publication_date": article.get("publish_date"),
+            "category_suggestion": "General", "original_topic_details": article
         }
         identified_topics.append(topic_object)
-        if db_path: # Save to DB if path is configured
-            _save_topic_to_db(topic_object, db_path)
-
-
+        _save_topic_to_db(topic_object)
     identified_topics.sort(key=lambda x: x["relevance_score"], reverse=True)
-    
-    logging.info(f"[TDA_LOGIC] Identified {len(identified_topics)} potential topics. Saved to DB: {bool(db_path)}. Returning top {min(limit, len(identified_topics))}.")
+    logging.info(f"[TDA_LOGIC] Identified {len(identified_topics)} potential topics from simulated sources. Returning top {min(limit, len(identified_topics))}.")
     return identified_topics[:limit]
 
-# --- API Endpoint ---
+# --- Other helper functions (generate_topic_id, generate_summary_from_title, calculate_relevance_score) ---
+# generate_topic_id is now just str(uuid.uuid4()) inline or within topic creation.
+# generate_summary_from_title and calculate_relevance_score are specific to simulated data.
 
+def generate_summary_from_title(title: str) -> str:
+    return f"This topic explores {title.lower()}, focusing on its recent developments and potential impact."
+
+def calculate_relevance_score(article: dict, query: str = None) -> float:
+    score = random.uniform(0.5, 0.9)
+    if query:
+        query_keywords = [q.strip().lower() for q in query.split()]
+        for qk in query_keywords:
+            if qk in [kw.lower() for kw in article.get("keywords", [])]: score = min(1.0, score + 0.2)
+            if qk in article.get("title", "").lower(): score = min(1.0, score + 0.1)
+    return round(score, 2)
+
+# --- API Endpoint ---
 @app.route("/discover_topics", methods=["POST"])
 def discover_topics_endpoint():
-    """
-    API endpoint for CPOA to request topic discovery.
-    Accepts a JSON payload with an optional 'query' and 'limit'.
-    """
     try:
         try:
-            request_data = flask.request.get_json()
-            if not request_data: # Handles cases where request_data is None (e.g. empty body with correct content-type)
-                request_data = {} # Allow empty payload for general discovery (default behavior)
-        except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
-            logging.warning(f"/discover_topics: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
-            return flask.jsonify({
-                "error_code": "TDA_MALFORMED_JSON",
-                "message": "Malformed JSON payload.",
-                "details": str(e_json_decode)
-            }), 400
-
-        query = request_data.get("query") # Optional query from CPOA
+            request_data = flask.request.get_json() if flask.request.content_length else {}
+        except Exception as e_json_decode:
+            logging.warning(f"/discover_topics: Failed to decode JSON: {e_json_decode}", exc_info=True)
+            return flask.jsonify({"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+        query = request_data.get("query")
         limit_raw = request_data.get("limit")
-        error_trigger = request_data.get("error_trigger") # For simulating errors
-
-        # Validate query
+        error_trigger = request_data.get("error_trigger")
         if query is not None and (not isinstance(query, str) or not query.strip()):
-            logging.warning(f"/discover_topics: Validation failed: 'query' must be a non-empty string if provided. Received: '{query}'")
-            return flask.jsonify({
-                "error_code": "TDA_INVALID_QUERY",
-                "message": "Validation failed: 'query' must be a non-empty string if provided."
-            }), 400
-
-        # Validate limit
-        limit = 5 # Default limit
+            return flask.jsonify({"error_code": "TDA_INVALID_QUERY", "message": "query must be non-empty string."}), 400
+        limit = 5
         if limit_raw is not None:
             try:
                 limit = int(limit_raw)
-                if not (1 <= limit <= 50): # Max results e.g. 50 (corrected range to be inclusive of 1)
-                    logging.warning(f"/discover_topics: Validation failed: 'limit' ({limit}) out of range (1-50).")
-                    return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "Validation failed: 'limit' must be an integer between 1 and 50."}), 400
+                if not (1 <= limit <= 50):
+                    return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "limit must be 1-50."}), 400
             except ValueError:
-                logging.warning(f"/discover_topics: Validation failed: 'limit' is not a valid integer. Received: '{limit_raw}'.")
-                return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "Validation failed: 'limit' must be a valid integer."}), 400
-
-        logging.info(f"Received POST /discover_topics request. Query: '{query}', Limit: {limit}, ErrorTrigger: '{error_trigger}'")
-
+                return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "limit must be integer."}), 400
+        logging.info(f"POST /discover_topics. Query: '{query}', Limit: {limit}, Trigger: '{error_trigger}'")
         if error_trigger == "tda_error":
-            logging.warning(f"[TDA_SIMULATED_ERROR] Simulating an error for /discover_topics based on error_trigger: {error_trigger}")
-            return flask.jsonify({
-                "error_code": "TDA_SIMULATED_ERROR",
-                "message": "A simulated error occurred in TDA.",
-                "details": "This is a controlled error triggered for testing purposes in TopicDiscoveryAgent."
-            }), 500
-
-        # global tda_config # tda_config is already globally accessible
+            return flask.jsonify({"error_code": "TDA_SIMULATED_ERROR", "message": "Simulated TDA error."}), 500
         
         discovered_topics = []
         if tda_config["USE_REAL_NEWS_API"]:
-            logging.info(f"Using REAL News API for /discover_topics. Query: '{query}'")
             request_keywords = [k.strip() for k in query.split(',')] if query else None
-            
-            # call_real_news_api expects a list of keywords.
-            # It does not currently use 'limit' directly; NewsAPI handles result size.
-            # We will slice the result if a limit is needed post-fetch.
-            raw_topics_from_api = call_real_news_api(
-                keywords=request_keywords,
-                language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")
-                # categories and country are not passed here, call_real_news_api uses defaults or endpoint specific logic
-            )
-
-            if raw_topics_from_api is None: # Check if NewsAPI call failed
-                logging.error(f"Failed to retrieve topics from NewsAPI for query: '{query}'. Upstream error.")
-                return flask.jsonify({
-                    "error_code": "TDA_NEWSAPI_FAILURE",
-                    "message": "Failed to retrieve topics from the external NewsAPI.",
-                    "details": "The Topic Discovery Agent encountered an issue with its upstream news provider."
-                }), 502 # Bad Gateway, as TDA depends on NewsAPI
-
-            # Proceed if raw_topics_from_api is a list (even if empty)
-            # Sort by relevance_score if available, assuming higher is better.
-            # The current call_real_news_api sets a static 0.8, so sorting won't do much unless changed.
-            # For now, we'll just take the list as is.
-            # raw_topics_from_api.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
-
-            # Apply limit if specified
-            if limit > 0 and isinstance(limit, int):
-                discovered_topics = raw_topics_from_api[:limit]
-            else:
-                discovered_topics = raw_topics_from_api
-        
-        else: # Not using real NewsAPI, use simulated data
-            logging.info(f"Using SIMULATED data for /discover_topics. Query: '{query}', Limit: {limit}")
+            raw_topics_from_api = call_real_news_api(keywords=request_keywords, language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE"))
+            if raw_topics_from_api is None: # Explicit check for None indicating API call failure
+                return flask.jsonify({"error_code": "TDA_NEWSAPI_FAILURE", "message": "Failed to get topics from NewsAPI."}), 502
+            discovered_topics = raw_topics_from_api[:limit] if limit > 0 else raw_topics_from_api
+        else:
             discovered_topics = identify_topics_from_sources(query=query, limit=limit)
-
-        if not discovered_topics:
-            # Provide a more specific message if using the real API and no topics were found
-            message = "No topics discovered."
-            if tda_config["USE_REAL_NEWS_API"]:
-                 message = "No topics discovered from NewsAPI for the given query."
-            else:
-                 message = "No topics discovered from simulated sources for the given query."
-            return flask.jsonify({"message": message, "topics": []}), 200
-
-        # This is the structure CPOA's `call_topic_discovery_agent` expects
-        response_data = {"discovered_topics": discovered_topics}
         
-        return flask.jsonify(response_data), 200
-
+        if not discovered_topics:
+            return flask.jsonify({"message": "No topics discovered.", "topics": []}), 200
+        return flask.jsonify({"discovered_topics": discovered_topics}), 200
     except Exception as e:
-        logging.error(f"Error in /discover_topics endpoint: {e}", exc_info=True)
-        return flask.jsonify({
-            "error_code": ENDPOINT_ERROR_INTERNAL_SERVER_TDA,
-            "message": "An unexpected error occurred in the Topic Discovery Agent.",
-            "details": str(e)
-        }), 500
+        logging.error(f"Error in /discover_topics: {e}", exc_info=True)
+        return flask.jsonify({"error_code": ENDPOINT_ERROR_INTERNAL_SERVER_TDA, "message": "Unexpected error."}), 500
 
 if __name__ == "__main__":
-    # In a real deployment, use a proper WSGI server like Gunicorn or uWSGI
-    # For development, Flask's built-in server is fine.
-    # The CPOA will call this service, so it needs to be running.
-    # Example: python aethercast/tda/main.py
+    if tda_config.get("DATABASE_TYPE") == "sqlite" and not tda_config.get("SHARED_DATABASE_PATH"):
+        logging.warning("SHARED_DATABASE_PATH not configured for TDA SQLite mode. Topic saving to DB will fail if not using Postgres.")
+    elif tda_config.get("DATABASE_TYPE") == "postgres" and not all(tda_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]):
+        logging.warning("PostgreSQL is configured as DATABASE_TYPE, but one or more connection variables are missing. DB operations might fail.")
+
+    init_tda_db() # Call init_db based on configured DB_TYPE
+
     host = tda_config.get("TDA_HOST")
     port = tda_config.get("TDA_PORT")
     debug_mode = tda_config.get("TDA_DEBUG_MODE")
-
-    # Initialize the database for TDA
-    if tda_config.get('SHARED_DATABASE_PATH'):
-        init_tda_db(tda_config['SHARED_DATABASE_PATH'])
-    else:
-        logging.warning("SHARED_DATABASE_PATH not configured for TDA. Topic saving to DB will fail.")
-
+    logging.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: {tda_config.get('DATABASE_TYPE')}) ---")
     app.run(host=host, port=port, debug=debug_mode)
+
+[end of aethercast/tda/main.py]

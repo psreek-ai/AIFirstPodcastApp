@@ -4,12 +4,15 @@ from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 import uuid
 import re
-import sqlite3
+# import sqlite3 # Removed
 import hashlib
 from datetime import datetime, timedelta
 import json
-import requests # Added for AIMS service call
-import time # Added for retry logic with AIMS
+import requests
+import time
+import psycopg2 # Added
+from psycopg2.extras import RealDictCursor # Added
+from typing import Optional, Dict, Any # Added for type hinting
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -20,11 +23,10 @@ pswa_config = {}
 def load_pswa_configuration():
     """Loads PSWA configurations from environment variables with defaults."""
     global pswa_config
-    # OPENAI_API_KEY is removed, PSWA will call AIMS
     pswa_config['AIMS_SERVICE_URL'] = os.getenv("AIMS_SERVICE_URL", "http://aims_service:8000/v1/generate")
     pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS'] = int(os.getenv("AIMS_REQUEST_TIMEOUT_SECONDS", "180"))
 
-    pswa_config['PSWA_LLM_MODEL'] = os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo") # This is now a request to AIMS
+    pswa_config['PSWA_LLM_MODEL'] = os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo")
     pswa_config['PSWA_LLM_TEMPERATURE'] = float(os.getenv("PSWA_LLM_TEMPERATURE", "0.7"))
     pswa_config['PSWA_LLM_MAX_TOKENS'] = int(os.getenv("PSWA_LLM_MAX_TOKENS", "1500"))
     pswa_config['PSWA_LLM_JSON_MODE'] = os.getenv("PSWA_LLM_JSON_MODE", "true").lower() == 'true'
@@ -52,7 +54,6 @@ return a JSON object with an error field:
   "message": "The provided content was not sufficient to generate a full podcast script for the topic: [topic_name_here]."
 }"""
     pswa_config['PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE'] = os.getenv("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", default_system_message_json)
-
     default_user_template_json = """Generate a podcast script for topic '{topic}' using the following content:
 ---
 {content}
@@ -64,190 +65,257 @@ Remember, your entire response must be a single JSON object conforming to the sc
     pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
     pswa_config['PSWA_DEBUG_MODE'] = os.getenv("PSWA_DEBUG_MODE", "True").lower() == "true"
 
-    pswa_config['SHARED_DATABASE_PATH'] = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db")
+    # Database Configuration
+    pswa_config["DATABASE_TYPE"] = os.getenv("DATABASE_TYPE", "sqlite") # Default to sqlite
+    pswa_config['SHARED_DATABASE_PATH'] = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db") # SQLite path
+    pswa_config["POSTGRES_HOST"] = os.getenv("POSTGRES_HOST")
+    pswa_config["POSTGRES_PORT"] = os.getenv("POSTGRES_PORT", "5432")
+    pswa_config["POSTGRES_USER"] = os.getenv("POSTGRES_USER")
+    pswa_config["POSTGRES_PASSWORD"] = os.getenv("POSTGRES_PASSWORD")
+    pswa_config["POSTGRES_DB"] = os.getenv("POSTGRES_DB")
+
     pswa_config['PSWA_SCRIPT_CACHE_ENABLED'] = os.getenv("PSWA_SCRIPT_CACHE_ENABLED", "True").lower() == 'true'
     pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'] = int(os.getenv("PSWA_SCRIPT_CACHE_MAX_AGE_HOURS", "720"))
     pswa_config['PSWA_TEST_MODE_ENABLED'] = os.getenv("PSWA_TEST_MODE_ENABLED", "False").lower() == 'true'
 
     logger.info("--- PSWA Configuration ---")
-    logger.info(f"  AIMS_SERVICE_URL: {pswa_config['AIMS_SERVICE_URL']}")
-    logger.info(f"  AIMS_REQUEST_TIMEOUT_SECONDS: {pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS']}")
-    logger.info(f"  PSWA_LLM_MODEL (request to AIMS): {pswa_config['PSWA_LLM_MODEL']}")
-    logger.info(f"  PSWA_LLM_TEMPERATURE (request to AIMS): {pswa_config['PSWA_LLM_TEMPERATURE']}")
-    logger.info(f"  PSWA_LLM_MAX_TOKENS (request to AIMS): {pswa_config['PSWA_LLM_MAX_TOKENS']}")
-    logger.info(f"  PSWA_LLM_JSON_MODE (request to AIMS): {pswa_config['PSWA_LLM_JSON_MODE']}")
-    # Log other configs as before, API_KEY related logging is removed
     for key, value in pswa_config.items():
-        if key not in ["AIMS_SERVICE_URL", "AIMS_REQUEST_TIMEOUT_SECONDS", "PSWA_LLM_MODEL", "PSWA_LLM_TEMPERATURE", "PSWA_LLM_MAX_TOKENS", "PSWA_LLM_JSON_MODE"]:
-            if key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
-                logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{value[:50].replace('\n', ' ')}...')")
-            else:
-                logger.info(f"  {key}: {value}")
+        if "PASSWORD" in key and value:
+            logger.info(f"  {key}: ********")
+        elif key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
+            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{value[:50].replace('\n', ' ')}...')")
+        else:
+            logger.info(f"  {key}: {value}")
     logger.info("--- End PSWA Configuration ---")
 
     if not pswa_config.get('AIMS_SERVICE_URL'):
         error_msg = "CRITICAL: AIMS_SERVICE_URL is not set. PSWA cannot function."
-        logger.error(error_msg)
+        logger.critical(error_msg)
         raise ValueError(error_msg)
 
-# --- Database Schema for Cache ---
+    if pswa_config["DATABASE_TYPE"] == "postgres":
+        required_pg_vars = ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]
+        missing_pg_vars = [var for var in required_pg_vars if not pswa_config.get(var)]
+        if missing_pg_vars:
+            error_msg = f"CRITICAL: DATABASE_TYPE is 'postgres' but required PostgreSQL config is missing: {', '.join(missing_pg_vars)}"
+            logger.critical(error_msg)
+            raise ValueError(error_msg)
+    elif pswa_config["DATABASE_TYPE"] == "sqlite" and pswa_config['PSWA_SCRIPT_CACHE_ENABLED']:
+        if not pswa_config.get("SHARED_DATABASE_PATH"):
+            error_msg = "CRITICAL: DATABASE_TYPE is 'sqlite' and cache is enabled, but SHARED_DATABASE_PATH is not set."
+            logger.critical(error_msg)
+            raise ValueError(error_msg)
+
+
+# --- Database Schema for Cache (PostgreSQL compatible) ---
 DB_SCHEMA_PSWA_CACHE_TABLE = """
 CREATE TABLE IF NOT EXISTS generated_scripts (
-    script_id TEXT PRIMARY KEY,
-    topic_hash TEXT NOT NULL UNIQUE,
-    structured_script_json TEXT NOT NULL,
-    generation_timestamp TEXT NOT NULL,
-    llm_model_used TEXT,
-    last_accessed_timestamp TEXT
+    script_id UUID PRIMARY KEY,
+    topic_hash VARCHAR(64) NOT NULL UNIQUE,
+    structured_script_json JSONB NOT NULL,
+    generation_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+    llm_model_used VARCHAR(255),
+    last_accessed_timestamp TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
 """
 
 # --- Constants ---
-KEY_TITLE = "title"
-KEY_INTRO = "intro"
-KEY_SEGMENTS = "segments"
-KEY_SEGMENT_TITLE = "segment_title"
-KEY_CONTENT = "content"
-KEY_OUTRO = "outro"
-KEY_ERROR = "error" # Used for LLM error structure within JSON
-KEY_MESSAGE = "message"
+KEY_TITLE = "title"; KEY_INTRO = "intro"; KEY_SEGMENTS = "segments"; KEY_SEGMENT_TITLE = "segment_title"
+KEY_CONTENT = "content"; KEY_OUTRO = "outro"; KEY_ERROR = "error"; KEY_MESSAGE = "message"
+SEGMENT_TITLE_INTRO = "INTRO"; SEGMENT_TITLE_OUTRO = "OUTRO"; SEGMENT_TITLE_ERROR = "ERROR"; TAG_TITLE = "TITLE"
 
-SEGMENT_TITLE_INTRO = "INTRO"
-SEGMENT_TITLE_OUTRO = "OUTRO"
-SEGMENT_TITLE_ERROR = "ERROR"
-TAG_TITLE = "TITLE"
-
-# --- Test Mode Scenario Constants (remain largely the same) ---
 SCENARIO_DEFAULT_SCRIPT_CONTENT = { KEY_TITLE: "Test Mode Default Title", KEY_INTRO: "This is the default intro for test mode.", KEY_SEGMENTS: [{KEY_SEGMENT_TITLE: "Test Segment 1", KEY_CONTENT: "Content of test segment 1."},{KEY_SEGMENT_TITLE: "Test Segment 2", KEY_CONTENT: "Content of test segment 2."}], KEY_OUTRO: "This is the default outro for test mode."}
 SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT = { KEY_TITLE: "Error: Test Scenario Insufficient Content", KEY_SEGMENTS: [{KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, KEY_CONTENT: "[ERROR] Insufficient content for test topic."}],}
 SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT = { KEY_TITLE: "Test Mode Title - Empty Segments", KEY_INTRO: "This intro leads to no actual content segments.", KEY_SEGMENTS: [], KEY_OUTRO: "This outro follows no actual content segments."}
 
-
-# --- Flask App Setup ---
 app = Flask(__name__)
+logger = logging.getLogger(__name__) # Use Flask's logger if available, else basicConfig
+if not logger.hasHandlers(): logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
+if not pswa_config: load_pswa_configuration()
 
-# --- Logging Configuration ---
-if app.logger and app.logger.name != 'root':
-    logger = app.logger
-else:
-    logger = logging.getLogger(__name__)
-    if not logger.hasHandlers():
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
-
-if not pswa_config:
-    load_pswa_configuration()
-
-# --- Database Initialization ---
-def init_pswa_db(db_path: str):
-    """Initializes the PSWA script cache database table and index if they don't exist."""
-    logger.info(f"[PSWA_DB_INIT] Ensuring PSWA database schema exists at {db_path}...")
-    conn = None
-    try:
-        conn = _get_db_connection(db_path) # Uses existing helper that raises error on connection fail
-        cursor = conn.cursor()
-        cursor.executescript(DB_SCHEMA_PSWA_CACHE_TABLE)
-        conn.commit()
-        logger.info("[PSWA_DB_INIT] PSWA: Database table 'generated_scripts' and index 'idx_topic_hash' ensured.")
-    except sqlite3.Error as e:
-        logger.error(f"[PSWA_DB_INIT] PSWA: Database error during schema initialization: {e}", exc_info=True)
-        # Depending on policy, might re-raise to halt startup if DB is critical even for non-cached operations.
-        # For now, logging the error and allowing service to continue (caching might fail).
-    except Exception as e_unexp:
-        logger.error(f"[PSWA_DB_INIT] PSWA: Unexpected error during schema initialization: {e_unexp}", exc_info=True)
-    finally:
-        if conn:
-            conn.close()
-
-# --- Database Helper Functions for Script Caching (remain the same) ---
-def _get_db_connection(db_path: str):
-    try:
+# --- Database Helper Functions for Script Caching ---
+def _get_db_connection():
+    db_type = pswa_config.get("DATABASE_TYPE")
+    if db_type == "postgres":
+        try:
+            conn = psycopg2.connect(
+                host=pswa_config["POSTGRES_HOST"], port=pswa_config["POSTGRES_PORT"],
+                user=pswa_config["POSTGRES_USER"], password=pswa_config["POSTGRES_PASSWORD"],
+                dbname=pswa_config["POSTGRES_DB"], cursor_factory=RealDictCursor
+            )
+            return conn
+        except psycopg2.Error as e:
+            logger.error(f"[PSWA_CACHE_DB] Error connecting to PostgreSQL: {e}")
+            raise
+    elif db_type == "sqlite":
+        db_path = pswa_config['SHARED_DATABASE_PATH']
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         return conn
-    except sqlite3.Error as e:
-        logger.error(f"[PSWA_CACHE_DB] Error connecting to database at {db_path}: {e}")
-        raise
+    else:
+        raise ValueError(f"Unsupported DATABASE_TYPE: {db_type}")
+
+def init_pswa_db():
+    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        logger.info("[PSWA_DB_INIT] Script caching is disabled. Skipping DB initialization.")
+        return
+    db_type = pswa_config.get("DATABASE_TYPE")
+    logger.info(f"[PSWA_DB_INIT] Ensuring PSWA cache schema exists (DB Type: {db_type})...")
+    conn = None; cursor = None
+    try:
+        conn = _get_db_connection()
+        cursor = conn.cursor()
+        if db_type == "postgres":
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_schema = 'public' AND table_name = 'generated_scripts'
+                );
+            """)
+            table_exists = cursor.fetchone()['exists']
+            if not table_exists:
+                cursor.execute(DB_SCHEMA_PSWA_CACHE_TABLE)
+                conn.commit()
+                logger.info("[PSWA_DB_INIT] PostgreSQL: Table 'generated_scripts' and index created.")
+            else:
+                logger.info("[PSWA_DB_INIT] PostgreSQL: Table 'generated_scripts' already exists.")
+        elif db_type == "sqlite":
+            cursor.executescript(DB_SCHEMA_PSWA_CACHE_TABLE) # executescript for SQLite
+            conn.commit()
+            logger.info("[PSWA_DB_INIT] SQLite: Table 'generated_scripts' and index ensured.")
+    except (psycopg2.Error, sqlite3.Error) as e:
+        logger.error(f"[PSWA_DB_INIT] Database error: {e}", exc_info=True)
+    finally:
+        if cursor: cursor.close()
+        if conn: conn.close()
 
 def _calculate_content_hash(topic: str, content: str) -> str:
+    # (Function remains the same)
     normalized_topic = topic.lower().strip()
     normalized_content_summary = content.lower().strip()[:1000]
     input_string = f"topic:{normalized_topic}|content_summary:{normalized_content_summary}"
     return hashlib.sha256(input_string.encode('utf-8')).hexdigest()
 
-def _get_cached_script(db_path: str, topic_hash: str, max_age_hours: int) -> Optional[dict]:
-    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        return None
-    logger.info(f"[PSWA_CACHE_DB] Attempting to fetch script from cache for hash: {topic_hash}")
-    conn = None
+def _get_cached_script(topic_hash: str, max_age_hours: int) -> Optional[Dict[str, Any]]:
+    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'): return None
+    logger.info(f"[PSWA_CACHE_DB] Fetching script from cache for hash: {topic_hash}")
+    conn = None; cursor = None
     try:
-        conn = _get_db_connection(db_path)
+        conn = _get_db_connection()
         cursor = conn.cursor()
-        cutoff_timestamp = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
-        cursor.execute(
-            "SELECT script_id, structured_script_json, llm_model_used, generation_timestamp FROM generated_scripts WHERE topic_hash = ? AND generation_timestamp >= ?",
-            (topic_hash, cutoff_timestamp)
-        )
+        cutoff_timestamp = (datetime.utcnow() - timedelta(hours=max_age_hours))
+
+        sql_query = """
+            SELECT script_id, structured_script_json, llm_model_used, generation_timestamp
+            FROM generated_scripts
+            WHERE topic_hash = %s AND generation_timestamp >= %s;
+        """
+        params = (topic_hash, cutoff_timestamp)
+
+        if pswa_config.get("DATABASE_TYPE") == "sqlite":
+            sql_query = sql_query.replace("%s", "?")
+            params = (topic_hash, cutoff_timestamp.isoformat())
+
+        cursor.execute(sql_query, params)
         row = cursor.fetchone()
+
         if row:
             logger.info(f"[PSWA_CACHE_DB] Cache hit for hash {topic_hash}. Script ID: {row['script_id']}")
-            structured_script = json.loads(row['structured_script_json'])
-            try:
-                cursor.execute("UPDATE generated_scripts SET last_accessed_timestamp = ? WHERE script_id = ?",
-                               (datetime.utcnow().isoformat(), row['script_id']))
-                conn.commit()
-            except sqlite3.Error as e_update:
-                logger.warning(f"[PSWA_CACHE_DB] Failed to update last_accessed_timestamp for script {row['script_id']}: {e_update}")
-            if 'source' not in structured_script:
-                 structured_script['source'] = "cache"
-            structured_script['script_id'] = row['script_id']
-            structured_script['llm_model_used'] = row['llm_model_used']
-            structured_script['generation_timestamp_from_cache'] = row['generation_timestamp']
+            # structured_script_json is already a dict due to RealDictCursor or json.loads for sqlite
+            structured_script = row['structured_script_json'] if isinstance(row['structured_script_json'], dict) else json.loads(row['structured_script_json'])
+
+            update_access_sql = "UPDATE generated_scripts SET last_accessed_timestamp = %s WHERE script_id = %s;"
+            update_params = (datetime.utcnow(), row['script_id'])
+            if pswa_config.get("DATABASE_TYPE") == "sqlite":
+                update_access_sql = update_access_sql.replace("%s", "?")
+                update_params = (datetime.utcnow().isoformat(), row['script_id'])
+
+            # Secondary cursor for update to not interfere with fetchone if needed, though not strictly necessary here
+            update_cursor = conn.cursor()
+            update_cursor.execute(update_access_sql, update_params)
+            conn.commit()
+            update_cursor.close()
+
+            structured_script['source'] = "cache"
+            # script_id and llm_model_used are already part of structured_script_json if saved correctly.
+            # If not, ensure they are added:
+            if 'script_id' not in structured_script: structured_script['script_id'] = row['script_id']
+            if 'llm_model_used' not in structured_script: structured_script['llm_model_used'] = row['llm_model_used']
+            structured_script['generation_timestamp_from_cache'] = row['generation_timestamp'].isoformat() if isinstance(row['generation_timestamp'], datetime) else str(row['generation_timestamp'])
             return structured_script
         else:
-            logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash} (max_age_hours: {max_age_hours})")
+            logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash}")
             return None
-    except (sqlite3.Error, json.JSONDecodeError) as e:
-        logger.error(f"[PSWA_CACHE_DB] Error accessing/decoding cache for hash {topic_hash}: {e}", exc_info=True)
+    except (psycopg2.Error, sqlite3.Error, json.JSONDecodeError) as e:
+        logger.error(f"[PSWA_CACHE_DB] Error accessing/decoding cache for {topic_hash}: {e}", exc_info=True)
+        if conn and pswa_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
         return None
     finally:
-        if conn:
-            conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
-def _save_script_to_cache(db_path: str, script_id: str, topic_hash: str, structured_script: dict, llm_model_used: str):
-    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        return
+def _save_script_to_cache(script_id: str, topic_hash: str, structured_script: Dict[str, Any], llm_model_used: str):
+    if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'): return
     logger.info(f"[PSWA_CACHE_DB] Saving script {script_id} to cache with hash: {topic_hash}")
-    conn = None
+    conn = None; cursor = None
     try:
-        script_to_save = structured_script.copy()
-        if 'source' in script_to_save : del script_to_save['source']
-        if 'generation_timestamp_from_cache' in script_to_save: del script_to_save['generation_timestamp_from_cache']
-        structured_script_json = json.dumps(script_to_save)
-        generation_timestamp = datetime.utcnow().isoformat()
-        conn = _get_db_connection(db_path)
+        conn = _get_db_connection()
         cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO generated_scripts (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp) VALUES (?, ?, ?, ?, ?, ?)",
-            (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, generation_timestamp)
-        )
+
+        script_to_save_db = structured_script.copy()
+        # Remove fields not part of the core stored JSON if they were added for runtime
+        script_to_save_db.pop('source', None)
+        script_to_save_db.pop('generation_timestamp_from_cache', None)
+
+        # For PostgreSQL JSONB, pass dict directly. For SQLite TEXT, dump to string.
+        script_json_for_db = script_to_save_db if pswa_config.get("DATABASE_TYPE") == "postgres" else json.dumps(script_to_save_db)
+
+        current_ts = datetime.utcnow()
+
+        sql_insert = """
+            INSERT INTO generated_scripts
+                (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (topic_hash) DO UPDATE SET
+                script_id = EXCLUDED.script_id,
+                structured_script_json = EXCLUDED.structured_script_json,
+                generation_timestamp = EXCLUDED.generation_timestamp,
+                llm_model_used = EXCLUDED.llm_model_used,
+                last_accessed_timestamp = EXCLUDED.last_accessed_timestamp;
+        """
+        # Note: SQLite's ON CONFLICT syntax is different for specific column updates.
+        # PostgreSQL's ON CONFLICT (topic_hash) DO UPDATE is more robust for this.
+        # For SQLite, it would typically be INSERT OR REPLACE, or separate INSERT and UPDATE.
+        # Given the schema has topic_hash UNIQUE, INSERT OR REPLACE is simpler for SQLite.
+        params = (script_id, topic_hash, script_json_for_db, current_ts, llm_model_used, current_ts)
+
+        if pswa_config.get("DATABASE_TYPE") == "sqlite":
+            sql_insert = """
+                INSERT OR REPLACE INTO generated_scripts
+                    (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """ # Using ? placeholders and ensuring JSON is string
+            params = (script_id, topic_hash, json.dumps(script_json_for_db) if isinstance(script_json_for_db, dict) else script_json_for_db, current_ts.isoformat(), llm_model_used, current_ts.isoformat())
+
+        cursor.execute(sql_insert, params)
         conn.commit()
         logger.info(f"[PSWA_CACHE_DB] Successfully saved script {script_id} to cache.")
-    except (sqlite3.Error, json.JSONEncodeError) as e:
+    except (psycopg2.Error, sqlite3.Error, json.JSONEncodeError) as e:
         logger.error(f"[PSWA_CACHE_DB] Error saving script {script_id} to cache: {e}", exc_info=True)
-    except Exception as e_unexp:
-        logger.error(f"[PSWA_CACHE_DB] Unexpected error saving script {script_id} to cache: {e_unexp}", exc_info=True)
+        if conn and pswa_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
     finally:
-        if conn:
-            conn.close()
+        if cursor: cursor.close()
+        if conn: conn.close()
 
-# --- LLM Output Parsing (parse_llm_script_output - remains largely the same) ---
+# --- LLM Output Parsing (parse_llm_script_output - remains the same) ---
 def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
+    # (Function content remains the same)
     script_id = f"pswa_script_{uuid.uuid4().hex}"
     parsed_script = {
         "script_id": script_id, "topic": topic, "title": f"Podcast on {topic}",
         "full_raw_script": raw_script_text, "segments": [],
-        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo") # Default, will be updated by actual model from AIMS
+        "llm_model_used": pswa_config.get('PSWA_LLM_MODEL', "gpt-3.5-turbo")
     }
     try:
         llm_json_data = json.loads(raw_script_text)
@@ -275,7 +343,7 @@ def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
         return parsed_script
     except json.JSONDecodeError:
         logger.warning(f"[PSWA_PARSING] LLM output was not valid JSON for topic '{topic}'. Raw output: '{raw_script_text[:200]}...' Attempting fallback.")
-        parsed_script[KEY_TITLE] = f"Podcast on {topic}"; parsed_script[KEY_SEGMENTS] = [] # Reset for fallback
+        parsed_script[KEY_TITLE] = f"Podcast on {topic}"; parsed_script[KEY_SEGMENTS] = []
     if raw_script_text.startswith("[ERROR] Insufficient content"):
         logger.warning(f"[PSWA_PARSING_FALLBACK] LLM indicated insufficient content for topic '{topic}'.")
         parsed_script[KEY_TITLE] = f"Error: Insufficient Content for {topic}"
@@ -314,11 +382,11 @@ def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
 
 # --- Main Script Weaving Logic ---
 def weave_script(content: str, topic: str) -> dict:
+    # (Function content largely remains the same, except for DB calls)
     logger.info(f"[PSWA_MAIN_LOGIC] weave_script called for topic: '{topic}'")
-    script_id_base = f"pswa_script_{uuid.uuid4().hex[:8]}"
+    script_id_base = f"pswa_script_{str(uuid.uuid4())}" # Use full UUID for script_id
 
     if pswa_config.get('PSWA_TEST_MODE_ENABLED'):
-        # Test mode logic remains the same as it bypasses LLM calls
         scenario = request.headers.get('X-Test-Scenario', 'default')
         logger.info(f"[PSWA_MAIN_LOGIC] Test mode enabled. Scenario: '{scenario}' for topic '{topic}'.")
         script_content_to_return = SCENARIO_DEFAULT_SCRIPT_CONTENT.copy()
@@ -328,194 +396,115 @@ def weave_script(content: str, topic: str) -> dict:
             script_content_to_return[KEY_TITLE] = f"Error: Test Scenario Insufficient Content for topic: {topic}"
             script_content_to_return[KEY_SEGMENTS] = [script_content_to_return[KEY_SEGMENTS][0].copy()]
             script_content_to_return[KEY_SEGMENTS][0][KEY_CONTENT] = f"[ERROR] Insufficient content for test topic: {topic}"
-        elif scenario == 'empty_segments':
-            script_content_to_return = SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT.copy()
-        else: # Default
-            script_content_to_return[KEY_TITLE] = f"Test Mode: {topic}"
-            if script_content_to_return.get(KEY_INTRO):
-                 script_content_to_return[KEY_INTRO] = f"This is the intro for the test mode topic: {topic}."
-
+        elif scenario == 'empty_segments': script_content_to_return = SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT.copy()
+        else: script_content_to_return[KEY_TITLE] = f"Test Mode: {topic}"; script_content_to_return.get(KEY_INTRO, f"This is the intro for test topic: {topic}.")
         final_test_script = {"script_id": f"{script_id_base}_test_{scenario}", "topic": topic, "llm_model_used": "test-mode-model", "source": source_info}
         final_test_script.update(script_content_to_return)
         if KEY_SEGMENTS not in final_test_script: final_test_script[KEY_SEGMENTS] = []
-        if scenario == 'insufficient_content':
-            raw_llm_error_sim = {"error": "Insufficient content", "message": f"The provided content was not sufficient... topic: {topic}"}
-            final_test_script["full_raw_script"] = json.dumps(raw_llm_error_sim)
-        else:
-            final_test_script["full_raw_script"] = json.dumps(script_content_to_return)
+        raw_script_output = {"error": "Insufficient content", "message": f"The provided content was not sufficient... topic: {topic}"} if scenario == 'insufficient_content' else script_content_to_return
+        final_test_script["full_raw_script"] = json.dumps(raw_script_output)
         return final_test_script
 
     topic_hash = _calculate_content_hash(topic, content)
-    logger.info(f"[PSWA_MAIN_LOGIC] Topic hash for caching: {topic_hash}")
     if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        cached_script = _get_cached_script(pswa_config['SHARED_DATABASE_PATH'], topic_hash, pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'])
+        # _get_cached_script no longer takes db_path
+        cached_script = _get_cached_script(topic_hash, pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'])
         if cached_script:
             logger.info(f"[PSWA_MAIN_LOGIC] Returning cached script for topic '{topic}', hash {topic_hash}")
-            if 'source' not in cached_script: cached_script['source'] = "cache"
-            return cached_script
-    logger.info(f"[PSWA_MAIN_LOGIC] No suitable cache entry or caching disabled for topic '{topic}'. Calling AIMS service.")
+            return cached_script # source is already in cached_script
 
-    current_topic = topic if topic else "an interesting subject"
-    current_content = content if content else "No specific content was provided. Please generate a general script based on the topic."
+    logger.info(f"[PSWA_MAIN_LOGIC] No cache for topic '{topic}'. Calling AIMS service.")
+    current_topic = topic or "an interesting subject"
+    current_content = content or "No specific content provided. Generate general script based on topic."
     user_prompt_template = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE')
-    try:
-        user_prompt = user_prompt_template.format(topic=current_topic, content=current_content)
-    except KeyError as e:
-        logger.error(f"[PSWA_MAIN_LOGIC] Error formatting user prompt template. Missing key: {e}. Using basic prompt.")
-        user_prompt = f"Topic: {current_topic}\nContent: {current_content}\nPlease generate a podcast script."
-
+    try: user_prompt = user_prompt_template.format(topic=current_topic, content=current_content)
+    except KeyError as e: logger.error(f"Error formatting user prompt: {e}. Using basic prompt."); user_prompt = f"Topic: {current_topic}\nContent: {current_content}\nPlease generate script."
     system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE')
-    full_prompt_for_aims = f"{system_message}\n\nUser Request:\n{user_prompt}" # Combine for AIMS
-
+    full_prompt_for_aims = f"{system_message}\n\nUser Request:\n{user_prompt}"
     aims_payload = {
         "prompt": full_prompt_for_aims,
         "model_id_override": pswa_config.get('PSWA_LLM_MODEL'),
         "max_tokens": pswa_config.get('PSWA_LLM_MAX_TOKENS'),
         "temperature": pswa_config.get('PSWA_LLM_TEMPERATURE'),
     }
-    if pswa_config.get('PSWA_LLM_JSON_MODE'):
-        aims_payload["response_format"] = {"type": "json_object"}
-
-    aims_url = pswa_config.get('AIMS_SERVICE_URL')
-    aims_timeout = pswa_config.get('AIMS_REQUEST_TIMEOUT_SECONDS')
-
-    logger.info(f"[PSWA_MAIN_LOGIC] Sending request to AIMS Service. URL: {aims_url}, Payload: {json.dumps(aims_payload)}")
-    raw_script_text_from_aims = None
-    llm_model_reported_by_aims = pswa_config.get('PSWA_LLM_MODEL') # Default, will be updated
-
+    if pswa_config.get('PSWA_LLM_JSON_MODE'): aims_payload["response_format"] = {"type": "json_object"}
+    aims_url = pswa_config.get('AIMS_SERVICE_URL'); aims_timeout = pswa_config.get('AIMS_REQUEST_TIMEOUT_SECONDS')
+    logger.info(f"[PSWA_MAIN_LOGIC] Sending request to AIMS. URL: {aims_url}, Payload: {json.dumps(aims_payload)}")
     try:
         response = requests.post(aims_url, json=aims_payload, timeout=aims_timeout)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-
+        response.raise_for_status()
         aims_response_data = response.json()
-
         if not aims_response_data.get("choices") or not aims_response_data["choices"][0].get("text"):
-            error_msg = "AIMS service response missing expected 'choices[0].text' field."
-            logger.error(f"[PSWA_MAIN_LOGIC] {error_msg} Response: {aims_response_data}")
-            return {"error_code": "PSWA_AIMS_BAD_RESPONSE", "message": error_msg, "details": aims_response_data, "source": "error"}
-
+            raise ValueError("AIMS response missing 'choices[0].text'.")
         raw_script_text_from_aims = aims_response_data["choices"][0]["text"].strip()
-        llm_model_reported_by_aims = aims_response_data.get("model_id", llm_model_reported_by_aims)
-        # Log usage if AIMS provides it, though PSWA doesn't directly use it now
-        if "usage" in aims_response_data:
-            logger.info(f"[PSWA_MAIN_LOGIC] AIMS reported usage: {aims_response_data['usage']}")
-
-        logger.info(f"[PSWA_MAIN_LOGIC] Successfully received script from AIMS (model: {llm_model_reported_by_aims}). Length: {len(raw_script_text_from_aims)}")
-
+        llm_model_reported_by_aims = aims_response_data.get("model_id", pswa_config.get('PSWA_LLM_MODEL'))
+        if "usage" in aims_response_data: logger.info(f"AIMS usage: {aims_response_data['usage']}")
+        logger.info(f"Received script from AIMS (model: {llm_model_reported_by_aims}). Length: {len(raw_script_text_from_aims)}")
         parsed_script = parse_llm_script_output(raw_script_text_from_aims, current_topic)
-        parsed_script["llm_model_used"] = llm_model_reported_by_aims # Store model reported by AIMS
+        parsed_script["llm_model_used"] = llm_model_reported_by_aims
         parsed_script["source"] = "generation_via_aims"
+        # Ensure script_id in parsed_script is a UUID string for DB
+        parsed_script["script_id"] = str(uuid.UUID(parsed_script.get("script_id", uuid.uuid4())))
 
-        if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED') and not (parsed_script.get("segments") and parsed_script["segments"][0]["segment_title"] == "ERROR"):
-            _save_script_to_cache(pswa_config['SHARED_DATABASE_PATH'], parsed_script["script_id"], topic_hash, parsed_script, llm_model_reported_by_aims)
+
+        if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED') and not (parsed_script.get("segments") and parsed_script["segments"][0].get("segment_title") == "ERROR"):
+            # _save_script_to_cache no longer takes db_path
+            _save_script_to_cache(parsed_script["script_id"], topic_hash, parsed_script, llm_model_reported_by_aims)
         return parsed_script
+    except requests.exceptions.Timeout as e_timeout: err_msg = f"AIMS request timed out: {e_timeout}"; logger.error(err_msg); return {"error_code": "PSWA_AIMS_TIMEOUT", "message": "AIMS request timed out.", "details": err_msg, "source": "error"}
+    except requests.exceptions.HTTPError as e_http: err_msg = f"AIMS HTTP error {e_http.response.status_code}: {e_http.response.text}"; logger.error(err_msg); return {"error_code": "PSWA_AIMS_HTTP_ERROR", "message": f"AIMS HTTP error {e_http.response.status_code}.", "details": e_http.response.text, "source": "error"}
+    except requests.exceptions.RequestException as e_req: err_msg = f"AIMS request error: {e_req}"; logger.error(err_msg); return {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "AIMS communication failed.", "details": err_msg, "source": "error"}
+    except (json.JSONDecodeError, ValueError) as e_parse: err_msg = f"Could not decode/parse AIMS response: {e_parse}."; logger.error(err_msg); return {"error_code": "PSWA_AIMS_BAD_RESPONSE", "message": "AIMS response invalid.", "details": err_msg, "source": "error"}
+    except Exception as e: err_msg = f"Unexpected error with AIMS: {e}"; logger.error(err_msg, exc_info=True); return {"error_code": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected AIMS error.", "details": err_msg, "source": "error"}
 
-    except requests.exceptions.Timeout as e_timeout:
-        error_msg = f"AIMS service request timed out after {aims_timeout}s: {str(e_timeout)}"
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        return {"error_code": "PSWA_AIMS_TIMEOUT", "message": "Request to AIMS service timed out.", "details": error_msg, "source": "error"}
-    except requests.exceptions.HTTPError as e_http:
-        error_msg = f"AIMS service returned HTTP error {e_http.response.status_code}: {e_http.response.text}"
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        aims_error_details = e_http.response.text
-        try: aims_error_details = e_http.response.json() # If AIMS returns JSON error
-        except ValueError: pass
-        return {"error_code": "PSWA_AIMS_HTTP_ERROR", "message": f"AIMS service returned HTTP {e_http.response.status_code}.", "details": aims_error_details, "source": "error"}
-    except requests.exceptions.RequestException as e_req:
-        error_msg = f"Error calling AIMS service: {type(e_req).__name__} - {str(e_req)}"
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        return {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "Failed to communicate with AIMS service.", "details": error_msg, "source": "error"}
-    except json.JSONDecodeError as e_json: # If AIMS response is not JSON
-        error_msg = f"Could not decode JSON response from AIMS: {str(e_json)}. Response text: {response.text[:200] if 'response' in locals() else 'N/A'}"
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}")
-        return {"error_code": "PSWA_AIMS_BAD_RESPONSE_JSON", "message": "AIMS service response was not valid JSON.", "details": error_msg, "source": "error"}
-    except Exception as e:
-        error_msg = f"An unexpected error occurred while interacting with AIMS: {type(e).__name__} - {str(e)}"
-        logger.error(f"[PSWA_MAIN_LOGIC] {error_msg}", exc_info=True)
-        return {"error_code": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "An unexpected error occurred while processing via AIMS.", "details": error_msg, "source": "error"}
-
-
-# --- Flask Endpoint (remains largely the same, but error handling might adapt based on weave_script's new error_codes) ---
+# --- Flask Endpoint ---
+# (Remains the same, validation and error handling are already robust)
 @app.route('/weave_script', methods=['POST'])
 def handle_weave_script():
     logger.info("[PSWA_FLASK_ENDPOINT] Received request for /weave_script")
-    data = request.get_json()
     try:
         data = request.get_json()
         if not data:
-            logger.error("[PSWA_FLASK_ENDPOINT] Invalid or empty JSON payload received.")
-            return jsonify({"error_code": "PSWA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
+            return jsonify({"error_code": "PSWA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload."}), 400
     except Exception as e_json_decode:
-        logger.error(f"[PSWA_FLASK_ENDPOINT] Failed to decode JSON payload: {e_json_decode}", exc_info=True)
-        return jsonify({"error_code": "PSWA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
+        return jsonify({"error_code": "PSWA_MALFORMED_JSON", "message": f"Malformed JSON: {e_json_decode}"}), 400
 
-    content = data.get(KEY_CONTENT)
-    topic = data.get(KEY_TOPIC)
-
-    # Validate content
+    content = data.get(KEY_CONTENT); topic = data.get(KEY_TOPIC)
     if not content or not isinstance(content, str) or not content.strip():
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation failed: '{KEY_CONTENT}' must be a non-empty string. Received: '{content}'")
-        return jsonify({"error_code": "PSWA_INVALID_CONTENT", "message": f"Validation failed: '{KEY_CONTENT}' must be a non-empty string."}), 400
-
-    # Optional: Consider a min/max length for content if it makes sense for script generation quality
-    CONTENT_MIN_LENGTH = 50 # Example minimum
-    CONTENT_MAX_LENGTH = 50000 # Example maximum (very generous)
-    if len(content) < CONTENT_MIN_LENGTH:
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation warning: '{KEY_CONTENT}' length ({len(content)}) is less than recommended minimum ({CONTENT_MIN_LENGTH}).")
-        # Not returning error, but logging. Could return 400 if strict.
-    if len(content) > CONTENT_MAX_LENGTH:
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation failed: '{KEY_CONTENT}' length ({len(content)}) exceeds maximum ({CONTENT_MAX_LENGTH}).")
-        return jsonify({"error_code": "PSWA_CONTENT_TOO_LONG", "message": f"Validation failed: '{KEY_CONTENT}' exceeds maximum length of {CONTENT_MAX_LENGTH} characters."}), 400
-
-    # Validate topic
+        return jsonify({"error_code": "PSWA_INVALID_CONTENT", "message": f"'{KEY_CONTENT}' must be non-empty string."}), 400
+    CONTENT_MIN_LENGTH = 50; CONTENT_MAX_LENGTH = 50000
+    if len(content) < CONTENT_MIN_LENGTH: logger.warning(f"Content length ({len(content)}) < min ({CONTENT_MIN_LENGTH}).")
+    if len(content) > CONTENT_MAX_LENGTH: return jsonify({"error_code": "PSWA_CONTENT_TOO_LONG", "message": f"Content exceeds max length {CONTENT_MAX_LENGTH}."}), 400
     if not topic or not isinstance(topic, str) or not topic.strip():
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation failed: '{KEY_TOPIC}' must be a non-empty string. Received: '{topic}'")
-        return jsonify({"error_code": "PSWA_INVALID_TOPIC", "message": f"Validation failed: '{KEY_TOPIC}' must be a non-empty string."}), 400
+        return jsonify({"error_code": "PSWA_INVALID_TOPIC", "message": f"'{KEY_TOPIC}' must be non-empty string."}), 400
 
-    logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script with topic: '{topic}' (Content length: {len(content)})")
+    logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script for topic: '{topic}'")
     result_data = weave_script(content, topic)
 
     if "error_code" in result_data:
-        error_code = result_data.get("error_code")
-        error_message = result_data.get("message", f"Error processing script for {topic}.")
-        error_details = result_data.get("details", "No additional details provided.")
-        logger.error(f"[PSWA_FLASK_ENDPOINT] Error from weave_script: {error_code} - {error_message} - {error_details}")
-        http_status_code = 500 # Default for internal/AIMS errors
-        if error_code == "PSWA_AIMS_TIMEOUT": http_status_code = 504 # Gateway Timeout
-        elif error_code == "PSWA_AIMS_HTTP_ERROR": # Could refine based on AIMS's actual status if available in details
-            if isinstance(error_details, dict) and error_details.get("status_code"): # Hypothetical if AIMS error includes original status
-                 pass # http_status_code = error_details.get("status_code")
-            else: # Generic for now
-                 http_status_code = 502 # Bad Gateway
-        elif error_code == "PSWA_AIMS_BAD_RESPONSE" or error_code == "PSWA_AIMS_BAD_RESPONSE_JSON":
-             http_status_code = 502 # Bad Gateway
-        return jsonify({"error_code": error_code, "message": error_message, "details": error_details}), http_status_code
-
-    if result_data.get(KEY_SEGMENTS) and result_data[KEY_SEGMENTS][0][KEY_SEGMENT_TITLE] == SEGMENT_TITLE_ERROR:
-        error_detail_from_script = result_data[KEY_SEGMENTS][0][KEY_CONTENT]
-        logger.warning(f"[PSWA_FLASK_ENDPOINT] Insufficient content indicated by LLM (via AIMS) for topic '{topic}'. Details: {error_detail_from_script}")
-        return jsonify({"error_code": "PSWA_INSUFFICIENT_CONTENT", "message": "Content provided was insufficient for script generation (reported by LLM).", "details": error_detail_from_script }), 400
-
-    if not result_data.get(KEY_TITLE) or not any(s[KEY_SEGMENT_TITLE] == SEGMENT_TITLE_INTRO for s in result_data.get(KEY_SEGMENTS,[])):
-         logger.error(f"[PSWA_FLASK_ENDPOINT] Failed to parse essential script structure from AIMS output for topic '{topic}'.")
-         return jsonify({ "error_code": "PSWA_SCRIPT_PARSING_FAILURE", "message": "Failed to parse essential script structure from AIMS output.", "details": "The AIMS output did not conform to the expected script structure.", "raw_output_preview": result_data.get("full_raw_script","")[:200] + "..."}), 500
-
-    logger.info("[PSWA_FLASK_ENDPOINT] Successfully generated and structured script via AIMS.")
+        error_code = result_data["error_code"]; message = result_data.get("message", "Error processing script.")
+        http_status = 500
+        if error_code == "PSWA_AIMS_TIMEOUT": http_status = 504
+        elif error_code in ["PSWA_AIMS_HTTP_ERROR", "PSWA_AIMS_BAD_RESPONSE", "PSWA_AIMS_BAD_RESPONSE_JSON"]: http_status = 502
+        return jsonify({"error_code": error_code, "message": message, "details": result_data.get("details")}), http_status
+    if result_data.get(KEY_SEGMENTS) and result_data[KEY_SEGMENTS][0].get(KEY_SEGMENT_TITLE) == SEGMENT_TITLE_ERROR:
+        return jsonify({"error_code": "PSWA_INSUFFICIENT_CONTENT", "message": "Content insufficient (LLM reported).", "details": result_data[KEY_SEGMENTS][0].get(KEY_CONTENT) }), 400
+    if not result_data.get(KEY_TITLE) or not any(s.get(KEY_SEGMENT_TITLE) == SEGMENT_TITLE_INTRO for s in result_data.get(KEY_SEGMENTS,[])):
+         return jsonify({ "error_code": "PSWA_SCRIPT_PARSING_FAILURE", "message": "Failed to parse script structure from AIMS."}), 500
     return jsonify(result_data)
 
 if __name__ == "__main__":
+    if pswa_config.get("DATABASE_TYPE") == "sqlite" and not pswa_config.get("SHARED_DATABASE_PATH") and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        logging.warning("SHARED_DATABASE_PATH not configured for PSWA SQLite mode with caching. Caching may fail.")
+    elif pswa_config.get("DATABASE_TYPE") == "postgres" and not all(pswa_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]) and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        logging.warning("PostgreSQL is cache DB_TYPE, but connection vars missing. Caching may fail.")
+
+    init_pswa_db() # Call init_db based on configured DB_TYPE
+
     host = pswa_config.get("PSWA_HOST", "0.0.0.0")
     port = pswa_config.get("PSWA_PORT", 5004)
     debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
-    print(f"\n--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}) ---")
-    if not pswa_config.get("AIMS_SERVICE_URL"):
-        # This case should ideally be prevented by load_pswa_configuration raising an error
-        print("CRITICAL ERROR: AIMS_SERVICE_URL is not set. PSWA will not function.")
-
-    # Initialize the database for PSWA script caching
-    if pswa_config.get('SHARED_DATABASE_PATH'):
-        init_pswa_db(pswa_config['SHARED_DATABASE_PATH'])
-    else:
-        print("WARNING: SHARED_DATABASE_PATH not configured for PSWA. Script caching will be disabled or use a default path if any.")
-
+    logging.info(f"--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}, DB: {pswa_config.get('DATABASE_TYPE')}) ---")
     app.run(host=host, port=port, debug=debug_mode)
+
+[end of aethercast/pswa/main.py]

@@ -12,9 +12,25 @@ Key Responsibilities:
 4.  **Database Interaction:** Manages interactions with a shared database (typically SQLite) for tasks such as:
     *   Creating and updating records in the `podcasts` table for tracking podcast generation tasks.
     *   Managing user session data in the `user_sessions` table.
+    *   Managing user accounts in the `users` table for authentication.
     *   (Note: Direct caching from `topics_snippets` by the API Gateway for the main snippets endpoint has been removed in favor of CPOA-led generation.)
 5.  **Response Formatting:** Consolidates responses from CPOA (or its own data) and formats them into user-friendly JSON responses for the client.
 6.  **Session Management:** Provides endpoints for initializing user sessions and managing user preferences.
+7.  **User Authentication:** Provides endpoints for user registration and login, issuing JWTs for accessing protected routes.
+
+## Authentication
+
+Several API endpoints require authentication using JSON Web Tokens (JWT).
+
+**Authentication Flow:**
+
+1.  **Registration:** New users should register using the `POST /auth/register` endpoint.
+2.  **Login:** Registered users can log in using the `POST /auth/login` endpoint to obtain an access token.
+3.  **Accessing Protected Routes:** For endpoints marked with "**Authentication Required**", the client must include the obtained access token in the `Authorization` header of their HTTP request, using the "Bearer" scheme.
+    -   Example: `Authorization: Bearer <your_jwt_token>`
+4.  **Token Expiration:** Access tokens are short-lived (currently 1 hour). If a token expires, the API will return a 401 Unauthorized error, and the client will need to re-authenticate (login again) to obtain a new token. (A refresh token mechanism is not part of the current implementation).
+
+If a token is missing, invalid, or expired, the API will respond with a 401 Unauthorized error, usually with an `error_code` like `AUTH_MISSING_TOKEN`, `AUTH_INVALID_TOKEN`, or `AUTH_EXPIRED_TOKEN`.
 
 ## Configuration
 
@@ -25,6 +41,8 @@ Key Environment Variables:
 -   `SHARED_DATABASE_PATH`: Path to the SQLite database file. This **must** be the same path used by CPOA and other services for shared data access.
     -   *Docker Default:* `/app/database/aethercast_podcasts.db`
     -   *Local Default in `main.py` if not set:* `/app/database/aethercast_podcasts.db` (effective path depends on execution context).
+-   `FLASK_SECRET_KEY`: **Required for JWT signing and session security.** A strong, random secret key. It's critical to set this to a persistent random value in your `.env` file for production. If not set, a temporary key is generated at startup (which is insecure and will invalidate tokens/sessions on restart).
+    -   *Example in `.env`:* `FLASK_SECRET_KEY=your_random_generated_secret_string`
 -   `TDA_SERVICE_URL`: The URL of the Topic Discovery Agent (TDA) service. (Note: Direct calls to TDA from API Gateway might be deprecated if CPOA handles all topic/snippet interactions).
     -   *Default:* `http://localhost:5000/discover_topics`
 -   `API_GW_HOST`: Host for the API Gateway's Flask development server when run directly.
@@ -57,12 +75,12 @@ Project dependencies are listed in `requirements.txt`. Install them using pip:
 ```bash
 pip install -r requirements.txt
 ```
-This includes `Flask`, `requests`, and `python-dotenv`.
+This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), and `Werkzeug` (for password hashing, often a Flask sub-dependency).
 
 ## Running the Service
 
 1.  Ensure all backend services that the API Gateway depends on (primarily CPOA and its underlying services) are running and configured.
-2.  Set up the necessary environment variables.
+2.  Set up the necessary environment variables, including a `FLASK_SECRET_KEY`.
 3.  Initialize the database: When `main.py` is run directly, `init_db()` is called, creating the schema if the database file doesn't exist.
 4.  Run the Flask development server:
     ```bash
@@ -84,6 +102,42 @@ This includes `Flask`, `requests`, and `python-dotenv`.
     -   **Description:** Returns API Gateway health, CPOA import status, and database connectivity.
     -   **Success Response (200 OK):** (Structure includes `status`, `cpoa_module_status`, individual CPOA function statuses, `database_status`).
 
+### Authentication Endpoints
+
+-   **`POST /auth/register`**
+    -   **Description:** Registers a new user.
+    -   **Request Payload (JSON):**
+        ```json
+        {
+            "username": "newuser",
+            "email": "user@example.com",
+            "password": "securepassword123"
+        }
+        ```
+        - `username` (string, required): Must be unique.
+        - `email` (string, required): Must be unique.
+        - `password` (string, required): Minimum 8 characters.
+    -   **Success Response (201 Created):** `{"message": "User registered successfully.", "user_id": "..."}`.
+    -   **Error Responses:**
+        -   400 Bad Request: If validation fails (e.g., missing fields, weak password) (`API_GW_AUTH_INVALID_USERNAME`, `API_GW_AUTH_INVALID_EMAIL`, `API_GW_AUTH_INVALID_PASSWORD`).
+        -   409 Conflict: If username or email already exists (`API_GW_AUTH_USER_EXISTS`).
+        -   500 Internal Server Error: For database errors (`API_GW_AUTH_DB_ERROR_REGISTER`).
+
+-   **`POST /auth/login`**
+    -   **Description:** Logs in an existing user and returns a JWT access token.
+    -   **Request Payload (JSON):**
+        ```json
+        {
+            "login_identifier": "user@example.com", // Can be username or email
+            "password": "securepassword123"
+        }
+        ```
+    -   **Success Response (200 OK):** `{"access_token": "your_jwt_here", "user_id": "...", "username": "..."}`.
+    -   **Error Responses:**
+        -   400 Bad Request: If validation fails (e.g., missing fields) (`API_GW_AUTH_INVALID_LOGIN_ID`, `API_GW_AUTH_INVALID_PASSWORD_LOGIN`).
+        -   401 Unauthorized: If credentials are invalid (`API_GW_AUTH_INVALID_CREDENTIALS`).
+        -   500 Internal Server Error: For JWT generation or database errors (`API_GW_AUTH_JWT_GENERATION_FAILED`, `API_GW_AUTH_DB_ERROR_LOGIN`).
+
 ### Snippets & Categories
 
 -   **`GET /api/v1/snippets`**
@@ -98,14 +152,14 @@ This includes `Flask`, `requests`, and `python-dotenv`.
     -   **Error Responses:** 503 (CPOA unavailable), 500 (CPOA error).
 
 -   **`POST /api/v1/topics/explore`**
-    -   **Description:** Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration` which generates new snippets (including text and image URLs).
+    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration`. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
             "current_topic_id": "topic_abc123", // Optional
             "keywords": ["space travel", "mars colonization"], // Optional, list of strings
             "depth_mode": "broader", // Optional, string, e.g., "deeper", "broader". Default: "deeper"
-            "client_id": "your_session_id" // Optional, for fetching user preferences
+            "client_id": "your_session_id" // Optional, for fetching user preferences for CPOA
         }
         ```
         *Note: At least `current_topic_id` or `keywords` must be provided.*
@@ -116,19 +170,20 @@ This includes `Flask`, `requests`, and `python-dotenv`.
             -   Neither `current_topic_id` nor `keywords` provided (`API_GW_EXPLORE_INPUT_REQUIRED`).
             -   `keywords` is not a list, or contains non-string/empty items (`API_GW_EXPLORE_INVALID_KEYWORDS_TYPE`, `API_GW_EXPLORE_INVALID_KEYWORD_ITEM`).
             -   `current_topic_id`, `depth_mode`, or `client_id` (if provided) are not non-empty strings (`API_GW_EXPLORE_INVALID_TOPIC_ID`, `API_GW_EXPLORE_INVALID_DEPTH_MODE`, `API_GW_CLIENT_ID_INVALID`).
+        -   **401 Unauthorized:** If authentication token is missing, invalid, or expired.
         -   **503 Service Unavailable:** If CPOA service is unavailable or reports an issue with its downstream dependencies (TDA, SCA).
         -   **500 Internal Server Error:** For other unexpected errors.
 
 ### Podcast Task Management
 
 -   **`POST /api/v1/podcasts`**
-    -   **Description:** Initiates a new podcast generation task. Calls CPOA to orchestrate generation. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA.
+    -   **Description:** (**Authentication Required.**) Initiates a new podcast generation task. Calls CPOA to orchestrate generation. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
             "topic": "The History of Podcasting",
             "voice_params": { /* Optional: VFA voice settings */ },
-            "client_id": "your_session_id", // Optional
+            "client_id": "your_session_id", // Optional, for fetching user preferences for CPOA
             "test_scenarios": { /* Optional: For CPOA test scenarios */ }
         }
         ```
@@ -140,6 +195,7 @@ This includes `Flask`, `requests`, and `python-dotenv`.
             -   `voice_params` (if provided) is not an object (`API_GW_PODCAST_INVALID_VOICE_PARAMS_TYPE`).
             -   `client_id` (if provided) is not a non-empty string (`API_GW_PODCAST_INVALID_CLIENT_ID`).
             -   `test_scenarios` (if provided) is not an object (`API_GW_PODCAST_INVALID_TEST_SCENARIOS_TYPE`).
+        -   **401 Unauthorized:** If authentication token is missing, invalid, or expired.
         -   **503 Service Unavailable:** If CPOA service is unavailable.
         -   **500 Internal Server Error:** For database errors during task creation or other unexpected errors.
 
@@ -160,12 +216,12 @@ This includes `Flask`, `requests`, and `python-dotenv`.
 ### Search
 
 -   **`POST /api/v1/search/podcasts`**
-    -   **Description:** Searches for podcast topics via CPOA based on a query. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA.
+    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
             "query": "artificial intelligence in healthcare",
-            "client_id": "your_session_id" // Optional
+            "client_id": "your_session_id" // Optional, for fetching user preferences for CPOA
         }
         ```
     -   **Success Response (200 OK):** `{"search_results": [...]}` (content from CPOA).
@@ -174,27 +230,28 @@ This includes `Flask`, `requests`, and `python-dotenv`.
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
             -   `query` is missing or not a non-empty string (`API_GW_SEARCH_QUERY_INVALID`).
             -   `client_id` (if provided) is not a non-empty string (`API_GW_CLIENT_ID_INVALID`).
+        -   **401 Unauthorized:** If authentication token is missing, invalid, or expired.
         -   **503 Service Unavailable:** If CPOA service or its downstream dependencies (TDA, SCA) are unavailable.
         -   **500 Internal Server Error:** For other unexpected errors.
 
 ### Session Management Endpoints
 
 -   **`POST /api/v1/session/init`**
-    -   **Description:** Initializes or acknowledges a user session. Creates a session record if `client_id` is new, or updates `last_seen_timestamp` if existing. Returns current preferences.
+    -   **Description:** Initializes or acknowledges a user session using a client-generated ID. Creates a session record if `client_id` is new, or updates `last_seen_timestamp` if existing. Returns current preferences associated with that `client_id`. This endpoint does not require JWT authentication itself.
     -   **Request Payload (JSON):** `{"client_id": "your_frontend_generated_id"}`.
     -   **Success Response (200 OK):** `{"client_id": "...", "preferences": {...}}`.
     -   **Error Responses:** 400 (missing `client_id`), 500 (DB error).
 
 -   **`GET /api/v1/session/preferences`**
-    -   **Description:** Retrieves current preferences for a given user session.
+    -   **Description:** Retrieves current preferences for a given user session `client_id`. This endpoint does not require JWT authentication itself but relies on the `client_id` to fetch session-specific data.
     -   **Query Parameters:** `client_id` (string, required).
     -   **Success Response (200 OK):** `{"client_id": "...", "preferences": {...}}`.
     -   **Error Responses:** 400 (missing `client_id`), 404 (session not found), 500 (DB error).
 
 -   **`POST /api/v1/session/preferences`**
-    -   **Description:** Updates (replaces) preferences for a given user session.
+    -   **Description:** (**Authentication Required.**) Updates (replaces) preferences for a given user session. The `client_id` in the payload identifies the session record. The Bearer token authenticates the user making the request. It's implied the authenticated user should have rights to modify the preferences associated with the given `client_id`. Requires a valid Bearer token.
     -   **Request Payload (JSON):** `{"client_id": "your_session_id", "preferences": {"key": "value", ...}}`.
-        -   `client_id` (string, required): Must be a non-empty string.
+        -   `client_id` (string, required): Must be a non-empty string. This is the identifier for the session record.
         -   `preferences` (object, required): Must be a valid JSON object (dictionary).
     -   **Success Response (200 OK):** `{"client_id": "...", "message": "Preferences updated successfully."}`.
     -   **Error Responses:**
@@ -202,6 +259,7 @@ This includes `Flask`, `requests`, and `python-dotenv`.
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
             -   `client_id` is missing or not a non-empty string (`API_GW_SESSION_CLIENT_ID_INVALID`).
             -   `preferences` is missing or not an object (`API_GW_SESSION_INVALID_PREFERENCES_PAYLOAD`).
+        -   **401 Unauthorized:** If authentication token is missing, invalid, or expired.
         -   **404 Not Found:** If the session for the given `client_id` does not exist.
         -   **500 Internal Server Error:** For database errors.
 
@@ -224,3 +282,7 @@ The API Gateway, CPOA, and other services may utilize a shared SQLite database. 
 ### `user_sessions` Table
 -   **Purpose:** Stores user session identifiers (client IDs) and their associated preferences, allowing for personalized experiences across requests.
 -   **Key Columns:** `session_id` (PK, corresponds to `client_id`), `created_timestamp`, `last_seen_timestamp`, `preferences_json` (JSON string for user preferences).
+
+### `users` Table
+-   **Purpose:** Stores user account information for authentication.
+-   **Key Columns:** `user_id` (PK), `username` (UNIQUE), `email` (UNIQUE), `hashed_password`, `created_at`.

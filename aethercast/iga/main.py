@@ -1,13 +1,14 @@
 import os
 import logging
-import uuid # Added
+import uuid
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
-# --- Google Cloud Vertex AI specific imports ---
-from google.cloud import aiplatform # Added
-from vertexai.preview.vision_models import ImageGenerationModel # Added
-from google.api_core import exceptions as google_exceptions # Added
+# --- Google Cloud specific imports ---
+from google.cloud import aiplatform
+from vertexai.preview.vision_models import ImageGenerationModel
+from google.cloud import storage # Added for GCS
+from google.api_core import exceptions as google_exceptions
 
 load_dotenv()
 
@@ -28,36 +29,41 @@ def load_iga_configuration():
     iga_config['IGA_VERTEXAI_PROJECT_ID'] = os.getenv("IGA_VERTEXAI_PROJECT_ID", os.getenv("GCP_PROJECT_ID"))
     iga_config['IGA_VERTEXAI_LOCATION'] = os.getenv("IGA_VERTEXAI_LOCATION", os.getenv("GCP_LOCATION"))
     iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'] = os.getenv("IGA_VERTEXAI_IMAGE_MODEL_ID", "imagegeneration@006")
-    iga_config['IGA_GENERATED_IMAGE_DIR'] = os.getenv("IGA_GENERATED_IMAGE_DIR", "/shared_audio/iga_images") # Standardized shared path
+
+    # GCS Configuration
+    iga_config['GCS_BUCKET_NAME'] = os.getenv("GCS_BUCKET_NAME")
+    iga_config['IGA_GCS_IMAGE_PREFIX'] = os.getenv("IGA_GCS_IMAGE_PREFIX", "images/iga/") # Default GCS prefix
+
+    # Local image directory (might be used for temp storage or if GCS is disabled, though current plan is GCS primary)
+    iga_config['IGA_GENERATED_IMAGE_DIR'] = os.getenv("IGA_GENERATED_IMAGE_DIR", "/shared_audio/iga_images")
+
     iga_config['IGA_DEFAULT_ASPECT_RATIO'] = os.getenv("IGA_DEFAULT_ASPECT_RATIO", "1:1")
     iga_config['IGA_ADD_WATERMARK'] = os.getenv("IGA_ADD_WATERMARK", "True").lower() == "true"
 
-    # Ensure GOOGLE_APPLICATION_CREDENTIALS is loaded if set (for Vertex AI)
-    # Although aiplatform.init() uses ADC by default if this is not explicitly passed to client.
-    # For clarity, we can log its presence.
     iga_config['GOOGLE_APPLICATION_CREDENTIALS'] = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
 
-
-    logging.info("--- IGA Configuration (Vertex AI) ---")
+    logging.info("--- IGA Configuration (Vertex AI & GCS) ---")
     for key, value in iga_config.items():
         if "CREDENTIALS" in key and value:
             logging.info(f"  {key}: Path Set ('{os.path.basename(value) if value else 'Not Set'}')")
+        elif "PASSWORD" in key and value: # Example if any passwords were here
+            logging.info(f"  {key}: ********")
         else:
             logging.info(f"  {key}: {value}")
     logging.info("--- End IGA Configuration ---")
 
-    # Critical startup checks for Vertex AI
+    # Critical startup checks
     if not iga_config['IGA_VERTEXAI_PROJECT_ID']:
-        error_msg = "CRITICAL: IGA_VERTEXAI_PROJECT_ID is not set. Vertex AI image generation will fail."
-        logging.critical(error_msg)
-        raise ValueError(error_msg)
+        logging.critical("CRITICAL: IGA_VERTEXAI_PROJECT_ID is not set.")
+        raise ValueError("IGA_VERTEXAI_PROJECT_ID is not set.")
     if not iga_config['IGA_VERTEXAI_LOCATION']:
-        error_msg = "CRITICAL: IGA_VERTEXAI_LOCATION is not set. Vertex AI image generation will fail."
-        logging.critical(error_msg)
-        raise ValueError(error_msg)
+        logging.critical("CRITICAL: IGA_VERTEXAI_LOCATION is not set.")
+        raise ValueError("IGA_VERTEXAI_LOCATION is not set.")
+    if not iga_config['GCS_BUCKET_NAME']: # Check for GCS bucket name
+        logging.critical("CRITICAL: GCS_BUCKET_NAME is not set for IGA. Image uploads will fail.")
+        raise ValueError("GCS_BUCKET_NAME is not set for IGA.")
     if not iga_config['GOOGLE_APPLICATION_CREDENTIALS']:
-        logging.warning("IGA WARNING: GOOGLE_APPLICATION_CREDENTIALS is not explicitly set for IGA. Vertex AI will attempt to use Application Default Credentials (ADC). Ensure ADC are configured if this is intended.")
-
+        logging.warning("IGA WARNING: GOOGLE_APPLICATION_CREDENTIALS not explicitly set. Using ADC if configured.")
 
 load_iga_configuration()
 
@@ -71,89 +77,72 @@ except Exception as e:
     raise ValueError(f"IGA Critical Error: Failed to initialize Vertex AI: {e}")
 
 
-# IGA_MODEL_VERSION is removed; version will be part of the response dynamically.
-
 @app.route("/generate_image", methods=["POST"])
 def generate_image_endpoint():
     request_id = f"iga_req_{uuid.uuid4().hex[:8]}"
     logging.info(f"IGA Request {request_id}: Received /generate_image request.")
+
+    # Configuration check (GCS bucket is essential now)
+    if not iga_config.get("GCS_BUCKET_NAME"):
+        logging.error(f"IGA Request {request_id}: GCS_BUCKET_NAME not configured.")
+        return jsonify({"error_code": "IGA_CONFIG_ERROR_GCS_BUCKET", "message": "IGA service GCS bucket not configured."}), 503
+
     try:
-        try:
-            data = request.get_json()
-            if not data:
-                logging.warning(f"IGA Request {request_id}: Invalid or empty JSON payload.")
-                return jsonify({
-                    "error_code": "IGA_INVALID_PAYLOAD",
-                    "message": "Invalid or empty JSON payload.",
-                    "details": "Request body must be a valid non-empty JSON object."
-                }), 400
-        except Exception as e_json_decode:
-            logging.warning(f"IGA Request {request_id}: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
-            return jsonify({
-                "error_code": "IGA_MALFORMED_JSON",
-                "message": "Malformed JSON payload.",
-                "details": str(e_json_decode)
-            }), 400
+        data = request.get_json()
+        if not data:
+            return jsonify({"error_code": "IGA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload."}), 400
+    except Exception as e_json_decode:
+        return jsonify({"error_code": "IGA_MALFORMED_JSON", "message": f"Malformed JSON: {str(e_json_decode)}"}), 400
 
-        prompt = data.get("prompt")
-        if not prompt or not isinstance(prompt, str) or not prompt.strip():
-            logging.warning(f"IGA Request {request_id}: Missing or empty 'prompt'.")
-            return jsonify({
-                "error_code": "IGA_BAD_REQUEST_PROMPT_MISSING",
-                "message": "Prompt is required for image generation.",
-                "details": "Missing or empty 'prompt' in request body."
-            }), 400
+    prompt = data.get("prompt")
+    if not prompt or not isinstance(prompt, str) or not prompt.strip():
+        return jsonify({"error_code": "IGA_BAD_REQUEST_PROMPT_MISSING", "message": "Prompt is required."}), 400
 
-        logging.info(f"IGA Request {request_id}: Processing prompt: '{prompt}'")
+    logging.info(f"IGA Request {request_id}: Processing prompt: '{prompt}' with model {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
 
+    try:
         model = ImageGenerationModel.from_pretrained(iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
 
-        # Parameters for image generation
-        # For safety_settings, using Vertex AI defaults unless specific needs arise.
-        # Example: safety_settings = { "person_presence": "block_all", "violence": "block_medium_and_above" }
-        # For now, relying on model's default safety filters.
-
-        logging.info(f"IGA Request {request_id}: Calling Vertex AI ImageGenerationModel.generate_images(). Model: {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
         images_response = model.generate_images(
             prompt=prompt,
-            number_of_images=1, # Fixed at 1 image per prompt for now
+            number_of_images=1,
             aspect_ratio=iga_config['IGA_DEFAULT_ASPECT_RATIO'],
             add_watermark=iga_config['IGA_ADD_WATERMARK']
-            # seed= can be used for reproducibility if needed
         )
         logging.info(f"IGA Request {request_id}: Vertex AI call completed.")
 
-        if not images_response or not images_response.images: # Check if images_response itself is None or empty, or if images list is empty
-            logging.error(f"IGA Request {request_id}: No images returned from Vertex AI for prompt: '{prompt}'")
-            return jsonify({
-                "error_code": "IGA_VERTEXAI_NO_IMAGES_RETURNED",
-                "message": "Image generation failed to produce an image.",
-                "details": "The Vertex AI model did not return any image data."
-            }), 500
+        if not images_response or not images_response.images:
+            logging.error(f"IGA Request {request_id}: No images from Vertex AI for prompt: '{prompt}'")
+            return jsonify({"error_code": "IGA_VERTEXAI_NO_IMAGES_RETURNED", "message": "Image generation failed."}), 500
 
-        image_object = images_response.images[0] # Assuming first image if multiple were somehow generated
-
+        image_object = images_response.images[0]
         if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
-            logging.error(f"IGA Request {request_id}: Image object from Vertex AI missing image bytes for prompt: '{prompt}'")
-            return jsonify({
-                "error_code": "IGA_VERTEXAI_EMPTY_IMAGE_BYTES",
-                "message": "Image generation produced an empty image.",
-                "details": "The image data from Vertex AI was empty or inaccessible."
-            }), 500
+            logging.error(f"IGA Request {request_id}: Vertex AI image bytes missing for prompt: '{prompt}'")
+            return jsonify({"error_code": "IGA_VERTEXAI_EMPTY_IMAGE_BYTES", "message": "Image generation produced empty image."}), 500
 
-        # Save the image
-        generated_image_dir = iga_config['IGA_GENERATED_IMAGE_DIR']
-        os.makedirs(generated_image_dir, exist_ok=True)
+        # Upload to GCS
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(iga_config['GCS_BUCKET_NAME'])
 
-        filename = f"{request_id}_{uuid.uuid4().hex[:8]}.png" # Assuming PNG, Vertex AI usually returns PNG
-        filepath_in_container = os.path.join(generated_image_dir, filename)
+        # Assuming PNG format from Vertex AI Imagen default. Could be made configurable or detected.
+        file_extension = "png"
+        gcs_object_name = f"{iga_config['IGA_GCS_IMAGE_PREFIX'].strip('/')}/{request_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
 
-        with open(filepath_in_container, "wb") as f:
-            f.write(image_object._image_bytes)
-        logging.info(f"IGA Request {request_id}: Image successfully saved to: {filepath_in_container}")
+        blob = bucket.blob(gcs_object_name)
+
+        # Determine content type for GCS (image/png for .png)
+        gcs_content_type = 'image/png'
+        # Add other types if image format can vary:
+        # if file_extension == "jpeg" or file_extension == "jpg":
+        #     gcs_content_type = 'image/jpeg'
+
+        logging.info(f"IGA Request {request_id}: Uploading to GCS. Bucket: {iga_config['GCS_BUCKET_NAME']}, Object: {gcs_object_name}")
+        blob.upload_from_string(image_object._image_bytes, content_type=gcs_content_type)
+        image_gcs_uri = f"gs://{iga_config['GCS_BUCKET_NAME']}/{gcs_object_name}"
+        logging.info(f"IGA Request {request_id}: Image uploaded to GCS: {image_gcs_uri}")
 
         response_data = {
-            "image_url": filepath_in_container, # This is the path inside the container, accessible via shared volume
+            "image_url": image_gcs_uri,
             "prompt_used": prompt,
             "model_version": f"vertex-ai-{iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}"
         }
@@ -161,48 +150,48 @@ def generate_image_endpoint():
 
     except google_exceptions.InvalidArgument as e:
         logging.error(f"IGA Request {request_id}: Vertex AI Invalid Argument: {e}", exc_info=True)
-        return jsonify({"error_code": "IGA_VERTEXAI_INVALID_ARGUMENT", "message": "Invalid argument provided to Vertex AI.", "details": str(e)}), 400
+        return jsonify({"error_code": "IGA_VERTEXAI_INVALID_ARGUMENT", "message": f"Invalid argument for Vertex AI: {e}"}), 400
     except google_exceptions.PermissionDenied as e:
         logging.error(f"IGA Request {request_id}: Vertex AI Permission Denied: {e}", exc_info=True)
-        return jsonify({"error_code": "IGA_VERTEXAI_PERMISSION_DENIED", "message": "Permission denied for Vertex AI operation.", "details": str(e)}), 403
-    except google_exceptions.ResourceExhausted as e: # Often means quota issues
-        logging.error(f"IGA Request {request_id}: Vertex AI Resource Exhausted (e.g., quota): {e}", exc_info=True)
-        return jsonify({"error_code": "IGA_VERTEXAI_RESOURCE_EXHAUSTED", "message": "Vertex AI resource exhausted (e.g., quota exceeded).", "details": str(e)}), 429
-    except google_exceptions.FailedPrecondition as e: # Can indicate safety policy violation / blocked prompt
+        return jsonify({"error_code": "IGA_VERTEXAI_PERMISSION_DENIED", "message": f"Vertex AI Permission Denied: {e}"}), 403
+    except google_exceptions.ResourceExhausted as e:
+        logging.error(f"IGA Request {request_id}: Vertex AI Resource Exhausted: {e}", exc_info=True)
+        return jsonify({"error_code": "IGA_VERTEXAI_RESOURCE_EXHAUSTED", "message": f"Vertex AI Resource Exhausted (quota): {e}"}), 429
+    except google_exceptions.FailedPrecondition as e:
         logging.warning(f"IGA Request {request_id}: Vertex AI Failed Precondition (often safety filters): {e}", exc_info=True)
-        # Check if the error message contains details about safety policy violation
+        error_message = f"Vertex AI: {e}"
+        error_code = "IGA_VERTEXAI_FAILED_PRECONDITION"
         if "blocked" in str(e).lower() and ("safety" in str(e).lower() or "policy" in str(e).lower()):
-            return jsonify({"error_code": "IGA_VERTEXAI_PROMPT_BLOCKED_SAFETY", "message": "Prompt blocked by safety filters.", "details": str(e)}), 400
-        return jsonify({"error_code": "IGA_VERTEXAI_FAILED_PRECONDITION", "message": "Vertex AI operation failed due to a precondition.", "details": str(e)}), 400
-    except google_exceptions.GoogleAPIError as e: # Catch other Google API errors
-        logging.error(f"IGA Request {request_id}: Google Vertex AI API Error: {e}", exc_info=True)
-        return jsonify({"error_code": "IGA_VERTEXAI_API_ERROR", "message": "An error occurred with the Vertex AI service.", "details": str(e)}), 500
-    except IOError as e:
-        logging.error(f"IGA Request {request_id}: File system I/O Error during image saving: {e}", exc_info=True)
-        return jsonify({"error_code": "IGA_FILE_SAVE_ERROR", "message": "Could not save generated image.", "details": str(e)}), 500
+            error_code = "IGA_VERTEXAI_PROMPT_BLOCKED_SAFETY"
+            error_message = f"Prompt blocked by safety filters: {e}"
+        return jsonify({"error_code": error_code, "message": error_message}), 400
+    except google_exceptions.GoogleCloudError as e: # Catch other GCS or general Google API errors
+        logging.error(f"IGA Request {request_id}: Google Cloud API Error (Vertex AI or GCS): {e}", exc_info=True)
+        return jsonify({"error_code": "IGA_GOOGLE_CLOUD_ERROR", "message": f"Google Cloud API error: {e}"}), 500
+    except IOError as e: # Should be less likely now with direct GCS upload
+        logging.error(f"IGA Request {request_id}: I/O Error (unexpected if not saving locally): {e}", exc_info=True)
+        return jsonify({"error_code": "IGA_IO_ERROR", "message": f"I/O error: {e}"}), 500
     except Exception as e:
-        logging.error(f"IGA Request {request_id}: Error in /generate_image endpoint: {e}", exc_info=True)
-        return jsonify({
-            "error_code": "IGA_INTERNAL_SERVER_ERROR",
-            "message": "IGA encountered an unexpected error.",
-            "details": str(e)
-        }), 500
+        logging.error(f"IGA Request {request_id}: Unexpected error in /generate_image: {e}", exc_info=True)
+        return jsonify({"error_code": "IGA_INTERNAL_SERVER_ERROR", "message": f"Unexpected error: {e}"}), 500
 
 if __name__ == "__main__":
-    # Ensure GOOGLE_APPLICATION_CREDENTIALS is checked at startup if required by local ADC flow
     if not iga_config.get('GOOGLE_APPLICATION_CREDENTIALS') and not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
-        logging.warning("GOOGLE_APPLICATION_CREDENTIALS is not set in the environment. Vertex AI will rely on Application Default Credentials (ADC).")
+        logging.warning("GOOGLE_APPLICATION_CREDENTIALS not set. Vertex AI/GCS will use ADC if available.")
+    if not iga_config.get('GCS_BUCKET_NAME'):
+         logging.warning("GCS_BUCKET_NAME not set. IGA will fail to upload images.")
 
-    # Create shared image directory if it doesn't exist at startup (best effort)
-    try:
-        os.makedirs(iga_config['IGA_GENERATED_IMAGE_DIR'], exist_ok=True)
-        logging.info(f"Ensured shared image directory exists: {iga_config['IGA_GENERATED_IMAGE_DIR']}")
-    except OSError as e:
-        logging.error(f"Could not create shared image directory {iga_config['IGA_GENERATED_IMAGE_DIR']} on startup: {e}")
+    # Local temp dir creation is no longer essential for primary flow
+    # local_image_dir = iga_config.get('IGA_GENERATED_IMAGE_DIR')
+    # if local_image_dir: # Only create if configured (e.g. for temp files)
+    #     try: os.makedirs(local_image_dir, exist_ok=True); logging.info(f"Ensured local dir exists (for temp): {local_image_dir}")
+    #     except OSError as e: logging.error(f"Could not create local dir {local_image_dir}: {e}")
 
     host = iga_config.get("IGA_HOST")
     port = iga_config.get("IGA_PORT")
     is_debug_mode = iga_config.get("IGA_DEBUG_MODE")
 
-    logging.info(f"--- IGA Service (Vertex AI Image Generation) starting on {host}:{port} (Debug: {is_debug_mode}) ---")
+    logging.info(f"--- IGA Service (Vertex AI & GCS) starting on {host}:{port} (Debug: {is_debug_mode}) ---")
     app.run(host=host, port=port, debug=is_debug_mode)
+
+[end of aethercast/iga/main.py]
