@@ -110,7 +110,14 @@ This includes `Flask`, `requests`, and `python-dotenv`.
         ```
         *Note: At least `current_topic_id` or `keywords` must be provided.*
     -   **Success Response (200 OK):** `{"explored_topics": [...]}` (list of snippet objects from CPOA).
-    -   **Error Responses:** 400 (bad request, e.g., missing required fields or invalid types), 503 (CPOA unavailable), 500 (other errors).
+    -   **Error Responses:**
+        -   **400 Bad Request:** For issues like:
+            -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
+            -   Neither `current_topic_id` nor `keywords` provided (`API_GW_EXPLORE_INPUT_REQUIRED`).
+            -   `keywords` is not a list, or contains non-string/empty items (`API_GW_EXPLORE_INVALID_KEYWORDS_TYPE`, `API_GW_EXPLORE_INVALID_KEYWORD_ITEM`).
+            -   `current_topic_id`, `depth_mode`, or `client_id` (if provided) are not non-empty strings (`API_GW_EXPLORE_INVALID_TOPIC_ID`, `API_GW_EXPLORE_INVALID_DEPTH_MODE`, `API_GW_CLIENT_ID_INVALID`).
+        -   **503 Service Unavailable:** If CPOA service is unavailable or reports an issue with its downstream dependencies (TDA, SCA).
+        -   **500 Internal Server Error:** For other unexpected errors.
 
 ### Podcast Task Management
 
@@ -126,7 +133,15 @@ This includes `Flask`, `requests`, and `python-dotenv`.
         }
         ```
     -   **Success Response (201 Created or 200 OK):** Includes `podcast_id`, `topic`, `generation_status`, `audio_url` (if successful), and `details` (full CPOA result). Status code depends on CPOA outcome.
-    -   **Error Responses:** 400 (bad request), 503 (CPOA unavailable), 500 (DB/other errors).
+    -   **Error Responses:**
+        -   **400 Bad Request:** For issues like:
+            -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
+            -   `topic` is missing or not a non-empty string (`API_GW_PODCAST_TOPIC_INVALID`).
+            -   `voice_params` (if provided) is not an object (`API_GW_PODCAST_INVALID_VOICE_PARAMS_TYPE`).
+            -   `client_id` (if provided) is not a non-empty string (`API_GW_PODCAST_INVALID_CLIENT_ID`).
+            -   `test_scenarios` (if provided) is not an object (`API_GW_PODCAST_INVALID_TEST_SCENARIOS_TYPE`).
+        -   **503 Service Unavailable:** If CPOA service is unavailable.
+        -   **500 Internal Server Error:** For database errors during task creation or other unexpected errors.
 
 -   **`GET /api/v1/podcasts`**
     -   **Description:** Lists all podcast tasks with pagination.
@@ -154,7 +169,13 @@ This includes `Flask`, `requests`, and `python-dotenv`.
         }
         ```
     -   **Success Response (200 OK):** `{"search_results": [...]}` (content from CPOA).
-    -   **Error Responses:** 400 (bad request), 503 (CPOA/downstream unavailable), 500 (other errors).
+    -   **Error Responses:**
+        -   **400 Bad Request:** For issues like:
+            -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
+            -   `query` is missing or not a non-empty string (`API_GW_SEARCH_QUERY_INVALID`).
+            -   `client_id` (if provided) is not a non-empty string (`API_GW_CLIENT_ID_INVALID`).
+        -   **503 Service Unavailable:** If CPOA service or its downstream dependencies (TDA, SCA) are unavailable.
+        -   **500 Internal Server Error:** For other unexpected errors.
 
 ### Session Management Endpoints
 
@@ -172,9 +193,17 @@ This includes `Flask`, `requests`, and `python-dotenv`.
 
 -   **`POST /api/v1/session/preferences`**
     -   **Description:** Updates (replaces) preferences for a given user session.
-    -   **Request Payload (JSON):** `{"client_id": "...", "preferences": {"key": "value", ...}}`.
+    -   **Request Payload (JSON):** `{"client_id": "your_session_id", "preferences": {"key": "value", ...}}`.
+        -   `client_id` (string, required): Must be a non-empty string.
+        -   `preferences` (object, required): Must be a valid JSON object (dictionary).
     -   **Success Response (200 OK):** `{"client_id": "...", "message": "Preferences updated successfully."}`.
-    -   **Error Responses:** 400 (bad payload), 404 (session not found), 500 (DB error).
+    -   **Error Responses:**
+        -   **400 Bad Request:** For issues like:
+            -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
+            -   `client_id` is missing or not a non-empty string (`API_GW_SESSION_CLIENT_ID_INVALID`).
+            -   `preferences` is missing or not an object (`API_GW_SESSION_INVALID_PREFERENCES_PAYLOAD`).
+        -   **404 Not Found:** If the session for the given `client_id` does not exist.
+        -   **500 Internal Server Error:** For database errors.
 
 ## Database Schema Details
 

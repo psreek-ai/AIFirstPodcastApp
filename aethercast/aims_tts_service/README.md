@@ -12,12 +12,12 @@ The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts
 -   **URL Path:** `/v1/synthesize`
 -   **Description:** Receives text and synthesis parameters, calls the Google Cloud Text-to-Speech API, saves the resulting audio to a shared file path, and returns metadata about the audio.
 -   **Request Payload (JSON):**
-    *   `text` (string, required): The text content to be synthesized into speech.
-    *   `voice_id` (string, optional): The specific Google Cloud TTS voice name to use (e.g., "en-US-Wavenet-D"). If not provided, defaults to the value of the `AIMS_TTS_DEFAULT_VOICE_ID` environment variable.
-    *   `language_code` (string, optional): The language code for the synthesis (e.g., "en-US"). If not provided, defaults to `AIMS_TTS_DEFAULT_LANGUAGE_CODE`.
-    *   `audio_format` (string, optional): The desired audio encoding for the output file (e.g., "MP3", "LINEAR16", "OGG_OPUS"). Defaults to `AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR`.
-    *   `speech_rate` (float, optional): The speaking rate for the synthesis. Ranges from 0.25 (slower) to 4.0 (faster). Defaults to `AIMS_TTS_DEFAULT_SPEAKING_RATE`.
-    *   `pitch` (float, optional): The speaking pitch for the synthesis. Ranges from -20.0 (lower) to 20.0 (higher). Defaults to `AIMS_TTS_DEFAULT_PITCH`.
+    *   `text` (string, required): The text content to be synthesized. Must be a non-empty string. Max length approx. 5000 characters. Invalid input results in a 400 error.
+    *   `voice_id` (string, optional): The specific Google Cloud TTS voice name (e.g., "en-US-Wavenet-D"). Defaults to `AIMS_TTS_DEFAULT_VOICE_ID`. If provided, must be a string, otherwise results in a 400 error.
+    *   `language_code` (string, optional): The language code (e.g., "en-US"). Defaults to `AIMS_TTS_DEFAULT_LANGUAGE_CODE`. If provided, must be a non-empty string, otherwise results in a 400 error.
+    *   `audio_format` (string, optional): Desired audio encoding (e.g., "MP3", "LINEAR16", "OGG_OPUS"). Defaults to `AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR`. Must be one of the supported formats ("MP3", "LINEAR16", "OGG_OPUS"), otherwise results in a 400 error.
+    *   `speech_rate` (float, optional): Speaking rate (0.25 to 4.0). Defaults to `AIMS_TTS_DEFAULT_SPEAKING_RATE`. Values outside this range are clamped. Non-float values result in a 400 error.
+    *   `pitch` (float, optional): Speaking pitch (-20.0 to 20.0). Defaults to `AIMS_TTS_DEFAULT_PITCH`. Values outside this range are clamped. Non-float values result in a 400 error.
 -   **Success Response (JSON):**
     *   `request_id` (string): A unique identifier for this synthesis request.
     *   `voice_id` (string): The voice ID that was used for the synthesis.
@@ -25,7 +25,18 @@ The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts
     *   `audio_duration_seconds` (float): An estimated duration of the generated audio in seconds.
     *   `audio_format` (string): The actual audio format (file extension) of the saved audio file (e.g., "mp3").
 -   **Error Responses (JSON):**
-    *   Structured JSON errors are returned for issues such as configuration problems, invalid request payloads, failures during the Google TTS API call, or file system errors. Example: `{"request_id": "...", "error": {"type": "tts_failure", "message": "Details..."}}`.
+    *   **400 Bad Request:** Returned for invalid request payloads, such as:
+        *   Missing or empty `text`.
+        *   `text` exceeding maximum length.
+        *   Invalid type for `voice_id` (if provided).
+        *   Invalid type or empty `language_code` (if provided).
+        *   Unsupported `audio_format`.
+        *   Non-float `speech_rate` or `pitch`.
+        *   Example: `{"request_id": "...", "error": {"type": "invalid_request_error", "message": "Validation failed: <specific_reason>"}}`
+    *   **500 Internal Server Error:** For unexpected errors during TTS synthesis or file system I/O errors.
+        *   Example: `{"request_id": "...", "error": {"type": "tts_failure", "message": "Google TTS API error: Details..."}}`
+        *   Example: `{"request_id": "...", "error": {"type": "file_system_error", "message": "Could not save audio file: Details..."}}`
+    *   **503 Service Unavailable:** If the service is not configured correctly (e.g., missing `GOOGLE_APPLICATION_CREDENTIALS`).
 
 *For the conceptual API contract that AIMS TTS aims to fulfill, including potential future features like direct audio streaming, refer to `aethercast/aims_tts/tts_api_placeholder.md`. The current implementation focuses on file-based generation via Google TTS.*
 

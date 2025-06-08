@@ -51,7 +51,21 @@ load_sca_configuration()
 app = flask.Flask(__name__)
 
 AIMS_LLM_PLACEHOLDER_URL = "http://localhost:8000/v1/generate" # Kept for placeholder, though not used if USE_REAL_LLM_SERVICE=true
-AIMS_LLM_HARDCODED_RESPONSE = { /* ... existing hardcoded response ... */ }
+AIMS_LLM_HARDCODED_RESPONSE = {
+    "request_id": "sca_placeholder_req_id",
+    "model_id": "sca_placeholder_model_id",
+    "choices": [
+        {
+            "text": "Placeholder text from AIMS_LLM_HARDCODED_RESPONSE in SCA",
+            "finish_reason": "STOP"
+        }
+    ],
+    "usage": {
+        "prompt_tokens": 5, # Example value
+        "completion_tokens": 10, # Example value
+        "total_tokens": 15 # Example value
+    }
+}
 
 def generate_snippet_id() -> str:
     return f"snippet_{uuid.uuid4().hex[:12]}"
@@ -79,7 +93,9 @@ def call_aims_llm_placeholder(prompt: str, topic_info: dict) -> dict:
     response["usage"]["total_tokens"] = response["usage"]["prompt_tokens"] + response["usage"]["completion_tokens"]
     return {
         "status": "success_placeholder",
-        "llm_response_direct": response,
+        "title": dynamic_title, # Return directly
+        "text_content": dynamic_content, # Return directly
+        "llm_response_direct": response, # Keep for full structure if needed elsewhere
         "llm_model_used": response.get("model_id", "AetherLLM-Placeholder-DynamicSnippet-v0.2"),
         "llm_prompt_sent": prompt
     }
@@ -179,34 +195,47 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
         logging.error(f"[SCA_AIMS_CALL] Unexpected error: {e_unexpected}", exc_info=True)
         return {"error_code": "SCA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected error with AIMS.", "details": str(e_unexpected)}
 
-def parse_llm_response_for_snippet(llm_response_text: str) -> tuple[str, str]:
-    # This function is primarily for the placeholder and might be simplified if placeholder changes
-    logging.debug(f"[SCA_DEPRECATED_PARSER] parse_llm_response_for_snippet called with text: '{llm_response_text[:100]}...'")
-    title_part_key = "generic title: '"
-    content_part_key = "generic content: '"
-    title_start_index = llm_response_text.find(title_part_key)
-    content_start_index = llm_response_text.find(content_part_key)
-    if title_start_index != -1 and content_start_index != -1:
-        title_start = title_start_index + len(title_part_key)
-        title_end = llm_response_text.find("'", title_start)
-        extracted_title = llm_response_text[title_start:title_end] if title_end != -1 else "Default Snippet Title (parsed)"
-        content_start = content_start_index + len(content_part_key)
-        content_end = llm_response_text.rfind("'")
-        extracted_content = llm_response_text[content_start:content_end] if content_end > content_start else llm_response_text[content_start:]
-        return extracted_title, extracted_content
-    logging.warning(f"Could not parse title/content using old placeholder logic: '{llm_response_text[:100]}...'")
-    return "Default Snippet Title (parse failed)", llm_response_text
+# parse_llm_response_for_snippet function is removed as it's no longer needed.
 
 @app.route("/craft_snippet", methods=["POST"])
 def craft_snippet_endpoint():
     try:
-        request_data = flask.request.get_json()
-        if not request_data:
-            return flask.jsonify({"error_code": "SCA_INVALID_PAYLOAD", "message": "Invalid JSON payload."}), 400
-        topic_id = request_data.get("topic_id"); content_brief = request_data.get("content_brief")
-        topic_info = request_data.get("topic_info", {}); error_trigger = request_data.get("error_trigger")
-        if not topic_id or not content_brief:
-            return flask.jsonify({"error_code": "SCA_MISSING_FIELDS", "message": "'topic_id' and 'content_brief' required."}), 400
+        try:
+            request_data = flask.request.get_json()
+            if not request_data: # Handles cases where request_data is None (e.g. empty body with correct content-type)
+                logging.warning("[SCA_REQUEST] /craft_snippet: Invalid or empty JSON payload received.")
+                return flask.jsonify({"error_code": "SCA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
+        except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
+            logging.warning(f"[SCA_REQUEST] /craft_snippet: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
+            return flask.jsonify({"error_code": "SCA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
+
+        topic_id = request_data.get("topic_id")
+        content_brief = request_data.get("content_brief")
+        topic_info = request_data.get("topic_info") # Will check type later
+        error_trigger = request_data.get("error_trigger")
+
+        # Validate topic_id
+        if not topic_id or not isinstance(topic_id, str) or not topic_id.strip():
+            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_id' must be a non-empty string. Received: '{topic_id}'")
+            return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_ID", "message": "Validation failed: 'topic_id' must be a non-empty string."}), 400
+
+        # Validate content_brief
+        if not content_brief or not isinstance(content_brief, str) or not content_brief.strip():
+            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' must be a non-empty string. Received: '{content_brief}'")
+            return flask.jsonify({"error_code": "SCA_INVALID_CONTENT_BRIEF", "message": "Validation failed: 'content_brief' must be a non-empty string."}), 400
+        # Optional: Max length for content_brief, e.g., 1000 chars
+        CONTENT_BRIEF_MAX_LENGTH = 1000
+        if len(content_brief) > CONTENT_BRIEF_MAX_LENGTH:
+            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' length ({len(content_brief)}) exceeds max ({CONTENT_BRIEF_MAX_LENGTH}).")
+            return flask.jsonify({"error_code": "SCA_CONTENT_BRIEF_TOO_LONG", "message": f"Validation failed: 'content_brief' exceeds maximum length of {CONTENT_BRIEF_MAX_LENGTH} characters."}), 400
+
+        # Validate topic_info
+        if topic_info is None or not isinstance(topic_info, dict): # Must be present and a dictionary
+            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_info' must be a valid JSON object (dictionary). Received: {topic_info}")
+            return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_INFO", "message": "Validation failed: 'topic_info' must be a valid JSON object (dictionary)."}), 400
+
+        # error_trigger is optional and for testing, no specific validation needed for its value
+
         logging.info(f"[SCA_REQUEST] /craft_snippet. TopicID: '{topic_id}', Brief: '{content_brief}', Trigger: '{error_trigger}'")
         if error_trigger == "sca_error":
             return flask.jsonify({"error_code": "SCA_SIMULATED_ERROR", "message": "Simulated SCA error."}), 500
@@ -236,8 +265,9 @@ def craft_snippet_endpoint():
         else:
             logging.info("Using SIMULATED/PLACEHOLDER LLM response.")
             placeholder_result = call_aims_llm_placeholder(prompt, topic_info)
-            generated_text_full = placeholder_result.get("llm_response_direct", {}).get("choices", [{}])[0].get("text", "Error: Placeholder format issue.")
-            snippet_title, snippet_text_content = parse_llm_response_for_snippet(generated_text_full)
+            # Directly use title and text_content from the placeholder_result
+            snippet_title = placeholder_result.get("title", "Default Placeholder Title")
+            snippet_text_content = placeholder_result.get("text_content", "Default placeholder content.")
             llm_model_used = placeholder_result.get("llm_model_used", "Placeholder-v0.2")
             llm_prompt_used = placeholder_result.get("llm_prompt_sent", prompt)
         

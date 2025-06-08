@@ -208,7 +208,7 @@ def _get_cached_script(db_path: str, topic_hash: str, max_age_hours: int) -> Opt
             logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash} (max_age_hours: {max_age_hours})")
             return None
     except (sqlite3.Error, json.JSONDecodeError) as e:
-        logger.error(f"[PSWA_CACHE_DB] Error accessing/decoding cache for hash {topic_hash}: {e}")
+        logger.error(f"[PSWA_CACHE_DB] Error accessing/decoding cache for hash {topic_hash}: {e}", exc_info=True)
         return None
     finally:
         if conn:
@@ -234,7 +234,7 @@ def _save_script_to_cache(db_path: str, script_id: str, topic_hash: str, structu
         conn.commit()
         logger.info(f"[PSWA_CACHE_DB] Successfully saved script {script_id} to cache.")
     except (sqlite3.Error, json.JSONEncodeError) as e:
-        logger.error(f"[PSWA_CACHE_DB] Error saving script {script_id} to cache: {e}")
+        logger.error(f"[PSWA_CACHE_DB] Error saving script {script_id} to cache: {e}", exc_info=True)
     except Exception as e_unexp:
         logger.error(f"[PSWA_CACHE_DB] Unexpected error saving script {script_id} to cache: {e_unexp}", exc_info=True)
     finally:
@@ -440,16 +440,39 @@ def weave_script(content: str, topic: str) -> dict:
 def handle_weave_script():
     logger.info("[PSWA_FLASK_ENDPOINT] Received request for /weave_script")
     data = request.get_json()
-    if not data:
-        logger.error("[PSWA_FLASK_ENDPOINT] No JSON payload received.")
-        return jsonify({"error_code": "PSWA_INVALID_PAYLOAD", "message": "Invalid or missing JSON payload.", "details": "No JSON payload received."}), 400
-    content = data.get(KEY_CONTENT); topic = data.get(KEY_TOPIC)
-    if not content or not topic:
-        missing_params = [p for p, v in [(KEY_CONTENT, content), (KEY_TOPIC, topic)] if not v]
-        logger.error(f"[PSWA_FLASK_ENDPOINT] Missing parameters: {', '.join(missing_params)}")
-        return jsonify({"error_code": "PSWA_MISSING_PARAMETERS", "message": "Content and topic are required.", "details": f"Missing required parameters: {', '.join(missing_params)}"}), 400
+    try:
+        data = request.get_json()
+        if not data:
+            logger.error("[PSWA_FLASK_ENDPOINT] Invalid or empty JSON payload received.")
+            return jsonify({"error_code": "PSWA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
+    except Exception as e_json_decode:
+        logger.error(f"[PSWA_FLASK_ENDPOINT] Failed to decode JSON payload: {e_json_decode}", exc_info=True)
+        return jsonify({"error_code": "PSWA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
 
-    logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script with topic: '{topic}'")
+    content = data.get(KEY_CONTENT)
+    topic = data.get(KEY_TOPIC)
+
+    # Validate content
+    if not content or not isinstance(content, str) or not content.strip():
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation failed: '{KEY_CONTENT}' must be a non-empty string. Received: '{content}'")
+        return jsonify({"error_code": "PSWA_INVALID_CONTENT", "message": f"Validation failed: '{KEY_CONTENT}' must be a non-empty string."}), 400
+
+    # Optional: Consider a min/max length for content if it makes sense for script generation quality
+    CONTENT_MIN_LENGTH = 50 # Example minimum
+    CONTENT_MAX_LENGTH = 50000 # Example maximum (very generous)
+    if len(content) < CONTENT_MIN_LENGTH:
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation warning: '{KEY_CONTENT}' length ({len(content)}) is less than recommended minimum ({CONTENT_MIN_LENGTH}).")
+        # Not returning error, but logging. Could return 400 if strict.
+    if len(content) > CONTENT_MAX_LENGTH:
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation failed: '{KEY_CONTENT}' length ({len(content)}) exceeds maximum ({CONTENT_MAX_LENGTH}).")
+        return jsonify({"error_code": "PSWA_CONTENT_TOO_LONG", "message": f"Validation failed: '{KEY_CONTENT}' exceeds maximum length of {CONTENT_MAX_LENGTH} characters."}), 400
+
+    # Validate topic
+    if not topic or not isinstance(topic, str) or not topic.strip():
+        logger.warning(f"[PSWA_FLASK_ENDPOINT] Validation failed: '{KEY_TOPIC}' must be a non-empty string. Received: '{topic}'")
+        return jsonify({"error_code": "PSWA_INVALID_TOPIC", "message": f"Validation failed: '{KEY_TOPIC}' must be a non-empty string."}), 400
+
+    logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script with topic: '{topic}' (Content length: {len(content)})")
     result_data = weave_script(content, topic)
 
     if "error_code" in result_data:

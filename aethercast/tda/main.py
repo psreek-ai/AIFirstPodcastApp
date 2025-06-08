@@ -154,7 +154,7 @@ def _save_topic_to_db(topic_object: dict, db_path: str):
         conn.commit()
         logging.info(f"Saved/Replaced topic {topic_object.get('topic_id')} to DB: {topic_object.get('title_suggestion')}")
     except sqlite3.Error as e:
-        logging.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}")
+        logging.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
     except Exception as e: # Catch any other unexpected error during DB interaction
         logging.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e}", exc_info=True)
     finally:
@@ -265,22 +265,22 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
         return topic_objects
 
     except requests.exceptions.JSONDecodeError as json_err:
-        logging.error(f"Failed to decode JSON from NewsAPI: {json_err}. Response text: {response.text if 'response' in locals() and response else 'N/A'}")
-        return []
+        logging.error(f"Failed to decode JSON from NewsAPI: {json_err}. Response text: {response.text if 'response' in locals() and response else 'N/A'}", exc_info=True)
+        return None # Indicate error
     except requests.exceptions.HTTPError as http_err:
-        logging.error(f"HTTP error occurred: {http_err} - {http_err.response.text if http_err.response else 'No response text'}")
-        return []
+        logging.error(f"HTTP error occurred: {http_err} - {http_err.response.text if http_err.response else 'No response text'}", exc_info=True)
+        return None # Indicate error
     except requests.exceptions.ConnectionError as conn_err:
-        logging.error(f"Connection error occurred: {conn_err}")
-        return []
+        logging.error(f"Connection error occurred: {conn_err}", exc_info=True)
+        return None # Indicate error
     except requests.exceptions.Timeout as timeout_err:
-        logging.error(f"Timeout error occurred: {timeout_err}")
-        return []
+        logging.error(f"Timeout error occurred: {timeout_err}", exc_info=True)
+        return None # Indicate error
     except requests.exceptions.RequestException as req_err: # Catch any other request-related errors
-        logging.error(f"An unexpected error occurred with the NewsAPI request: {req_err}")
-        return []
+        logging.error(f"An unexpected error occurred with the NewsAPI request: {req_err}", exc_info=True)
+        return None # Indicate error
     # Default return for any other unhandled issues within this function, though try/except should cover most.
-    return []
+    return None # Indicate error if reached unexpectedly
 
 SIMULATED_DATA_SOURCES = [
     {
@@ -399,13 +399,41 @@ def discover_topics_endpoint():
     Accepts a JSON payload with an optional 'query' and 'limit'.
     """
     try:
-        request_data = flask.request.get_json()
-        if not request_data:
-            request_data = {} # Allow empty payload for general discovery
+        try:
+            request_data = flask.request.get_json()
+            if not request_data: # Handles cases where request_data is None (e.g. empty body with correct content-type)
+                request_data = {} # Allow empty payload for general discovery (default behavior)
+        except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
+            logging.warning(f"/discover_topics: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
+            return flask.jsonify({
+                "error_code": "TDA_MALFORMED_JSON",
+                "message": "Malformed JSON payload.",
+                "details": str(e_json_decode)
+            }), 400
 
         query = request_data.get("query") # Optional query from CPOA
-        limit = request_data.get("limit", 5) # Default limit
+        limit_raw = request_data.get("limit")
         error_trigger = request_data.get("error_trigger") # For simulating errors
+
+        # Validate query
+        if query is not None and (not isinstance(query, str) or not query.strip()):
+            logging.warning(f"/discover_topics: Validation failed: 'query' must be a non-empty string if provided. Received: '{query}'")
+            return flask.jsonify({
+                "error_code": "TDA_INVALID_QUERY",
+                "message": "Validation failed: 'query' must be a non-empty string if provided."
+            }), 400
+
+        # Validate limit
+        limit = 5 # Default limit
+        if limit_raw is not None:
+            try:
+                limit = int(limit_raw)
+                if not (1 <= limit <= 50): # Max results e.g. 50 (corrected range to be inclusive of 1)
+                    logging.warning(f"/discover_topics: Validation failed: 'limit' ({limit}) out of range (1-50).")
+                    return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "Validation failed: 'limit' must be an integer between 1 and 50."}), 400
+            except ValueError:
+                logging.warning(f"/discover_topics: Validation failed: 'limit' is not a valid integer. Received: '{limit_raw}'.")
+                return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "Validation failed: 'limit' must be a valid integer."}), 400
 
         logging.info(f"Received POST /discover_topics request. Query: '{query}', Limit: {limit}, ErrorTrigger: '{error_trigger}'")
 
@@ -428,26 +456,32 @@ def discover_topics_endpoint():
             # It does not currently use 'limit' directly; NewsAPI handles result size.
             # We will slice the result if a limit is needed post-fetch.
             raw_topics_from_api = call_real_news_api(
-                keywords=request_keywords, 
+                keywords=request_keywords,
                 language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")
                 # categories and country are not passed here, call_real_news_api uses defaults or endpoint specific logic
             )
-            
-            if raw_topics_from_api:
-                # Sort by relevance_score if available, assuming higher is better.
-                # The current call_real_news_api sets a static 0.8, so sorting won't do much unless changed.
-                # For now, we'll just take the list as is.
-                # raw_topics_from_api.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
-                
-                # Apply limit if specified
-                if limit > 0 and isinstance(limit, int):
-                    discovered_topics = raw_topics_from_api[:limit]
-                else:
-                    discovered_topics = raw_topics_from_api
+
+            if raw_topics_from_api is None: # Check if NewsAPI call failed
+                logging.error(f"Failed to retrieve topics from NewsAPI for query: '{query}'. Upstream error.")
+                return flask.jsonify({
+                    "error_code": "TDA_NEWSAPI_FAILURE",
+                    "message": "Failed to retrieve topics from the external NewsAPI.",
+                    "details": "The Topic Discovery Agent encountered an issue with its upstream news provider."
+                }), 502 # Bad Gateway, as TDA depends on NewsAPI
+
+            # Proceed if raw_topics_from_api is a list (even if empty)
+            # Sort by relevance_score if available, assuming higher is better.
+            # The current call_real_news_api sets a static 0.8, so sorting won't do much unless changed.
+            # For now, we'll just take the list as is.
+            # raw_topics_from_api.sort(key=lambda x: x.get("relevance_score", 0), reverse=True)
+
+            # Apply limit if specified
+            if limit > 0 and isinstance(limit, int):
+                discovered_topics = raw_topics_from_api[:limit]
             else:
-                discovered_topics = [] # Ensure it's an empty list if API returns nothing or error
+                discovered_topics = raw_topics_from_api
         
-        else:
+        else: # Not using real NewsAPI, use simulated data
             logging.info(f"Using SIMULATED data for /discover_topics. Query: '{query}', Limit: {limit}")
             discovered_topics = identify_topics_from_sources(query=query, limit=limit)
 

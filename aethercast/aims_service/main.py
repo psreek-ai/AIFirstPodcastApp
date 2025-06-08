@@ -88,34 +88,69 @@ def generate_text():
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Invalid JSON payload: {str(e)}"}}), 400
 
     prompt_text = data.get("prompt")
-    if not prompt_text:
-        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Missing 'prompt' in request payload."}}), 400
+    if not prompt_text or not isinstance(prompt_text, str) or not prompt_text.strip():
+        logger.warning(f"Request {request_id}: Validation failed: 'prompt' is missing, not a string, or empty.")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'prompt' must be a non-empty string."}}), 400
 
     model_id_override = data.get("model_id_override", data.get("model"))
-    max_output_tokens = data.get("max_tokens", 2048) # Default for Gemini, adjust as needed
-    temperature = data.get("temperature", 0.7)
-    # top_p = data.get("top_p") # Example if AIMS API supports it
-    # top_k = data.get("top_k") # Example if AIMS API supports it
-    response_format_req = data.get("response_format", {})
-    response_mime_type_req = response_format_req.get("type") if isinstance(response_format_req, dict) else None
+    if model_id_override is not None and not isinstance(model_id_override, str):
+        logger.warning(f"Request {request_id}: Validation failed: 'model_id_override' is not a string.")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'model_id_override' must be a string if provided."}}), 400
 
+    # Validate max_output_tokens
+    raw_max_tokens = data.get("max_tokens")
+    if raw_max_tokens is not None:
+        try:
+            max_output_tokens = int(raw_max_tokens)
+            if max_output_tokens <= 0:
+                logger.warning(f"Request {request_id}: Validation failed: 'max_tokens' must be positive. Received: {max_output_tokens}")
+                return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'max_tokens' must be a positive integer."}}), 400
+        except ValueError:
+            logger.warning(f"Request {request_id}: Validation failed: 'max_tokens' is not a valid integer. Received: {raw_max_tokens}")
+            return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'max_tokens' must be a valid integer."}}), 400
+    else:
+        max_output_tokens = 2048 # Default
+
+    # Validate temperature
+    raw_temperature = data.get("temperature")
+    if raw_temperature is not None:
+        try:
+            temperature = float(raw_temperature)
+            if not (0.0 <= temperature <= 2.0): # Gemini typical range is 0.0-2.0 for some models, 0.0-1.0 for others. Using a broader valid range.
+                logger.warning(f"Request {request_id}: Validation failed: 'temperature' out of range [0.0, 2.0]. Received: {temperature}")
+                return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'temperature' must be a float between 0.0 and 2.0."}}), 400
+        except ValueError:
+            logger.warning(f"Request {request_id}: Validation failed: 'temperature' is not a valid float. Received: {raw_temperature}")
+            return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'temperature' must be a valid float."}}), 400
+    else:
+        temperature = 0.7 # Default
+
+    response_format_req = data.get("response_format", {})
+    if not isinstance(response_format_req, dict):
+        logger.warning(f"Request {request_id}: Validation failed: 'response_format' must be an object. Received: {response_format_req}")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'response_format' must be an object."}}), 400
+
+    response_mime_type_req = response_format_req.get("type")
+    if response_mime_type_req is not None and not isinstance(response_mime_type_req, str):
+        logger.warning(f"Request {request_id}: Validation failed: 'response_format.type' must be a string. Received: {response_mime_type_req}")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'response_format.type' must be a string if provided."}}), 400
 
     model_name_to_use = model_id_override if model_id_override else AIMS_GOOGLE_LLM_MODEL_ID
     logger.info(f"Request {request_id}: Using model '{model_name_to_use}'. Prompt (first 80 chars): '{prompt_text[:80]}...'")
 
     try:
         model = GenerativeModel(model_name_to_use)
+        gemini_contents = [Part.from_text(prompt_text)]
 
-        gemini_contents = [Part.from_text(prompt_text)] # Simple text prompt
-
+        # Parameters already validated and converted, directly use them
         generation_config_params = {
-            "temperature": float(temperature), # Ensure float
-            "max_output_tokens": int(max_output_tokens), # Ensure int
+            "temperature": temperature,
+            "max_output_tokens": max_output_tokens,
         }
-        # if top_p is not None: generation_config_params["top_p"] = float(top_p)
-        # if top_k is not None: generation_config_params["top_k"] = int(top_k)
+        # if top_p is not None: generation_config_params["top_p"] = top_p # Assuming top_p, top_k are pre-validated if added
+        # if top_k is not None: generation_config_params["top_k"] = top_k
 
-        if response_mime_type_req == "json_object":
+        if response_mime_type_req == "json_object": # Already validated as string or None
             generation_config_params["response_mime_type"] = "application/json"
             logger.info(f"Request {request_id}: Requesting JSON object response format from Gemini model.")
 

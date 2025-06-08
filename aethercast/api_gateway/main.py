@@ -341,13 +341,21 @@ def IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS():
 # --- Session Management Endpoints ---
 @app.route('/api/v1/session/init', methods=['POST'])
 def session_init():
-    data = request.get_json()
-    client_id = data.get('client_id') if data else None
-    if not client_id:
+    try:
+        data = request.get_json()
+        if not data:
+            app.logger.warning("Bad request to /api/v1/session/init: Missing or empty JSON payload.")
+            return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Invalid or empty JSON payload."}), 400
+    except Exception as e_json:
+        app.logger.warning(f"Bad request to /api/v1/session/init: Malformed JSON. Error: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json)}), 400
+
+    client_id = data.get('client_id')
+    if not client_id or not isinstance(client_id, str) or not client_id.strip():
         return jsonify({
-            "error_code": "API_GW_SESSION_CLIENT_ID_REQUIRED",
-            "message": "Client ID is required for session initialization.",
-            "details": "client_id is required."
+            "error_code": "API_GW_SESSION_CLIENT_ID_INVALID",
+            "message": "Client ID is required and must be a non-empty string for session initialization.",
+            "details": "'client_id' must be a non-empty string."
         }), 400
 
     conn = None
@@ -383,11 +391,13 @@ def session_init():
 @app.route('/api/v1/session/preferences', methods=['GET'])
 def get_session_preferences():
     client_id = request.args.get('client_id')
-    if not client_id:
+    # Added .strip() to ensure non-whitespace only string and type check
+    if not client_id or not isinstance(client_id, str) or not client_id.strip():
+        app.logger.warning(f"Bad request to /api/v1/session/preferences (GET): 'client_id' must be a non-empty string. Received: {client_id}")
         return jsonify({
-            "error_code": "API_GW_SESSION_CLIENT_ID_REQUIRED",
-            "message": "Client ID query parameter is required to get preferences.",
-            "details": "client_id query parameter is required."
+            "error_code": "API_GW_SESSION_CLIENT_ID_INVALID",
+            "message": "Client ID query parameter is required and must be a non-empty string to get preferences.",
+            "details": "'client_id' query parameter must be a non-empty string."
         }), 400
 
     conn = None
@@ -422,21 +432,29 @@ def get_session_preferences():
 
 @app.route('/api/v1/session/preferences', methods=['POST'])
 def update_session_preferences_endpoint():
-    data = request.get_json()
-    client_id = data.get('client_id') if data else None
-    preferences = data.get('preferences') if data else None
+    try:
+        data = request.get_json()
+        if not data:
+            app.logger.warning("Bad request to /api/v1/session/preferences (POST): Missing or empty JSON payload.")
+            return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Invalid or empty JSON payload."}), 400
+    except Exception as e_json:
+        app.logger.warning(f"Bad request to /api/v1/session/preferences (POST): Malformed JSON. Error: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json)}), 400
 
-    if not client_id:
+    client_id = data.get('client_id')
+    preferences = data.get('preferences')
+
+    if not client_id or not isinstance(client_id, str) or not client_id.strip():
         return jsonify({
-            "error_code": "API_GW_SESSION_CLIENT_ID_REQUIRED",
-            "message": "Client ID is required to update preferences.",
-            "details": "client_id is required."
+            "error_code": "API_GW_SESSION_CLIENT_ID_INVALID",
+            "message": "Client ID is required and must be a non-empty string to update preferences.",
+            "details": "'client_id' must be a non-empty string."
         }), 400
-    if preferences is None or not isinstance(preferences, dict):
+    if preferences is None or not isinstance(preferences, dict): # preferences can be an empty dict {}
         return jsonify({
             "error_code": "API_GW_SESSION_INVALID_PREFERENCES_PAYLOAD",
-            "message": "Preferences payload is invalid or missing.",
-            "details": "preferences (dictionary) is required."
+            "message": "Preferences payload is required and must be a dictionary.",
+            "details": "'preferences' (dictionary) is required."
         }), 400
 
     conn = None
@@ -480,10 +498,20 @@ def get_dynamic_snippets():
         }), 503
 
     try:
-        limit = request.args.get('limit', default=6, type=int)
-        if not 1 <= limit <= 20:
-            app.logger.warning(f"Invalid limit value '{request.args.get('limit')}' requested for /snippets, defaulting to 6.")
-            limit = 6
+        limit_str = request.args.get('limit', default="6") # Get as string first
+        try:
+            limit = int(limit_str)
+            if not (1 <= limit <= 20):
+                app.logger.warning(f"Invalid limit value '{limit_str}' for /snippets. Must be 1-20. Defaulting to 6.")
+                # For GET requests, defaulting is often preferred over erroring for optional, simple params.
+                # If strictness is required by product decision, uncomment the return below:
+                # return jsonify({"error_code": "API_GW_INVALID_LIMIT_RANGE", "message": "Validation failed: 'limit' must be an integer between 1 and 20."}), 400
+                limit = 6 # Defaulting behavior
+        except ValueError:
+            app.logger.warning(f"Invalid limit type '{limit_str}' for /snippets. Must be integer. Defaulting to 6.")
+            # If strictness is required, uncomment the return below:
+            # return jsonify({"error_code": "API_GW_INVALID_LIMIT_TYPE", "message": "Validation failed: 'limit' must be a valid integer."}), 400
+            limit = 6 # Defaulting behavior
 
         # User preferences are not yet passed for general landing page snippets.
         # client_id = request.args.get('client_id')
@@ -582,14 +610,14 @@ def explore_topic():
             "details": "CPOA topic exploration function (orchestrate_topic_exploration) is not available."
         }), 503
 
-    data = request.get_json()
-    if not data:
-        app.logger.warning("Bad request to /api/v1/topics/explore: Missing JSON payload.")
-        return jsonify({
-            "error_code": "API_GW_EXPLORE_PAYLOAD_REQUIRED",
-            "message": "Request payload is required.",
-            "details": "Missing JSON request body."
-        }), 400
+    try:
+        data = request.get_json()
+        if not data:
+            app.logger.warning("Bad request to /api/v1/topics/explore: Missing or empty JSON payload.")
+            return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Invalid or empty JSON payload."}), 400
+    except Exception as e_json:
+        app.logger.warning(f"Bad request to /api/v1/topics/explore: Malformed JSON. Error: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json)}), 400
 
     current_topic_id = data.get("current_topic_id")
     keywords = data.get("keywords") # Expected to be a list of strings
@@ -605,14 +633,35 @@ def explore_topic():
             "details": "Missing 'current_topic_id' and 'keywords'. One or both are required."
         }), 400
 
-    if keywords is not None and not isinstance(keywords, list):
-        app.logger.warning(f"Bad request to /api/v1/topics/explore: 'keywords' provided but not as a list. Received: {keywords}")
-        return jsonify({
-            "error_code": "API_GW_EXPLORE_INVALID_KEYWORDS_TYPE",
-            "message": "'keywords' must be a list of strings.",
-            "details": f"Invalid type for 'keywords': expected list, got {type(keywords).__name__}."
-        }), 400
+    if keywords is not None: # If keywords key is present
+        if not isinstance(keywords, list):
+            app.logger.warning(f"Bad request to /api/v1/topics/explore: 'keywords' provided but not as a list. Received: {keywords}")
+            return jsonify({
+                "error_code": "API_GW_EXPLORE_INVALID_KEYWORDS_TYPE",
+                "message": "'keywords' must be a list of strings.",
+                "details": f"Invalid type for 'keywords': expected list, got {type(keywords).__name__}."
+            }), 400
+        for i, kw in enumerate(keywords): # Check each item in the list
+            if not isinstance(kw, str) or not kw.strip(): # Each keyword must be a non-empty string
+                app.logger.warning(f"Bad request to /api/v1/topics/explore: keyword at index {i} is not a non-empty string. Received: '{kw}'")
+                return jsonify({
+                    "error_code": "API_GW_EXPLORE_INVALID_KEYWORD_ITEM",
+                    "message": "All items in 'keywords' list must be non-empty strings.",
+                    "details": f"Invalid keyword at index {i}."
+                }), 400
 
+    # Validate other optional fields if present
+    if current_topic_id is not None and (not isinstance(current_topic_id, str) or not current_topic_id.strip()):
+        app.logger.warning(f"Bad request to /api/v1/topics/explore: 'current_topic_id' must be a non-empty string if provided. Received: '{current_topic_id}'")
+        return jsonify({"error_code": "API_GW_EXPLORE_INVALID_TOPIC_ID", "message": "'current_topic_id' must be a non-empty string if provided."}), 400
+
+    if depth_mode is not None and (not isinstance(depth_mode, str) or not depth_mode.strip()):
+        app.logger.warning(f"Bad request to /api/v1/topics/explore: 'depth_mode' must be a non-empty string if provided. Received: '{depth_mode}'")
+        return jsonify({"error_code": "API_GW_EXPLORE_INVALID_DEPTH_MODE", "message": "'depth_mode' must be a non-empty string if provided."}), 400
+
+    if client_id is not None and (not isinstance(client_id, str) or not client_id.strip()): # Check if client_id is non-empty string
+        app.logger.warning(f"Bad request to /api/v1/topics/explore: 'client_id' must be a non-empty string if provided. Received: '{client_id}'")
+        return jsonify({"error_code": "API_GW_CLIENT_ID_INVALID", "message": "If 'client_id' is provided, it must be a non-empty string."}), 400
 
     user_preferences = None
     if client_id:
@@ -717,17 +766,31 @@ def search_podcasts_endpoint():
             "details": "CPOA search function not available."
         }), 503
 
-    data = request.get_json()
-    if not data or not data.get("query"):
-        app.logger.warning("Bad request to /api/v1/search/podcasts: Missing or empty 'query'.")
+    try:
+        data = request.get_json()
+        if not data:
+            app.logger.warning("Bad request to /api/v1/search/podcasts: Missing or empty JSON payload.")
+            return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Invalid or empty JSON payload."}), 400
+    except Exception as e_json:
+        app.logger.warning(f"Bad request to /api/v1/search/podcasts: Malformed JSON. Error: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json)}), 400
+
+    query = data.get("query")
+    if not query or not isinstance(query, str) or not query.strip():
+        app.logger.warning(f"Bad request to /api/v1/search/podcasts: 'query' must be a non-empty string. Received: {query}")
         return jsonify({
-            "error_code": "API_GW_SEARCH_QUERY_REQUIRED",
-            "message": "A search query is required.",
-            "details": "Missing or empty 'query' in request body."
+            "error_code": "API_GW_SEARCH_QUERY_INVALID",
+            "message": "A non-empty search query string is required.",
+            "details": "'query' must be a non-empty string."
         }), 400
 
-    query = data["query"]
     client_id = data.get("client_id")
+    if client_id is not None and (not isinstance(client_id, str) or not client_id.strip()):
+        app.logger.warning(f"Bad request to /api/v1/search/podcasts: 'client_id' must be a non-empty string if provided. Received: {client_id}")
+        return jsonify({
+            "error_code": "API_GW_CLIENT_ID_INVALID",
+            "message": "If 'client_id' is provided, it must be a non-empty string.",
+        }), 400
     user_preferences = None
 
     if client_id:
@@ -790,41 +853,47 @@ def search_podcasts_endpoint():
 # --- Podcast Generation Endpoint ---
 @app.route('/api/v1/podcasts', methods=['POST'])
 def create_podcast_generation_task():
-    data = request.get_json()
+    try:
+        data = request.get_json()
+        if not data:
+            app.logger.warning("Bad request to /api/v1/podcasts (POST): Missing or empty JSON payload.")
+            return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Invalid or empty JSON payload."}), 400
+    except Exception as e_json:
+        app.logger.warning(f"Bad request to /api/v1/podcasts (POST): Malformed JSON. Error: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json)}), 400
 
-    if not data or 'topic' not in data or not data['topic']:
-        app.logger.warning("Bad request to /api/v1/podcasts: Missing or empty 'topic'.")
+    topic = data.get('topic')
+    if not topic or not isinstance(topic, str) or not topic.strip():
+        app.logger.warning(f"Bad request to /api/v1/podcasts: 'topic' must be a non-empty string. Received: {topic}")
         return jsonify({
-            "error_code": "API_GW_PODCAST_TOPIC_REQUIRED",
-            "message": "A topic is required to generate a podcast.",
-            "details": "Missing or empty 'topic' in request body."
+            "error_code": "API_GW_PODCAST_TOPIC_INVALID",
+            "message": "A non-empty topic string is required to generate a podcast.",
+            "details": "'topic' must be a non-empty string."
         }), 400
     
-    topic = data['topic']
     voice_params_from_request = data.get('voice_params')
-    client_id_from_request = data.get('client_id')
-    test_scenarios_from_request = data.get('test_scenarios') # Added
-
     if voice_params_from_request is not None and not isinstance(voice_params_from_request, dict):
-        app.logger.warning("Bad request to /api/v1/podcasts: 'voice_params' was provided but not as a valid JSON object.")
+        app.logger.warning(f"Bad request to /api/v1/podcasts: 'voice_params' must be an object if provided. Received: {voice_params_from_request}")
         return jsonify({
-            "error_code": "API_GW_PODCAST_INVALID_VOICE_PARAMS",
+            "error_code": "API_GW_PODCAST_INVALID_VOICE_PARAMS_TYPE",
             "message": "Provided voice parameters are invalid.",
             "details": "'voice_params' must be a valid JSON object if provided."
         }), 400
 
-    if client_id_from_request is not None and not isinstance(client_id_from_request, str):
-        app.logger.warning("Bad request to /api/v1/podcasts: 'client_id' was provided but not as a string.")
+    client_id_from_request = data.get('client_id')
+    if client_id_from_request is not None and (not isinstance(client_id_from_request, str) or not client_id_from_request.strip()):
+        app.logger.warning(f"Bad request to /api/v1/podcasts: 'client_id' must be a non-empty string if provided. Received: {client_id_from_request}")
         return jsonify({
             "error_code": "API_GW_PODCAST_INVALID_CLIENT_ID",
             "message": "Provided client ID is invalid.",
-            "details": "'client_id' must be a string if provided."
+            "details": "'client_id' must be a non-empty string if provided."
         }), 400
 
-    if test_scenarios_from_request is not None and not isinstance(test_scenarios_from_request, dict): # Added validation
-        app.logger.warning("Bad request to /api/v1/podcasts: 'test_scenarios' was provided but not as a valid JSON object.")
+    test_scenarios_from_request = data.get('test_scenarios')
+    if test_scenarios_from_request is not None and not isinstance(test_scenarios_from_request, dict):
+        app.logger.warning(f"Bad request to /api/v1/podcasts: 'test_scenarios' must be an object if provided. Received: {test_scenarios_from_request}")
         return jsonify({
-            "error_code": "API_GW_PODCAST_INVALID_TEST_SCENARIOS",
+            "error_code": "API_GW_PODCAST_INVALID_TEST_SCENARIOS_TYPE",
             "message": "Provided test_scenarios are invalid.",
             "details": "'test_scenarios' must be a valid JSON object if provided."
         }), 400
@@ -984,11 +1053,32 @@ def create_podcast_generation_task():
 @app.route('/api/v1/podcasts', methods=['GET'])
 def list_podcasts():
     try:
-        page = request.args.get('page', 1, type=int)
-        per_page = request.args.get('per_page', 10, type=int)
-        if page < 1: page = 1
-        if per_page < 1: per_page = 10 # Min per_page
-        if per_page > 100: per_page = 100 # Max per_page to prevent abuse
+        page_str = request.args.get('page', default="1")
+        per_page_str = request.args.get('per_page', default="10")
+
+        try:
+            page = int(page_str)
+            if page < 1:
+                app.logger.warning(f"Invalid page number '{page_str}' for /podcasts GET. Must be >= 1. Defaulting to 1.")
+                # Optionally return 400 if strict validation is preferred
+                # return jsonify({"error_code": "API_GW_INVALID_PAGE_NUM", "message": "Validation failed: 'page' must be a positive integer."}), 400
+                page = 1 # Defaulting behavior
+        except ValueError:
+            app.logger.warning(f"Invalid page type '{page_str}' for /podcasts GET. Must be integer. Defaulting to 1.")
+            # return jsonify({"error_code": "API_GW_INVALID_PAGE_TYPE", "message": "Validation failed: 'page' must be a valid integer."}), 400
+            page = 1 # Defaulting behavior
+
+        try:
+            per_page = int(per_page_str)
+            if not (1 <= per_page <= 100): # Max 100 per page
+                app.logger.warning(f"Invalid per_page value '{per_page_str}' for /podcasts GET. Must be 1-100. Defaulting to 10.")
+                # return jsonify({"error_code": "API_GW_INVALID_PER_PAGE_RANGE", "message": "Validation failed: 'per_page' must be an integer between 1 and 100."}), 400
+                per_page = 10 # Defaulting behavior
+        except ValueError:
+            app.logger.warning(f"Invalid per_page type '{per_page_str}' for /podcasts GET. Must be integer. Defaulting to 10.")
+            # return jsonify({"error_code": "API_GW_INVALID_PER_PAGE_TYPE", "message": "Validation failed: 'per_page' must be a valid integer."}), 400
+            per_page = 10 # Defaulting behavior
+
         offset = (page - 1) * per_page
 
         conn = get_db_connection()
@@ -1153,3 +1243,7 @@ if __name__ == '__main__':
     # Add logging for these specific run parameters
     app.logger.info(f"Starting API Gateway: Host={host}, Port={port}, DebugMode={debug_mode}")
     app.run(host=host, port=port, debug=debug_mode, use_reloader=False)
+
+[end of aethercast/api_gateway/main.py]
+
+[end of aethercast/api_gateway/main.py]

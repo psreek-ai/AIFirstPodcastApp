@@ -149,8 +149,14 @@ ASF exposes internal HTTP endpoints for other services.
 -   **URL Path:** `/asf/internal/notify_new_audio`
 -   **Description:** Used by CPOA (after VFA generates audio) to inform ASF about the `stream_id` and `filepath` of the new audio file.
 -   **Request Payload Example (JSON):** `{"stream_id": "strm_abcdef12345", "filepath": "/path/to/audio.mp3"}`
+    -   `stream_id` (string, required): Must be a non-empty string.
+    -   `filepath` (string, required): Must be a non-empty string.
 -   **Success Response (200 OK - JSON):** `{"message": "Notification received successfully", "stream_id": "..."}`.
--   **Error Response (400 Bad Request - JSON):** If `stream_id` or `filepath` missing.
+-   **Error Responses (400 Bad Request - JSON):**
+    -   `{"error_code": "ASF_NOTIFY_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": "..."}`
+    -   `{"error_code": "ASF_NOTIFY_INVALID_PAYLOAD", "message": "Request payload is missing or not valid JSON.", "details": "..."}`
+    -   `{"error_code": "ASF_NOTIFY_INVALID_STREAM_ID", "message": "Validation failed: 'stream_id' must be a non-empty string."}`
+    -   `{"error_code": "ASF_NOTIFY_INVALID_FILEPATH", "message": "Validation failed: 'filepath' must be a non-empty string."}`
 
 ### Send UI Update
 
@@ -177,7 +183,12 @@ ASF exposes internal HTTP endpoints for other services.
     }
     ```
 -   **Error Responses (JSON):**
-    -   `400 Bad Request`: If `client_id`, `event_name`, or `data` are missing in the request.
-        Example: `{"error_code": "ASF_SENDUI_MISSING_PARAMETERS", "message": "...", "details": "..."}`
-    -   `500 Internal Server Error`: If ASF server configuration is missing (e.g., UI namespace not loaded) or if the SocketIO emit fails internally.
-        Example: `{"error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE", "message": "...", "details": "..."}` or `{"error_code": "ASF_SOCKETIO_EMIT_FAILED", "message": "...", "details": "..."}`
+    -   **400 Bad Request:** If payload is malformed, or `client_id`, `event_name`, or the `data` field are missing/invalid.
+        -   `{"error_code": "ASF_SENDUI_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": "..."}`
+        -   `{"error_code": "ASF_SENDUI_INVALID_PAYLOAD", "message": "Request payload is missing or not valid JSON for sending UI update.", "details": "..."}`
+        -   `{"error_code": "ASF_SENDUI_INVALID_CLIENT_ID", "message": "Validation failed: 'client_id' must be a non-empty string."}`
+        -   `{"error_code": "ASF_SENDUI_INVALID_EVENT_NAME", "message": "Validation failed: 'event_name' must be a non-empty string."}`
+        -   `{"error_code": "ASF_SENDUI_MISSING_DATA", "message": "Validation failed: 'data' field is required."}`
+    -   **500 Internal Server Error:** If ASF server configuration is missing (e.g., UI namespace not loaded) or if the SocketIO emit fails internally.
+        -   Example: `{"error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE", "message": "...", "details": "..."}`
+        -   Example: `{"error_code": "ASF_SOCKETIO_EMIT_FAILED", "message": "...", "details": "..."}`

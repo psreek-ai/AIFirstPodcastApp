@@ -137,7 +137,7 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
                 "tts_settings_used": {"voice_name": simulated_aims_tts_voice_id, "audio_encoding": simulated_aims_tts_audio_format, **requested_tts_settings}
             }
         except IOError as e:
-            logger.error(f"[VFA_MAIN_LOGIC] Test mode: Failed during dummy directory/file operation: {e}")
+            logger.error(f"[VFA_MAIN_LOGIC] Test mode: Failed during dummy directory/file operation: {e}", exc_info=True)
             return {"error_code": "VFA_TEST_MODE_IO_ERROR", "message": "Test mode failed during disk op.", "details": str(e), "audio_filepath": None, "stream_id": stream_id, "script_char_count": 0, "engine_used": "test_mode_io_error", "tts_settings_used": requested_tts_settings}
 
     # --- Real AIMS_TTS Call Logic ---
@@ -221,22 +221,22 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
 
     except requests.exceptions.Timeout as e_timeout:
         err_msg = f"AIMS_TTS service request timed out after {aims_tts_timeout}s: {str(e_timeout)}"
-        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}")
+        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}", exc_info=True)
         return {"error_code": "VFA_AIMS_TTS_TIMEOUT", "message": "AIMS_TTS request timed out.", "details": err_msg, "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
     except requests.exceptions.HTTPError as e_http:
         aims_tts_error_details = e_http.response.text
         try: aims_tts_error_details = e_http.response.json()
         except ValueError: pass
         err_msg = f"AIMS_TTS service returned HTTP error {e_http.response.status_code}. Details: {aims_tts_error_details}"
-        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}")
+        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}", exc_info=True) # Added exc_info
         return {"error_code": "VFA_AIMS_TTS_HTTP_ERROR", "message": f"AIMS_TTS request failed (HTTP {e_http.response.status_code}).", "details": err_msg, "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
     except requests.exceptions.RequestException as e_req:
         err_msg = f"Error calling AIMS_TTS service: {type(e_req).__name__} - {str(e_req)}"
-        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}")
+        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}", exc_info=True)
         return {"error_code": "VFA_AIMS_TTS_REQUEST_ERROR", "message": "Failed to communicate with AIMS_TTS.", "details": err_msg, "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
     except (ValueError, KeyError, json.JSONDecodeError) as e_parse: # Covers missing audio_url or bad JSON from AIMS_TTS
         err_msg = f"Error parsing AIMS_TTS response or missing critical data: {str(e_parse)}. Response: {response.text[:200] if 'response' in locals() else 'N/A'}"
-        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}")
+        logger.error(f"[VFA_AIMS_TTS_CALL] Stream {stream_id}: {err_msg}", exc_info=True) # Added exc_info
         return {"error_code": "VFA_AIMS_TTS_BAD_RESPONSE", "message": "AIMS_TTS returned an invalid response.", "details": err_msg, "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
     except Exception as e:
         err_msg = f"Unexpected error during AIMS_TTS interaction: {type(e).__name__} - {str(e)}"
@@ -248,17 +248,65 @@ def forge_voice(script_input: dict, voice_params_input: Optional[dict] = None) -
 def handle_forge_voice():
     logger.info("[VFA_FLASK_ENDPOINT] Received request for /forge_voice")
     data = request.get_json()
-    if not data:
-        return jsonify({"error_code": "VFA_PAYLOAD_ERROR", "message": "Invalid payload", "details": "No JSON payload received"}), 400
-    script_payload = data.get('script'); voice_params_payload = data.get('voice_params')
-    if script_payload is None:
-        return jsonify({"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "Missing 'script' parameter"}), 400
-    if not isinstance(script_payload, dict):
-        return jsonify({"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "'script' parameter must be a valid JSON object (dictionary)."}), 400
-    if voice_params_payload is not None and not isinstance(voice_params_payload, dict):
-        return jsonify({"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "'voice_params' parameter must be a valid JSON object if provided."}), 400
+    try:
+        data = request.get_json()
+        if not data:
+            logger.error("[VFA_FLASK_ENDPOINT] Invalid or empty JSON payload received.")
+            return jsonify({"error_code": "VFA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
+    except Exception as e_json_decode:
+        logger.error(f"[VFA_FLASK_ENDPOINT] Failed to decode JSON payload: {e_json_decode}", exc_info=True)
+        return jsonify({"error_code": "VFA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
 
-    logger.info(f"[VFA_FLASK_ENDPOINT] Calling forge_voice with script: '{script_payload.get('topic', 'N/A')}', voice_params: {voice_params_payload}")
+    script_payload = data.get('script')
+    voice_params_payload = data.get('voice_params')
+
+    # Validate script payload
+    if script_payload is None or not isinstance(script_payload, dict):
+        logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: 'script' must be a non-empty JSON object. Received: {script_payload}")
+        return jsonify({"error_code": "VFA_INVALID_SCRIPT_PAYLOAD", "message": "Validation failed: 'script' must be a non-empty JSON object."}), 400
+
+    required_script_keys = ["script_id", "topic", "title", "segments"]
+    for key in required_script_keys:
+        if key not in script_payload or not script_payload[key]: # Check for presence and non-empty (for strings)
+            if key == "segments" and isinstance(script_payload.get(key), list): # Segments can be an empty list
+                pass
+            else:
+                logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: 'script.{key}' is missing or empty. Received: {script_payload.get(key)}")
+                return jsonify({"error_code": f"VFA_INVALID_SCRIPT_{key.upper()}", "message": f"Validation failed: 'script.{key}' is missing or invalid."}), 400
+
+    if not isinstance(script_payload["segments"], list):
+        logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: 'script.segments' must be a list. Received type: {type(script_payload['segments'])}")
+        return jsonify({"error_code": "VFA_INVALID_SCRIPT_SEGMENTS_TYPE", "message": "Validation failed: 'script.segments' must be a list."}), 400
+
+    for i, segment in enumerate(script_payload["segments"]):
+        if not isinstance(segment, dict):
+            logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: script.segments[{i}] is not an object. Received: {segment}")
+            return jsonify({"error_code": "VFA_INVALID_SEGMENT_STRUCTURE", "message": f"Validation failed: script.segments[{i}] must be an object."}), 400
+        if not segment.get("segment_title") or not isinstance(segment.get("segment_title"), str):
+            logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: script.segments[{i}].segment_title is missing or not a string.")
+            return jsonify({"error_code": "VFA_INVALID_SEGMENT_TITLE", "message": f"Validation failed: script.segments[{i}].segment_title is missing or not a string."}), 400
+        if not segment.get("content") or not isinstance(segment.get("content"), str): # Allow empty string for content, but must be present and string
+            logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: script.segments[{i}].content is missing or not a string.")
+            return jsonify({"error_code": "VFA_INVALID_SEGMENT_CONTENT", "message": f"Validation failed: script.segments[{i}].content is missing or not a string."}), 400
+
+    # Validate voice_params payload (if provided)
+    if voice_params_payload is not None:
+        if not isinstance(voice_params_payload, dict):
+            logger.warning(f"[VFA_FLASK_ENDPOINT] Validation failed: 'voice_params' must be a JSON object if provided. Received: {voice_params_payload}")
+            return jsonify({"error_code": "VFA_INVALID_VOICE_PARAMS_TYPE", "message": "Validation failed: 'voice_params' must be a JSON object if provided."}), 400
+
+        if "voice_name" in voice_params_payload and not isinstance(voice_params_payload["voice_name"], str):
+            return jsonify({"error_code": "VFA_INVALID_VOICE_NAME", "message": "Validation failed: 'voice_params.voice_name' must be a string."}), 400
+        if "audio_encoding" in voice_params_payload and not isinstance(voice_params_payload["audio_encoding"], str):
+            return jsonify({"error_code": "VFA_INVALID_AUDIO_ENCODING", "message": "Validation failed: 'voice_params.audio_encoding' must be a string."}), 400
+        if "speaking_rate" in voice_params_payload:
+            try: float(voice_params_payload["speaking_rate"]) # Check if convertible
+            except ValueError: return jsonify({"error_code": "VFA_INVALID_SPEAKING_RATE", "message": "Validation failed: 'voice_params.speaking_rate' must be a float."}), 400
+        if "pitch" in voice_params_payload:
+            try: float(voice_params_payload["pitch"]) # Check if convertible
+            except ValueError: return jsonify({"error_code": "VFA_INVALID_PITCH", "message": "Validation failed: 'voice_params.pitch' must be a float."}), 400
+
+    logger.info(f"[VFA_FLASK_ENDPOINT] Calling forge_voice with script topic: '{script_payload.get('topic', 'N/A')}', voice_params: {voice_params_payload}")
     result = forge_voice(script_payload, voice_params_input=voice_params_payload)
 
     status_code = 500 # Default for errors

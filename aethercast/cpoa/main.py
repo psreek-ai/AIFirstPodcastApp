@@ -209,9 +209,6 @@ def requests_with_retry(method: str, url: str, max_retries: int, backoff_factor:
     raise Exception(f"Requests with retry failed for {url} after {max_retries} attempts without specific exception.")
 
 
-def get_timestamp() -> str: # This function seems unused in the provided snippet, consider removing if not used elsewhere.
-    return datetime.utcnow().isoformat() + "Z"
-
 def _update_task_status_in_db(db_path: str, task_id: str, new_cpoa_status: str, error_msg: Optional[str] = None) -> None:
     """
     Updates the cpoa_status, cpoa_error_message, and last_updated_timestamp for a task in the database.
@@ -234,7 +231,7 @@ def _update_task_status_in_db(db_path: str, task_id: str, new_cpoa_status: str, 
         conn.commit()
         logger.info(f"Task {task_id}: Successfully updated CPOA status in DB to '{new_cpoa_status}'.")
     except sqlite3.Error as e:
-        logger.error(f"CPOA: Database error for task {task_id} updating to status {new_cpoa_status}: {type(e).__name__} - {e}")
+        logger.error(f"CPOA: Database error for task {task_id} updating to status {new_cpoa_status}: {type(e).__name__} - {e}", exc_info=True)
     except Exception as e: # Catch any other unexpected error during DB update
         logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id} (status: {new_cpoa_status}): {type(e).__name__} - {e}", exc_info=True)
     finally:
@@ -724,7 +721,7 @@ def _save_snippet_to_db(snippet_object: dict, db_path: str):
         conn.commit()
         logger.info(f"Saved/Replaced snippet {snippet_object.get('snippet_id')} to DB: {snippet_object.get('title')}")
     except sqlite3.Error as e:
-        logger.error(f"Database error saving snippet {snippet_object.get('snippet_id')}: {e}")
+        logger.error(f"Database error saving snippet {snippet_object.get('snippet_id')}: {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Unexpected error saving snippet {snippet_object.get('snippet_id')} to DB: {e}", exc_info=True)
     finally:
@@ -765,17 +762,34 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
     Orchestrates snippet generation by calling the SnippetCraftAgent (SCA) service.
     """
     function_name = "orchestrate_snippet_generation"
+    # --- Input Validation ---
+    if not isinstance(topic_info, dict):
+        logger.error(f"CPOA: {function_name} - Input 'topic_info' must be a dictionary. Received: {type(topic_info)}")
+        return {"error": SCA_STATUS_REQUEST_INVALID, "details": "Input 'topic_info' must be a dictionary."}
+
     logger.info(f"CPOA: {function_name} called for topic_info: {topic_info.get('title_suggestion', 'N/A')}")
 
     topic_id = topic_info.get("topic_id")
+    if topic_id and not isinstance(topic_id, str):
+        logger.error(f"CPOA: {function_name} - If provided, 'topic_id' must be a string. Received: {type(topic_id)}")
+        return {"error": SCA_STATUS_REQUEST_INVALID, "details": "If provided, 'topic_id' must be a string."}
     if not topic_id:
-        topic_id = f"topic_adhoc_{uuid.uuid4().hex[:6]}"
-        logger.warning(f"CPOA: {function_name} - topic_id missing from input, generated adhoc topic_id: {topic_id}")
+        topic_id = f"topic_adhoc_{uuid.uuid4().hex[:6]}" # Generate if not provided or if invalid type was ignored
+        logger.warning(f"CPOA: {function_name} - 'topic_id' missing or invalid, generated adhoc topic_id: {topic_id}")
     
     content_brief = topic_info.get("title_suggestion") # Using title_suggestion as the content_brief
-    if not content_brief:
-        logger.error(f"CPOA: {function_name} - 'title_suggestion' (for content_brief) missing from topic_info for topic_id: {topic_id}.")
-        return {"error": SCA_STATUS_REQUEST_INVALID, "details": "Missing title_suggestion for content_brief."}
+    if not content_brief or not isinstance(content_brief, str) or not content_brief.strip():
+        logger.error(f"CPOA: {function_name} - 'title_suggestion' (for content_brief) must be a non-empty string. Received: '{content_brief}' for topic_id: {topic_id}.")
+        return {"error": SCA_STATUS_REQUEST_INVALID, "details": "Missing or invalid 'title_suggestion' (must be a non-empty string)."}
+
+    # Optional fields validation
+    if "summary" in topic_info and not isinstance(topic_info["summary"], str):
+        logger.warning(f"CPOA: {function_name} - 'summary' provided but not a string. Will be ignored or might cause issues downstream if SCA expects string. Topic_id: {topic_id}")
+        # Decide if this is a hard error or just a warning. For now, warning.
+    if "keywords" in topic_info and not (isinstance(topic_info["keywords"], list) and all(isinstance(kw, str) for kw in topic_info["keywords"])):
+        logger.warning(f"CPOA: {function_name} - 'keywords' provided but not a list of strings. Will be ignored or might cause issues downstream. Topic_id: {topic_id}")
+        # Decide if this is a hard error or just a warning. For now, warning.
+
 
     sca_payload = {
         "topic_id": topic_id,
@@ -1031,15 +1045,38 @@ def orchestrate_topic_exploration(
     """
     Orchestrates topic exploration by getting related topics from TDA
     and then generating snippets for them via SCA.
+    Returns a list of generated snippet objects or an error dictionary if validation fails early.
     """
-    logger.info(f"Starting topic exploration. Mode: {depth_mode}, Topic ID: {current_topic_id}, Keywords: {keywords}, UserPrefs: {user_preferences}")
+    function_name = "orchestrate_topic_exploration"
+    logger.info(f"CPOA: {function_name} called. Mode: {depth_mode}, Topic ID: {current_topic_id}, Keywords: {keywords}, UserPrefs: {user_preferences}")
+
+    # --- Input Validation ---
+    if current_topic_id and (not isinstance(current_topic_id, str) or not current_topic_id.strip()):
+        logger.error(f"CPOA: {function_name} - 'current_topic_id' must be a non-empty string if provided. Received: '{current_topic_id}'")
+        # Consistent with API Gateway, this function is internal but let's return a structure that can be propagated.
+        # However, the original code raises ValueError, which might be fine for internal logic.
+        # For now, let's align with raising ValueError as per existing pattern for this func.
+        raise ValueError("'current_topic_id' must be a non-empty string if provided.")
+
+    if keywords:
+        if not isinstance(keywords, list) or not all(isinstance(kw, str) and kw.strip() for kw in keywords):
+            logger.error(f"CPOA: {function_name} - 'keywords' must be a list of non-empty strings if provided. Received: {keywords}")
+            raise ValueError("'keywords' must be a list of non-empty strings if provided.")
+
+    if not isinstance(depth_mode, str) or not depth_mode.strip(): # Basic check for depth_mode
+        logger.error(f"CPOA: {function_name} - 'depth_mode' must be a non-empty string. Received: '{depth_mode}'")
+        raise ValueError("'depth_mode' must be a non-empty string.")
+        # Could add validation for specific allowed values for depth_mode if they are defined.
+
+    if user_preferences and not isinstance(user_preferences, dict):
+        logger.error(f"CPOA: {function_name} - 'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}")
+        raise ValueError("'user_preferences' must be a dictionary if provided.")
+
+    # Log user preferences if available (moved after validation)
     if user_preferences and PREF_KEY_NEWS_CATEGORY in user_preferences:
-        logger.info(f"TopicExploration: User preference for news category found: {user_preferences[PREF_KEY_NEWS_CATEGORY]}. This could influence TDA query if no specific keywords provided by user for this exploration call.")
-        # Actual use of this preference in forming query_for_tda would be an enhancement.
-        # For example, if not keywords and not current_topic_id, TDA could use this preferred_category.
+        logger.info(f"CPOA: {function_name} - User preference for news category found: {user_preferences[PREF_KEY_NEWS_CATEGORY]}. This could influence TDA query if no specific keywords provided by user for this exploration call.")
 
     explored_snippets: List[Dict[str, Any]] = []
-
     query_for_tda = None
     original_topic_title = "original topic"
 
@@ -1152,7 +1189,18 @@ def orchestrate_topic_exploration(
 
 
 def orchestrate_search_results_generation(query: str, user_preferences: Optional[dict] = None) -> Dict[str, Any]:
-    logger.info(f"CPOA: Starting search results generation for query: '{query}'")
+    function_name = "orchestrate_search_results_generation"
+    logger.info(f"CPOA: {function_name} called with query: '{query}', user_preferences: {user_preferences}")
+
+    # --- Input Validation ---
+    if not query or not isinstance(query, str) or not query.strip():
+        logger.error(f"CPOA: {function_name} - 'query' must be a non-empty string. Received: '{query}'")
+        return {"error": "CPOA_REQUEST_INVALID", "details": "'query' must be a non-empty string.", "search_results": []}
+
+    if user_preferences and not isinstance(user_preferences, dict):
+        logger.error(f"CPOA: {function_name} - 'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}")
+        return {"error": "CPOA_REQUEST_INVALID", "details": "'user_preferences' must be a dictionary if provided.", "search_results": []}
+
     search_results_snippets: List[Dict[str, Any]] = []
 
     # 1. Call TDA
@@ -1255,27 +1303,35 @@ def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional
     function_name = "orchestrate_landing_page_snippets"
     logger.info(f"CPOA: {function_name} called with limit: {limit}, user_preferences: {user_preferences}")
 
+    # --- Input Validation ---
+    if not isinstance(limit, int) or not (1 <= limit <= 20): # Example range for limit
+        logger.error(f"CPOA: {function_name} - 'limit' must be an integer between 1 and 20. Received: {limit}")
+        return {"error": "CPOA_REQUEST_INVALID", "details": "'limit' must be an integer between 1 and 20.", "snippets": []}
+
+    if user_preferences and not isinstance(user_preferences, dict):
+        logger.error(f"CPOA: {function_name} - 'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}")
+        return {"error": "CPOA_REQUEST_INVALID", "details": "'user_preferences' must be a dictionary if provided.", "snippets": []}
+
     default_keywords = ["technology", "science", "lifestyle", "business", "arts", "global news", "innovation", "culture"]
     query_for_tda = None
 
+    # Construct query for TDA (logic remains the same, moved after validation)
     if user_preferences and isinstance(user_preferences.get("preferred_categories"), list) and user_preferences["preferred_categories"]:
         query_for_tda = " ".join(user_preferences["preferred_categories"])
         logger.info(f"CPOA: {function_name} - Using user preferred categories for TDA query: '{query_for_tda}'")
     elif user_preferences and isinstance(user_preferences.get(PREF_KEY_NEWS_CATEGORY), str) and user_preferences[PREF_KEY_NEWS_CATEGORY]:
-        # Fallback to a single preferred news category if multiple preferred_categories list is not available
         query_for_tda = user_preferences[PREF_KEY_NEWS_CATEGORY]
         logger.info(f"CPOA: {function_name} - Using user preferred news category for TDA query: '{query_for_tda}'")
     else:
-        # Select a random keyword from defaults if no specific user preference is applicable
-        # To make it somewhat dynamic, let's pick one, or a combination
-        if limit == 1 and len(default_keywords) > 0: # if only one snippet, pick one specific keyword
+        if limit == 1 and len(default_keywords) > 0:
             query_for_tda = random.choice(default_keywords)
-        else: # for multiple snippets, try to get a broader mix
-            query_for_tda = " ".join(random.sample(default_keywords, min(len(default_keywords), 3))) # Mix of 3 random keywords
+        else:
+            query_for_tda = " ".join(random.sample(default_keywords, min(len(default_keywords), 3)))
         logger.info(f"CPOA: {function_name} - No specific user preferences for categories found. Using default query for TDA: '{query_for_tda}'")
 
-    if not query_for_tda: # Should not happen if default_keywords is populated
-        logger.error(f"CPOA: {function_name} - Query for TDA is empty. Cannot proceed.")
+    if not query_for_tda: # Should not happen if default_keywords is populated and limit > 0
+        logger.error(f"CPOA: {function_name} - Query for TDA is empty. Cannot proceed (limit: {limit}).")
+        # This case should ideally be prevented by limit validation and default keyword logic
         return {"error": "TDA_QUERY_EMPTY", "details": "Failed to construct a query for TDA.", "snippets": []}
 
     # Call TDA Service

@@ -90,23 +90,58 @@ def synthesize_speech():
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Invalid JSON payload: {str(e)}"}}), 400
 
     text_to_synthesize = data.get("text")
-    if not text_to_synthesize:
-        logger.warning(f"Request {request_id}: Missing 'text' in request payload.")
-        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Missing 'text' in request payload."}}), 400
+    # Validate text
+    if not text_to_synthesize or not isinstance(text_to_synthesize, str) or not text_to_synthesize.strip():
+        logger.warning(f"Request {request_id}: Validation failed: 'text' must be a non-empty string.")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'text' must be a non-empty string."}}), 400
 
-    voice_id = data.get("voice_id", AIMS_TTS_DEFAULT_VOICE_ID)
-    language_code = data.get("language_code", AIMS_TTS_DEFAULT_LANGUAGE_CODE) # Assuming voice_id implies language, or allow separate
+    # Google TTS character limit is often around 5000. This is a soft check.
+    # The API itself will return an error if it's too long.
+    TEXT_MAX_LENGTH = 5000
+    if len(text_to_synthesize) > TEXT_MAX_LENGTH:
+        logger.warning(f"Request {request_id}: Validation failed: 'text' length ({len(text_to_synthesize)}) exceeds max ({TEXT_MAX_LENGTH}).")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Validation failed: 'text' length exceeds maximum of {TEXT_MAX_LENGTH} characters."}}), 400
+
+    voice_id_req = data.get("voice_id")
+    if voice_id_req is not None and not isinstance(voice_id_req, str):
+        logger.warning(f"Request {request_id}: Validation failed: 'voice_id' must be a string if provided.")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'voice_id' must be a string if provided."}}), 400
+    voice_id = voice_id_req if voice_id_req else AIMS_TTS_DEFAULT_VOICE_ID
+
+    language_code_req = data.get("language_code")
+    if language_code_req is not None:
+        if not isinstance(language_code_req, str) or not language_code_req.strip():
+            logger.warning(f"Request {request_id}: Validation failed: 'language_code' must be a non-empty string if provided.")
+            return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "Validation failed: 'language_code' must be a non-empty string if provided."}}), 400
+        # Optional: Add pattern check e.g. r"^[a-z]{2,3}(-[A-Z]{2,3})?$" for language codes
+    language_code = language_code_req if language_code_req else AIMS_TTS_DEFAULT_LANGUAGE_CODE
+
     output_format_str = data.get("audio_format", AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR).upper()
-    speech_rate = float(data.get("speech_rate", AIMS_TTS_DEFAULT_SPEAKING_RATE))
-    pitch = float(data.get("pitch", AIMS_TTS_DEFAULT_PITCH))
+    # Stricter validation for audio_format:
+    if output_format_str not in AUDIO_ENCODING_MAP:
+        logger.warning(f"Request {request_id}: Invalid 'audio_format' requested: {output_format_str}. Supported formats: {list(AUDIO_ENCODING_MAP.keys())}")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Unsupported audio_format: {output_format_str}. Supported formats: {list(AUDIO_ENCODING_MAP.keys())}"}}), 400
+
+    try:
+        speech_rate = float(data.get("speech_rate", AIMS_TTS_DEFAULT_SPEAKING_RATE))
+        pitch = float(data.get("pitch", AIMS_TTS_DEFAULT_PITCH))
+    except ValueError as ve:
+        logger.warning(f"Request {request_id}: Invalid type for speech_rate or pitch. Error: {ve}")
+        return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Invalid speech_rate or pitch parameter: {ve}"}}), 400
+
     # response_type = data.get("response_type", "url") # For now, only "url" is implemented
 
     # Validate and clamp parameters
     speech_rate = max(0.25, min(speech_rate, 4.0))
     pitch = max(-20.0, min(pitch, 20.0))
 
-    selected_audio_encoding_enum = AUDIO_ENCODING_MAP.get(output_format_str, DEFAULT_AUDIO_ENCODING_ENUM)
-    file_extension = output_format_str.lower() if output_format_str in AUDIO_ENCODING_MAP else AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR.lower()
+    # Stricter validation for audio_format is now done above.
+    # if output_format_str not in AUDIO_ENCODING_MAP:
+    #     logger.warning(f"Request {request_id}: Invalid 'audio_format' requested: {output_format_str}. Defaulting to {AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR}.")
+    #     output_format_str = AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR # Fallback to default
+
+    selected_audio_encoding_enum = AUDIO_ENCODING_MAP[output_format_str] # Now safe due to check or fallback
+    file_extension = output_format_str.lower()
 
 
     try:

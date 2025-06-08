@@ -76,8 +76,8 @@ flask run --host=0.0.0.0 --port=5000
 -   **Request Payload Example (JSON):**
     ```json
     {
-        "query": "artificial intelligence in education", // Optional
-        "limit": 5, // Optional
+        "query": "artificial intelligence in education", // Optional, string.
+        "limit": 5, // Optional, integer (1-50). Invalid types or out-of-range values will result in a 400 error.
         "error_trigger": null // Optional: for testing, e.g., "tda_error"
     }
     ```
@@ -109,8 +109,17 @@ flask run --host=0.0.0.0 --port=5000
     }
     ```
 -   **Error Response Examples (JSON):**
-    -   500 Internal Server Error (Simulated): `{"error_code": "TDA_SIMULATED_ERROR", "message": "...", "details": "..."}`
-    -   500 Internal Server Error (Real API call issue): May return 200 with empty topics/message, or a generic 500 for unhandled errors: `{"error_code": "INTERNAL_SERVER_ERROR_TDA", "message": "...", "details": "..."}`.
+    -   **400 Bad Request (Invalid Input):**
+        -   `{"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": "..."}`
+        -   `{"error_code": "TDA_INVALID_QUERY", "message": "Validation failed: 'query' must be a non-empty string if provided."}`
+        -   `{"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "Validation failed: 'limit' must be a valid integer."}`
+        -   `{"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "Validation failed: 'limit' must be an integer between 1 and 50."}`
+    -   **500 Internal Server Error (Simulated):**
+        -   `{"error_code": "TDA_SIMULATED_ERROR", "message": "A simulated error occurred in TDA.", "details": "..."}`
+    -   **502 Bad Gateway (NewsAPI Failure):**
+        -   `{"error_code": "TDA_NEWSAPI_FAILURE", "message": "Failed to retrieve topics from the external NewsAPI.", "details": "..."}`
+    -   **500 Internal Server Error (Generic):**
+        -   `{"error_code": "INTERNAL_SERVER_ERROR_TDA", "message": "An unexpected error occurred in the Topic Discovery Agent.", "details": "..."}`
 
 ```
 **Note on Ports:** The `main.py` for TDA defaults to port 5000 in its configuration. Ensure ports are distinct for each service in a running Aethercast deployment. This README reflects the code's current default.

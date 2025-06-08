@@ -134,14 +134,23 @@ flask run --host=0.0.0.0 --port=5004
     }
     ```
 -   **Error Response Examples (JSON):**
-    -   **400 Bad Request (Missing Parameters):**
-        ```json
-        {
-            "error_code": "PSWA_MISSING_PARAMETERS",
-            "message": "Content and topic are required.",
-            "details": "Missing required parameters: content, topic"
-        }
-        ```
+    -   **400 Bad Request (Invalid Input):**
+        - Payload not JSON or empty:
+          ```json
+          {
+              "error_code": "PSWA_MALFORMED_JSON", # or PSWA_INVALID_PAYLOAD
+              "message": "Malformed JSON payload.", # or "Invalid or empty JSON payload."
+              "details": "..."
+          }
+          ```
+        - Missing or invalid `content` or `topic`:
+          ```json
+          {
+              "error_code": "PSWA_INVALID_CONTENT", # or PSWA_INVALID_TOPIC, PSWA_CONTENT_TOO_LONG
+              "message": "Validation failed: 'content' must be a non-empty string.",
+              "details": "'content' must be a non-empty string."
+          }
+          ```
     -   **400 Bad Request (Insufficient Content Indicated by LLM via AIMS):**
         ```json
         {

@@ -201,20 +201,20 @@ def harvest_from_url(url: str, min_length: int = 150) -> dict: # min_length defa
             logger.warning(f"[WCHA_LOGIC_WEB] Trafilatura extracted no content from URL: {url}.")
             return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
 
-    except requests.exceptions.Timeout:
+    except requests.exceptions.Timeout as e_timeout: # Specific exception type
         error_msg = f"Timeout after {request_timeout} seconds while fetching '{url}'."
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
+        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
-    except requests.exceptions.HTTPError as e_http:
+    except requests.exceptions.HTTPError as e_http: # Specific exception type
         error_msg = f"HTTP Status {e_http.response.status_code} while fetching '{url}'."
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg} Response: {e_http.response.text[:200]}")
+        logger.error(f"[WCHA_LOGIC_WEB] {error_msg} Response: {e_http.response.text[:200]}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
-    except requests.exceptions.RequestException as e_req:
+    except requests.exceptions.RequestException as e_req: # Specific exception type
         error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url}': {e_req}"
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
+        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
-    except Exception as e_traf: # Catch potential errors from trafilatura itself
-        error_msg = f"Trafilatura processing failed for '{url}': {type(e_traf).__name__} - {e_traf}"
+    except Exception as e_traf: # Catch potential errors from trafilatura itself or other unexpected issues
+        error_msg = f"Trafilatura processing or other unexpected error for '{url}': {type(e_traf).__name__} - {e_traf}"
         logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_EXTRACTION, "error_message": error_msg}
 
@@ -251,7 +251,7 @@ def get_content_for_topic(topic: str, max_results_override: Optional[int] = None
         logger.info(f"[WCHA_SEARCH_HARVEST] Found {len(search_urls)} URLs for topic '{topic}': {search_urls}")
     except Exception as e:
         error_msg = f"{ERROR_WCHA_SEARCH_FAILED} '{topic}': {type(e).__name__} - {e}."
-        logger.error(f"[WCHA_SEARCH_HARVEST] {error_msg}")
+        logger.error(f"[WCHA_SEARCH_HARVEST] {error_msg}", exc_info=True)
         return {"status": "failure", "content": None, "source_urls": [], "message": error_msg}
 
     if not search_urls:
@@ -312,9 +312,14 @@ try:
     @app.route("/harvest", methods=["POST"]) # Renamed endpoint
     def harvest_api_endpoint():
         try:
-            request_data = flask.request.get_json()
-            if not request_data:
-                return flask.jsonify({"error_code": "WCHA_INVALID_PAYLOAD", "message": "Invalid or missing JSON payload."}), 400 # Standardized error
+            try:
+                request_data = flask.request.get_json()
+                if not request_data: # Handles cases where request_data is None
+                    logger.warning("[WCHA_API] Received empty or non-JSON payload for /harvest.")
+                    return flask.jsonify({"error_code": "WCHA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
+            except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
+                logger.warning(f"[WCHA_API] Failed to decode JSON payload for /harvest: {e_json_decode}", exc_info=True)
+                return flask.jsonify({"error_code": "WCHA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
 
             topic = request_data.get("topic")
             url_to_harvest = request_data.get("url")

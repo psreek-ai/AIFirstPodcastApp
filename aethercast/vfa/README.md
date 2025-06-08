@@ -127,10 +127,23 @@ This includes `Flask`, `requests` (for AIMS_TTS calls), and `python-dotenv`. The
     }
     ```
 -   **Error Response Examples (JSON):**
-    -   **400 Bad Request (e.g., Missing `script`):**
-        ```json
-        {"error_code": "VFA_VALIDATION_ERROR", "message": "Invalid input", "details": "Missing 'script' parameter"}
-        ```
+    -   **400 Bad Request (Invalid Input):**
+        - Missing or invalid JSON payload:
+          ```json
+          {"error_code": "VFA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": "..."}
+          ```
+        - Missing `script` payload or invalid basic structure:
+          ```json
+          {"error_code": "VFA_INVALID_SCRIPT_PAYLOAD", "message": "Validation failed: 'script' must be a non-empty JSON object."}
+          ```
+        - Invalid field within `script` (e.g., `script_id`):
+          ```json
+          {"error_code": "VFA_INVALID_SCRIPT_SCRIPT_ID", "message": "Validation failed: 'script.script_id' is missing or invalid."}
+          ```
+        - Invalid field within `voice_params` (e.g., `speaking_rate`):
+          ```json
+          {"error_code": "VFA_INVALID_SPEAKING_RATE", "message": "Validation failed: 'voice_params.speaking_rate' must be a float."}
+          ```
     -   **502 Bad Gateway (Problem with AIMS_TTS call):**
         ```json
         {

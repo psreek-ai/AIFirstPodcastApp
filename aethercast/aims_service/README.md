@@ -12,11 +12,11 @@ The AIMS (AI Model Service) acts as a centralized gateway for interacting with L
 -   **URL Path:** `/v1/generate`
 -   **Description:** Receives a prompt and other parameters, calls the configured Google Cloud Vertex AI LLM (e.g., a Gemini model), and returns the generated text along with metadata.
 -   **Request Payload (JSON):**
-    *   `prompt` (string, required): The textual prompt for the LLM.
-    *   `model_id_override` (string, optional): Specify a Google LLM model ID (e.g., "gemini-1.5-pro-preview-0409") to use instead of the service's default. Also accepts `model`.
-    *   `max_tokens` (integer, optional): Maximum tokens to generate. Defaults to a model-specific value or a service default (e.g., 2048 for Gemini Pro).
-    *   `temperature` (float, optional): Sampling temperature. Defaults to a service/model default (e.g., 0.7).
-    *   `response_format` (object, optional): Specify desired output format. For JSON output from compatible models, use `{"type": "json_object"}`.
+    *   `prompt` (string, required): The textual prompt for the LLM. Must be a non-empty string.
+    *   `model_id_override` (string, optional): Specify a Google LLM model ID (e.g., "gemini-1.5-pro-preview-0409") to use instead of the service's default. Also accepts `model`. If provided, must be a string.
+    *   `max_tokens` (integer, optional): Maximum tokens to generate. Must be a positive integer if provided. Defaults to a model-specific value or a service default (e.g., 2048 for Gemini Pro). Invalid values result in a 400 error.
+    *   `temperature` (float, optional): Sampling temperature. Must be a float between 0.0 and 2.0 (inclusive) if provided. Defaults to a service/model default (e.g., 0.7). Invalid values result in a 400 error.
+    *   `response_format` (object, optional): Specify desired output format. Must be an object if provided. For JSON output from compatible models, use `{"type": "json_object"}`. The `type` field, if present, must be a string. Invalid structures result in a 400 error.
     *   *(For more details on the API contract, refer to `aethercast/aims/llm_api_placeholder.md` which defines the intended stable interface AIMS provides.)*
 -   **Success Response (JSON):**
     *   `request_id` (string): Unique ID for the request.
@@ -30,8 +30,13 @@ The AIMS (AI Model Service) acts as a centralized gateway for interacting with L
         *   `total_tokens` (integer): Total tokens processed.
     *   *(Refer to `aethercast/aims/llm_api_placeholder.md` for the detailed response structure.)*
 -   **Error Responses (JSON):**
-    *   Structured JSON errors are returned for issues like configuration problems, invalid requests, or errors from the Vertex AI service. Example: `{"request_id": "...", "error": {"type": "google_vertex_ai_error", "message": "Details..."}}`.
-    *   Specific error types exist for `configuration_error`, `invalid_request_error`, `generation_blocked_safety`, and various `google_vertex_ai_*` errors.
+    *   Structured JSON errors are returned for issues like configuration problems, invalid requests, or errors from the Vertex AI service.
+    *   **400 Bad Request:** Returned for issues like missing `prompt`, invalid types for parameters (e.g., `max_tokens` not an integer, `temperature` not a float), or values out of allowed range (e.g., `max_tokens` not positive, `temperature` outside 0.0-2.0). The error response will typically look like: `{"request_id": "...", "error": {"type": "invalid_request_error", "message": "Validation failed: <specific_reason>"}}`.
+    *   **403 Forbidden:** May be returned by Vertex AI for permission issues.
+    *   **429 Too Many Requests:** May be returned by Vertex AI if rate limits are exceeded.
+    *   **500 Internal Server Error:** For unexpected errors within AIMS or non-specific errors from Vertex AI.
+    *   **503 Service Unavailable:** If Vertex AI is unavailable or if AIMS is not configured correctly.
+    *   Specific error types also exist for `configuration_error`, `generation_blocked_safety`, and various `google_vertex_ai_*` errors.
 
 ## Configuration
 

@@ -31,8 +31,24 @@ IGA_MODEL_VERSION = "iga-placeholder-v0.1"
 @app.route("/generate_image", methods=["POST"])
 def generate_image_endpoint():
     try:
-        data = request.get_json()
-        if not data or "prompt" not in data or not data["prompt"]:
+        try:
+            data = request.get_json()
+            if not data: # Handles cases where data is None (e.g. empty body with correct content-type)
+                logging.warning("IGA: Bad request to /generate_image: Invalid or empty JSON payload.")
+                return jsonify({
+                    "error_code": "IGA_INVALID_PAYLOAD",
+                    "message": "Invalid or empty JSON payload.",
+                    "details": "Request body must be a valid non-empty JSON object."
+                }), 400
+        except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
+            logging.warning(f"IGA: Failed to decode JSON payload for /generate_image: {e_json_decode}", exc_info=True)
+            return jsonify({
+                "error_code": "IGA_MALFORMED_JSON",
+                "message": "Malformed JSON payload.",
+                "details": str(e_json_decode)
+            }), 400
+
+        if "prompt" not in data or not data["prompt"]: # Check after confirming data is a dict
             logging.warning("IGA: Bad request to /generate_image: Missing or empty 'prompt'.")
             return jsonify({
                 "error_code": "IGA_BAD_REQUEST_PROMPT_MISSING",

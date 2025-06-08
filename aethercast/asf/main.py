@@ -186,29 +186,38 @@ def notify_new_audio():
     Internal endpoint for other services (like VFA) to notify ASF about new audio files.
     Expects JSON: {"stream_id": "...", "filepath": "..."}
     """
-    data = request.get_json()
-    if not data:
-        logger.error("ASF_NOTIFY: Received empty payload for /notify_new_audio")
+    try:
+        data = request.get_json()
+        if not data:
+            logger.error("ASF_NOTIFY: Received empty or non-JSON payload for /notify_new_audio")
+            return jsonify({
+                "error_code": "ASF_NOTIFY_INVALID_PAYLOAD",
+                "message": "Request payload is missing or not valid JSON.",
+                "details": "Payload must be a valid non-empty JSON object."
+            }), 400
+    except Exception as e_json:
+        logger.error(f"ASF_NOTIFY: Error decoding JSON for /notify_new_audio: {e_json}", exc_info=True)
         return jsonify({
-            "error_code": "ASF_NOTIFY_NO_PAYLOAD",
-            "message": "Request payload is missing or not valid JSON.",
-            "details": "No JSON payload received"
+            "error_code": "ASF_NOTIFY_MALFORMED_JSON",
+            "message": "Malformed JSON payload.",
+            "details": str(e_json)
         }), 400
 
     stream_id = data.get('stream_id')
     filepath = data.get('filepath')
 
-    if not stream_id or not filepath:
-        missing_params = []
-        if not stream_id:
-            missing_params.append('stream_id')
-        if not filepath:
-            missing_params.append('filepath')
-        logger.error(f"ASF_NOTIFY: Missing parameters in /notify_new_audio: {', '.join(missing_params)}. Payload: {data}")
+    if not stream_id or not isinstance(stream_id, str) or not stream_id.strip():
+        logger.error(f"ASF_NOTIFY: Invalid or missing 'stream_id'. Payload: {data}")
         return jsonify({
-            "error_code": "ASF_NOTIFY_MISSING_PARAMETERS",
-            "message": "Required parameters are missing for audio notification.",
-            "details": f"Missing required parameters: {', '.join(missing_params)}"
+            "error_code": "ASF_NOTIFY_INVALID_STREAM_ID",
+            "message": "Validation failed: 'stream_id' must be a non-empty string."
+        }), 400
+
+    if not filepath or not isinstance(filepath, str) or not filepath.strip():
+        logger.error(f"ASF_NOTIFY: Invalid or missing 'filepath'. Payload: {data}")
+        return jsonify({
+            "error_code": "ASF_NOTIFY_INVALID_FILEPATH",
+            "message": "Validation failed: 'filepath' must be a non-empty string."
         }), 400
 
     # Store the mapping
@@ -220,7 +229,8 @@ def notify_new_audio():
     # For now, just storing the path is sufficient.
 
     return jsonify({"message": "Notification received successfully", "stream_id": stream_id}), 200
-
+    # No specific try-except Exception here as most logic is simple dict access after JSON parsing.
+    # Flask's default error handling or a potential @app.errorhandler would catch deeper issues.
 
 # --- UI Update Namespace Handlers ---
 @socketio.on('connect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE) # Use lambda to access config post-init
@@ -253,29 +263,38 @@ def send_ui_update():
     Internal endpoint for CPOA to send UI updates to specific clients.
     Expects JSON: {"client_id": "...", "event_name": "...", "data": {...}}
     """
-    payload = request.get_json()
-    if not payload:
-        logger.error("ASF_SEND_UI: Received empty payload for /send_ui_update")
+    try:
+        payload = request.get_json()
+        if not payload:
+            logger.error("ASF_SEND_UI: Received empty or non-JSON payload for /send_ui_update")
+            return jsonify({
+                "error_code": "ASF_SENDUI_INVALID_PAYLOAD",
+                "message": "Request payload is missing or not valid JSON for sending UI update.",
+                "details": "Payload must be a valid non-empty JSON object."
+            }), 400
+    except Exception as e_json:
+        logger.error(f"ASF_SEND_UI: Error decoding JSON for /send_ui_update: {e_json}", exc_info=True)
         return jsonify({
-            "error_code": "ASF_SENDUI_NO_PAYLOAD",
-            "message": "Request payload is missing or not valid JSON for sending UI update.",
-            "details": "No JSON payload received"
+            "error_code": "ASF_SENDUI_MALFORMED_JSON",
+            "message": "Malformed JSON payload.",
+            "details": str(e_json)
         }), 400
 
     client_id = payload.get('client_id')
     event_name = payload.get('event_name')
-    event_data = payload.get('data')
+    event_data = payload.get('data') # data field presence is checked, its content can be anything (null, object, etc.)
 
-    if not all([client_id, event_name, event_data is not None]): # event_data can be an empty dict
-        missing_params = [p for p, v in {"client_id": client_id, "event_name": event_name, "data": event_data}.items() if v is None] # Check for None specifically for data if it can be empty dict
-        if event_data is None and "data" not in missing_params : missing_params.append("data")
+    if not client_id or not isinstance(client_id, str) or not client_id.strip():
+        logger.error(f"ASF_SEND_UI: Invalid or missing 'client_id'. Payload: {payload}")
+        return jsonify({"error_code": "ASF_SENDUI_INVALID_CLIENT_ID", "message": "Validation failed: 'client_id' must be a non-empty string."}), 400
 
-        logger.error(f"ASF_SEND_UI: Missing parameters in /send_ui_update: {', '.join(missing_params)}. Payload: {payload}")
-        return jsonify({
-            "error_code": "ASF_SENDUI_MISSING_PARAMETERS",
-            "message": "Required parameters are missing for sending UI update.",
-            "details": f"Missing required parameters: {', '.join(missing_params)}"
-        }), 400
+    if not event_name or not isinstance(event_name, str) or not event_name.strip():
+        logger.error(f"ASF_SEND_UI: Invalid or missing 'event_name'. Payload: {payload}")
+        return jsonify({"error_code": "ASF_SENDUI_INVALID_EVENT_NAME", "message": "Validation failed: 'event_name' must be a non-empty string."}), 400
+
+    if 'data' not in payload: # Check for presence of 'data' key explicitly
+        logger.error(f"ASF_SEND_UI: Missing 'data' field. Payload: {payload}")
+        return jsonify({"error_code": "ASF_SENDUI_MISSING_DATA", "message": "Validation failed: 'data' field is required."}), 400
 
     if not ASF_UI_UPDATES_NAMESPACE: # Ensure namespace is loaded
         logger.error("ASF_SEND_UI: ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message.")
@@ -296,7 +315,14 @@ def send_ui_update():
             "message": "Failed to emit SocketIO event for UI update.",
             "details": str(e)
         }), 500
-
+    # Broader exception for the overall endpoint logic, though most specific errors are handled.
+    except Exception as e_general:
+        logger.error(f"ASF_SEND_UI: Unexpected error in /send_ui_update endpoint: {e_general}", exc_info=True)
+        return jsonify({
+            "error_code": "ASF_SENDUI_UNEXPECTED_ERROR",
+            "message": "An unexpected server error occurred.",
+            "details": str(e_general)
+        }), 500
 
 if __name__ == '__main__':
     # Set the namespace globally after config is loaded and before app runs

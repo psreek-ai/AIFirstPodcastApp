@@ -41,6 +41,7 @@ Then, edit the `.env` file. The following variables are used:
     -   *Default:* `0.7`
 -   `USE_REAL_LLM_SERVICE`: Set to `true` to use a real LLM (via AIMS); `false` for simulated placeholder responses (bypasses AIMS).
     -   *Default:* `false`
+    -   *Note on placeholder mode (when `false`):* The placeholder generates snippet titles and content directly based on the `content_brief` and `keywords` from the `topic_info` in the request. This provides a more consistent and cleaner simulated response compared to older parsing-based placeholder behavior.
 
 **Flask Application Parameters:**
 -   `SCA_HOST` / `FLASK_RUN_HOST`: Host for the Flask development server.
