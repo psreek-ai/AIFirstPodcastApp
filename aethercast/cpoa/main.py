@@ -9,6 +9,7 @@ import uuid
 from typing import Optional, Dict, Any, List
 import requests # Added for service calls
 import time # Added for retry logic
+import random # Added for landing page snippet keyword randomization
 
 # Ensure the 'aethercast' directory is in the Python path.
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -699,9 +700,9 @@ def _save_snippet_to_db(snippet_object: dict, db_path: str):
             INSERT OR REPLACE INTO topics_snippets (
                 id, type, title, summary, keywords,
                 source_url, source_name, original_topic_details,
-                llm_model_used_for_snippet, cover_art_prompt,
+                llm_model_used_for_snippet, cover_art_prompt, image_url,
                 generation_timestamp, last_accessed_timestamp, relevance_score
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snippet_object.get("snippet_id"),
@@ -714,6 +715,7 @@ def _save_snippet_to_db(snippet_object: dict, db_path: str):
                 original_topic_details_json,
                 snippet_object.get("llm_model_used"),
                 snippet_object.get("cover_art_prompt"),
+                snippet_object.get("image_url"), # Added image_url
                 snippet_object.get("generation_timestamp", current_ts),
                 current_ts, # last_accessed_timestamp
                 relevance_score
@@ -1243,6 +1245,120 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
 
     logger.info(f"CPOA: Successfully generated {successful_snippet_generations} snippets for search query '{query}' out of {len(discovered_topics)} topics found.")
     return {"search_results": search_results_snippets}
+
+
+def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional[dict] = None) -> Dict[str, Any]:
+    """
+    Orchestrates the generation of snippets for the landing page by discovering diverse topics
+    via TDA and then generating a snippet for each relevant topic using SCA.
+    """
+    function_name = "orchestrate_landing_page_snippets"
+    logger.info(f"CPOA: {function_name} called with limit: {limit}, user_preferences: {user_preferences}")
+
+    default_keywords = ["technology", "science", "lifestyle", "business", "arts", "global news", "innovation", "culture"]
+    query_for_tda = None
+
+    if user_preferences and isinstance(user_preferences.get("preferred_categories"), list) and user_preferences["preferred_categories"]:
+        query_for_tda = " ".join(user_preferences["preferred_categories"])
+        logger.info(f"CPOA: {function_name} - Using user preferred categories for TDA query: '{query_for_tda}'")
+    elif user_preferences and isinstance(user_preferences.get(PREF_KEY_NEWS_CATEGORY), str) and user_preferences[PREF_KEY_NEWS_CATEGORY]:
+        # Fallback to a single preferred news category if multiple preferred_categories list is not available
+        query_for_tda = user_preferences[PREF_KEY_NEWS_CATEGORY]
+        logger.info(f"CPOA: {function_name} - Using user preferred news category for TDA query: '{query_for_tda}'")
+    else:
+        # Select a random keyword from defaults if no specific user preference is applicable
+        # To make it somewhat dynamic, let's pick one, or a combination
+        if limit == 1 and len(default_keywords) > 0: # if only one snippet, pick one specific keyword
+            query_for_tda = random.choice(default_keywords)
+        else: # for multiple snippets, try to get a broader mix
+            query_for_tda = " ".join(random.sample(default_keywords, min(len(default_keywords), 3))) # Mix of 3 random keywords
+        logger.info(f"CPOA: {function_name} - No specific user preferences for categories found. Using default query for TDA: '{query_for_tda}'")
+
+    if not query_for_tda: # Should not happen if default_keywords is populated
+        logger.error(f"CPOA: {function_name} - Query for TDA is empty. Cannot proceed.")
+        return {"error": "TDA_QUERY_EMPTY", "details": "Failed to construct a query for TDA.", "snippets": []}
+
+    # Call TDA Service
+    tda_topics = []
+    tda_limit = limit * 2 # Fetch more topics from TDA to have a buffer for snippet generation
+    if not TDA_SERVICE_URL:
+        logger.error(f"CPOA: {function_name} - TDA_SERVICE_URL is not configured.")
+        return {"error": "TDA_CONFIG_ERROR", "details": "TDA_SERVICE_URL not set.", "snippets": []}
+
+    tda_payload = {"query": query_for_tda, "limit": tda_limit}
+    logger.info(f"CPOA: {function_name} - Calling TDA service with payload: {tda_payload}")
+
+    try:
+        response = requests_with_retry("post", TDA_SERVICE_URL,
+                                       max_retries=CPOA_SERVICE_RETRY_COUNT,
+                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                       json=tda_payload, timeout=30)
+        tda_data = response.json()
+        tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", []))
+        logger.info(f"CPOA: {function_name} - TDA returned {len(tda_topics)} topics for query '{query_for_tda}'.")
+
+        if not tda_topics:
+            logger.warning(f"CPOA: {function_name} - TDA returned no topics for query '{query_for_tda}'.")
+            return {"message": "TDA_NO_TOPICS_FOUND", "details": f"No topics found by TDA for query: {query_for_tda}", "snippets": []}
+
+    except requests.exceptions.RequestException as e_req:
+        error_msg = f"CPOA: {function_name} - TDA service call failed: {e_req}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": "TDA_FAILURE", "details": str(e_req), "snippets": []}
+    except json.JSONDecodeError as e_json:
+        response_text_preview = "N/A"
+        if 'response' in locals() and hasattr(response, 'text'):
+            response_text_preview = response.text[:200]
+        error_msg = f"CPOA: {function_name} - Failed to decode TDA response: {e_json}. Response preview: {response_text_preview}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": "TDA_RESPONSE_INVALID_JSON", "details": str(e_json), "snippets": []}
+    except Exception as e_gen_tda:
+        error_msg = f"CPOA: {function_name} - Unexpected error during TDA call: {e_gen_tda}"
+        logger.error(error_msg, exc_info=True)
+        return {"error": "TDA_UNEXPECTED_ERROR", "details": str(e_gen_tda), "snippets": []}
+
+    generated_snippets: List[Dict[str, Any]] = []
+    for topic_obj in tda_topics:
+        if len(generated_snippets) >= limit:
+            break # Stop if we have reached the desired number of snippets
+
+        if not isinstance(topic_obj, dict):
+            logger.warning(f"CPOA: {function_name} - Skipping non-dictionary topic object from TDA: {topic_obj}")
+            continue
+
+        topic_info_for_sca = {
+            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id"),
+            "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"),
+            "summary": topic_obj.get("summary"),
+            "keywords": topic_obj.get("keywords", []),
+            "original_topic_details_from_tda": topic_obj
+        }
+
+        if not topic_info_for_sca["title_suggestion"]:
+            logger.warning(f"CPOA: {function_name} - Skipping TDA topic due to missing title/title_suggestion. Topic: {topic_obj}")
+            continue
+
+        logger.info(f"CPOA: {function_name} - Attempting to generate snippet for topic: '{topic_info_for_sca['title_suggestion']}'")
+        try:
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
+            if snippet_result and "error" not in snippet_result:
+                generated_snippets.append(snippet_result)
+                logger.info(f"CPOA: {function_name} - Successfully generated snippet for topic: '{topic_info_for_sca['title_suggestion']}'")
+            else:
+                err_detail = "Unknown SCA error"
+                if snippet_result:
+                    err_detail = snippet_result.get('details', snippet_result.get('error', err_detail))
+                logger.warning(f"CPOA: {function_name} - Snippet generation failed for topic: '{topic_info_for_sca['title_suggestion']}'. Error: {err_detail}")
+        except Exception as e_sca_orch:
+            logger.error(f"CPOA: {function_name} - Unexpected error calling orchestrate_snippet_generation for topic '{topic_info_for_sca['title_suggestion']}': {e_sca_orch}", exc_info=True)
+
+    if not generated_snippets:
+        logger.info(f"CPOA: {function_name} - No snippets could be generated after processing {len(tda_topics)} TDA topics.")
+        return {"message": "NO_SNIPPETS_GENERATED", "details": "Failed to generate any snippets from the discovered topics.", "snippets": []}
+
+    logger.info(f"CPOA: {function_name} - Successfully generated {len(generated_snippets)} snippets for landing page.")
+    return {"snippets": generated_snippets, "source": "generation"}
+
 
 def get_popular_categories() -> Dict[str, Any]:
     """

@@ -25,12 +25,12 @@ It is called by the Central Podcast Orchestrator Agent (CPOA) when a `cover_art_
 -   **Success Response (200 OK) (JSON):**
     ```json
     {
-        "image_url": "https://source.unsplash.com/random/400x225/?abstract,podcast",
+        "image_url": "https://source.unsplash.com/random/400x225/?keyword1,keyword2,theme,podcast,abstract",
         "prompt_used": "The prompt that was processed by the placeholder",
         "model_version": "iga-placeholder-v0.1"
     }
     ```
-    -   `image_url` (string): A URL to a placeholder image. This placeholder might return a random image fitting a general theme.
+    -   `image_url` (string): A URL to a placeholder image from Unsplash. The URL is dynamically constructed using keywords from the prompt (first few words), a randomly selected theme (e.g., "tech", "news", "audio"), and default terms like "podcast" and "abstract" to provide some visual variety.
     -   `prompt_used` (string): The prompt string that was received and processed by the placeholder.
     -   `model_version` (string): An identifier for the placeholder model.
 

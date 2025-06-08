@@ -18,8 +18,10 @@ Key responsibilities include:
         -   Returns a list of these generated snippets.
     -   **Landing Page Snippet Orchestration (`orchestrate_landing_page_snippets`):**
         -   Orchestrates the generation of multiple diverse snippets for the application's landing page.
-        -   Conceptually, this function would call TDA for topics and then `orchestrate_snippet_generation` for each.
-        -   **Note: While `orchestrate_landing_page_snippets` is a key conceptual function expected by other parts of the system (like the API Gateway for the `/api/v1/snippets` endpoint), its implementation is currently **missing** in `aethercast/cpoa/main.py`. The API Gateway has a placeholder for its import.**
+        -   It calls the Topic Discovery Agent (TDA) to fetch a list of diverse topics based on general keywords or user preferences.
+        -   For each relevant topic from TDA, it then calls `orchestrate_snippet_generation` (which internally calls SCA for text and IGA for an image URL) to create a complete snippet.
+        -   The function returns a list of these fully generated snippets, ready for display on the landing page.
+        -   This function is implemented in `aethercast/cpoa/main.py` and used by the API Gateway's `/api/v1/snippets` endpoint.
     -   **Popular Category Provisioning (`get_popular_categories`):**
         -   Provides a predefined list of popular podcast categories.
 -   **Task State Management:** Updates the status of podcast generation tasks in the `podcasts` table of a shared database.
@@ -66,8 +68,8 @@ Formal unit tests are in `aethercast/cpoa/tests/`. Run with `python -m unittest 
 -   CPOA updates the `podcasts` table for task tracking.
 -   **Snippet Data Persistence:**
     -   The `orchestrate_snippet_generation` function calls SCA and IGA. The `image_url` obtained from IGA is part of the returned `SnippetDataObject`.
-    -   The helper `_save_snippet_to_db` saves snippet information (title, summary, text, cover_art_prompt, etc.) to the `topics_snippets` table.
-    -   **Important:** The `image_url` fetched from IGA is **not currently saved** to the `topics_snippets` table by `_save_snippet_to_db`. This is due to the `topics_snippets` table schema lacking an `image_url` column. While CPOA can provide the `image_url` to the API Gateway for immediate use (e.g., in search results or newly generated snippets), this URL will not be available if the snippet data were to be re-fetched solely from the database at a later time.
+    -   The helper `_save_snippet_to_db` saves snippet information (title, summary, text, cover_art_prompt, `image_url`, etc.) to the `topics_snippets` table.
+    -   The `topics_snippets` table schema has been updated to include an `image_url TEXT` column, and the `_save_snippet_to_db` function now correctly persists the `image_url` obtained from IGA. This ensures that the image URL is available if snippet data is re-fetched from the database.
 -   CPOA functions accept `task_id`, `db_path`, and optional `voice_params_input`, `client_id`, `user_preferences`, and `test_scenarios`.
 -   `user_preferences` can influence agent calls (e.g., preferred VFA voice).
 -   `test_scenarios` allow passing headers like `X-Test-Scenario` to downstream services for testing.

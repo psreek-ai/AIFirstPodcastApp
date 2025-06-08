@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS topics_snippets (
     original_topic_details TEXT,
     llm_model_used_for_snippet TEXT,
     cover_art_prompt TEXT,
+    image_url TEXT,
     generation_timestamp TEXT NOT NULL,
     last_accessed_timestamp TEXT,
     relevance_score REAL

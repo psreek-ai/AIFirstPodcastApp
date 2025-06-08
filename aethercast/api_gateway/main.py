@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS topics_snippets (
     original_topic_details TEXT,
     llm_model_used_for_snippet TEXT,
     cover_art_prompt TEXT,
+    image_url TEXT,
     generation_timestamp TEXT NOT NULL,
     last_accessed_timestamp TEXT,
     relevance_score REAL
@@ -571,32 +572,138 @@ def get_categories_endpoint():
 # --- Topic Exploration Endpoint ---
 @app.route('/api/v1/topics/explore', methods=['POST'])
 def explore_topic():
-    # ... (existing topic exploration logic - can be kept as is)
     app.logger.info("Request received for /api/v1/topics/explore")
-    if not cpoa_exploration_func_imported:
-        app.logger.error("CPOA topic exploration function not available.")
-        return jsonify({"error_code": "API_GW_CPOA_EXPLORE_SERVICE_UNAVAILABLE", "message": "Topic exploration service is currently unavailable.", "details": "CPOA topic exploration function not available."}), 503
 
-    # TODO: Add payload validation (e.g., for keywords or topic_id) when fully implemented
-    # data = request.get_json()
-    # current_topic_id = data.get("current_topic_id")
-    # keywords = data.get("keywords")
-    # if not current_topic_id and not keywords:
-    #    return jsonify({"error_code": "API_GW_EXPLORE_INPUT_REQUIRED", "message": "Either current_topic_id or keywords must be provided.", "details": "Missing input for topic exploration."}), 400
+    if not cpoa_exploration_func_imported:
+        app.logger.error("CPOA topic exploration function (cpoa_exploration_func_imported) is not available.")
+        return jsonify({
+            "error_code": "API_GW_CPOA_EXPLORE_SERVICE_UNAVAILABLE",
+            "message": "Topic exploration service is currently unavailable.",
+            "details": "CPOA topic exploration function (orchestrate_topic_exploration) is not available."
+        }), 503
+
+    data = request.get_json()
+    if not data:
+        app.logger.warning("Bad request to /api/v1/topics/explore: Missing JSON payload.")
+        return jsonify({
+            "error_code": "API_GW_EXPLORE_PAYLOAD_REQUIRED",
+            "message": "Request payload is required.",
+            "details": "Missing JSON request body."
+        }), 400
+
+    current_topic_id = data.get("current_topic_id")
+    keywords = data.get("keywords") # Expected to be a list of strings
+    depth_mode = data.get("depth_mode", "deeper") # Default to "deeper"
+    client_id = data.get("client_id")
+
+    # Validate input: current_topic_id or keywords must be provided
+    if not current_topic_id and not keywords:
+        app.logger.warning("Bad request to /api/v1/topics/explore: Neither 'current_topic_id' nor 'keywords' provided.")
+        return jsonify({
+            "error_code": "API_GW_EXPLORE_INPUT_REQUIRED",
+            "message": "Either 'current_topic_id' or 'keywords' must be provided for topic exploration.",
+            "details": "Missing 'current_topic_id' and 'keywords'. One or both are required."
+        }), 400
+
+    if keywords is not None and not isinstance(keywords, list):
+        app.logger.warning(f"Bad request to /api/v1/topics/explore: 'keywords' provided but not as a list. Received: {keywords}")
+        return jsonify({
+            "error_code": "API_GW_EXPLORE_INVALID_KEYWORDS_TYPE",
+            "message": "'keywords' must be a list of strings.",
+            "details": f"Invalid type for 'keywords': expected list, got {type(keywords).__name__}."
+        }), 400
+
+
+    user_preferences = None
+    if client_id:
+        conn_prefs = None
+        try:
+            conn_prefs = get_db_connection()
+            session_data = _get_session(conn_prefs, client_id)
+            if session_data and session_data["preferences_json"]:
+                user_preferences = json.loads(session_data["preferences_json"])
+                app.logger.info(f"Fetched preferences for client_id {client_id} for topic exploration: {user_preferences}")
+                _touch_session_last_seen(conn_prefs, client_id)
+            elif not session_data: # Session does not exist, create it with empty preferences
+                _create_session(conn_prefs, client_id) # Will create with "{}"
+                app.logger.info(f"No session found for client_id {client_id} during topic exploration. Created one.")
+                user_preferences = {} # Initialize as empty dict
+            else: # Session exists but no preferences JSON (or it's null)
+                user_preferences = {}
+                _touch_session_last_seen(conn_prefs, client_id)
+
+        except sqlite3.Error as e_prefs_sql:
+            app.logger.error(f"DB error fetching/creating preferences for client {client_id} during topic exploration: {e_prefs_sql}")
+            # Proceed without preferences if DB error occurs, CPOA can handle None
+        except json.JSONDecodeError as e_prefs_json:
+            app.logger.error(f"JSON decode error for preferences for client {client_id} during topic exploration: {e_prefs_json}")
+            user_preferences = {} # Corrupted prefs, treat as empty
+        finally:
+            if conn_prefs:
+                conn_prefs.close()
 
     try:
-        # Placeholder for actual call to CPOA's orchestrate_topic_exploration
-        # For now, just returning placeholder if function is considered imported.
-        # result = orchestrate_topic_exploration(current_topic_id=request.args.get("topic_id"), keywords=request.args.getlist("keyword"))
-        # return jsonify(result), 200
-        # This is the current placeholder logic:
-        return jsonify({"message": "Topic exploration endpoint placeholder.", "explored_topics_or_snippets": [{"id": "dummy_explored_1", "title": "Dummy Explored Topic", "summary": "Exploration result."}]}), 200
-    except ImportError: # Should be caught by the flag, but as a safeguard for direct call issues
-         app.logger.critical("CPOA topic exploration function became unavailable after initial check.", exc_info=True)
-         return jsonify({"error_code": "API_GW_CPOA_EXPLORE_MODULE_UNAVAILABLE", "message": "Topic exploration module component is critically unavailable.", "details": "CPOA topic exploration function became unavailable after initial check."}), 503
+        app.logger.info(f"Calling CPOA orchestrate_topic_exploration with topic_id: '{current_topic_id}', keywords: {keywords}, mode: '{depth_mode}', user_prefs: {user_preferences}")
+        # CPOA function expects: current_topic_id, keywords, depth_mode, user_preferences
+        cpoa_response = orchestrate_topic_exploration(
+            current_topic_id=current_topic_id,
+            keywords=keywords,
+            depth_mode=depth_mode,
+            user_preferences=user_preferences
+        )
+
+        # CPOA's orchestrate_topic_exploration is expected to return a list of snippet objects
+        # or an error structure (though the spec implies direct list or raises exception handled by CPOA)
+        # For robustness, check if it's a list. If CPOA returns an error dict, it should be handled here.
+        if isinstance(cpoa_response, dict) and "error" in cpoa_response: # Check if CPOA itself returned an error dict
+            app.logger.error(f"CPOA orchestrate_topic_exploration returned an error: {cpoa_response}")
+            # Try to map CPOA error to a client-friendly message and appropriate status code
+            error_details = cpoa_response.get("details", "Internal error during topic exploration.")
+            error_code_from_cpoa = cpoa_response.get("error", "CPOA_EXPLORATION_ERROR")
+            status_code = 500 # Default internal server error
+            if "TDA_" in error_code_from_cpoa or "SCA_" in error_code_from_cpoa or "CPOA_CONFIG_ERROR" in error_code_from_cpoa:
+                 status_code = 503 # Service unavailable for downstream issues
+
+            return jsonify({
+                "error_code": f"API_GW_CPOA_EXPLORE_ERROR_{error_code_from_cpoa.replace('.', '_').upper()}",
+                "message": "Topic exploration failed.",
+                "details": error_details
+            }), status_code
+
+        # If CPOA returns a list (expected success case)
+        if isinstance(cpoa_response, list):
+            app.logger.info(f"CPOA orchestrate_topic_exploration returned {len(cpoa_response)} explored topics/snippets.")
+            return jsonify({"explored_topics": cpoa_response}), 200
+        else:
+            # Should not happen if CPOA adheres to its contract (list of dicts or raises exception)
+            app.logger.error(f"CPOA orchestrate_topic_exploration returned an unexpected response type: {type(cpoa_response)}. Response: {cpoa_response}")
+            return jsonify({
+                "error_code": "API_GW_CPOA_EXPLORE_UNEXPECTED_RESPONSE",
+                "message": "Topic exploration service returned an unexpected response.",
+                "details": "The format of the response from the exploration service was not as expected."
+            }), 500
+
+    except ImportError: # Safeguard if the function became unavailable after the initial check
+        app.logger.critical("CPOA orchestrate_topic_exploration function became unavailable after initial check.", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_CPOA_EXPLORE_MODULE_UNAVAILABLE_RUNTIME",
+            "message": "Topic exploration module component is critically unavailable (runtime).",
+            "details": "CPOA orchestrate_topic_exploration function became unavailable after initial check."
+        }), 503
+    except ValueError as ve: # Catch specific ValueErrors, e.g. from CPOA if it raises one for bad inputs not caught here
+        app.logger.warning(f"ValueError during topic exploration: {ve}", exc_info=True)
+        return jsonify({
+            "error_code": "API_GW_EXPLORE_INVALID_INPUT_OR_STATE",
+            "message": "Invalid input or internal state issue during topic exploration.",
+            "details": str(ve)
+        }), 400 # Or 500 if it's more of an internal CPOA state issue from the ValueError
     except Exception as e:
         app.logger.error(f"Unexpected error in /api/v1/topics/explore endpoint: {e}", exc_info=True)
-        return jsonify({"error_code": "API_GW_EXPLORE_UNEXPECTED_ERROR", "message": "An unexpected error occurred during topic exploration.", "details": str(e)}), 500
+        return jsonify({
+            "error_code": "API_GW_EXPLORE_UNEXPECTED_ERROR",
+            "message": "An unexpected error occurred during topic exploration.",
+            "details": str(e)
+        }), 500
 
 # --- Search Endpoint ---
 @app.route('/api/v1/search/podcasts', methods=['POST'])

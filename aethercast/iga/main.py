@@ -1,5 +1,6 @@
 import os
 import logging
+import random # Added: For selecting random theme
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 
@@ -50,14 +51,19 @@ def generate_image_endpoint():
         sanitized_keywords = "".join(c if c.isalnum() or c == '+' else '+' for c in keywords)
         sanitized_keywords = "+".join(filter(None, sanitized_keywords.split('+'))) # Remove multiple/empty '+'
 
-        image_url = f"https://source.unsplash.com/random/400x225/?{sanitized_keywords},podcast,abstract"
+        # Add a rotating or randomly selected theme for more variety
+        themes = ["tech", "news", "discussion", "audio", "waves", "studio", "microphone"]
+        selected_theme = random.choice(themes)
 
-        # Fallback if keywords are empty after sanitization
-        if not sanitized_keywords:
-            image_url = "https://source.unsplash.com/random/400x225/?podcast,abstract"
+        base_query_keywords = "podcast,abstract," + selected_theme
 
+        if sanitized_keywords:
+            image_url = f"https://source.unsplash.com/random/400x225/?{sanitized_keywords},{base_query_keywords}"
+        else:
+            # Fallback if keywords are empty after sanitization
+            image_url = f"https://source.unsplash.com/random/400x225/?{base_query_keywords}"
 
-        logging.info(f"IGA: Returning placeholder image URL: {image_url} for prompt: '{prompt}'")
+        logging.info(f"IGA: Returning placeholder image URL: {image_url} for prompt: '{prompt}' (theme: {selected_theme})")
 
         response_data = {
             "image_url": image_url,
