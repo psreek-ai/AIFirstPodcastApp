@@ -21,9 +21,9 @@ The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts
 -   **Success Response (JSON):**
     *   `request_id` (string): A unique identifier for this synthesis request.
     *   `voice_id` (string): The voice ID that was used for the synthesis.
-    *   `audio_url` (string): The file path of the generated audio within the container's shared audio volume (e.g., `/shared_audio/aims_tts/aims-tts-req-xxxx_yyyy.mp3`). **Note: This is a file path, not an HTTP URL, intended for inter-service access via a shared volume.**
+    *   `audio_url` (string): The GCS URI of the generated audio file (e.g., `gs://your-bucket-name/audio/aims_tts/aims-tts-req-xxxx_yyyy.mp3`). This URI is used by other services (like VFA and CPOA) to access the audio.
     *   `audio_duration_seconds` (float): An estimated duration of the generated audio in seconds.
-    *   `audio_format` (string): The actual audio format (file extension) of the saved audio file (e.g., "mp3").
+    *   `audio_format` (string): The actual audio format (file extension) of the saved audio file (e.g., "mp3"), which also influences the GCS object name.
 -   **Error Responses (JSON):**
     *   **400 Bad Request:** Returned for invalid request payloads, such as:
         *   Missing or empty `text`.
@@ -65,8 +65,12 @@ Key environment variables:
     -   *Default:* `1.0`
 -   `AIMS_TTS_DEFAULT_PITCH`: Default speaking pitch if not specified.
     -   *Default:* `0.0`
--   `SHARED_AUDIO_DIR_CONTAINER`: **Required.** The directory path inside the container where generated audio files will be saved. This path should be part of a shared volume for other services to access the audio.
-    -   *Default:* `/shared_audio/aims_tts`
+-   `SHARED_AUDIO_DIR_CONTAINER`: **Deprecated.** This was previously used for saving files to a shared volume. Audio is now saved directly to Google Cloud Storage (GCS). A local temporary directory might still be used internally before uploading to GCS.
+    -   *Default:* `/shared_audio/aims_tts` (but its role has changed to a temporary location if used at all).
+-   `GCS_BUCKET_NAME`: **Required.** The name of the Google Cloud Storage bucket where generated audio files will be uploaded.
+    -   *Example:* `GCS_BUCKET_NAME=your-aethercast-audio-bucket`
+-   `AIMS_TTS_GCS_AUDIO_PREFIX`: **Required.** The prefix (folder path) within the GCS bucket where AIMS_TTS audio files will be stored.
+    -   *Default:* `audio/aims_tts/` (Ensure it ends with a `/`).
 
 ## Dependencies
 
@@ -74,6 +78,7 @@ Service dependencies are listed in `requirements.txt`:
 -   `Flask`: Web framework.
 -   `python-dotenv`: For loading environment variables from `.env` files.
 -   `google-cloud-texttospeech`: The Google Cloud Text-to-Speech client library.
+-   `google-cloud-storage`: The Google Cloud Storage client library (for uploading audio to GCS).
 
 Install dependencies using:
 ```bash
@@ -84,23 +89,25 @@ pip install -r requirements.txt
 
 To run the AIMS TTS service directly for development or testing:
 
-1.  Ensure all required environment variables are set (e.g., in an `.env` file in this directory). Crucially, `GOOGLE_APPLICATION_CREDENTIALS` must point to a valid GCP key file, and `SHARED_AUDIO_DIR_CONTAINER` must be a writable path on your local system.
-2.  Create the directory specified by `SHARED_AUDIO_DIR_CONTAINER` if it doesn't exist (e.g., `mkdir -p ./audio_files/aims_tts` and set `SHARED_AUDIO_DIR_CONTAINER=./audio_files/aims_tts`).
-3.  Execute the main script:
+    1.  Ensure all required environment variables are set (e.g., in an `.env` file in this directory). Crucially, `GOOGLE_APPLICATION_CREDENTIALS` must point to a valid GCP key file, and `GCS_BUCKET_NAME` must be set to your target bucket.
+    2.  Execute the main script:
     ```bash
     python aethercast/aims_tts_service/main.py
     ```
-    The service will typically start on `http://0.0.0.0:9000` (or as configured).
+    The service will typically start on `http://0.0.0.0:9000` (or as configured). Audio files will be uploaded to GCS.
 
 ## Docker
 
 The AIMS TTS service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
 
 -   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build aims_tts_service`.
--   **Credentials in Docker:** The `docker-compose.yml` is configured to mount a local Google Cloud credentials file into the container.
+-   **Credentials and Configuration in Docker:**
     1.  Place your GCP service account key JSON file (e.g., `gcp-credentials.json`) into the `./aethercast/aims_tts_service/` directory.
-    2.  In your `aethercast/aims_tts_service/.env` file, ensure `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path inside the container where the file will be mounted).
--   **Shared Volume for Audio:** The `docker-compose.yml` file defines a named volume `aethercast_audio_data` which is mounted to `/shared_audio` inside the `aims_tts_service` container (and other services like VFA and ASF). The `SHARED_AUDIO_DIR_CONTAINER` (defaulting to `/shared_audio/aims_tts`) will reside within this shared volume, allowing other services to access the generated audio files.
+    2.  In your `aethercast/aims_tts_service/.env` file (or `common.env` if sourced from there), ensure:
+        -   `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path inside the container where the file will be mounted).
+        -   `GCS_BUCKET_NAME` is set to your bucket name.
+        -   `AIMS_TTS_GCS_AUDIO_PREFIX` is configured as desired.
+-   **Shared Volume for Audio:** The shared volume `aethercast_audio_data` (mounted to `/shared_audio`) is no longer the primary storage for AIMS_TTS outputs. Audio is uploaded to GCS. The volume might still be used for temporary files or by other services that haven't fully migrated.
 -   **Running with Docker Compose:**
     ```bash
     docker-compose up -d aims_tts_service

@@ -13,9 +13,12 @@ Key Responsibilities:
 1.  **WebSocket Server:** Provides WebSocket endpoints for audio streaming (`/api/v1/podcasts/stream`) and UI updates (`/ui_updates`).
 2.  **Audio Stream Management:**
     *   Allows clients to `join_stream` using a unique `stream_id`.
-    *   Maintains a mapping from `stream_id` to the actual audio file path.
+    *   Maintains a mapping from `stream_id` to the audio resource identifier (which is now typically a GCS URI, e.g., `gs://bucket/audio.mp3`).
 3.  **Audio Chunk Streaming:**
-    *   Reads audio files in chunks and sends them as binary WebSocket messages (`audio_chunk`).
+    *   When a client joins a stream for a GCS URI:
+        1.  ASF calls an internal endpoint on the API Gateway (using `INTERNAL_API_GW_BASE_URL`) to obtain a short-lived signed HTTP URL for the GCS URI.
+        2.  ASF then fetches the audio content from this signed HTTP URL using a streaming GET request.
+    *   Reads audio data in chunks from the HTTP stream (or a local file for legacy/testing paths) and sends them as binary WebSocket messages (`audio_chunk`).
     *   Sends `audio_control` messages for `start_of_stream` and `end_of_stream`.
 4.  **UI Update Relaying:**
     *   Allows clients to `subscribe_to_ui_updates` for a specific `client_id`.
@@ -45,10 +48,12 @@ Key variables include:
     -   *Default:* `True`
 -   `ASF_UI_UPDATES_NAMESPACE`: The Socket.IO namespace dedicated to UI status updates and real-time event relay.
     -   *Default:* `/ui_updates`
+-   `INTERNAL_API_GW_BASE_URL`: The base URL of the API Gateway, used by ASF to make internal calls (e.g., to fetch signed URLs for GCS resources).
+    -   *Default:* `http://api_gateway:5001` (when running in Docker Compose).
 
 ## Dependencies
 
-Project dependencies are listed in `requirements.txt` (includes `Flask`, `Flask-SocketIO`, `python-dotenv`, `eventlet`). Install with `pip install -r requirements.txt`.
+Project dependencies are listed in `requirements.txt` (includes `Flask`, `Flask-SocketIO`, `python-dotenv`, `eventlet`, `requests`). Install with `pip install -r requirements.txt`.
 
 ## Running the Service
 
@@ -147,16 +152,16 @@ ASF exposes internal HTTP endpoints for other services.
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/asf/internal/notify_new_audio`
--   **Description:** Used by CPOA (after VFA generates audio) to inform ASF about the `stream_id` and `filepath` of the new audio file.
--   **Request Payload Example (JSON):** `{"stream_id": "strm_abcdef12345", "filepath": "/path/to/audio.mp3"}`
+-   **Description:** Used by CPOA (after VFA generates audio) to inform ASF about the `stream_id` and `filepath` (now a GCS URI, e.g., `gs://bucket/audio.mp3`) of the new audio resource.
+-   **Request Payload Example (JSON):** `{"stream_id": "strm_abcdef12345", "filepath": "gs://your-bucket/audio/file.mp3"}`
     -   `stream_id` (string, required): Must be a non-empty string.
-    -   `filepath` (string, required): Must be a non-empty string.
+    -   `filepath` (string, required): Must be a non-empty string, typically a GCS URI.
 -   **Success Response (200 OK - JSON):** `{"message": "Notification received successfully", "stream_id": "..."}`.
 -   **Error Responses (400 Bad Request - JSON):**
     -   `{"error_code": "ASF_NOTIFY_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": "..."}`
     -   `{"error_code": "ASF_NOTIFY_INVALID_PAYLOAD", "message": "Request payload is missing or not valid JSON.", "details": "..."}`
     -   `{"error_code": "ASF_NOTIFY_INVALID_STREAM_ID", "message": "Validation failed: 'stream_id' must be a non-empty string."}`
-    -   `{"error_code": "ASF_NOTIFY_INVALID_FILEPATH", "message": "Validation failed: 'filepath' must be a non-empty string."}`
+    -   `{"error_code": "ASF_NOTIFY_INVALID_FILEPATH", "message": "Validation failed: 'filepath' (GCS URI) must be a non-empty string."}`
 
 ### Send UI Update
 

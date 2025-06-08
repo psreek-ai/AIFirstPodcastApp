@@ -1,346 +1,350 @@
 import flask
-from flask import request, jsonify # Ensure request and jsonify are imported
+from flask import request, jsonify
 from flask_socketio import SocketIO, emit, join_room, leave_room
 import logging
 import time
-import os # Added for os.path.exists
-from dotenv import load_dotenv # Added
-import uuid # Added for default secret key
+import os
+from dotenv import load_dotenv
+import uuid
+import requests # Ensure requests is imported
 
 # --- Load Environment Variables ---
-load_dotenv() # Added
+load_dotenv()
 
 # --- ASF Configuration ---
 asf_config = {}
+
+# --- Logging Configuration (must be set up before load_asf_configuration uses logger) ---
+_temp_app_for_logger = flask.Flask(__name__)
+if _temp_app_for_logger.logger and _temp_app_for_logger.logger.name != 'root':
+    logger = _temp_app_for_logger.logger
+    logger.setLevel(logging.INFO) # Default to INFO, can be overridden by FLASK_DEBUG later
+else:
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - ASF - %(message)s')
+    logger = logging.getLogger(__name__)
 
 def load_asf_configuration():
     """Loads ASF configurations from environment variables with defaults."""
     global asf_config
     default_secret = str(uuid.uuid4())
     asf_config['ASF_SECRET_KEY'] = os.getenv('ASF_SECRET_KEY', default_secret)
-    if asf_config['ASF_SECRET_KEY'] == default_secret:
-        logger.warning(f"Using default generated ASF_SECRET_KEY: {default_secret}. Please set a persistent secret key in your environment for production.")
+    if asf_config['ASF_SECRET_KEY'] == default_secret and not os.getenv('ASF_SECRET_KEY'): # Log only if not explicitly set
+        logger.warning(f"Using default generated ASF_SECRET_KEY. Please set a persistent secret key for production.")
 
     asf_config['ASF_CORS_ALLOWED_ORIGINS'] = os.getenv('ASF_CORS_ALLOWED_ORIGINS', '*')
     asf_config['ASF_CHUNK_SIZE'] = int(os.getenv('ASF_CHUNK_SIZE', '4096'))
     asf_config['ASF_STREAM_SLEEP_INTERVAL'] = float(os.getenv('ASF_STREAM_SLEEP_INTERVAL', '0.01'))
-    asf_config['ASF_UI_UPDATES_NAMESPACE'] = os.getenv('ASF_UI_UPDATES_NAMESPACE', '/ui_updates') # Added
+    asf_config['ASF_UI_UPDATES_NAMESPACE'] = os.getenv('ASF_UI_UPDATES_NAMESPACE', '/ui_updates')
+
+    # New configuration for internal API Gateway URL
+    asf_config['INTERNAL_API_GW_BASE_URL'] = os.getenv('INTERNAL_API_GW_BASE_URL', 'http://api_gateway:5001')
+    if not os.getenv('INTERNAL_API_GW_BASE_URL'): # Log if using default because it wasn't set
+        logger.info(f"INTERNAL_API_GW_BASE_URL not set, using default: {asf_config['INTERNAL_API_GW_BASE_URL']}")
+
 
     asf_config['ASF_HOST'] = os.getenv("ASF_HOST", '0.0.0.0')
     asf_config['ASF_PORT'] = int(os.getenv("ASF_PORT", 5006))
     asf_config['ASF_DEBUG_MODE'] = os.getenv("ASF_DEBUG_MODE", "True").lower() == "true"
 
+    # Adjust logger level based on debug mode
+    logger.setLevel(logging.DEBUG if asf_config['ASF_DEBUG_MODE'] else logging.INFO)
+
+
     logger.info("--- ASF Configuration ---")
     for key, value in asf_config.items():
-        if "SECRET_KEY" in key and value: # Mask secret key
-            logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
+        if "SECRET_KEY" in key and value and len(value) > 4:
+            logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:]}")
         else:
             logger.info(f"  {key}: {value}")
     logger.info("--- End ASF Configuration ---")
-
-# --- Logging Configuration (must be set up before load_asf_configuration uses logger) ---
-# Use app.logger if available and not the root logger to integrate with Flask's logging
-# This initial app object is temporary, just to get the logger context.
-# It will be replaced by the fully configured one.
-_temp_app_for_logger = flask.Flask(__name__)
-if _temp_app_for_logger.logger and _temp_app_for_logger.logger.name != 'root':
-    logger = _temp_app_for_logger.logger
-    logger.setLevel(logging.INFO)
-else:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - ASF - %(message)s')
-    logger = logging.getLogger(__name__)
 
 # Load configuration at startup
 load_asf_configuration()
 
 # --- Constants ---
-# Socket.IO Event Names - Audio Namespace
 AUDIO_EVENT_CONNECT_ACK = 'connection_ack'
-AUDIO_EVENT_ERROR = 'error' # Generic client-facing error
-AUDIO_EVENT_STREAM_ERROR = 'stream_error' # Specific to stream failures
+AUDIO_EVENT_ERROR = 'error'
+AUDIO_EVENT_STREAM_ERROR = 'stream_error'
 AUDIO_EVENT_STREAM_STATUS = 'stream_status'
 AUDIO_EVENT_AUDIO_CHUNK = 'audio_chunk'
 AUDIO_EVENT_AUDIO_CONTROL = 'audio_control'
-AUDIO_EVENT_START_OF_STREAM = 'start_of_stream' # Used as data in AUDIO_EVENT_AUDIO_CONTROL
-AUDIO_EVENT_END_OF_STREAM = 'end_of_stream'   # Used as data in AUDIO_EVENT_AUDIO_CONTROL
+AUDIO_EVENT_START_OF_STREAM = 'start_of_stream'
+AUDIO_EVENT_END_OF_STREAM = 'end_of_stream'
 
-# Socket.IO Event Names - UI Namespace
 UI_EVENT_CONNECT_ACK = 'ui_connection_ack'
-UI_EVENT_ERROR = 'ui_error' # Generic client-facing error for UI namespace
+UI_EVENT_ERROR = 'ui_error'
 UI_EVENT_SUBSCRIBED = 'subscribed_ui_updates'
-# Event names for CPOA to send (used by send_ui_update, received by client)
-# Example: 'generation_status', 'task_error' - these are dynamic based on CPOA needs, not ASF internals.
-
-# HTTP Endpoint Error Types/Messages (Old constants, replaced by specific error_code strings)
-# HTTP_ERROR_NO_PAYLOAD = "NO_JSON_PAYLOAD"
-# HTTP_ERROR_MISSING_PARAMETERS = "MISSING_PARAMETERS"
-# HTTP_ERROR_ASF_CONFIG_ERROR = "ASF_SERVER_CONFIG_ERROR"
-# HTTP_ERROR_SOCKETIO_EMIT_FAILED = "SOCKETIO_EMIT_FAILED"
 
 # --- Flask App and SocketIO Setup ---
 app = flask.Flask(__name__)
 app.config['SECRET_KEY'] = asf_config['ASF_SECRET_KEY']
 socketio = SocketIO(app, cors_allowed_origins=asf_config['ASF_CORS_ALLOWED_ORIGINS'])
 
-# Define namespace after config is loaded
-ASF_UI_UPDATES_NAMESPACE = None # Will be set in main block or after load_asf_configuration if called there
+ASF_UI_UPDATES_NAMESPACE = asf_config['ASF_UI_UPDATES_NAMESPACE'] # Set from loaded config
 
 # --- Global Data Structures ---
-stream_id_to_filepath_map = {} # Stores mapping from stream_id to audio file path
+stream_id_to_filepath_map = {} # Stores mapping from stream_id to GCS URI or local path
 
 # --- ASF Logic ---
-# In a real ASF, this would be more complex, involving:
-# - Using the stream_id_to_filepath_map to get actual audio data.
-# - Fetching actual audio data (e.g., from S3 or a shared volume).
-# - Chunking the audio data into binary format.
-# - Streaming binary audio chunks.
-
 @socketio.on('connect', namespace='/api/v1/podcasts/stream')
 def handle_connect():
-    """
-    Handles a new WebSocket connection.
-    The stream_id is expected to be part of the connection URL,
-    but Flask-SocketIO namespaces don't directly expose URL parameters in connect handler.
-    We'll expect a 'join_stream' event with stream_id from client.
-    """
-    logger.info(f"ASF: Client connected with sid: {flask.request.sid} to namespace /api/v1/podcasts/stream")
+    logger.info(f"ASF: Client connected with sid: {flask.request.sid} to audio namespace.")
     emit(AUDIO_EVENT_CONNECT_ACK, {'message': 'Connected to ASF. Please send join_stream with your stream_id.'})
 
 @socketio.on('join_stream', namespace='/api/v1/podcasts/stream')
 def handle_join_stream(data):
-    """
-    Client joins a specific stream room.
-    'data' is expected to be a dict like {'stream_id': 'some_stream_id'}
-    """
     stream_id = data.get('stream_id')
+    client_sid = flask.request.sid
     if not stream_id:
-        logger.warning(f"ASF: Client {flask.request.sid} tried to join stream without stream_id.")
+        logger.warning(f"ASF: Client {client_sid} tried to join stream without stream_id.")
         emit(AUDIO_EVENT_ERROR, {'message': 'stream_id is required for join_stream.'})
         return
 
-    join_room(stream_id) # Use SocketIO rooms to manage clients for specific streams
-    logger.info(f"ASF: Client {flask.request.sid} joined stream: {stream_id}")
+    join_room(stream_id)
+    logger.info(f"ASF: Client {client_sid} joined stream room: {stream_id}")
 
-    filepath = stream_id_to_filepath_map.get(stream_id)
+    gcs_uri = stream_id_to_filepath_map.get(stream_id)
 
-    if not filepath:
+    if not gcs_uri: # Filepath is now GCS URI
         logger.error(f"ASF: Stream ID {stream_id} not found in map. Cannot stream audio.")
         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio stream ID not found or not yet processed.'}, room=stream_id)
         return
 
-    if not os.path.exists(filepath):
-        logger.error(f"ASF: Audio file not found for stream ID {stream_id} at path: {filepath}")
-        emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio file unavailable for this stream.'}, room=stream_id)
-        return
-    
     emit(AUDIO_EVENT_STREAM_STATUS, {'status': 'joined', 'stream_id': stream_id, 'message': f'Successfully joined stream {stream_id}. Preparing to stream audio.'}, room=stream_id)
-    logger.info(f"ASF: Starting audio stream for {stream_id} from {filepath}")
+    logger.info(f"ASF: Starting audio stream for {stream_id} from GCS URI: {gcs_uri}")
 
     chunk_size = asf_config.get('ASF_CHUNK_SIZE', 4096)
     stream_sleep_interval = asf_config.get('ASF_STREAM_SLEEP_INTERVAL', 0.01)
+    signed_url_from_api_gw = None
 
+    # --- New Logic to get Signed URL ---
+    if gcs_uri.startswith("gs://"):
+        try:
+            # Ensure filepath (gcs_uri) is URL-encoded for the query parameter if it could contain special chars
+            # For gs://bucket/object URIs, this is usually not an issue, but good practice for arbitrary strings.
+            # from urllib.parse import quote_plus
+            # encoded_gcs_uri = quote_plus(gcs_uri)
+            # However, requests usually handles URL encoding for query parameters.
+
+            signed_url_fetch_endpoint = f"{asf_config['INTERNAL_API_GW_BASE_URL']}/api/v1/internal/media_access_url"
+            params = {'gcs_uri': gcs_uri}
+
+            logger.debug(f"ASF: Requesting signed URL for GCS URI '{gcs_uri}' from endpoint: {signed_url_fetch_endpoint}")
+
+            # Using a short timeout for this internal call
+            response = requests.get(signed_url_fetch_endpoint, params=params, timeout=5)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+            response_data = response.json()
+            signed_url_from_api_gw = response_data.get("signed_url")
+
+            if not signed_url_from_api_gw:
+                logger.error(f"ASF: API Gateway did not return a signed_url for GCS URI {gcs_uri} (stream {stream_id}). Response: {response_data}")
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to obtain secure access for audio stream.'}, room=stream_id)
+                return
+            logger.info(f"ASF: Successfully obtained signed URL for GCS URI {gcs_uri} (stream {stream_id}).")
+
+        except requests.exceptions.Timeout:
+            logger.error(f"ASF: Timeout requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}).")
+            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal timeout.'}, room=stream_id)
+            return
+        except requests.exceptions.HTTPError as e_http:
+            logger.error(f"ASF: HTTP error {e_http.response.status_code} requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}). Response: {e_http.response.text}")
+            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal error.'}, room=stream_id)
+            return
+        except requests.exceptions.RequestException as e_req:
+            logger.error(f"ASF: Error requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}): {e_req}", exc_info=True)
+            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream.'}, room=stream_id)
+            return
+        except json.JSONDecodeError:
+            logger.error(f"ASF: Failed to decode JSON response from API Gateway when fetching signed URL for GCS URI {gcs_uri} (stream {stream_id}). Response: {response.text if 'response' in locals() else 'N/A'}")
+            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Invalid response from internal service preparing audio stream.'}, room=stream_id)
+            return
+    else: # If it's not a GCS URI, assume it's a local path (legacy or testing)
+        logger.warning(f"ASF: Filepath for stream {stream_id} is not a GCS URI: '{gcs_uri}'. Attempting local streaming.")
+        if not os.path.exists(gcs_uri):
+            logger.error(f"ASF: Local audio file not found for stream ID {stream_id} at path: {gcs_uri}")
+            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio file unavailable for this stream.'}, room=stream_id)
+            return
+        # For local files, the "signed URL" is just the path itself for the subsequent logic
+        signed_url_from_api_gw = gcs_uri # This will make the 'requests.get' logic below fail for local files. This needs to be handled.
+
+    # --- Streaming Logic ---
     try:
         emit(AUDIO_EVENT_AUDIO_CONTROL, {'event': AUDIO_EVENT_START_OF_STREAM, 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
         logger.info(f"ASF: Sent {AUDIO_EVENT_START_OF_STREAM} for stream_id: {stream_id}")
 
-        with open(filepath, 'rb') as audio_file:
-            sequence_number = 0
-            while True:
-                audio_chunk = audio_file.read(chunk_size)
-                if not audio_chunk:
-                    break # End of file
+        if gcs_uri.startswith("gs://"): # Streaming from GCS signed URL
+            if not signed_url_from_api_gw: # Should have been caught above, but as a safeguard
+                logger.error(f"ASF: Critical error - signed URL is None before attempting GCS stream for {stream_id}.")
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Internal error preparing stream.'}, room=stream_id)
+                return
 
-                # Emit the binary audio chunk.
-                # The `binary=True` argument is implicitly handled by Flask-SocketIO if the data is `bytes`.
-                socketio.emit(AUDIO_EVENT_AUDIO_CHUNK, audio_chunk, namespace='/api/v1/podcasts/stream', room=stream_id)
-                logger.debug(f"ASF: Sent audio chunk {sequence_number} for stream {stream_id} (size: {len(audio_chunk)} bytes)")
-                sequence_number += 1
-                socketio.sleep(stream_sleep_interval) # Use configured sleep interval
+            with requests.get(signed_url_from_api_gw, stream=True, timeout=10) as r: # Added timeout for GCS GET
+                r.raise_for_status() # Check for HTTP errors from GCS (e.g., expired URL, permissions)
+                logger.info(f"ASF: Streaming from GCS signed URL for stream_id: {stream_id}")
+                sequence_number = 0
+                for chunk in r.iter_content(chunk_size=chunk_size):
+                    if chunk: # filter out keep-alive new chunks
+                        socketio.emit(AUDIO_EVENT_AUDIO_CHUNK, chunk, namespace='/api/v1/podcasts/stream', room=stream_id)
+                        logger.debug(f"ASF: Sent GCS audio chunk {sequence_number} for stream {stream_id} (size: {len(chunk)} bytes)")
+                        sequence_number += 1
+                        socketio.sleep(stream_sleep_interval)
+            logger.info(f"ASF: Finished streaming from GCS for stream_id: {stream_id}")
+
+        else: # Streaming from local file (legacy or testing)
+            logger.info(f"ASF: Streaming from local file for stream_id: {stream_id}, path: {gcs_uri}")
+            with open(gcs_uri, 'rb') as audio_file:
+                sequence_number = 0
+                while True:
+                    audio_chunk = audio_file.read(chunk_size)
+                    if not audio_chunk: break
+                    socketio.emit(AUDIO_EVENT_AUDIO_CHUNK, audio_chunk, namespace='/api/v1/podcasts/stream', room=stream_id)
+                    logger.debug(f"ASF: Sent local audio chunk {sequence_number} for stream {stream_id} (size: {len(audio_chunk)} bytes)")
+                    sequence_number += 1
+                    socketio.sleep(stream_sleep_interval)
+            logger.info(f"ASF: Finished streaming from local file for stream_id: {stream_id}")
 
         emit(AUDIO_EVENT_AUDIO_CONTROL, {'event': AUDIO_EVENT_END_OF_STREAM, 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
-        logger.info(f"ASF: Sent {AUDIO_EVENT_END_OF_STREAM} for stream_id: {stream_id} from file {filepath}")
+        logger.info(f"ASF: Sent {AUDIO_EVENT_END_OF_STREAM} for stream_id: {stream_id}")
 
-    except Exception as e:
-        logger.error(f"ASF: Error during audio streaming for stream_id {stream_id}: {e}", exc_info=True)
-        emit(AUDIO_EVENT_STREAM_ERROR, {'message': f'An error occurred during streaming for stream {stream_id}.'}, room=stream_id)
+    except requests.exceptions.HTTPError as e_gcs_http: # Specifically for GCS GET errors
+        logger.error(f"ASF: HTTP error when streaming from GCS URL for stream {stream_id} (URL might be expired or invalid): {e_gcs_http}", exc_info=True)
+        emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to stream audio from source (access denied or link expired).'}, room=stream_id)
+    except requests.exceptions.RequestException as e_req_stream: # Other requests errors (network, etc.)
+        logger.error(f"ASF: Error streaming audio for stream {stream_id}: {e_req_stream}", exc_info=True)
+        emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to stream audio from source.'}, room=stream_id)
+    except Exception as e_stream: # General errors during streaming
+        logger.error(f"ASF: General error during audio streaming for stream_id {stream_id}: {e_stream}", exc_info=True)
+        emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'An unexpected error occurred during streaming.'}, room=stream_id)
     finally:
-        # Optionally, leave room or close connection if appropriate.
-        # For now, client manages connection lifecycle after stream ends or errors.
+        # Clean up or other actions after streaming finishes or errors
         pass
-
 
 @socketio.on('disconnect', namespace='/api/v1/podcasts/stream')
 def handle_disconnect():
-    # Rooms are automatically left on disconnect by default with Flask-SocketIO
-    logger.info(f"ASF: Client disconnected sid: {flask.request.sid}")
+    logger.info(f"ASF: Client disconnected sid: {flask.request.sid} from audio namespace.")
 
-# Basic HTTP endpoint to confirm ASF is running (optional)
 @app.route('/asf/health', methods=['GET'])
 def health_check():
-    return flask.jsonify({"status": "AudioStreamFeeder is healthy and running"}), 200
+    # Check connectivity to API Gateway for signed URLs if INTERNAL_API_GW_BASE_URL is set
+    api_gw_status = "Not configured or not checked."
+    if asf_config.get('INTERNAL_API_GW_BASE_URL'):
+        try:
+            # Check if the base URL is reachable, maybe a specific health endpoint on API GW if available
+            # For now, just checking the base URL with a timeout.
+            # This doesn't guarantee the /api/v1/internal/media_access_url endpoint itself is working.
+            health_url = f"{asf_config['INTERNAL_API_GW_BASE_URL']}/health" # Assuming API GW has a health endpoint
+            response = requests.get(health_url, timeout=2)
+            if response.status_code == 200:
+                api_gw_status = f"Successfully connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']} (HTTP {response.status_code})."
+            else:
+                api_gw_status = f"Connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}, but got HTTP {response.status_code}."
+        except requests.exceptions.ConnectionError:
+            api_gw_status = f"Failed to connect to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']} (Connection Error)."
+        except requests.exceptions.Timeout:
+            api_gw_status = f"Timed out connecting to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}."
+        except Exception as e_gw_health:
+             api_gw_status = f"Error checking API Gateway health: {str(e_gw_health)}"
 
-# --- Internal HTTP Endpoints ---
+
+    return flask.jsonify({
+        "status": "AudioStreamFeeder is healthy and running",
+        "api_gateway_connectivity": api_gw_status,
+        "config": { # Expose some non-sensitive config for easier debugging
+            "chunk_size": asf_config.get('ASF_CHUNK_SIZE'),
+            "sleep_interval": asf_config.get('ASF_STREAM_SLEEP_INTERVAL'),
+            "ui_namespace": ASF_UI_UPDATES_NAMESPACE,
+            "internal_api_gw_url_configured": bool(asf_config.get('INTERNAL_API_GW_BASE_URL'))
+        }
+    }), 200
+
+
 @app.route('/asf/internal/notify_new_audio', methods=['POST'])
 def notify_new_audio():
-    """
-    Internal endpoint for other services (like VFA) to notify ASF about new audio files.
-    Expects JSON: {"stream_id": "...", "filepath": "..."}
-    """
-    try:
-        data = request.get_json()
-        if not data:
-            logger.error("ASF_NOTIFY: Received empty or non-JSON payload for /notify_new_audio")
-            return jsonify({
-                "error_code": "ASF_NOTIFY_INVALID_PAYLOAD",
-                "message": "Request payload is missing or not valid JSON.",
-                "details": "Payload must be a valid non-empty JSON object."
-            }), 400
-    except Exception as e_json:
-        logger.error(f"ASF_NOTIFY: Error decoding JSON for /notify_new_audio: {e_json}", exc_info=True)
-        return jsonify({
-            "error_code": "ASF_NOTIFY_MALFORMED_JSON",
-            "message": "Malformed JSON payload.",
-            "details": str(e_json)
-        }), 400
+    try: data = request.get_json()
+    except Exception: return jsonify({"error_code": "ASF_NOTIFY_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+    if not data: return jsonify({"error_code": "ASF_NOTIFY_INVALID_PAYLOAD", "message": "Payload required."}), 400
 
     stream_id = data.get('stream_id')
-    filepath = data.get('filepath')
+    filepath = data.get('filepath') # This should now be a GCS URI
 
     if not stream_id or not isinstance(stream_id, str) or not stream_id.strip():
-        logger.error(f"ASF_NOTIFY: Invalid or missing 'stream_id'. Payload: {data}")
-        return jsonify({
-            "error_code": "ASF_NOTIFY_INVALID_STREAM_ID",
-            "message": "Validation failed: 'stream_id' must be a non-empty string."
-        }), 400
-
+        return jsonify({"error_code": "ASF_NOTIFY_INVALID_STREAM_ID", "message": "'stream_id' must be non-empty string."}), 400
     if not filepath or not isinstance(filepath, str) or not filepath.strip():
-        logger.error(f"ASF_NOTIFY: Invalid or missing 'filepath'. Payload: {data}")
-        return jsonify({
-            "error_code": "ASF_NOTIFY_INVALID_FILEPATH",
-            "message": "Validation failed: 'filepath' must be a non-empty string."
-        }), 400
+        return jsonify({"error_code": "ASF_NOTIFY_INVALID_FILEPATH", "message": "'filepath' (GCS URI) must be non-empty string."}), 400
 
-    # Store the mapping
+    # Validate if it's a GCS URI or allow local paths for testing/legacy
+    if not filepath.startswith("gs://") and not os.path.isabs(filepath): # Basic check
+         logger.warning(f"ASF_NOTIFY: Filepath '{filepath}' for stream '{stream_id}' does not look like a GCS URI or an absolute local path. Proceeding, but streaming might fail if not handled.")
+
     stream_id_to_filepath_map[stream_id] = filepath
-    logger.info(f"ASF_NOTIFY: Received new audio notification. Stream ID: {stream_id}, Filepath: {filepath}. Map updated.")
-
-    # TODO: In a real system, we might want to trigger something here if a client is already
-    # waiting for this stream_id, or if the stream should start proactively.
-    # For now, just storing the path is sufficient.
-
+    logger.info(f"ASF_NOTIFY: New audio notification. Stream ID: {stream_id}, Path/URI: {filepath}. Map updated.")
     return jsonify({"message": "Notification received successfully", "stream_id": stream_id}), 200
-    # No specific try-except Exception here as most logic is simple dict access after JSON parsing.
-    # Flask's default error handling or a potential @app.errorhandler would catch deeper issues.
 
 # --- UI Update Namespace Handlers ---
-@socketio.on('connect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE) # Use lambda to access config post-init
+@socketio.on('connect', namespace=ASF_UI_UPDATES_NAMESPACE)
 def handle_ui_connect():
     logger.info(f"ASF: Client {request.sid} connected to UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
     emit(UI_EVENT_CONNECT_ACK, {'message': f'Connected to ASF UI updates on namespace {ASF_UI_UPDATES_NAMESPACE}.'})
 
-@socketio.on('disconnect', namespace=lambda: ASF_UI_UPDATES_NAMESPACE)
+@socketio.on('disconnect', namespace=ASF_UI_UPDATES_NAMESPACE)
 def handle_ui_disconnect():
     logger.info(f"ASF: Client {request.sid} disconnected from UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
-    # Rooms are left automatically by Flask-SocketIO on disconnect from namespace
 
-@socketio.on('subscribe_to_ui_updates', namespace=lambda: ASF_UI_UPDATES_NAMESPACE)
+@socketio.on('subscribe_to_ui_updates', namespace=ASF_UI_UPDATES_NAMESPACE)
 def handle_subscribe_ui_updates(data):
     client_id = data.get('client_id')
     if not client_id:
-        logger.warning(f"ASF: Client {request.sid} attempted to subscribe to UI updates without a client_id.")
+        logger.warning(f"ASF: Client {request.sid} attempted UI subscription without client_id.")
         emit(UI_EVENT_ERROR, {'message': 'client_id is required for UI update subscription.'})
         return
-
-    join_room(client_id) # Use client_id as the room name
-    logger.info(f"ASF: Client {request.sid} (client_id: {client_id}) subscribed to UI updates in room '{client_id}' on namespace {ASF_UI_UPDATES_NAMESPACE}.")
+    join_room(client_id)
+    logger.info(f"ASF: Client {request.sid} (client_id: {client_id}) subscribed to UI updates in room '{client_id}'.")
     emit(UI_EVENT_SUBSCRIBED, {'status': 'success', 'client_id': client_id, 'subscribed_to_room': client_id})
 
-
-# --- Internal HTTP Endpoint for CPOA to send UI updates ---
 @app.route('/asf/internal/send_ui_update', methods=['POST'])
 def send_ui_update():
-    """
-    Internal endpoint for CPOA to send UI updates to specific clients.
-    Expects JSON: {"client_id": "...", "event_name": "...", "data": {...}}
-    """
-    try:
-        payload = request.get_json()
-        if not payload:
-            logger.error("ASF_SEND_UI: Received empty or non-JSON payload for /send_ui_update")
-            return jsonify({
-                "error_code": "ASF_SENDUI_INVALID_PAYLOAD",
-                "message": "Request payload is missing or not valid JSON for sending UI update.",
-                "details": "Payload must be a valid non-empty JSON object."
-            }), 400
-    except Exception as e_json:
-        logger.error(f"ASF_SEND_UI: Error decoding JSON for /send_ui_update: {e_json}", exc_info=True)
-        return jsonify({
-            "error_code": "ASF_SENDUI_MALFORMED_JSON",
-            "message": "Malformed JSON payload.",
-            "details": str(e_json)
-        }), 400
+    try: payload = request.get_json()
+    except Exception: return jsonify({"error_code": "ASF_SENDUI_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+    if not payload: return jsonify({"error_code": "ASF_SENDUI_INVALID_PAYLOAD", "message": "Payload required."}), 400
 
     client_id = payload.get('client_id')
     event_name = payload.get('event_name')
-    event_data = payload.get('data') # data field presence is checked, its content can be anything (null, object, etc.)
+    event_data = payload.get('data')
 
     if not client_id or not isinstance(client_id, str) or not client_id.strip():
-        logger.error(f"ASF_SEND_UI: Invalid or missing 'client_id'. Payload: {payload}")
-        return jsonify({"error_code": "ASF_SENDUI_INVALID_CLIENT_ID", "message": "Validation failed: 'client_id' must be a non-empty string."}), 400
-
+        return jsonify({"error_code": "ASF_SENDUI_INVALID_CLIENT_ID", "message": "'client_id' must be non-empty string."}), 400
     if not event_name or not isinstance(event_name, str) or not event_name.strip():
-        logger.error(f"ASF_SEND_UI: Invalid or missing 'event_name'. Payload: {payload}")
-        return jsonify({"error_code": "ASF_SENDUI_INVALID_EVENT_NAME", "message": "Validation failed: 'event_name' must be a non-empty string."}), 400
+        return jsonify({"error_code": "ASF_SENDUI_INVALID_EVENT_NAME", "message": "'event_name' must be non-empty string."}), 400
+    if 'data' not in payload: # Check for presence of 'data' key
+        return jsonify({"error_code": "ASF_SENDUI_MISSING_DATA", "message": "'data' field required."}), 400
 
-    if 'data' not in payload: # Check for presence of 'data' key explicitly
-        logger.error(f"ASF_SEND_UI: Missing 'data' field. Payload: {payload}")
-        return jsonify({"error_code": "ASF_SENDUI_MISSING_DATA", "message": "Validation failed: 'data' field is required."}), 400
-
-    if not ASF_UI_UPDATES_NAMESPACE: # Ensure namespace is loaded
-        logger.error("ASF_SEND_UI: ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message.")
-        return jsonify({
-            "error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE",
-            "message": "ASF server configuration error for UI updates namespace.",
-            "details": "ASF_UI_UPDATES_NAMESPACE not configured/loaded. Cannot emit message."
-        }), 500
+    if not ASF_UI_UPDATES_NAMESPACE:
+        logger.error("ASF_SEND_UI: ASF_UI_UPDATES_NAMESPACE not configured. Cannot emit.")
+        return jsonify({"error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE", "message": "ASF server config error for UI namespace."}), 500
 
     try:
-        logger.info(f"ASF_SEND_UI: Emitting '{event_name}' to client_id (room) '{client_id}' in namespace '{ASF_UI_UPDATES_NAMESPACE}' with data: {event_data}")
+        logger.info(f"ASF_SEND_UI: Emitting '{event_name}' to client_id '{client_id}' in namespace '{ASF_UI_UPDATES_NAMESPACE}' with data: {event_data}")
         socketio.emit(event_name, event_data, room=client_id, namespace=ASF_UI_UPDATES_NAMESPACE)
-        return jsonify({"status": "success", "message": "UI update sent to client."}), 200
+        return jsonify({"status": "success", "message": "UI update sent."}), 200
     except Exception as e:
         logger.error(f"ASF_SEND_UI: Failed to emit SocketIO event for client_id '{client_id}': {e}", exc_info=True)
-        return jsonify({
-            "error_code": "ASF_SOCKETIO_EMIT_FAILED",
-            "message": "Failed to emit SocketIO event for UI update.",
-            "details": str(e)
-        }), 500
-    # Broader exception for the overall endpoint logic, though most specific errors are handled.
-    except Exception as e_general:
-        logger.error(f"ASF_SEND_UI: Unexpected error in /send_ui_update endpoint: {e_general}", exc_info=True)
-        return jsonify({
-            "error_code": "ASF_SENDUI_UNEXPECTED_ERROR",
-            "message": "An unexpected server error occurred.",
-            "details": str(e_general)
-        }), 500
+        return jsonify({"error_code": "ASF_SOCKETIO_EMIT_FAILED", "message": "Failed to emit SocketIO event for UI update."}), 500
 
 if __name__ == '__main__':
-    # Set the namespace globally after config is loaded and before app runs
-    ASF_UI_UPDATES_NAMESPACE = asf_config.get('ASF_UI_UPDATES_NAMESPACE')
-    if not ASF_UI_UPDATES_NAMESPACE:
-        logger.error("ASF_UI_UPDATES_NAMESPACE is not defined in config. UI updates will not work.")
-        # Optionally exit or raise error if this is critical for startup
-    else:
-        logger.info(f"ASF UI Updates Namespace configured to: {ASF_UI_UPDATES_NAMESPACE}")
+    if not ASF_UI_UPDATES_NAMESPACE: # Ensure it's set from config before running
+        logger.critical("ASF_UI_UPDATES_NAMESPACE is not defined in config. UI updates will not work. Exiting.")
+        exit(1) # Critical configuration missing
 
     asf_host = asf_config.get('ASF_HOST')
     asf_port = asf_config.get('ASF_PORT')
     asf_debug_mode = asf_config.get('ASF_DEBUG_MODE')
 
-    logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {asf_host}:{asf_port} (Debug: {asf_debug_mode})...")
-    # The host '0.0.0.0' makes it accessible externally if needed.
-    # allow_unsafe_werkzeug=True is for development with Werkzeug dev server.
-    # In production, use a proper WSGI server like Gunicorn with eventlet or gevent.
-    # For eventlet, you would typically run: `eventlet_wsgi.server(eventlet.listen((asf_host, asf_port)), app)`
-    # but socketio.run handles this for development.
-    socketio.run(app, host=asf_host, port=asf_port, debug=asf_debug_mode, allow_unsafe_werkzeug=True if asf_debug_mode else False)
+    logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {asf_host}:{asf_port} (Debug: {asf_debug_mode}).")
+    # allow_unsafe_werkzeug=True is needed for Werkzeug dev server if debug is True and reloader is on.
+    # Gunicorn with eventlet/gevent worker is preferred for production.
+    socketio.run(app, host=asf_host, port=asf_port, debug=asf_debug_mode,
+                 allow_unsafe_werkzeug=True if asf_debug_mode else False,
+                 # Consider use_reloader=False if issues with background threads or state
+                 )

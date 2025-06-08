@@ -53,6 +53,10 @@ Key Environment Variables:
     -   *Default in `main.py` if run directly:* `True`
 -   `FEND_DIR`: (Optional) Path to the frontend static files directory.
     -   *Note:* This is typically derived in `main.py` relative to its own location (e.g., `../fend`). Setting this environment variable can override the derivation.
+-   `GCS_BUCKET_NAME`: (Optional) The name of the Google Cloud Storage bucket. While the signed URL generation can derive the bucket name from the `gs://` URI, this can be used for validation or as a default. Required if such validation is active.
+    -   *Example:* `GCS_BUCKET_NAME=your-aethercast-gcs-bucket`
+-   `GOOGLE_APPLICATION_CREDENTIALS`: Path to the GCP service account key file. This is essential for the API Gateway to authenticate with GCS and generate signed URLs.
+    -   *Example (in Docker):* `/app/gcp-credentials.json` (assuming the key file is mounted there).
 
 **Deprecated Environment Variables (for Snippet Fetching):**
 The following variables were previously used for API Gateway-level snippet caching but are no longer utilized by the `/api/v1/snippets` endpoint, as this logic is now handled by CPOA:
@@ -75,7 +79,7 @@ Project dependencies are listed in `requirements.txt`. Install them using pip:
 ```bash
 pip install -r requirements.txt
 ```
-This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), and `Werkzeug` (for password hashing, often a Flask sub-dependency).
+This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), `Werkzeug` (for password hashing, often a Flask sub-dependency), and `google-cloud-storage` (for GCS signed URL generation).
 
 ## Running the Service
 
@@ -141,10 +145,10 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Snippets & Categories
 
 -   **`GET /api/v1/snippets`**
-    -   **Description:** Fetches dynamically generated podcast snippets via CPOA, suitable for a landing page. CPOA orchestrates topic discovery (TDA), snippet text generation (SCA), and image generation (IGA), returning snippets that include an `image_url`.
+    -   **Description:** Fetches dynamically generated podcast snippets via CPOA, suitable for a landing page. CPOA orchestrates topic discovery (TDA), snippet text generation (SCA), and image generation (IGA). `image_url`s for snippets (originally GCS URIs from IGA via CPOA) are converted to short-lived signed GCS HTTP URLs by the API Gateway before being sent to the client.
     -   **Query Parameters:** `limit` (optional, integer, default 6, max 20): Number of snippets.
-    -   **Success Response (200 OK):** `{"snippets": [...], "source": "generation"}` (content from CPOA, where each snippet object can contain an `image_url`).
-    -   **Error Responses:** 503 (CPOA/downstream unavailable), 500 (other errors).
+    -   **Success Response (200 OK):** `{"snippets": [...], "source": "generation"}` (content from CPOA, where each snippet object's `image_url` is a signed HTTP URL).
+    -   **Error Responses:** 503 (CPOA/downstream unavailable), 500 (other errors, including signed URL generation failure).
 
 -   **`GET /api/v1/categories`**
     -   **Description:** Fetches a list of predefined podcast categories from CPOA.
@@ -152,7 +156,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
     -   **Error Responses:** 503 (CPOA unavailable), 500 (CPOA error).
 
 -   **`POST /api/v1/topics/explore`**
-    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration`. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration`. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -163,7 +167,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
         }
         ```
         *Note: At least `current_topic_id` or `keywords` must be provided.*
-    -   **Success Response (200 OK):** `{"explored_topics": [...]}` (list of snippet objects from CPOA).
+    -   **Success Response (200 OK):** `{"explored_topics": [...]}` (list of snippet objects from CPOA, with `image_url`s as signed HTTP URLs).
     -   **Error Responses:**
         -   **400 Bad Request:** For issues like:
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
@@ -206,17 +210,17 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 
 -   **`GET /api/v1/podcasts/<podcast_id>`**
     -   **Description:** Retrieves detailed information for a specific podcast task.
-    -   **Success Response (200 OK):** Full podcast details including status, logs, filepaths, and `tts_settings_used`.
+    -   **Success Response (200 OK):** Full podcast details including status, logs, GCS URI for `final_audio_filepath`, and `tts_settings_used`. The `audio_url` field will point to the `/audio.mp3` streaming endpoint.
 
 -   **`GET /api/v1/podcasts/<podcast_id>/audio.mp3`**
-    -   **Description:** Serves the generated audio file.
-    -   **Success Response (200 OK):** Raw audio data.
-    -   **Error Responses:** 404 (not found), 500 (DB error).
+    -   **Description:** Redirects to a short-lived, signed GCS HTTP URL for the generated audio file. The actual audio content is served from GCS.
+    -   **Success Response (302 Found):** Redirects to the signed GCS URL.
+    -   **Error Responses:** 404 (podcast or audio GCS URI not found), 500 (DB error or failure to generate signed URL).
 
 ### Search
 
 -   **`POST /api/v1/search/podcasts`**
-    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -224,7 +228,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
             "client_id": "your_session_id" // Optional, for fetching user preferences for CPOA
         }
         ```
-    -   **Success Response (200 OK):** `{"search_results": [...]}` (content from CPOA).
+    -   **Success Response (200 OK):** `{"search_results": [...]}` (content from CPOA, with `image_url`s as signed HTTP URLs).
     -   **Error Responses:**
         -   **400 Bad Request:** For issues like:
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
@@ -263,17 +267,33 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
         -   **404 Not Found:** If the session for the given `client_id` does not exist.
         -   **500 Internal Server Error:** For database errors.
 
+### Internal Endpoints (Primarily for Service-to-Service Communication)
+
+-   **`GET /api/v1/internal/media_access_url`**
+    -   **Description:** Provides a short-lived signed GCS HTTP URL for a given GCS URI. This is intended for internal services (like ASF) to securely access GCS resources without needing direct GCS credentials.
+    -   **Query Parameters:**
+        -   `gcs_uri` (string, required): The GCS URI of the resource (e.g., `gs://your-bucket/path/to/object.mp3`).
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "signed_url": "https://storage.googleapis.com/your-bucket/..."
+        }
+        ```
+    -   **Error Responses:**
+        -   400 Bad Request: If `gcs_uri` is missing or invalid (`MISSING_GCS_URI`, `INVALID_GCS_URI_FORMAT`).
+        -   500 Internal Server Error: If signed URL generation fails (`SIGNED_URL_GENERATION_FAILED`, `INTERNAL_SERVER_ERROR`).
+
 ## Database Schema Details
 
-The API Gateway, CPOA, and other services may utilize a shared SQLite database. Key tables include:
+The API Gateway, CPOA, and other services may utilize a shared database (PostgreSQL recommended, SQLite for basic local dev). Key tables include:
 
 ### `podcasts` Table
--   **Purpose:** Tracks the status and metadata of each podcast generation task.
--   **Key Columns:** `podcast_id` (PK), `topic`, `cpoa_status`, `cpoa_error_message`, `final_audio_filepath`, `stream_id`, `asf_websocket_url`, `asf_notification_status`, `task_created_timestamp`, `last_updated_timestamp`, `cpoa_full_orchestration_log` (JSON), `tts_settings_used` (JSON).
+-   **Purpose:** Tracks the status and metadata of each podcast generation task. `final_audio_filepath` now stores a GCS URI.
+-   **Key Columns (PostgreSQL types):** `podcast_id` (UUID PK), `topic` (TEXT), `cpoa_status` (TEXT), `cpoa_error_message` (TEXT), `final_audio_filepath` (TEXT - GCS URI), `stream_id` (TEXT), `asf_websocket_url` (TEXT), `asf_notification_status` (TEXT), `task_created_timestamp` (TIMESTAMPTZ), `last_updated_timestamp` (TIMESTAMPTZ), `cpoa_full_orchestration_log` (JSONB), `tts_settings_used` (JSONB).
 
 ### `topics_snippets` Table
--   **Purpose:** Stores discovered topics (e.g., from TDA) and generated snippets (e.g., by SCA via CPOA). While the API Gateway's `/api/v1/snippets` endpoint now relies on CPOA for on-demand generation rather than direct caching from this table, this table may still be used by CPOA or other backend agents for their internal caching or operational needs.
--   **Key Columns:** `id` (PK), `type` ('topic' or 'snippet'), `title`, `summary`, `keywords` (JSON), `source_url`, `source_name`, `original_topic_details` (JSON for snippets), `llm_model_used_for_snippet`, `cover_art_prompt`, `image_url TEXT`, `generation_timestamp`, `last_accessed_timestamp`, `relevance_score`.
+-   **Purpose:** Stores discovered topics and generated snippets. `image_url` now stores a GCS URI.
+-   **Key Columns (PostgreSQL types):** `id` (UUID PK), `type` (TEXT), `title` (TEXT), `summary` (TEXT), `keywords` (JSONB), `source_url` (TEXT), `source_name` (TEXT), `original_topic_details` (JSONB), `llm_model_used_for_snippet` (TEXT), `cover_art_prompt` (TEXT), `image_url` (TEXT - GCS URI), `generation_timestamp` (TIMESTAMPTZ), `last_accessed_timestamp` (TIMESTAMPTZ), `relevance_score` (REAL).
 
 ### `generated_scripts` Table
 -   **Purpose:** Serves as a cache for podcast scripts generated by the Podcast Script Weaver Agent (PSWA), typically managed by CPOA. This helps avoid re-generating scripts for identical topics if a fresh script is already available.

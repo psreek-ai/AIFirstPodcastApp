@@ -79,11 +79,20 @@ This project uses Docker Compose to manage and run the suite of microservices in
                     *   In `aethercast/vfa/.env`: `VFA_TEST_MODE_ENABLED=True` (bypasses TTS)
                     *   In `aethercast/tda/.env`: `USE_REAL_NEWS_API=False` (uses simulated news)
                     The `common.env` file sets these test modes to `True` by default, but service-specific `.env` files can override them if needed.
-            *   **Google Cloud Platform (GCP) Setup for AIMS, AIMS_TTS, and IGA:**
-                *   These three services now utilize Google Cloud Vertex AI.
-                *   In `common.env`, you **must** set your actual `GCP_PROJECT_ID` and `GCP_LOCATION`.
-                *   For **each** of these services (`aims_service`, `aims_tts_service`, `iga`), place your GCP service account key JSON file (e.g., named `gcp-credentials.json`) inside their respective directories (e.g., `aethercast/aims_service/gcp-credentials.json`).
-                *   Ensure the `.env` file for each of these services correctly sets `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path where the key file will be mounted inside their containers as per `docker-compose.yml`).
+            *   **Google Cloud Platform (GCP) Setup for AIMS, AIMS_TTS, IGA, and API Gateway (GCS):**
+                *   AIMS, AIMS_TTS, and IGA utilize Google Cloud Vertex AI.
+                *   AIMS_TTS, IGA, and the API Gateway interact with Google Cloud Storage (GCS).
+                *   In `common.env`, you **must** set your actual `GCP_PROJECT_ID`, `GCP_LOCATION`, and `GCS_BUCKET_NAME`.
+                *   **Create a GCS Bucket:** You need to create a Google Cloud Storage bucket. The name you choose must be globally unique. Update `GCS_BUCKET_NAME` in `common.env` with this name.
+                *   **Service Account Key:**
+                    *   Create a GCP service account.
+                    *   Grant this service account the following roles (or more fine-grained permissions):
+                        *   `Vertex AI User` (for AIMS, AIMS_TTS, IGA).
+                        *   `Storage Object Admin` (for AIMS_TTS and IGA to write objects, and API Gateway to manage them if needed). Or, more granularly: `Storage Object Creator` and `Storage Object Viewer`.
+                        *   If the service account itself will be generating signed URLs (common for local/Docker setup where ADC isn't a K8s SA), it needs `Service Account Token Creator` on itself or on a relevant Google-managed service account if using impersonation (advanced). Simpler for local dev is to ensure the SA key used has rights to sign blobs.
+                    *   Download the JSON key file for this service account.
+                    *   For **each** of the services (`aims_service`, `aims_tts_service`, `iga`, and `api_gateway` if it needs to directly manipulate GCS beyond signed URLs, though currently it only signs), place this GCP service account key JSON file (e.g., named `gcp-credentials.json`) inside their respective directories (e.g., `aethercast/aims_service/gcp-credentials.json`).
+                    *   Ensure the `.env` file for each of these services correctly sets `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path where the key file will be mounted inside their containers as per `docker-compose.yml`).
 
 2.  **Build and Run Services:**
     Open a terminal at the project root (where `docker-compose.yml` is located) and run:
@@ -107,8 +116,9 @@ This project uses Docker Compose to manage and run the suite of microservices in
     Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes. The main interaction point for users is the API Gateway. IGA now performs real image generation using Vertex AI.
 
 4.  **Shared Volumes:**
-    *   `aethercast_db_data`: A named volume that stores the shared SQLite database (`aethercast_podcasts.db`). This ensures data persistence across container restarts and allows all services to access the same DB instance.
-    *   `aethercast_audio_data`: A named volume that stores generated audio files. VFA writes to this volume, and ASF reads from it.
+    *   `postgres_data`: A named volume used by the PostgreSQL service to persist database data. This is the primary database for the application.
+    *   `aethercast_db_data`: (Legacy for SQLite, may be phased out) A named volume that previously stored the shared SQLite database.
+    *   `aethercast_audio_data`: (Legacy for local file sharing, less critical now) A named volume that was used for storing generated audio/image files locally. With GCS integration, final media assets are stored in the cloud. This volume might still be used for temporary files by some services or if local file handling is still partially active.
 
 5.  **Stopping Services:**
     Press `Ctrl+C` in the terminal where `docker-compose up` is running. If in detached mode, use:

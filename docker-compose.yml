@@ -52,6 +52,8 @@ services:
       # - tda # Example, can be added if strict startup order is needed
       # - cpoa (though cpoa is part of api_gateway image)
       # - aims_service # If API Gateway directly called AIMS
+      # GCS_BUCKET_NAME is sourced from common.env
+      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
     networks: # Example: assuming a custom network for all backend services
       - aethercast_network
 
@@ -206,10 +208,16 @@ services:
       - "5006:5006" # Assuming ASF runs on 5006
     volumes:
       - ./aethercast:/app/aethercast
-      - aethercast_audio_data:/shared_audio # ASF needs to read audio files from the shared volume
+      - aethercast_audio_data:/shared_audio # ASF might still need this for non-GCS paths or other functionalities
     env_file:
       - common.env
       - ./aethercast/asf/.env
+    environment: # Added environment block for ASF
+      # INTERNAL_API_GW_BASE_URL will be sourced from asf/.env, which should source it from common.env or define it.
+      # Example if sourcing from common.env (ensure common.env has it or it's defined in asf/.env):
+      - INTERNAL_API_GW_BASE_URL=${INTERNAL_API_GW_BASE_URL:-http://api_gateway:5001}
+    depends_on: # Added depends_on for ASF
+      - api_gateway
     networks:
       - aethercast_network
 

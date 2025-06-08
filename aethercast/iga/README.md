@@ -21,12 +21,12 @@ The Image Generation Agent (IGA) is responsible for generating images based on t
 -   **Success Response (200 OK) (JSON):**
     ```json
     {
-        "image_url": "/shared_audio/iga_images/iga_req_xxxx_yyyy.png", // Path within the shared volume
+        "image_url": "gs://your-bucket-name/images/iga/iga_req_xxxx_yyyy.png", // GCS URI of the generated image
         "prompt_used": "The prompt that was processed",
         "model_version": "vertex-ai-imagegeneration@006" // Example, reflects actual model used
     }
     ```
-    -   `image_url` (string): The filepath of the generated image within the container's shared volume. This path is intended for inter-service access.
+    -   `image_url` (string): The GCS URI of the generated image. This URI is used by other services (like CPOA) to reference the image.
     -   `prompt_used` (string): The prompt string that was received and processed.
     -   `model_version` (string): An identifier for the Vertex AI model used.
 
@@ -131,8 +131,12 @@ Key environment variables:
 -   `IGA_VERTEXAI_LOCATION`: **Required.** The Google Cloud location/region for Vertex AI operations (e.g., `us-central1`). Can fallback to `GCP_LOCATION` if that env var is set.
 -   `IGA_VERTEXAI_IMAGE_MODEL_ID`: The Vertex AI Imagen model ID to use.
     -   *Default:* `imagegeneration@006`
--   `IGA_GENERATED_IMAGE_DIR`: **Required.** Directory path *inside the container* where generated images will be saved. This path must be on a shared volume accessible by other services (like CPOA or API Gateway if they need direct access, though typically only the path is needed by CPOA).
-    -   *Default:* `/shared_audio/iga_images` (aligns with typical shared volume structures like `aethercast_audio_data:/shared_audio`)
+-   `IGA_GENERATED_IMAGE_DIR`: **Deprecated.** Directory path *inside the container* where generated images were temporarily saved. Images are now uploaded directly to Google Cloud Storage (GCS). A local temporary directory might still be used internally before uploading.
+    -   *Default:* `/shared_audio/iga_images` (but its role has changed to a temporary location if used at all).
+-   `GCS_BUCKET_NAME`: **Required.** The name of the Google Cloud Storage bucket where generated images will be uploaded.
+    -   *Example:* `GCS_BUCKET_NAME=your-aethercast-image-bucket`
+-   `IGA_GCS_IMAGE_PREFIX`: **Required.** The prefix (folder path) within the GCS bucket where IGA images will be stored.
+    -   *Default:* `images/iga/` (Ensure it ends with a `/`).
 -   `IGA_DEFAULT_ASPECT_RATIO`: Default aspect ratio for generated images.
     -   *Default:* `1:1`
 -   `IGA_ADD_WATERMARK`: Whether to add a Google watermark to generated images (boolean).
@@ -144,6 +148,7 @@ Service dependencies are listed in `requirements.txt`:
 -   `Flask>=2.0`
 -   `python-dotenv>=0.15`
 -   `google-cloud-aiplatform>=1.0.0`
+-   `google-cloud-storage>=1.30.0` (for uploading images to GCS)
 
 Install dependencies using:
 ```bash
@@ -157,23 +162,27 @@ To run the IGA service directly for development or testing:
 1.  Ensure all required environment variables are set (e.g., in an `.env` file in this directory).
     *   `IGA_VERTEXAI_PROJECT_ID` and `IGA_VERTEXAI_LOCATION` are critical.
     *   Ensure Google Cloud authentication is configured (either via `GOOGLE_APPLICATION_CREDENTIALS` pointing to a key file, or by having Application Default Credentials set up in your environment, e.g., by running `gcloud auth application-default login`).
-    *   The `IGA_GENERATED_IMAGE_DIR` must be a writable path on your local system if running outside Docker with that path. For consistency with Docker, you might map a local path to `/shared_audio/iga_images`.
-2.  Create the directory specified by `IGA_GENERATED_IMAGE_DIR` if it doesn't exist (e.g., `mkdir -p ./shared_data_mount/iga_images` and set `IGA_GENERATED_IMAGE_DIR=./shared_data_mount/iga_images`).
-3.  Execute the main script:
+    *   `GCS_BUCKET_NAME` must be set.
+2.  Execute the main script:
     ```bash
     python aethercast/iga/main.py
     ```
-    The service will typically start on `http://0.0.0.0:5007` (or as configured).
+    The service will typically start on `http://0.0.0.0:5007` (or as configured). Images will be uploaded to GCS.
 
 ## Docker
 
 The IGA service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
 
 -   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build iga_service`.
--   **Credentials in Docker:**
+-   **Credentials and Configuration in Docker:**
     *   The recommended way for services running in Google Cloud (like Cloud Run, GKE) is to use service account identity.
-    *   For local Docker development, you can mount your GCP service account key JSON file into the container. Ensure your `.env` file for IGA sets `GOOGLE_APPLICATION_CREDENTIALS` to the path where this key will be mounted inside the container (e.g., `/app/gcp-credentials.json`). The `docker-compose.yml` should handle this mounting.
--   **Shared Volume for Images:** The `docker-compose.yml` file should define a named volume (e.g., `aethercast_audio_data` or a new `aethercast_image_data`) and mount it to a common path like `/shared_data` or `/shared_audio` inside the `iga_service` container. The `IGA_GENERATED_IMAGE_DIR` (e.g., `/shared_audio/iga_images`) will then reside within this shared volume, allowing other services to potentially access these files if needed (though typically CPOA only needs the path).
+    *   For local Docker development, you can mount your GCP service account key JSON file into the container.
+    *   Ensure your `.env` file for IGA (or `common.env` if sourced) sets:
+        -   `GOOGLE_APPLICATION_CREDENTIALS` to the path where this key will be mounted inside the container (e.g., `/app/gcp-credentials.json`).
+        -   `GCS_BUCKET_NAME` to your target bucket.
+        -   `IGA_GCS_IMAGE_PREFIX` as desired.
+    *   The `docker-compose.yml` should handle the mounting of credentials.
+-   **Shared Volume for Images:** The shared volume (`aethercast_audio_data` or similar) is no longer the primary storage for IGA outputs. Images are uploaded directly to GCS. The volume might still be used for temporary files.
 -   **Running with Docker Compose:**
     ```bash
     docker-compose up -d iga_service
