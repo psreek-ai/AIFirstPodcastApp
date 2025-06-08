@@ -18,7 +18,7 @@ The system consists of several microservices that work together:
 
 -   **AIMS Service (`aims_service`):** Provides access to general-purpose AI models (e.g., Large Language Models) used by other agents like SCA and PSWA.
 -   **AIMS TTS Service (`aims_tts_service`):** Handles Text-to-Speech synthesis, converting scripts from VFA into audio. It's used by the VFA.
--   **Image Generation Agent (IGA):** Responsible for dynamically generating cover art or accompanying images for podcasts, typically based on prompts from SCA or PSWA.
+-   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen, based on prompts.
 
 ## Features (Conceptual)
 
@@ -79,6 +79,11 @@ This project uses Docker Compose to manage and run the suite of microservices in
                     *   In `aethercast/vfa/.env`: `VFA_TEST_MODE_ENABLED=True` (bypasses TTS)
                     *   In `aethercast/tda/.env`: `USE_REAL_NEWS_API=False` (uses simulated news)
                     The `common.env` file sets these test modes to `True` by default, but service-specific `.env` files can override them if needed.
+            *   **Google Cloud Platform (GCP) Setup for AIMS, AIMS_TTS, and IGA:**
+                *   These three services now utilize Google Cloud Vertex AI.
+                *   In `common.env`, you **must** set your actual `GCP_PROJECT_ID` and `GCP_LOCATION`.
+                *   For **each** of these services (`aims_service`, `aims_tts_service`, `iga`), place your GCP service account key JSON file (e.g., named `gcp-credentials.json`) inside their respective directories (e.g., `aethercast/aims_service/gcp-credentials.json`).
+                *   Ensure the `.env` file for each of these services correctly sets `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path where the key file will be mounted inside their containers as per `docker-compose.yml`).
 
 2.  **Build and Run Services:**
     Open a terminal at the project root (where `docker-compose.yml` is located) and run:
@@ -95,11 +100,11 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   PSWA: `http://localhost:5004`
     *   VFA: `http://localhost:5005`
     *   ASF: `ws://localhost:5006` (for WebSocket connections)
-    *   AIMS Service: `http://localhost:PORT` (Replace `PORT` with actual, if directly accessible for debugging)
-    *   AIMS TTS Service: `http://localhost:PORT` (Replace `PORT` with actual, if directly accessible for debugging)
-    *   IGA: `http://localhost:PORT` (Replace `PORT` with actual, if directly accessible for debugging)
+    *   AIMS Service: `http://localhost:8008` (maps to container port 8000)
+    *   AIMS TTS Service: `http://localhost:9009` (maps to container port 9000)
+    *   IGA: `http://localhost:5007` (Image Generation Agent, now uses Vertex AI)
 
-    Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes. The main interaction point for users is the API Gateway.
+    Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes. The main interaction point for users is the API Gateway. IGA now performs real image generation using Vertex AI.
 
 4.  **Shared Volumes:**
     *   `aethercast_db_data`: A named volume that stores the shared SQLite database (`aethercast_podcasts.db`). This ensures data persistence across container restarts and allows all services to access the same DB instance.

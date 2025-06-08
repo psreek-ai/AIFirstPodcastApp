@@ -148,14 +148,30 @@ services:
     ports:
       - "5007:5007" # Expose port 5007 for IGA
     env_file:
-      # - ./aethercast/iga/.env # Users must create this from .env.example
-      # For now, directly using .env.example to ensure it runs out of the box
-      # In a real setup, users would copy .env.example to .env and customize
-      - ./aethercast/iga/.env.example
+      - common.env # To pick up GCP_PROJECT_ID, GCP_LOCATION, FLASK_DEBUG_MODE
+      - ./aethercast/iga/.env # Service-specific vars (user should create this from .env.example)
     environment:
       PYTHONUNBUFFERED: 1
+      # Essential for Vertex AI. Path inside the container.
+      GOOGLE_APPLICATION_CREDENTIALS: /app/gcp-credentials.json
+      # IGA specific Vertex AI settings, can be overridden in .env if needed
+      IGA_VERTEXAI_PROJECT_ID: ${GCP_PROJECT_ID} # From common.env
+      IGA_VERTEXAI_LOCATION: ${GCP_LOCATION} # From common.env
+      IGA_VERTEXAI_IMAGE_MODEL_ID: imagegeneration@006 # Default model
+      IGA_GENERATED_IMAGE_DIR: /shared_audio/iga_images # Path on shared volume
+      IGA_DEFAULT_ASPECT_RATIO: "1:1"
+      IGA_ADD_WATERMARK: "True"
+      # Flask server settings for IGA
+      IGA_HOST: 0.0.0.0
+      IGA_PORT: 5007
+      FLASK_DEBUG: ${FLASK_DEBUG_MODE:-True} # Use common.env value, default to True
     volumes:
       - ./aethercast/iga:/app # For live development
+      # Mount the GCP credentials file into the container (read-only)
+      # User must place their gcp-credentials.json in ./aethercast/iga/
+      - ./aethercast/iga/gcp-credentials.json:/app/gcp-credentials.json:ro
+      # Mount the shared volume for image output
+      - aethercast_audio_data:/shared_audio
     networks:
       - aethercast_network
     restart: unless-stopped
@@ -191,5 +207,6 @@ networks:
 # This means the Python code should use imports like 'from aethercast.module.file import ...'
 # and the PYTHONPATH=/app should make this work.
 # The CMD ["python", "aethercast/service_dir/main.py"] should also work with this structure.
-# The build context for each service is set to '.' (project root) to allow Dockerfiles to COPY ./aethercast.
-# For IGA, context is specific to its directory as it's self-contained.
+# The build context for services like api_gateway, tda, etc., is set to '.' (project root)
+# to allow Dockerfiles to COPY ./aethercast, while services like aims_service and iga
+# have their build context set directly to their own directories.
