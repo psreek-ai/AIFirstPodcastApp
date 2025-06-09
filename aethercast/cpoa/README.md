@@ -75,5 +75,35 @@ Formal unit tests are in `aethercast/cpoa/tests/`. Run with `python -m unittest 
 -   CPOA functions accept `task_id` and optional `voice_params_input`, `client_id`, `user_preferences`, and `test_scenarios`. The `db_path` parameter has been removed as CPOA now uses its configured `DATABASE_TYPE`.
 -   `user_preferences` can influence agent calls (e.g., preferred VFA voice).
 -   `test_scenarios` allow passing headers like `X-Test-Scenario` to downstream services for testing.
--   The final dictionary from `orchestrate_podcast_generation` includes status, error messages, ASF details, the GCS URI for the audio (`final_audio_filepath`), stream ID, actual TTS settings used, and a detailed orchestration log.
+-   The final dictionary from `orchestrate_podcast_generation` includes status, error messages, ASF details, the GCS URI for the audio (`final_audio_filepath`), stream ID, actual TTS settings used, a detailed CPOA internal orchestration log, and now also a `workflow_id`.
+
+## Workflow State Management
+
+CPOA now implements robust state management for its orchestration flows using two primary PostgreSQL tables: `workflow_instances` and `task_instances`. This provides enhanced observability, debugging capabilities, and a foundation for future features like workflow resumption.
+
+-   **`workflow_instances`**: Each call to a major CPOA orchestration function (e.g., `orchestrate_podcast_generation`, `orchestrate_landing_page_snippets`) creates a record here. This table tracks the overall workflow, including:
+    -   `workflow_id` (unique identifier for the entire process).
+    -   `user_id` (if provided from an authenticated API Gateway call).
+    -   `trigger_event_type` (e.g., "podcast_generation", "landing_page_snippets").
+    -   `trigger_event_details_json` (initial parameters of the request).
+    -   `overall_status` ("pending", "in_progress", "completed", "failed", "completed_with_errors").
+    -   Timestamps, evolving context data (like generated GCS URIs), and top-level error messages.
+-   **`task_instances`**: Each call to an external agent (TDA, SCA, PSWA, VFA, IGA) or significant internal step within a workflow is logged as a task instance. This table tracks:
+    -   `task_id` (unique identifier for the specific task).
+    -   `workflow_id` (linking back to the parent workflow).
+    -   `agent_name` (e.g., "TDA", "PSWA").
+    -   `task_order`, `status`, `input_params_json`, `output_result_summary_json`, `error_details_json`, timestamps, and `retry_count`.
+
+**Interaction Flow:**
+1.  When a CPOA orchestration function is called, it first creates a `workflow_instance` record.
+2.  Before each call to an agent (e.g., TDA, PSWA), a `task_instance` record is created.
+3.  After the agent call completes or fails, the corresponding `task_instance` record is updated with the status and outcome.
+4.  Once all steps in the workflow are done, or if a critical error occurs, the `workflow_instances` record is updated to its final status.
+
+**Key Changes to Orchestration Functions:**
+-   They now accept an optional `user_id: Optional[str]` parameter, which is passed by the API Gateway for authenticated requests and stored in `workflow_instances`.
+-   They now return a `workflow_id` (string) as part of their primary response dictionary, allowing callers (like the API Gateway) to reference the specific workflow instance.
+
+This detailed state tracking occurs in the PostgreSQL database, managed by internal CPOA helper functions (`_create_workflow_instance`, `_update_task_instance_status`, etc.). For more details on the schema, see `docs/architecture/CPOA_State_Management.md`.
+The legacy `podcasts` table is still updated by `orchestrate_podcast_generation` for backward compatibility with existing API Gateway logic, but the new `workflow_instances` and `task_instances` tables provide a more granular and comprehensive state management solution.
 ```

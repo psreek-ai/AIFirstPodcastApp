@@ -166,10 +166,10 @@ Below are descriptions of the major components depicted in the architecture diag
     * **Description:** Persistent storage for various types of data required by the application.
     * **Key Responsibilities & Data Types:**
         * **User Session State:** Current context of user interaction (managed by CPOA).
-        * **Generated Content Metadata:** Information about snippets, generated scripts (e.g., source URLs, generation parameters).
-        * **Agent Task State:** Tracking progress and status of tasks handled by agents.
-        * **Topic Cache:** Storing discovered or processed topics.
-        * **Script Cache (Optional):** Caching generated scripts to avoid re-generation if the same podcast is requested shortly after by another user (trade-off with "always real-time" principle).
+        * **Generated Content Metadata:** Information about snippets, generated scripts (e.g., source URLs, generation parameters for `topics_snippets` and `generated_scripts` tables).
+        * **Workflow and Task Instance State (CPOA):** Detailed tracking of CPOA orchestration flows (`workflow_instances` table) and individual agent task statuses (`task_instances` table). This is crucial for observability and debugging.
+        * **Topic Cache:** Storing discovered or processed topics (potentially in `topics_snippets` or a dedicated cache).
+        * **Script Cache (Optional):** Caching generated scripts (in `generated_scripts` table) to avoid re-generation.
         * **User Preferences (Future):** Storing user feedback or preferences for personalization.
     * **Potential Technologies:**
         * Session/Cache: Redis, Memcached.

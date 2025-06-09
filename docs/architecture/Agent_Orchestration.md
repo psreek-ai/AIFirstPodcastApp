@@ -268,8 +268,10 @@ Effective state management is crucial for orchestration.
         * Current step in the workflow.
         * Status of each dispatched task (`task_id`, agent assigned, status, start/end time, input/output references).
         * Intermediate data/results from agents that are needed by subsequent agents in the same workflow.
-    * **Storage:** This is critical. Can be stored in a persistent database (e.g., PostgreSQL, MongoDB) managed by CPOA, or potentially within a dedicated workflow engine if one is used as part of CPOA.
-    * **Purpose:** To track progress, enable recovery from failures, resume long workflows, and for debugging/auditing.
+    * **Storage:** This is implemented using two primary PostgreSQL tables:
+        *   **`workflow_instances`**: Stores high-level information about each workflow initiated by CPOA (e.g., `workflow_id`, `user_id`, `trigger_event_type`, `overall_status`, timestamps, `context_data_json` for shared workflow data, `error_message`).
+        *   **`task_instances`**: Stores details for each individual agent call or significant step within a workflow (e.g., `task_id`, `workflow_id` (FK), `agent_name`, `task_order`, `status`, `input_params_json`, `output_result_summary_json`, `error_details_json`, timestamps, `retry_count`).
+    * **Purpose:** To track progress, enable recovery from failures (future), resume long workflows (future), and for detailed debugging, auditing, and observability of CPOA operations. (See `docs/architecture/CPOA_State_Management.md` for detailed schema).
 * **Global Orchestration State:**
     * **Content:** Availability/status of specialized agents or underlying models (e.g., AIMS health), rate limits for external APIs, cached popular topics, blacklisted sources.
     * **Storage:** Could be in-memory for CPOA (if single instance and state is ephemeral) or a shared configuration store/cache.

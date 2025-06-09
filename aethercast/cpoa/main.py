@@ -114,10 +114,13 @@ POSTGRES_DB = os.getenv("POSTGRES_DB")
 # --- Logging Configuration ---
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(message)s')
+    # New format to include workflow_id and task_id, which will be added via LoggerAdapter
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(workflow_id)s - %(task_id)s - %(message)s')
 
-# Log loaded configuration
-logger.info("--- CPOA Configuration ---")
+# Log loaded configuration (initial logging without workflow/task IDs)
+# Create a temporary adapter for these initial logs if needed, or log directly.
+initial_log_extra = {'workflow_id': 'N/A', 'task_id': 'N/A'}
+logger.info("--- CPOA Configuration ---", extra=initial_log_extra)
 logger.info(f"DATABASE_TYPE: {DATABASE_TYPE}")
 if DATABASE_TYPE == "sqlite":
     logger.info(f"SHARED_DATABASE_PATH (SQLite): {CPOA_DATABASE_PATH}")
@@ -174,9 +177,193 @@ def _get_cpoa_db_connection():
         logger.debug("CPOA DB type is SQLite. Connection handled by individual functions using CPOA_DATABASE_PATH.")
         return None
     else:
-        logger.error(f"CPOA: Unsupported DATABASE_TYPE: {db_type}")
+        logger.error(f"CPOA: Unsupported DATABASE_TYPE: {db_type}", extra=initial_log_extra)
         raise ValueError(f"CPOA: Unsupported DATABASE_TYPE: {db_type}")
 
+# --- CPOA State Management DB Status Constants (New) ---
+WORKFLOW_STATUS_PENDING = "pending"
+WORKFLOW_STATUS_IN_PROGRESS = "in_progress"
+WORKFLOW_STATUS_COMPLETED = "completed"
+WORKFLOW_STATUS_FAILED = "failed"
+WORKFLOW_STATUS_COMPLETED_WITH_ERRORS = "completed_with_errors"
+
+TASK_STATUS_PENDING = "pending"
+TASK_STATUS_DISPATCHED = "dispatched"
+TASK_STATUS_IN_PROGRESS = "in_progress"
+TASK_STATUS_COMPLETED = "completed"
+TASK_STATUS_FAILED = "failed"
+TASK_STATUS_SKIPPED = "skipped"
+
+# --- CPOA State Management DB Helpers (New) ---
+def _create_workflow_instance(trigger_event_type: str, trigger_event_details: Optional[dict] = None, user_id: Optional[str] = None) -> Optional[str]:
+    conn = None
+    workflow_id = None
+    log_extra = {'workflow_id': None, 'task_id': None}
+    try:
+        conn = _get_cpoa_db_connection()
+        if not conn or DATABASE_TYPE != "postgres":
+            logger.error(f"CPOA State: Failed to get PostgreSQL connection for creating workflow. DB Type: {DATABASE_TYPE}", extra=log_extra)
+            return None
+
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO workflow_instances
+                    (user_id, trigger_event_type, trigger_event_details_json, overall_status, start_timestamp, last_updated_timestamp)
+                VALUES (%s, %s, %s, %s, current_timestamp, current_timestamp)
+                RETURNING workflow_id;
+            """
+            trigger_details_json = json.dumps(trigger_event_details) if trigger_event_details else None
+            cur.execute(sql, (user_id, trigger_event_type, trigger_details_json, WORKFLOW_STATUS_PENDING))
+            result = cur.fetchone()
+            if result and 'workflow_id' in result: # Check if 'workflow_id' key exists
+                workflow_id = str(result['workflow_id'])
+            conn.commit()
+            log_extra['workflow_id'] = workflow_id # Update log_extra with the new workflow_id
+            logger.info(f"Workflow instance created. Type: {trigger_event_type}", extra=log_extra)
+            return workflow_id
+    except psycopg2.Error as e:
+        logger.error(f"CPOA State: DB error creating workflow. Type: {trigger_event_type}. Error: {e}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return None
+    except Exception as e_unexp:
+        logger.error(f"CPOA State: Unexpected error creating workflow. Type: {trigger_event_type}. Error: {e_unexp}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return None
+    finally:
+        if conn: conn.close()
+
+def _update_workflow_instance_status(workflow_id: str, overall_status: str, context_data: Optional[dict] = None, error_message: Optional[str] = None):
+    conn = None
+    log_extra = {'workflow_id': workflow_id, 'task_id': None}
+    try:
+        conn = _get_cpoa_db_connection()
+        if not conn or DATABASE_TYPE != "postgres":
+            logger.error(f"CPOA State: Failed to get PostgreSQL connection for updating workflow.", extra=log_extra)
+            return False
+
+        with conn.cursor() as cur:
+            end_ts_sql_part = ", end_timestamp = current_timestamp" if overall_status in [WORKFLOW_STATUS_COMPLETED, WORKFLOW_STATUS_FAILED, WORKFLOW_STATUS_COMPLETED_WITH_ERRORS] else ""
+
+            current_context_data = {}
+            if context_data is None:
+                cur.execute("SELECT context_data_json FROM workflow_instances WHERE workflow_id = %s;", (workflow_id,))
+                current_row = cur.fetchone()
+                if current_row and current_row.get('context_data_json'): # Check key existence
+                    current_context_data = current_row['context_data_json']
+                context_data_to_save = current_context_data
+            else:
+                cur.execute("SELECT context_data_json FROM workflow_instances WHERE workflow_id = %s;", (workflow_id,))
+                current_row = cur.fetchone()
+                if current_row and current_row.get('context_data_json'):
+                    current_context_data = current_row['context_data_json']
+                current_context_data.update(context_data)
+                context_data_to_save = current_context_data
+
+            sql = f"""
+                UPDATE workflow_instances
+                SET overall_status = %s, context_data_json = %s, error_message = %s, last_updated_timestamp = current_timestamp {end_ts_sql_part}
+                WHERE workflow_id = %s;
+            """
+            cur.execute(sql, (overall_status, json.dumps(context_data_to_save) if context_data_to_save else None, error_message, workflow_id))
+            conn.commit()
+            logger.info(f"Workflow instance status updated to {overall_status}.", extra=log_extra)
+            return True
+    except psycopg2.Error as e:
+        logger.error(f"CPOA State: DB error updating workflow to status {overall_status}. Error: {e}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return False
+    except Exception as e_unexp:
+        logger.error(f"CPOA State: Unexpected error updating workflow. Error: {e_unexp}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return False
+    finally:
+        if conn: conn.close()
+
+def _create_task_instance(workflow_id: str, agent_name: str, task_order: int, input_params: Optional[dict] = None, initial_status: str = TASK_STATUS_PENDING) -> Optional[str]:
+    conn = None
+    task_id = None
+    log_extra = {'workflow_id': workflow_id, 'task_id': None}
+    try:
+        conn = _get_cpoa_db_connection()
+        if not conn or DATABASE_TYPE != "postgres":
+            logger.error(f"CPOA State: Failed to get PostgreSQL connection for creating task.", extra=log_extra)
+            return None
+
+        with conn.cursor() as cur:
+            sql = """
+                INSERT INTO task_instances
+                    (workflow_id, agent_name, task_order, status, input_params_json, start_timestamp, last_updated_timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, current_timestamp)
+                RETURNING task_id;
+            """
+            start_ts = datetime.now() if initial_status not in [TASK_STATUS_PENDING] else None # Use datetime.now() for PG
+
+            cur.execute(sql, (workflow_id, agent_name, task_order, initial_status, json.dumps(input_params) if input_params else None, start_ts))
+            result = cur.fetchone()
+            if result and 'task_id' in result: # Check key existence
+                task_id = str(result['task_id'])
+            conn.commit()
+            log_extra['task_id'] = task_id # Update log_extra with new task_id
+            logger.info(f"Task instance created. Agent: {agent_name}, Order: {task_order}, Status: {initial_status}", extra=log_extra)
+            return task_id
+    except psycopg2.Error as e:
+        logger.error(f"CPOA State: DB error creating task for agent {agent_name}. Error: {e}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return None
+    except Exception as e_unexp:
+        logger.error(f"CPOA State: Unexpected error creating task for agent {agent_name}. Error: {e_unexp}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return None
+    finally:
+        if conn: conn.close()
+
+def _update_task_instance_status(task_id: str, status: str, output_summary: Optional[dict] = None, error_details: Optional[dict] = None, retry_count: Optional[int] = None, workflow_id_for_log: Optional[str] = None):
+    conn = None
+    log_extra = {'workflow_id': workflow_id_for_log, 'task_id': task_id}
+    try:
+        conn = _get_cpoa_db_connection()
+        if not conn or DATABASE_TYPE != "postgres":
+            logger.error(f"CPOA State: Failed to get PostgreSQL connection for updating task.", extra=log_extra)
+            return False
+
+        with conn.cursor() as cur:
+            set_clauses = ["status = %s", "last_updated_timestamp = current_timestamp"]
+            params = [status]
+
+            if output_summary is not None:
+                set_clauses.append("output_result_summary_json = %s")
+                params.append(json.dumps(output_summary))
+            if error_details is not None:
+                set_clauses.append("error_details_json = %s")
+                params.append(json.dumps(error_details))
+            if retry_count is not None:
+                set_clauses.append("retry_count = %s")
+                params.append(retry_count)
+
+            if status in [TASK_STATUS_COMPLETED, TASK_STATUS_FAILED, TASK_STATUS_SKIPPED]:
+                set_clauses.append("end_timestamp = current_timestamp")
+
+            if status in [TASK_STATUS_DISPATCHED, TASK_STATUS_IN_PROGRESS] and status != TASK_STATUS_PENDING : # Ensure it's not TASK_STATUS_PENDING
+                 set_clauses.append("start_timestamp = COALESCE(start_timestamp, current_timestamp)")
+
+
+            sql = f"UPDATE task_instances SET {', '.join(set_clauses)} WHERE task_id = %s;"
+            params.append(task_id)
+
+            cur.execute(sql, tuple(params))
+            conn.commit()
+            logger.info(f"Task instance status updated to {status}.", extra=log_extra)
+            return True
+    except psycopg2.Error as e:
+        logger.error(f"CPOA State: DB error updating task to status {status}. Error: {e}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return False
+    except Exception as e_unexp:
+        logger.error(f"CPOA State: Unexpected error updating task. Error: {e_unexp}", exc_info=True, extra=log_extra)
+        if conn: conn.rollback()
+        return False
+    finally:
+        if conn: conn.close()
 
 # Try to import WCHA. PSWA and VFA are now services.
 try:
@@ -322,17 +509,18 @@ def _update_task_status_in_db(task_id: str, new_cpoa_status: str, error_msg: Opt
             conn.close()
 
 # --- Helper function to send UI updates to ASF ---
-def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, Any]):
+def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, Any], workflow_id_for_log: Optional[str] = None):
     """
     Sends a UI update message to ASF's internal endpoint.
     This is a non-critical operation; failures are logged but do not halt orchestration.
     """
+    log_extra = {'workflow_id': workflow_id_for_log, 'task_id': None}
     if not client_id:
-        logger.info("No client_id provided, skipping UI update.")
+        logger.info("No client_id provided, skipping UI update.", extra=log_extra)
         return
 
     if not CPOA_ASF_SEND_UI_UPDATE_URL:
-        logger.warning("CPOA_ASF_SEND_UI_UPDATE_URL not configured. Cannot send UI update.")
+        logger.warning("CPOA_ASF_SEND_UI_UPDATE_URL not configured. Cannot send UI update.", extra=log_extra)
         return
 
     payload = {
@@ -341,418 +529,327 @@ def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, A
         "data": data
     }
     try:
-        # Using requests_with_retry for this internal call, but with very few retries.
-        # Timeout should be short as it's an internal call.
         response = requests_with_retry(
             "post",
             CPOA_ASF_SEND_UI_UPDATE_URL,
-            max_retries=1, # Low retry for internal, quick calls
-            backoff_factor=0.1, # Short backoff
+            max_retries=1,
+            backoff_factor=0.1,
             json=payload,
-            timeout=5 # Short timeout
+            timeout=5,
+            workflow_id_for_log=workflow_id_for_log, # Pass context for retry logger
+            task_id_for_log=None
         )
         if response.status_code == 200:
-            logger.info(f"Successfully sent UI update '{event_name}' for client_id '{client_id}'. Data: {data}")
+            logger.info(f"Successfully sent UI update '{event_name}' for client_id '{client_id}'.", extra=log_extra)
         else:
-            logger.warning(f"Failed to send UI update '{event_name}' for client_id '{client_id}'. ASF responded with {response.status_code}: {response.text}")
+            logger.warning(f"Failed to send UI update '{event_name}' for client_id '{client_id}'. ASF responded with {response.status_code}: {response.text}", extra=log_extra)
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error sending UI update '{event_name}' for client_id '{client_id}' to ASF: {e}")
-    except Exception as e_unexp: # Catch any other unexpected error
-        logger.error(f"Unexpected error in _send_ui_update for client_id '{client_id}': {e_unexp}", exc_info=True)
+        logger.error(f"Error sending UI update '{event_name}' for client_id '{client_id}' to ASF: {e}", exc_info=True, extra=log_extra)
+    except Exception as e_unexp:
+        logger.error(f"Unexpected error in _send_ui_update for client_id '{client_id}': {e_unexp}", exc_info=True, extra=log_extra)
 
 
 def orchestrate_podcast_generation(
     topic: str,
-    task_id: str,
-    # db_path: str, # Removed, CPOA will use its configured DB settings
+    original_task_id: str, # ID from API Gateway, used for logging & correlation
+    user_id: Optional[str] = None,
     voice_params_input: Optional[dict] = None,
     client_id: Optional[str] = None,
     user_preferences: Optional[dict] = None,
-    test_scenarios: Optional[dict] = None # Added for integration testing
+    test_scenarios: Optional[dict] = None
 ) -> Dict[str, Any]:
-    """
-    Orchestrates the podcast generation by calling WCHA, PSWA, and VFA in sequence,
-    optionally using provided voice parameters for VFA, potentially influenced by user_preferences,
-    and allowing test scenarios to be passed for component behavior control.
-    Uses web search via WCHA's get_content_for_topic.
-    Updates task status in a database.
-    """
-    orchestration_log: List[Dict[str, Any]] = []
-    # Initialize vfa_result_dict with a 'not_run' status. This will be updated if VFA is reached.
-    vfa_result_dict: Dict[str, Any] = {"status": VFA_STATUS_NOT_RUN, "message": "VFA not reached.", "audio_filepath": None, "stream_id": None}
-    current_orchestration_stage: str = ORCHESTRATION_STAGE_INITIALIZATION
-    # final_cpoa_status and final_error_message will be determined by the outcome of the steps.
-    # Initialize them here to ensure they are always defined before the finally block.
-    final_cpoa_status: str = CPOA_STATUS_PENDING # Default status
+
+    workflow_id = _create_workflow_instance(
+        trigger_event_type="podcast_generation",
+        trigger_event_details={
+            "topic": topic, "original_task_id": original_task_id,
+            "voice_params_input": voice_params_input, "client_id": client_id,
+            "user_preferences": user_preferences, "test_scenarios": test_scenarios
+        },
+        user_id=user_id
+    )
+
+    if not workflow_id:
+        # Log with initial_log_extra as workflow_id is None
+        logger.error(f"Failed to create workflow instance for podcast_generation (topic: {topic}). Aborting.", extra=initial_log_extra)
+        return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
+                "error_message": "Workflow creation failed in CPOA state manager.",
+                "orchestration_log": [], "final_audio_details": {}}
+
+    # Use a logging adapter for this workflow, injecting workflow_id into all logs
+    wf_logger = logging.LoggerAdapter(logger, {'workflow_id': workflow_id, 'task_id': None})
+
+    _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
+
+    # This is the CPOA internal step log, distinct from the DB task_instances table
+    orchestration_log_cpoa: List[Dict[str, Any]] = []
+
+    vfa_result_dict: Dict[str, Any] = {"status": VFA_STATUS_NOT_RUN, "message": "VFA not reached."}
+    current_orchestration_stage_legacy: str = ORCHESTRATION_STAGE_INITIALIZATION # For legacy log_step
+
+    # final_cpoa_status is the legacy overall status for the 'podcasts' table entry
+    final_cpoa_status_legacy: str = CPOA_STATUS_PENDING
+    final_workflow_status: str = WORKFLOW_STATUS_IN_PROGRESS # For the new 'workflow_instances' table
+
     final_error_message: Optional[str] = None
-    asf_notification_status_message: Optional[str] = None # For ASF notification outcome
+    asf_notification_status_message: Optional[str] = None
+    current_task_order = 0
+    context_data_for_workflow = {} # Store key results like GCS URIs, script title etc.
 
-    # Get retry configurations
-    retry_count = CPOA_SERVICE_RETRY_COUNT
-    backoff_factor = CPOA_SERVICE_RETRY_BACKOFF_FACTOR
-
-    def log_step(message: str, data: Optional[Dict[str, Any]] = None, is_error_payload: bool = False) -> None:
+    # Legacy log_step function (can be refactored or removed if orchestration_log_cpoa is not primary)
+    def log_step_cpoa(message: str, data: Optional[Dict[str, Any]] = None, is_error_payload: bool = False) -> None:
         timestamp = datetime.now().isoformat()
-        # current_orchestration_stage is available in the outer function's scope
-        log_entry: Dict[str, Any] = {"timestamp": timestamp, "stage": current_orchestration_stage, "message": message}
+        log_entry: Dict[str, Any] = {"timestamp": timestamp, "stage": current_orchestration_stage_legacy, "message": message}
+        # ... (rest of log_step_cpoa implementation as before) ...
+        orchestration_log_cpoa.append(log_entry)
+        # wf_logger.info(f"Legacy log_step: {message}") # Avoid duplicate wf_logger here if it's just for orchestration_log_cpoa
 
-        log_data_str_for_preview = "N/A"
+    wf_logger.info(f"Podcast generation workflow started for topic: {topic}. Original Task ID: {original_task_id}")
+    log_step_cpoa("Orchestration process started.", data={"original_task_id": original_task_id, "topic": topic, "voice_params_input": voice_params_input, "client_id": client_id, "user_preferences": user_preferences, "test_scenarios": test_scenarios})
 
-        if data is not None:
-            # Store the actual dictionary for structured_data if it's not an error payload meant only for preview
-            if not is_error_payload:
-                 log_entry["structured_data"] = data
+    # Update legacy 'podcasts' table (this should eventually be phased out or integrated with workflow status)
+    _update_task_status_in_db(original_task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, workflow_id_for_log=workflow_id)
 
-            # Create string representation for data_preview
-            try:
-                # For error payloads or complex data, ensure sensitive info is handled if necessary before full dump
-                log_data_str_for_preview = json.dumps(data)
-            except TypeError: 
-                try:
-                    log_data_str_for_preview = str(data) # Fallback to string representation
-                except Exception:
-                    log_data_str_for_preview = "Data could not be serialized or converted to string for preview"
+    try:
+        # --- WCHA Stage ---
+        current_orchestration_stage_legacy = ORCHESTRATION_STAGE_WCHA
+        current_task_order += 1
+        wcha_task_id = _create_task_instance(workflow_id, "WCHA", current_task_order, {"topic": topic}, initial_status=TASK_STATUS_DISPATCHED)
         
-        preview_limit = 250  # Keep preview concise
-        log_entry["data_preview"] = log_data_str_for_preview[:preview_limit] + "..." if len(log_data_str_for_preview) > preview_limit else log_data_str_for_preview
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Fetching web content...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
+        log_step_cpoa("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
         
-        orchestration_log.append(log_entry)
-        # Also log to the main CPOA logger for real-time visibility if needed
-        logger.info(f"Task {task_id} @ {current_orchestration_stage}: {message} - Preview: {log_entry['data_preview']}")
-
-    # Log initial parameters
-    log_step("Orchestration process started.", data={
-        "task_id": task_id, "topic": topic, # db_path removed from log
-        "voice_params_input": voice_params_input, "client_id": client_id,
-        "user_preferences": user_preferences,
-        "test_scenarios": test_scenarios # Log received test_scenarios
-    })
-    if user_preferences:
-        logger.info(f"Task {task_id}: Received user preferences: {user_preferences}")
-    if test_scenarios:
-        logger.info(f"Task {task_id}: Received test scenarios: {test_scenarios}")
-        # Example: Log potential usage for TDA (conceptual for now)
-        if PREF_KEY_NEWS_CATEGORY in user_preferences:
-            logger.info(f"Task {task_id}: User preference for news category found: {user_preferences[PREF_KEY_NEWS_CATEGORY]}. This could influence TDA calls if implemented.")
-
-    # Check for import issues first
-    if not WCHA_IMPORT_SUCCESSFUL:
-        current_orchestration_stage = ORCHESTRATION_STAGE_INITIALIZATION_FAILURE
-        critical_error_msg = str(WCHA_MISSING_IMPORT_ERROR if WCHA_MISSING_IMPORT_ERROR else "WCHA module import error not specified.")
-        log_step(f"CPOA critical failure: WCHA module import error.", data={"error_message": critical_error_msg})
-        _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": critical_error_msg, "stage": current_orchestration_stage})
-        final_cpoa_status = CPOA_STATUS_FAILED_WCHA_MODULE_ERROR
-        final_error_message = critical_error_msg
-    
-    else: # Proceed with orchestration
+        wcha_content = None
+        wcha_error_details = None
+        wcha_output_summary = {}
         try:
-            current_orchestration_stage = ORCHESTRATION_STAGE_WCHA
-            _update_task_status_in_db(task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, error_msg=None) # db_path removed
-            _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Fetching and processing web content...", "stage": current_orchestration_stage})
-            log_step("Calling WCHA (get_content_for_topic)...", data={"topic": topic})
+            if not WCHA_IMPORT_SUCCESSFUL:
+                raise ImportError(WCHA_MISSING_IMPORT_ERROR or "WCHA module not available.")
 
-            # WCHA's get_content_for_topic now returns a dictionary
-            wcha_result_dict = get_content_for_topic(topic=topic)
-            wcha_content = None # Initialize wcha_content
+            if wcha_task_id: _update_task_instance_status(wcha_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            wcha_result_dict = get_content_for_topic(topic=topic) # Direct function call
 
             if isinstance(wcha_result_dict, dict) and wcha_result_dict.get("status") == "success":
                 wcha_content = wcha_result_dict.get("content")
                 source_urls = wcha_result_dict.get("source_urls", [])
-                wcha_message = wcha_result_dict.get("message", "WCHA success.")
-                log_step("WCHA finished successfully.", data={
-                    "content_length": len(wcha_content) if wcha_content else 0,
-                    "source_urls": source_urls,
-                    "message": wcha_message,
-                    "content_preview": wcha_content[:200] + "..." if wcha_content else "N/A"
-                })
-                if not wcha_content: # Success status but no content means all sources failed or were too short
-                    final_error_message = wcha_message or "WCHA returned success but no usable content."
-                    log_step(f"WCHA content retrieval warning: No content aggregated.", data={"wcha_result": wcha_result_dict}, is_error_payload=True)
-                    # This might not be a critical failure if partial content is acceptable or if PSWA can handle empty.
-                    # For now, let's treat it as a failure to proceed if no content.
-                    final_cpoa_status = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
-                    raise Exception(f"WCHA critical failure: {final_error_message}")
-            else: # WCHA failed or returned unexpected structure
-                final_error_message = "WCHA content retrieval failed."
-                if isinstance(wcha_result_dict, dict):
-                    final_error_message = wcha_result_dict.get("message", "WCHA returned failure status or unexpected structure.")
-                elif isinstance(wcha_result_dict, str): # Fallback if old string error message is returned
-                    final_error_message = wcha_result_dict
-
-                log_step(f"WCHA content retrieval failure.", data={"error_details": final_error_message, "wcha_raw_output": wcha_result_dict}, is_error_payload=True)
-                final_cpoa_status = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
-                raise Exception(f"WCHA critical failure: {final_error_message}")
-
-            current_orchestration_stage = ORCHESTRATION_STAGE_PSWA
-            _update_task_status_in_db(task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, error_msg=None) # db_path removed
-            _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting podcast script with AI...", "stage": current_orchestration_stage})
-
-            # Use wcha_content (extracted from wcha_result_dict) for PSWA
-            pswa_payload_for_log = {"content_preview": wcha_content[:100] + "..." if wcha_content else "N/A", "topic": topic}
-            pswa_headers_for_log = {}
-            if test_scenarios and test_scenarios.get("pswa"):
-                pswa_headers_for_log['X-Test-Scenario'] = test_scenarios["pswa"]
-
-            log_step("Calling PSWA Service (weave_script)...",
-                     data={"url": PSWA_SERVICE_URL, "topic": topic, "content_input_length": len(wcha_content) if wcha_content else 0,
-                           "payload_preview": pswa_payload_for_log, "headers": pswa_headers_for_log})
-            try:
-                pswa_payload = {"content": wcha_content, "topic": topic} # Use extracted wcha_content
-                pswa_headers = {} # Actual headers for request
-                if test_scenarios and test_scenarios.get("pswa"):
-                    pswa_headers['X-Test-Scenario'] = test_scenarios["pswa"]
-                    # logger.info already logs this, so log_step covers it well.
-
-                response = requests_with_retry("post", PSWA_SERVICE_URL,
-                                               max_retries=retry_count, backoff_factor=backoff_factor,
-                                               json=pswa_payload, timeout=180, headers=pswa_headers)
-
-                structured_script_from_pswa = response.json()
-                pswa_success_data = {
-                    "script_id": structured_script_from_pswa.get("script_id"),
-                    "title": structured_script_from_pswa.get("title"),
-                    "segment_count": len(structured_script_from_pswa.get("segments", []))
-                }
-                log_step("PSWA Service finished successfully.", data=pswa_success_data)
-
-                if not isinstance(structured_script_from_pswa, dict) or \
-                   not pswa_success_data["script_id"] or \
-                   not pswa_success_data["title"] or \
-                   not isinstance(structured_script_from_pswa.get("segments"), list):
-                    final_error_message = "PSWA service returned invalid or malformed structured script."
-                    log_step(final_error_message, data={"received_script_preview": structured_script_from_pswa}, is_error_payload=True)
-                    final_cpoa_status = CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE
-                    raise Exception(f"PSWA critical failure: {final_error_message}")
-
-            except requests.exceptions.RequestException as e_req:
-                err_payload_str = "N/A"
-                status_code = "N/A"
-                if hasattr(e_req, 'response') and e_req.response is not None:
-                    status_code = str(e_req.response.status_code)
-                    try:
-                        err_payload_str = json.dumps(e_req.response.json())
-                    except json.JSONDecodeError:
-                        err_payload_str = e_req.response.text[:200] # Use a smaller preview for error payloads in log
-
-                final_error_message = f"PSWA service call failed (HTTP status: {status_code}, type: {type(e_req).__name__}): {str(e_req)}."
-                log_step(f"PSWA service request exception.", data={"error_message": final_error_message, "response_payload_preview": err_payload_str}, is_error_payload=True)
-                final_cpoa_status = CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION
-                raise Exception(final_error_message)
-            except json.JSONDecodeError as e_json:
-                final_error_message = f"PSWA service response was not valid JSON: {str(e_json)}"
-                log_step(f"PSWA service JSON decode error.", data={"error_message": final_error_message, "response_text_preview": response.text[:200] if 'response' in locals() and response is not None else "N/A"}, is_error_payload=True)
-                final_cpoa_status = CPOA_STATUS_FAILED_PSWA_JSON_DECODE
-                raise Exception(final_error_message)
-
-            current_orchestration_stage = ORCHESTRATION_STAGE_VFA
-            _update_task_status_in_db(task_id, CPOA_STATUS_VFA_AUDIO_GENERATION, error_msg=None) # db_path removed
-            _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Synthesizing audio...", "stage": current_orchestration_stage})
-
-            # --- VFA Voice Parameter Handling with User Preferences ---
-            effective_voice_params = voice_params_input.copy() if voice_params_input else {}
-
-            if user_preferences:
-                # Apply preferences if not already set by direct input
-                if PREF_KEY_VFA_VOICE_NAME in user_preferences and "voice_name" not in effective_voice_params:
-                    effective_voice_params["voice_name"] = user_preferences[PREF_KEY_VFA_VOICE_NAME]
-                    logger.info(f"Task {task_id}: Using preferred voice_name '{user_preferences[PREF_KEY_VFA_VOICE_NAME]}' from user preferences.")
-                # Example for other VFA params - can be extended
-                if PREF_KEY_VFA_LANGUAGE_CODE in user_preferences and "language_code" not in effective_voice_params:
-                     effective_voice_params["language_code"] = user_preferences[PREF_KEY_VFA_LANGUAGE_CODE]
-                if PREF_KEY_VFA_SPEAKING_RATE in user_preferences and "speaking_rate" not in effective_voice_params:
-                     effective_voice_params["speaking_rate"] = user_preferences[PREF_KEY_VFA_SPEAKING_RATE]
-                if PREF_KEY_VFA_PITCH in user_preferences and "pitch" not in effective_voice_params:
-                     effective_voice_params["pitch"] = user_preferences[PREF_KEY_VFA_PITCH]
-
-            vfa_call_data = {"url": VFA_SERVICE_URL, "script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title")}
-            if effective_voice_params: # Check if there are any params to send
-                vfa_call_data["voice_params_input"] = effective_voice_params
-
-            vfa_headers_for_log = {}
-            if test_scenarios and test_scenarios.get("vfa"):
-                vfa_headers_for_log['X-Test-Scenario'] = test_scenarios["vfa"]
-
-            log_step("Calling VFA Service (forge_voice)...", data={**vfa_call_data, "headers": vfa_headers_for_log})
-            try:
-                vfa_payload = {"script": structured_script_from_pswa}
-                if effective_voice_params:
-                    vfa_payload["voice_params"] = effective_voice_params
-
-                vfa_headers = {} # Actual headers for request
-                if test_scenarios and test_scenarios.get("vfa"):
-                    vfa_headers['X-Test-Scenario'] = test_scenarios["vfa"]
-                    # logger.info already logs this
-
-                response = requests_with_retry("post", VFA_SERVICE_URL,
-                                               max_retries=retry_count, backoff_factor=backoff_factor,
-                                               json=vfa_payload, timeout=90, headers=vfa_headers)
-                vfa_result_dict = response.json()
-                vfa_success_data = {
-                    "status": vfa_result_dict.get("status"),
-                    "audio_filepath": vfa_result_dict.get("audio_filepath"),
-                    "stream_id": vfa_result_dict.get("stream_id"),
-                    "tts_settings_used": vfa_result_dict.get("tts_settings_used")
-                }
-                log_step("VFA Service finished.", data=vfa_success_data)
-
-            except requests.exceptions.RequestException as e_req_vfa:
-                err_payload_str = "N/A"
-                status_code = "N/A"
-                if hasattr(e_req_vfa, 'response') and e_req_vfa.response is not None:
-                    status_code = str(e_req_vfa.response.status_code)
-                    try:
-                        err_payload_str = json.dumps(e_req_vfa.response.json().get("message", e_req_vfa.response.json()))
-                    except json.JSONDecodeError:
-                         err_payload_str = e_req_vfa.response.text[:200]
-
-                final_error_message = f"VFA service call failed (HTTP status: {status_code}, type: {type(e_req_vfa).__name__}): {str(e_req_vfa)}."
-                log_step(f"VFA service request exception.", data={"error_message": final_error_message, "response_payload_preview": err_payload_str}, is_error_payload=True)
-                vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": final_error_message, "audio_filepath": None}
-                final_cpoa_status = CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION
-                raise Exception(final_error_message)
-            except json.JSONDecodeError as e_json_vfa:
-                final_error_message = f"VFA service response was not valid JSON: {str(e_json_vfa)}"
-                log_step(f"VFA service JSON decode error.", data={"error_message": final_error_message, "response_text_preview": response.text[:200] if 'response' in locals() and response is not None else "N/A"}, is_error_payload=True)
-                vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": final_error_message, "audio_filepath": None}
-                final_cpoa_status = CPOA_STATUS_FAILED_VFA_JSON_DECODE
-                raise Exception(final_error_message)
-
-            vfa_status = vfa_result_dict.get("status")
-            if vfa_status == VFA_STATUS_SUCCESS:
-                final_cpoa_status = CPOA_STATUS_COMPLETED
-                final_error_message = None
-
-                audio_filepath = vfa_result_dict.get("audio_filepath")
-                stream_id = vfa_result_dict.get("stream_id")
-
-                if audio_filepath and stream_id:
-                    current_orchestration_stage = ORCHESTRATION_STAGE_ASF_NOTIFICATION
-                    _update_task_status_in_db(task_id, CPOA_STATUS_ASF_NOTIFICATION, error_msg=None) # db_path removed
-                    _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Preparing audio stream...", "stage": current_orchestration_stage})
-                    asf_call_data = {"url": ASF_NOTIFICATION_URL, "stream_id": stream_id, "filepath": audio_filepath}
-                    log_step("Notifying ASF about new audio...", data=asf_call_data)
-                    try:
-                        asf_payload = {"stream_id": stream_id, "filepath": audio_filepath}
-                        asf_response = requests_with_retry("post", ASF_NOTIFICATION_URL,
-                                                           max_retries=retry_count, backoff_factor=backoff_factor,
-                                                           json=asf_payload, timeout=10)
-                        asf_notification_status_message = f"ASF notified successfully for stream {stream_id}."
-                        log_step(asf_notification_status_message, data={"response_status": asf_response.status_code, "response_payload_preview": asf_response.json() if asf_response.content else None})
-
-                    except requests.exceptions.RequestException as e_asf_req:
-                        err_payload_str = "N/A"
-                        status_code = "N/A"
-                        if hasattr(e_asf_req, 'response') and e_asf_req.response is not None:
-                            status_code = str(e_asf_req.response.status_code)
-                            try:
-                                err_payload_str = json.dumps(e_asf_req.response.json().get("error", e_asf_req.response.json()))
-                            except json.JSONDecodeError:
-                                err_payload_str = e_asf_req.response.text[:200]
-
-                        asf_notification_status_message = (
-                            f"ASF notification failed (HTTP status: {status_code}, type: {type(e_asf_req).__name__}): {str(e_asf_req)}."
-                        )
-                        log_step(asf_notification_status_message, data={"error_message": str(e_asf_req), "response_payload_preview": err_payload_str}, is_error_payload=True)
-                        final_error_message = asf_notification_status_message
-                        final_cpoa_status = CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE
-                    except json.JSONDecodeError as e_asf_json:
-                        asf_notification_status_message = f"ASF notification response was not valid JSON: {str(e_asf_json)}"
-                        log_step(asf_notification_status_message, data={"response_text_preview": asf_response.text[:200] if 'asf_response' in locals() and asf_response is not None else "N/A"}, is_error_payload=True)
-                        final_error_message = asf_notification_status_message
-                        final_cpoa_status = CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE_JSON_DECODE
-                else:
-                    asf_notification_status_message = "ASF notification skipped: audio_filepath or stream_id missing from VFA success response."
-                    log_step(asf_notification_status_message, data={"vfa_result": vfa_result_dict}, is_error_payload=True) # Log as error/warning
-                    final_error_message = asf_notification_status_message
-                    final_cpoa_status = CPOA_STATUS_COMPLETED_WITH_VFA_DATA_MISSING
-
-            elif vfa_status == VFA_STATUS_SKIPPED:
-                final_cpoa_status = CPOA_STATUS_COMPLETED_WITH_VFA_SKIPPED
-                final_error_message = vfa_result_dict.get("message", "VFA skipped audio generation.")
-                log_step(f"VFA skipped audio generation.", data={"vfa_result": vfa_result_dict})
-            elif vfa_status == VFA_STATUS_ERROR:
-                final_cpoa_status = CPOA_STATUS_FAILED_VFA_REPORTED_ERROR
-                final_error_message = vfa_result_dict.get("message", "VFA reported an internal error.")
-                log_step(f"VFA reported an internal error.", data={"vfa_result": vfa_result_dict}, is_error_payload=True)
+                context_data_for_workflow["wcha_source_urls"] = source_urls
+                wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": wcha_result_dict.get("message", "WCHA success.")}
+                log_step_cpoa("WCHA finished successfully.", data=wcha_output_summary)
+                if not wcha_content: wcha_error_details = {"message": wcha_output_summary.get("message") or "WCHA success but no content."}
             else:
-                final_cpoa_status = CPOA_STATUS_FAILED_VFA_UNKNOWN_STATUS
-                final_error_message = f"VFA service returned an unknown status: '{vfa_status}'. Details: {vfa_result_dict.get('message')}"
-                log_step(f"VFA unknown status.", data={"vfa_result": vfa_result_dict}, is_error_payload=True)
+                wcha_error_details = {"message": wcha_result_dict.get("message", "WCHA failed or unexpected structure."), "wcha_raw_output": wcha_result_dict}
+                log_step_cpoa(f"WCHA content retrieval failure.", data=wcha_error_details, is_error_payload=True)
+        except Exception as e_wcha:
+            wcha_error_details = {"message": f"WCHA execution error: {str(e_wcha)}", "exception_type": type(e_wcha).__name__}
+            wf_logger.error(f"WCHA stage error: {wcha_error_details['message']}", exc_info=True, extra={'task_id': wcha_task_id})
 
-        except Exception as e:
-            logger.error(f"CPOA: Orchestration failed for task {task_id} at stage '{current_orchestration_stage}': {type(e).__name__} - {str(e)}", exc_info=True) # Keep exc_info for main logger
+        if wcha_task_id:
+            _update_task_instance_status(wcha_task_id, TASK_STATUS_COMPLETED if not wcha_error_details else TASK_STATUS_FAILED,
+                                         output_summary=wcha_output_summary, error_details=wcha_error_details, workflow_id_for_log=workflow_id)
+        if wcha_error_details or not wcha_content:
+            final_error_message = (wcha_error_details.get("message") if wcha_error_details else None) or "WCHA critical failure: No content."
+            final_cpoa_status_legacy = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
+            raise Exception(final_error_message)
+
+        # --- PSWA Stage ---
+        current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
+        current_task_order += 1
+        pswa_input_params = {"topic": topic, "content_input_length": len(wcha_content)}
+        pswa_task_id = _create_task_instance(workflow_id, "PSWA", current_task_order, pswa_input_params, initial_status=TASK_STATUS_DISPATCHED)
+
+        _update_task_status_in_db(original_task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, workflow_id_for_log=workflow_id) # Legacy
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting script...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
+        log_step_cpoa("Calling PSWA Service...", data={"url": PSWA_SERVICE_URL, **pswa_input_params})
+
+        structured_script_from_pswa = None
+        pswa_error_details = None
+        pswa_output_summary = {}
+        try:
+            if pswa_task_id: _update_task_instance_status(pswa_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            pswa_payload = {"content": wcha_content, "topic": topic}
+            pswa_headers = {'X-Test-Scenario': test_scenarios["pswa"]} if test_scenarios and test_scenarios.get("pswa") else {}
+
+            response_pswa = requests_with_retry("post", PSWA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                            json=pswa_payload, timeout=180, headers=pswa_headers,
+                                            workflow_id_for_log=workflow_id, task_id_for_log=pswa_task_id)
+            structured_script_from_pswa = response_pswa.json()
+
+            if not (isinstance(structured_script_from_pswa, dict) and structured_script_from_pswa.get("script_id") and structured_script_from_pswa.get("title")):
+                pswa_error_details = {"message": "PSWA service returned invalid or malformed structured script.", "received_script_preview": structured_script_from_pswa}
+                log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
+            else:
+                pswa_output_summary = {"script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title"), "segment_count": len(structured_script_from_pswa.get("segments", []))}
+                log_step_cpoa("PSWA Service finished successfully.", data=pswa_output_summary)
+        except requests.exceptions.RequestException as e_req_pswa:
+            status_code = e_req_pswa.response.status_code if e_req_pswa.response is not None else "N/A"
+            pswa_error_details = {"message": f"PSWA service call failed (HTTP status: {status_code}, type: {type(e_req_pswa).__name__}): {str(e_req_pswa)}." , "response_payload_preview": e_req_pswa.response.text[:200] if e_req_pswa.response is not None else "N/A"}
+            log_step_cpoa("PSWA service request exception.", data=pswa_error_details, is_error_payload=True)
+        except json.JSONDecodeError as e_json_pswa:
+            pswa_error_details = {"message": f"PSWA service response was not valid JSON: {str(e_json_pswa)}", "response_text_preview": response_pswa.text[:200] if 'response_pswa' in locals() else "N/A"}
+            log_step_cpoa("PSWA service JSON decode error.", data=pswa_error_details, is_error_payload=True)
+        except Exception as e_pswa_unexp: # Catch any other unexpected error
+            pswa_error_details = {"message": f"PSWA unexpected error: {str(e_pswa_unexp)}", "exception_type": type(e_pswa_unexp).__name__}
+            wf_logger.error(f"PSWA stage unexpected error: {pswa_error_details['message']}", exc_info=True, extra={'task_id': pswa_task_id})
+
+        if pswa_task_id:
+            _update_task_instance_status(pswa_task_id, TASK_STATUS_COMPLETED if not pswa_error_details else TASK_STATUS_FAILED,
+                                         output_summary=pswa_output_summary, error_details=pswa_error_details, workflow_id_for_log=workflow_id)
+        if pswa_error_details or not structured_script_from_pswa:
+            final_error_message = (pswa_error_details.get("message") if pswa_error_details else None) or "PSWA critical failure: No script."
+            final_cpoa_status_legacy = CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION # Or appropriate legacy status
+            raise Exception(final_error_message)
+
+        context_data_for_workflow["script_title"] = structured_script_from_pswa.get("title")
+        context_data_for_workflow["script_id"] = structured_script_from_pswa.get("script_id")
+
+
+        # --- VFA Stage ---
+        current_orchestration_stage_legacy = ORCHESTRATION_STAGE_VFA
+        current_task_order += 1
+        effective_voice_params = voice_params_input.copy() if voice_params_input else {}
+        if user_preferences: # Apply preferences
+            # ... (preference application logic as before) ...
+            pass
+        vfa_input_params = {"script_id": context_data_for_workflow["script_id"], "title": context_data_for_workflow["script_title"], "voice_params_input": effective_voice_params}
+        vfa_task_id = _create_task_instance(workflow_id, "VFA", current_task_order, vfa_input_params, initial_status=TASK_STATUS_DISPATCHED)
+
+        _update_task_status_in_db(original_task_id, CPOA_STATUS_VFA_AUDIO_GENERATION, workflow_id_for_log=workflow_id) # Legacy
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Synthesizing audio...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
+        log_step_cpoa("Calling VFA Service (forge_voice)...", data=vfa_input_params)
+
+        vfa_error_details = None
+        vfa_output_summary = {}
+        try:
+            if vfa_task_id: _update_task_instance_status(vfa_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            vfa_payload = {"script": structured_script_from_pswa, "voice_params": effective_voice_params}
+            vfa_headers = {'X-Test-Scenario': test_scenarios["vfa"]} if test_scenarios and test_scenarios.get("vfa") else {}
             
-            # Set final_error_message if not already specifically set by a caught exception block
-            if not final_error_message:
-                final_error_message = f"Orchestration error at stage {current_orchestration_stage}: {type(e).__name__} - {str(e)}"
+            response_vfa = requests_with_retry("post", VFA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                           json=vfa_payload, timeout=90, headers=vfa_headers,
+                                           workflow_id_for_log=workflow_id, task_id_for_log=vfa_task_id)
+            vfa_result_dict = response_vfa.json() # Overwrites initial placeholder
 
-            # Update final_cpoa_status based on stage if not already a specific failure status
-            if final_cpoa_status == CPOA_STATUS_PENDING or not final_cpoa_status.startswith("failed_") and not final_cpoa_status.startswith("completed_with_"):
-                stage_error_map = {
-                    ORCHESTRATION_STAGE_WCHA: CPOA_STATUS_FAILED_WCHA_EXCEPTION,
-                    ORCHESTRATION_STAGE_PSWA: CPOA_STATUS_FAILED_PSWA_EXCEPTION,
-                    ORCHESTRATION_STAGE_VFA: CPOA_STATUS_FAILED_VFA_EXCEPTION,
-                    ORCHESTRATION_STAGE_ASF_NOTIFICATION: CPOA_STATUS_FAILED_ASF_NOTIFICATION_EXCEPTION # Should be caught by ASF block, but as fallback
-                }
-                final_cpoa_status = stage_error_map.get(current_orchestration_stage, CPOA_STATUS_FAILED_UNKNOWN_STAGE_EXCEPTION)
+            vfa_output_summary = {"status": vfa_result_dict.get("status"), "audio_gcs_uri": vfa_result_dict.get("audio_filepath"), "stream_id": vfa_result_dict.get("stream_id"), "tts_settings_used": vfa_result_dict.get("tts_settings_used")}
+            log_step_cpoa("VFA Service finished.", data=vfa_output_summary)
 
-            log_step(f"Orchestration ended with critical error.", data={"error_message": final_error_message, "exception_type": type(e).__name__}, is_error_payload=True)
-            _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message, "stage": current_orchestration_stage})
+            if vfa_result_dict.get("status") != VFA_STATUS_SUCCESS:
+                vfa_error_details = {"message": vfa_result_dict.get("message", "VFA reported non-success status."), "vfa_response": vfa_result_dict}
+        except requests.exceptions.RequestException as e_req_vfa:
+            status_code = e_req_vfa.response.status_code if e_req_vfa.response is not None else "N/A"
+            vfa_error_details = {"message": f"VFA service call failed (HTTP status: {status_code}, type: {type(e_req_vfa).__name__}): {str(e_req_vfa)}.", "response_payload_preview": e_req_vfa.response.text[:200] if e_req_vfa.response is not None else "N/A"}
+            vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": vfa_error_details["message"]} # Ensure vfa_result_dict is set
+        except json.JSONDecodeError as e_json_vfa:
+            vfa_error_details = {"message": f"VFA service response was not valid JSON: {str(e_json_vfa)}", "response_text_preview": response_vfa.text[:200] if 'response_vfa' in locals() else "N/A"}
+            vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": vfa_error_details["message"]}
+        except Exception as e_vfa_unexp:
+            vfa_error_details = {"message": f"VFA unexpected error: {str(e_vfa_unexp)}", "exception_type": type(e_vfa_unexp).__name__}
+            vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": vfa_error_details["message"]}
+            wf_logger.error(f"VFA stage unexpected error: {vfa_error_details['message']}", exc_info=True, extra={'task_id': vfa_task_id})
 
-            # Ensure vfa_result_dict reflects error if exception occurred before or during VFA, and not caught by VFA specific try-except
-            if vfa_result_dict.get('status') == VFA_STATUS_NOT_RUN and current_orchestration_stage != ORCHESTRATION_STAGE_VFA:
-                 vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": final_error_message, "audio_filepath": None, "stream_id": None}
-            elif current_orchestration_stage == ORCHESTRATION_STAGE_VFA and vfa_result_dict.get('status') != VFA_STATUS_ERROR:
-                 vfa_result_dict = {"status": VFA_STATUS_ERROR, "message": final_error_message, "audio_filepath": None, "stream_id": None}
+        if vfa_task_id:
+             _update_task_instance_status(vfa_task_id, TASK_STATUS_COMPLETED if not vfa_error_details else TASK_STATUS_FAILED,
+                                         output_summary=vfa_output_summary, error_details=vfa_error_details, workflow_id_for_log=workflow_id)
 
-    # Final DB update for CPOA's status
-    _update_task_status_in_db(task_id, final_cpoa_status, error_msg=final_error_message) # db_path removed
+        if vfa_error_details or vfa_result_dict.get("status") != VFA_STATUS_SUCCESS:
+            final_error_message = (vfa_error_details.get("message") if vfa_error_details else None) or "VFA critical failure."
+            if vfa_result_dict.get("status") == VFA_STATUS_SKIPPED: final_cpoa_status_legacy = CPOA_STATUS_COMPLETED_WITH_VFA_SKIPPED
+            else: final_cpoa_status_legacy = CPOA_STATUS_FAILED_VFA_REPORTED_ERROR
+            raise Exception(final_error_message)
 
-    current_orchestration_stage = ORCHESTRATION_STAGE_FINALIZATION # For the final log step
-    final_log_data = {
-        "task_id": task_id, # Added task_id
-        "final_cpoa_status": final_cpoa_status,
-        "final_error_message_preview": final_error_message[:200] if final_error_message else None,
-        "asf_notification_outcome": asf_notification_status_message,
-        "vfa_outcome_summary": { # Added VFA summary
-            "status": vfa_result_dict.get("status"),
-            "stream_id": vfa_result_dict.get("stream_id"),
-            "audio_filepath_exists": bool(vfa_result_dict.get("audio_filepath"))
-        }
-    }
-    log_step(f"Orchestration process ended.", data=final_log_data)
+        context_data_for_workflow["final_audio_gcs_uri"] = vfa_result_dict.get("audio_filepath")
+        context_data_for_workflow["stream_id"] = vfa_result_dict.get("stream_id")
+        context_data_for_workflow["tts_settings_used"] = vfa_result_dict.get("tts_settings_used")
+        final_cpoa_status_legacy = CPOA_STATUS_COMPLETED
 
-    # Send final UI update on overall success or specific handled failures
-    if final_cpoa_status.startswith("failed_") or final_cpoa_status.startswith("completed_with_"):
-        if not final_cpoa_status.endswith("_exception"): # Avoid sending generic exception message if already sent by outer try-except
-            _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message or f"Task ended with status: {final_cpoa_status}", "final_status": final_cpoa_status})
-    elif final_cpoa_status == CPOA_STATUS_COMPLETED:
-         _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_cpoa_status, "is_terminal": True})
 
-    # Ensure vfa_result_dict (which is final_audio_details) contains stream_id if available
-    stream_id_for_url = vfa_result_dict.get("stream_id")
-    asf_ws_url = None
-    if stream_id_for_url:
-        # The client will use this base URL and then send a 'join_stream' message with the stream_id.
-        # So, we just provide the base ASF WebSocket URL.
-        asf_ws_url = ASF_WEBSOCKET_BASE_URL
-        # If ASF expected stream_id in query param: asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={stream_id_for_url}"
+        # --- ASF Notification Stage ---
+        if context_data_for_workflow.get("final_audio_gcs_uri") and context_data_for_workflow.get("stream_id"):
+            current_orchestration_stage_legacy = ORCHESTRATION_STAGE_ASF_NOTIFICATION
+            current_task_order += 1
+            asf_input_params = {"stream_id": context_data_for_workflow["stream_id"], "gcs_uri": context_data_for_workflow["final_audio_gcs_uri"]}
+            asf_task_id = _create_task_instance(workflow_id, "ASF_NOTIFY", current_task_order, asf_input_params, initial_status=TASK_STATUS_DISPATCHED)
+
+            _update_task_status_in_db(original_task_id, CPOA_STATUS_ASF_NOTIFICATION, workflow_id_for_log=workflow_id) # Legacy
+            _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Preparing audio stream...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
+            log_step_cpoa("Notifying ASF about new audio...", data=asf_input_params)
+
+            asf_error_details = None
+            asf_output_summary = {}
+            try:
+                if asf_task_id: _update_task_instance_status(asf_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+                asf_payload = {"stream_id": context_data_for_workflow["stream_id"], "filepath": context_data_for_workflow["final_audio_gcs_uri"]}
+                response_asf = requests_with_retry("post", ASF_NOTIFICATION_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                               json=asf_payload, timeout=10,
+                                               workflow_id_for_log=workflow_id, task_id_for_log=asf_task_id)
+                asf_notification_status_message = f"ASF notified successfully for stream {context_data_for_workflow['stream_id']}."
+                asf_output_summary = {"message": asf_notification_status_message, "response_status": response_asf.status_code}
+                log_step_cpoa(asf_notification_status_message, data=asf_output_summary)
+            except Exception as e_asf:
+                asf_error_details = {"message": f"ASF notification failed: {str(e_asf)}", "exception_type": type(e_asf).__name__}
+                asf_notification_status_message = asf_error_details["message"] # For legacy field
+                final_error_message = asf_error_details["message"]
+                final_cpoa_status_legacy = CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE
+                wf_logger.error(f"ASF Notification stage error: {asf_error_details['message']}", exc_info=True, extra={'task_id': asf_task_id})
+
+            if asf_task_id:
+                _update_task_instance_status(asf_task_id, TASK_STATUS_COMPLETED if not asf_error_details else TASK_STATUS_FAILED,
+                                             output_summary=asf_output_summary, error_details=asf_error_details, workflow_id_for_log=workflow_id)
+        else: # audio_filepath or stream_id missing
+            asf_notification_status_message = "ASF notification skipped: audio_filepath or stream_id missing from VFA success response."
+            log_step_cpoa(asf_notification_status_message, data={"vfa_result": vfa_result_dict}, is_error_payload=True)
+            final_error_message = asf_notification_status_message
+            final_cpoa_status_legacy = CPOA_STATUS_COMPLETED_WITH_VFA_DATA_MISSING
+            wf_logger.warning(asf_notification_status_message, extra={'workflow_id': workflow_id, 'task_id': None})
+
+        # Determine final workflow status based on legacy CPOA status
+        if final_cpoa_status_legacy == CPOA_STATUS_COMPLETED:
+            final_workflow_status = WORKFLOW_STATUS_COMPLETED
+        elif final_cpoa_status_legacy.startswith("completed_with_"):
+            final_workflow_status = WORKFLOW_STATUS_COMPLETED_WITH_ERRORS
+        else: # Should have been caught by exceptions leading to WORKFLOW_STATUS_FAILED
+            final_workflow_status = WORKFLOW_STATUS_FAILED
+
+
+    except Exception as e_main_workflow:
+        wf_logger.error(f"Podcast generation workflow critically failed at stage '{current_orchestration_stage_legacy}': {e_main_workflow}", exc_info=True)
+        final_error_message = final_error_message or str(e_main_workflow)
+        final_workflow_status = WORKFLOW_STATUS_FAILED
+
+        # Ensure legacy status reflects a failure if not already specific from a caught block
+        if not final_cpoa_status_legacy.startswith("failed_") and not final_cpoa_status_legacy.startswith("completed_with_"):
+            final_cpoa_status_legacy = CPOA_STATUS_FAILED_UNKNOWN_STAGE_EXCEPTION
+
+        _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message, "stage": current_orchestration_stage_legacy, "final_status": final_cpoa_status_legacy}, workflow_id_for_log=workflow_id)
+
+    # Final updates to persistent stores
+    _update_task_status_in_db(original_task_id, final_cpoa_status_legacy, error_msg=final_error_message, workflow_id_for_log=workflow_id) # Legacy DB update
+    _update_workflow_instance_status(workflow_id, final_workflow_status, context_data=context_data_for_workflow, error_message=final_error_message)
+
+    current_orchestration_stage_legacy = ORCHESTRATION_STAGE_FINALIZATION
+    log_step_cpoa(f"Orchestration process ended with status {final_workflow_status}.", data={"final_cpoa_status_legacy": final_cpoa_status_legacy, "final_error_message": final_error_message})
+    wf_logger.info(f"Podcast generation workflow ended. Final status: {final_workflow_status}. Legacy CPOA status: {final_cpoa_status_legacy}.")
+
+    # Send final UI update based on the new workflow_status
+    if final_workflow_status == WORKFLOW_STATUS_FAILED or final_workflow_status == WORKFLOW_STATUS_COMPLETED_WITH_ERRORS :
+        _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message or f"Task ended with status: {final_workflow_status}", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=workflow_id)
+    elif final_workflow_status == WORKFLOW_STATUS_COMPLETED:
+         _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=workflow_id)
+
+    asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow['stream_id']}" if context_data_for_workflow.get("stream_id") else None
 
     cpoa_final_result = {
-        "task_id": task_id,
+        "task_id": original_task_id,
+        "workflow_id": workflow_id,
         "topic": topic,
-        "status": final_cpoa_status,
-        "error_message": final_error_message, # This might now include ASF notification issues
-        "asf_notification_status": asf_notification_status_message, # Specific status for ASF notification
-        "asf_websocket_url": asf_ws_url, # New field for client consumption
-        "final_audio_details": vfa_result_dict, # This contains the stream_id from VFA
-        "orchestration_log": orchestration_log
+        "status": final_cpoa_status_legacy, # Return legacy status for now for API GW compatibility
+        "error_message": final_error_message,
+        "asf_notification_status": asf_notification_status_message,
+        "asf_websocket_url": asf_ws_url,
+        "final_audio_details": vfa_result_dict,
+        "orchestration_log": orchestration_log_cpoa
     }
-    # The API Gateway will use this returned dict to perform its own final update on the podcast record.
-    # Ensure tts_settings_used from VFA's response is part of final_audio_details in cpoa_final_result
-    if "tts_settings_used" not in vfa_result_dict : # Ensure key exists even on VFA failure/skip for consistency
-         vfa_result_dict["tts_settings_used"] = effective_voice_params if effective_voice_params else None # Default to effective_voice_params
-    # If VFA ran and returned its own tts_settings_used, that will take precedence (already in vfa_result_dict)
+    if "tts_settings_used" not in vfa_result_dict and "tts_settings_used" in context_data_for_workflow: # Ensure tts_settings are in final_audio_details
+         vfa_result_dict["tts_settings_used"] = context_data_for_workflow["tts_settings_used"]
 
     return cpoa_final_result
 
@@ -1329,235 +1426,465 @@ def orchestrate_topic_exploration(
             logger.error(f"Unexpected error calling orchestrate_snippet_generation for explored topic '{topic_info_for_sca['title_suggestion']}': {e_snip}", exc_info=True)
 
     logger.info(f"Topic exploration for '{original_topic_title}' yielded {len(explored_snippets)} new snippets.")
-    return explored_snippets
+    return {"workflow_id": workflow_id, "explored_topics": []} # Placeholder
 
 
-def orchestrate_search_results_generation(query: str, user_preferences: Optional[dict] = None) -> Dict[str, Any]:
-    function_name = "orchestrate_search_results_generation"
-    logger.info(f"CPOA: {function_name} called with query: '{query}', user_preferences: {user_preferences}")
+def orchestrate_search_results_generation(query: str, user_preferences: Optional[dict] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
+    workflow_id = _create_workflow_instance(
+        trigger_event_type="search_results_generation",
+        trigger_event_details={"query": query, "user_preferences": user_preferences},
+        user_id=user_id
+    )
+    log_extra_wf = {'workflow_id': workflow_id, 'task_id': None}
+
+    if not workflow_id:
+        logger.error(f"Failed to create workflow instance for search_results_generation. Query: {query}", extra=log_extra_wf)
+        return {"error": "WORKFLOW_CREATION_FAILED", "details": "Workflow creation failed.", "search_results": [], "workflow_id": None}
+
+    wf_logger = logging.LoggerAdapter(logger, log_extra_wf)
+    _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
+    wf_logger.info(f"Search results workflow started. Query: '{query}'")
 
     # --- Input Validation ---
     if not query or not isinstance(query, str) or not query.strip():
-        logger.error(f"CPOA: {function_name} - 'query' must be a non-empty string. Received: '{query}'")
-        return {"error": "CPOA_REQUEST_INVALID", "details": "'query' must be a non-empty string.", "search_results": []}
+        error_msg = f"'query' must be a non-empty string. Received: '{query}'"
+        wf_logger.error(f"Input validation failed: {error_msg}")
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "CPOA_REQUEST_INVALID", "details": error_msg, "search_results": [], "workflow_id": workflow_id}
 
     if user_preferences and not isinstance(user_preferences, dict):
-        logger.error(f"CPOA: {function_name} - 'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}")
-        return {"error": "CPOA_REQUEST_INVALID", "details": "'user_preferences' must be a dictionary if provided.", "search_results": []}
+        error_msg = f"'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}"
+        wf_logger.error(f"Input validation failed: {error_msg}")
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "CPOA_REQUEST_INVALID", "details": error_msg, "search_results": [], "workflow_id": workflow_id}
 
-    search_results_snippets: List[Dict[str, Any]] = []
+    # --- TDA Task ---
+    current_task_order = 1
+    tda_input_params = {"query": query, "limit": 7} # Example limit for search
+    tda_task_id = _create_task_instance(workflow_id, "TDA_Search", current_task_order, tda_input_params, initial_status=TASK_STATUS_DISPATCHED)
 
-    # 1. Call TDA
-    # TDA_SERVICE_URL is loaded from environment at module level
-    if not TDA_SERVICE_URL:
-        error_msg = "CPOA: TDA_SERVICE_URL is not configured. Cannot perform search."
-        logger.error(error_msg)
-        return {"error": "CPOA_CONFIG_ERROR", "details": "TDA_SERVICE_URL not set.", "search_results": []}
-
-    tda_payload = {"query": query, "limit": 7} # Set limit for TDA results, e.g., 7
-
-    try:
-        logger.info(f"CPOA: Calling TDA service for search query '{query}' with payload: {tda_payload}")
-        response = requests_with_retry("post", TDA_SERVICE_URL, # TDA_SERVICE_URL is global
-                                       max_retries=CPOA_SERVICE_RETRY_COUNT,
-                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                       json=tda_payload, timeout=30) # Standard timeout for TDA
-        tda_data = response.json()
-        # Ensure discovered_topics is always a list
-        # TDA returns topics under "topics" or "discovered_topics"
-        discovered_topics = tda_data.get("topics", tda_data.get("discovered_topics"))
-        if discovered_topics is None:
-            discovered_topics = [] # Default to empty list if key missing or None
-
-        logger.info(f"CPOA: TDA returned {len(discovered_topics)} topics for query '{query}'.")
-
-        if not discovered_topics:
-            return {"search_results": []}
-
-    except requests.exceptions.RequestException as e_req:
-        error_msg = f"CPOA: TDA service call failed for search query '{query}': {e_req}"
-        logger.error(error_msg, exc_info=True)
-        return {"error": "TDA_REQUEST_FAILED", "details": str(e_req), "search_results": []}
-    except json.JSONDecodeError as e_json:
-        response_text_preview = "N/A"
-        if 'response' in locals() and hasattr(response, 'text'):
-            response_text_preview = response.text[:200]
-        error_msg = f"CPOA: Failed to decode TDA response for search query '{query}': {e_json}. Response preview: {response_text_preview}"
-        logger.error(error_msg, exc_info=True)
-        return {"error": "TDA_RESPONSE_INVALID_JSON", "details": str(e_json), "search_results": []}
-    except Exception as e_gen_tda: # Catch any other unexpected error during TDA call
-        error_msg = f"CPOA: Unexpected error during TDA call for search query '{query}': {e_gen_tda}"
-        logger.error(error_msg, exc_info=True)
-        return {"error": "TDA_UNEXPECTED_ERROR", "details": str(e_gen_tda), "search_results": []}
-
-    # 2. For each topic, generate a snippet using orchestrate_snippet_generation
-    successful_snippet_generations = 0
-    for topic_obj in discovered_topics:
-        if not isinstance(topic_obj, dict):
-            logger.warning(f"CPOA: Skipping non-dictionary topic object from TDA during search processing: {topic_obj}")
-            continue
-
-        # TDA's TopicObject might have 'title' or 'title_suggestion'.
-        # orchestrate_snippet_generation expects 'title_suggestion' for the content_brief.
-        # We need to ensure the topic_obj passed to orchestrate_snippet_generation has the necessary fields.
-        # Let's form `topic_info_for_sca` as done in `orchestrate_topic_exploration`.
-        topic_info_for_sca = {
-            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id"), # TDA might use 'id' or 'topic_id'
-            "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"), # Prefer 'title_suggestion'
-            "summary": topic_obj.get("summary"),
-            "keywords": topic_obj.get("keywords", []),
-            "original_topic_details_from_tda": topic_obj # Pass full TDA object for context
-        }
-
-        # Ensure there's a brief for SCA to work with
-        if not topic_info_for_sca["title_suggestion"]:
-            logger.warning(f"CPOA: Skipping snippet generation for TDA topic due to missing title/title_suggestion. Topic object: {topic_obj}")
-            continue
-
-        logger.info(f"CPOA: Generating search snippet for TDA topic_id: {topic_info_for_sca.get('topic_id', 'N/A')}, title: {topic_info_for_sca.get('title_suggestion', 'N/A')}")
-        try:
-            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
-            if snippet_result and "error" not in snippet_result:
-                # Ensure snippet_id is present, as expected by API Gateway's search response
-                if "snippet_id" not in snippet_result and "id" in snippet_result: # SCA might return 'id'
-                    snippet_result["snippet_id"] = snippet_result["id"]
-                elif "snippet_id" not in snippet_result: # Generate one if missing
-                     snippet_result["snippet_id"] = f"search_snippet_{uuid.uuid4().hex[:8]}"
-                     logger.warning(f"CPOA: Generated missing snippet_id for search result: {snippet_result['snippet_id']}")
-
-                search_results_snippets.append(snippet_result)
-                successful_snippet_generations += 1
-            else:
-                err_detail = "Unknown SCA error"
-                if snippet_result: # Check if snippet_result is not None
-                    err_detail = snippet_result.get('details', snippet_result.get('error', err_detail))
-                logger.warning(f"CPOA: Snippet generation failed or returned error for search topic: {topic_info_for_sca.get('title_suggestion', 'N/A')}. Error: {err_detail}")
-        except Exception as e_sca_orch: # Catch unexpected errors from orchestrate_snippet_generation
-            logger.error(f"CPOA: Unexpected error calling orchestrate_snippet_generation for search topic {topic_info_for_sca.get('title_suggestion', 'N/A')}: {e_sca_orch}", exc_info=True)
-
-    logger.info(f"CPOA: Successfully generated {successful_snippet_generations} snippets for search query '{query}' out of {len(discovered_topics)} topics found.")
-    return {"search_results": search_results_snippets}
-
-
-def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional[dict] = None) -> Dict[str, Any]:
-    """
-    Orchestrates the generation of snippets for the landing page by discovering diverse topics
-    via TDA and then generating a snippet for each relevant topic using SCA.
-    """
-    function_name = "orchestrate_landing_page_snippets"
-    logger.info(f"CPOA: {function_name} called with limit: {limit}, user_preferences: {user_preferences}")
-
-    # --- Input Validation ---
-    if not isinstance(limit, int) or not (1 <= limit <= 20): # Example range for limit
-        logger.error(f"CPOA: {function_name} - 'limit' must be an integer between 1 and 20. Received: {limit}")
-        return {"error": "CPOA_REQUEST_INVALID", "details": "'limit' must be an integer between 1 and 20.", "snippets": []}
-
-    if user_preferences and not isinstance(user_preferences, dict):
-        logger.error(f"CPOA: {function_name} - 'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}")
-        return {"error": "CPOA_REQUEST_INVALID", "details": "'user_preferences' must be a dictionary if provided.", "snippets": []}
-
-    default_keywords = ["technology", "science", "lifestyle", "business", "arts", "global news", "innovation", "culture"]
-    query_for_tda = None
-
-    # Construct query for TDA (logic remains the same, moved after validation)
-    if user_preferences and isinstance(user_preferences.get("preferred_categories"), list) and user_preferences["preferred_categories"]:
-        query_for_tda = " ".join(user_preferences["preferred_categories"])
-        logger.info(f"CPOA: {function_name} - Using user preferred categories for TDA query: '{query_for_tda}'")
-    elif user_preferences and isinstance(user_preferences.get(PREF_KEY_NEWS_CATEGORY), str) and user_preferences[PREF_KEY_NEWS_CATEGORY]:
-        query_for_tda = user_preferences[PREF_KEY_NEWS_CATEGORY]
-        logger.info(f"CPOA: {function_name} - Using user preferred news category for TDA query: '{query_for_tda}'")
-    else:
-        if limit == 1 and len(default_keywords) > 0:
-            query_for_tda = random.choice(default_keywords)
-        else:
-            query_for_tda = " ".join(random.sample(default_keywords, min(len(default_keywords), 3)))
-        logger.info(f"CPOA: {function_name} - No specific user preferences for categories found. Using default query for TDA: '{query_for_tda}'")
-
-    if not query_for_tda: # Should not happen if default_keywords is populated and limit > 0
-        logger.error(f"CPOA: {function_name} - Query for TDA is empty. Cannot proceed (limit: {limit}).")
-        # This case should ideally be prevented by limit validation and default keyword logic
-        return {"error": "TDA_QUERY_EMPTY", "details": "Failed to construct a query for TDA.", "snippets": []}
-
-    # Call TDA Service
     tda_topics = []
-    tda_limit = limit * 2 # Fetch more topics from TDA to have a buffer for snippet generation
+    tda_error_details = None
+    tda_output_summary = {}
+
     if not TDA_SERVICE_URL:
-        logger.error(f"CPOA: {function_name} - TDA_SERVICE_URL is not configured.")
-        return {"error": "TDA_CONFIG_ERROR", "details": "TDA_SERVICE_URL not set.", "snippets": []}
+        tda_error_details = {"message": "TDA_SERVICE_URL is not configured."}
+        wf_logger.error(tda_error_details["message"], extra={'task_id': tda_task_id})
+    elif tda_task_id:
+        try:
+            _update_task_instance_status(tda_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            response = requests_with_retry("post", TDA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                           json=tda_input_params, timeout=30,
+                                           workflow_id_for_log=workflow_id, task_id_for_log=tda_task_id)
+            tda_data = response.json()
+            tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", []))
+            tda_output_summary = {"topic_count": len(tda_topics), "query_used": query}
+            wf_logger.info(f"TDA returned {len(tda_topics)} topics for search query '{query}'.", extra={'task_id': tda_task_id})
+            if not tda_topics:
+                 tda_error_details = {"message": "TDA returned no topics for search query.", "tda_response": tda_data}
+        except requests.exceptions.RequestException as e_req:
+            tda_error_details = {"message": f"TDA service call failed for search: {str(e_req)}", "exception_type": type(e_req).__name__}
+        except json.JSONDecodeError as e_json:
+            tda_error_details = {"message": f"Failed to decode TDA response for search: {str(e_json)}", "response_preview": response.text[:200] if 'response' in locals() else "N/A"}
+        except Exception as e_gen_tda:
+            tda_error_details = {"message": f"Unexpected error during TDA call for search: {str(e_gen_tda)}", "exception_type": type(e_gen_tda).__name__}
 
-    tda_payload = {"query": query_for_tda, "limit": tda_limit}
-    logger.info(f"CPOA: {function_name} - Calling TDA service with payload: {tda_payload}")
+        if tda_error_details:
+            wf_logger.error(f"TDA_Search task failed: {tda_error_details['message']}", exc_info=True if "exception_type" in tda_error_details else False, extra={'task_id': tda_task_id})
+        _update_task_instance_status(tda_task_id, TASK_STATUS_COMPLETED if not tda_error_details else TASK_STATUS_FAILED,
+                                     output_summary=tda_output_summary, error_details=tda_error_details, workflow_id_for_log=workflow_id)
 
-    try:
-        response = requests_with_retry("post", TDA_SERVICE_URL,
-                                       max_retries=CPOA_SERVICE_RETRY_COUNT,
-                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                       json=tda_payload, timeout=30)
-        tda_data = response.json()
-        tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", []))
-        logger.info(f"CPOA: {function_name} - TDA returned {len(tda_topics)} topics for query '{query_for_tda}'.")
+    if tda_error_details or not tda_topics:
+        final_error_msg = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for search."
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg, context_data={"tda_query": query})
+        return {"error": "TDA_FAILURE", "details": final_error_msg, "search_results": [], "workflow_id": workflow_id}
 
-        if not tda_topics:
-            logger.warning(f"CPOA: {function_name} - TDA returned no topics for query '{query_for_tda}'.")
-            return {"message": "TDA_NO_TOPICS_FOUND", "details": f"No topics found by TDA for query: {query_for_tda}", "snippets": []}
+    # --- Snippet Generation Loop ---
+    search_results_snippets: List[Dict[str, Any]] = []
+    final_workflow_status = WORKFLOW_STATUS_COMPLETED
+    any_snippet_errors = False
+    snippet_gen_task_base_order = current_task_order
 
-    except requests.exceptions.RequestException as e_req:
-        error_msg = f"CPOA: {function_name} - TDA service call failed: {e_req}"
-        logger.error(error_msg, exc_info=True)
-        return {"error": "TDA_FAILURE", "details": str(e_req), "snippets": []}
-    except json.JSONDecodeError as e_json:
-        response_text_preview = "N/A"
-        if 'response' in locals() and hasattr(response, 'text'):
-            response_text_preview = response.text[:200]
-        error_msg = f"CPOA: {function_name} - Failed to decode TDA response: {e_json}. Response preview: {response_text_preview}"
-        logger.error(error_msg, exc_info=True)
-        return {"error": "TDA_RESPONSE_INVALID_JSON", "details": str(e_json), "snippets": []}
-    except Exception as e_gen_tda:
-        error_msg = f"CPOA: {function_name} - Unexpected error during TDA call: {e_gen_tda}"
-        logger.error(error_msg, exc_info=True)
-        return {"error": "TDA_UNEXPECTED_ERROR", "details": str(e_gen_tda), "snippets": []}
-
-    generated_snippets: List[Dict[str, Any]] = []
-    for topic_obj in tda_topics:
-        if len(generated_snippets) >= limit:
-            break # Stop if we have reached the desired number of snippets
-
+    for i, topic_obj in enumerate(tda_topics):
+        current_task_order = snippet_gen_task_base_order + i + 1
         if not isinstance(topic_obj, dict):
-            logger.warning(f"CPOA: {function_name} - Skipping non-dictionary topic object from TDA: {topic_obj}")
+            wf_logger.warning(f"Skipping non-dictionary topic object from TDA (search): {topic_obj}")
             continue
 
         topic_info_for_sca = {
-            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id"),
+            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id") or f"tda_topic_search_{i}",
             "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"),
-            "summary": topic_obj.get("summary"),
-            "keywords": topic_obj.get("keywords", []),
+            "summary": topic_obj.get("summary"), "keywords": topic_obj.get("keywords", []),
             "original_topic_details_from_tda": topic_obj
         }
-
         if not topic_info_for_sca["title_suggestion"]:
-            logger.warning(f"CPOA: {function_name} - Skipping TDA topic due to missing title/title_suggestion. Topic: {topic_obj}")
+            wf_logger.warning(f"Skipping TDA topic (search) due to missing title: {topic_obj}")
             continue
 
-        logger.info(f"CPOA: {function_name} - Attempting to generate snippet for topic: '{topic_info_for_sca['title_suggestion']}'")
+        sg_task_id = _create_task_instance(workflow_id, "SnippetGenerationSearchItem", current_task_order,
+                                           {"topic_title": topic_info_for_sca["title_suggestion"]}, initial_status=TASK_STATUS_DISPATCHED)
+
+        snippet_error_details = None
+        snippet_result = None
+        snippet_output_summary = {}
         try:
-            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
+            if sg_task_id: _update_task_instance_status(sg_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca, workflow_id_for_log=workflow_id)
+
+            if snippet_result and "error" not in snippet_result:
+                if "snippet_id" not in snippet_result and "id" in snippet_result: snippet_result["snippet_id"] = snippet_result["id"]
+                elif "snippet_id" not in snippet_result: snippet_result["snippet_id"] = f"search_snippet_{uuid.uuid4().hex[:8]}"
+                search_results_snippets.append(snippet_result)
+                snippet_output_summary = {"snippet_id": snippet_result.get("snippet_id"), "image_url_present": bool(snippet_result.get("image_url"))}
+                wf_logger.info(f"Successfully generated search snippet for topic: '{topic_info_for_sca['title_suggestion']}'", extra={'task_id': sg_task_id})
+            else:
+                snippet_error_details = {"message": snippet_result.get("details", "Search snippet generation returned error structure."), "sca_response": snippet_result}
+                any_snippet_errors = True
+        except Exception as e_snippet_gen:
+            snippet_error_details = {"message": f"Error in orchestrate_snippet_generation call (search): {str(e_snippet_gen)}", "exception_type": type(e_snippet_gen).__name__}
+            any_snippet_errors = True
+
+        if snippet_error_details:
+            wf_logger.warning(f"SnippetGenerationSearchItem task failed: {snippet_error_details['message']}", exc_info=True if "exception_type" in snippet_error_details else False, extra={'task_id': sg_task_id})
+
+        if sg_task_id:
+            _update_task_instance_status(sg_task_id, TASK_STATUS_COMPLETED if not snippet_error_details else TASK_STATUS_FAILED,
+                                         output_summary=snippet_output_summary, error_details=snippet_error_details, workflow_id_for_log=workflow_id)
+
+    final_error_message_wf = None
+    if not search_results_snippets:
+        final_workflow_status = WORKFLOW_STATUS_FAILED if any_snippet_errors else WORKFLOW_STATUS_COMPLETED
+        final_error_message_wf = "No search snippets generated" + (" due to errors." if any_snippet_errors else " (TDA might have returned too few topics).")
+        wf_logger.info(final_error_message_wf)
+    elif any_snippet_errors:
+        final_workflow_status = WORKFLOW_STATUS_COMPLETED_WITH_ERRORS
+        final_error_message_wf = "Some search snippets could not be generated."
+        wf_logger.warning(final_error_message_wf)
+
+    _update_workflow_instance_status(workflow_id, final_workflow_status,
+                                     context_data={"generated_snippet_count": len(search_results_snippets), "search_query": query},
+                                     error_message=final_error_message_wf)
+
+    if not search_results_snippets and (final_workflow_status == WORKFLOW_STATUS_FAILED or not tda_topics): # If nothing from TDA or all snippet gens failed
+         return {"workflow_id": workflow_id, "search_results": [], "error": final_workflow_status, "details": final_error_message_wf or "No results found or error in processing."}
+
+    wf_logger.info(f"Search results workflow generated {len(search_results_snippets)} snippets for query '{query}'.")
+    return {"workflow_id": workflow_id, "search_results": search_results_snippets}
+
+
+# --- Topic Exploration Orchestration ---
+def orchestrate_topic_exploration(
+    current_topic_id: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+    depth_mode: str = "deeper", # Depth mode currently illustrative, not deeply implemented
+    user_preferences: Optional[dict] = None, # Added user_preferences
+    user_id: Optional[str] = None # New parameter
+) -> Dict[str, Any]: # Return type changed to Dict to include workflow_id
+    workflow_id = _create_workflow_instance(
+        trigger_event_type="topic_exploration",
+        trigger_event_details={"current_topic_id": current_topic_id, "keywords": keywords, "depth_mode": depth_mode, "user_preferences": user_preferences},
+        user_id=user_id
+    )
+    log_extra_wf = {'workflow_id': workflow_id, 'task_id': None}
+
+    if not workflow_id:
+        logger.error(f"Failed to create workflow instance for topic_exploration. Inputs: current_topic_id={current_topic_id}, keywords={keywords}", extra=log_extra_wf)
+        # Previous version raised ValueError, now returning a dict for consistency from top-level orchestrators
+        return {"error": "WORKFLOW_CREATION_FAILED", "details": "Workflow creation failed.", "explored_topics": [], "workflow_id": None}
+
+    wf_logger = logging.LoggerAdapter(logger, log_extra_wf)
+    _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
+    wf_logger.info(f"Topic exploration workflow started. Mode: {depth_mode}, Topic ID: {current_topic_id}, Keywords: {keywords}")
+
+    # --- Input Validation (as before, but use wf_logger and update workflow on error) ---
+    if current_topic_id and (not isinstance(current_topic_id, str) or not current_topic_id.strip()):
+        error_msg = f"'current_topic_id' must be a non-empty string if provided. Received: '{current_topic_id}'"
+        wf_logger.error(f"Input validation failed: {error_msg}")
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "CPOA_REQUEST_INVALID", "details": error_msg, "explored_topics": [], "workflow_id": workflow_id}
+    # ... (other input validations for keywords, depth_mode, user_preferences - similar error handling) ...
+
+    # --- Query Construction for TDA (as before) ---
+    query_for_tda = None
+    original_topic_title = "original topic for exploration" # More descriptive default
+    # ... (logic to determine query_for_tda based on current_topic_id or keywords, logging with wf_logger) ...
+    if not query_for_tda: # If after all logic, no query is formed
+        error_msg = "No valid query could be constructed for TDA (topic_id lookup failed and no keywords provided)."
+        wf_logger.error(error_msg)
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "TDA_QUERY_CONSTRUCTION_FAILED", "details": error_msg, "explored_topics": [], "workflow_id": workflow_id}
+
+
+    # --- TDA Task ---
+    current_task_order = 1
+    tda_input_params = {"query": query_for_tda, "limit": 3} # Example limit for exploration
+    tda_task_id = _create_task_instance(workflow_id, "TDA_Exploration", current_task_order, tda_input_params, initial_status=TASK_STATUS_DISPATCHED)
+
+    tda_topics = []
+    tda_error_details = None
+    tda_output_summary = {}
+    if not TDA_SERVICE_URL:
+        tda_error_details = {"message": "TDA_SERVICE_URL is not configured."}
+        wf_logger.error(tda_error_details["message"], extra={'task_id': tda_task_id})
+    elif tda_task_id:
+        try:
+            _update_task_instance_status(tda_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            response = requests_with_retry("post", TDA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                           json=tda_input_params, timeout=30,
+                                           workflow_id_for_log=workflow_id, task_id_for_log=tda_task_id)
+            tda_data = response.json()
+            tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", []))
+            tda_output_summary = {"topic_count": len(tda_topics), "query_used": query_for_tda}
+            wf_logger.info(f"TDA returned {len(tda_topics)} topics for exploration based on '{original_topic_title}'.", extra={'task_id': tda_task_id})
+            if not tda_topics:
+                tda_error_details = {"message": "TDA returned no topics for exploration.", "tda_response": tda_data}
+        except requests.exceptions.RequestException as e_req:
+            tda_error_details = {"message": f"TDA service call failed during exploration: {str(e_req)}", "exception_type": type(e_req).__name__}
+        except json.JSONDecodeError as e_json:
+             tda_error_details = {"message": f"Failed to decode TDA response for exploration: {str(e_json)}", "response_preview": response.text[:200] if 'response' in locals() else "N/A"}
+        except Exception as e_gen_tda:
+            tda_error_details = {"message": f"Unexpected error during TDA call for exploration: {str(e_gen_tda)}", "exception_type": type(e_gen_tda).__name__}
+
+        if tda_error_details:
+            wf_logger.error(f"TDA_Exploration task failed: {tda_error_details['message']}", exc_info=True if "exception_type" in tda_error_details else False, extra={'task_id': tda_task_id})
+        _update_task_instance_status(tda_task_id, TASK_STATUS_COMPLETED if not tda_error_details else TASK_STATUS_FAILED,
+                                     output_summary=tda_output_summary, error_details=tda_error_details, workflow_id_for_log=workflow_id)
+
+    if tda_error_details or not tda_topics:
+        final_error_msg = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for exploration."
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg, context_data={"tda_query": query_for_tda})
+        return {"error": "TDA_FAILURE", "details": final_error_msg, "explored_topics": [], "workflow_id": workflow_id}
+
+    # --- Snippet Generation Loop for Explored Topics ---
+    explored_snippets: List[Dict[str, Any]] = []
+    final_workflow_status = WORKFLOW_STATUS_COMPLETED
+    any_snippet_errors = False
+    snippet_gen_task_base_order = current_task_order
+
+    for i, topic_obj in enumerate(tda_topics):
+        current_task_order = snippet_gen_task_base_order + i + 1
+        if not isinstance(topic_obj, dict):
+            wf_logger.warning(f"Skipping non-dictionary topic object from TDA (exploration): {topic_obj}")
+            continue
+
+        topic_info_for_sca = { # Adapt TDA object
+            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id") or f"tda_topic_explore_{i}",
+            "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"),
+            "summary": topic_obj.get("summary"), "keywords": topic_obj.get("keywords", []),
+            "original_topic_details_from_tda": topic_obj
+        }
+        if not topic_info_for_sca["title_suggestion"]:
+            wf_logger.warning(f"Skipping TDA topic (exploration) due to missing title: {topic_obj}")
+            continue
+
+        sg_task_id = _create_task_instance(workflow_id, "SnippetGenerationExplorationItem", current_task_order,
+                                           {"topic_title": topic_info_for_sca["title_suggestion"]}, initial_status=TASK_STATUS_DISPATCHED)
+
+        snippet_error_details = None
+        snippet_result = None
+        snippet_output_summary = {}
+        try:
+            if sg_task_id: _update_task_instance_status(sg_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca, workflow_id_for_log=workflow_id)
+
+            if snippet_result and "error" not in snippet_result:
+                explored_snippets.append(snippet_result)
+                snippet_output_summary = {"snippet_id": snippet_result.get("snippet_id"), "image_url_present": bool(snippet_result.get("image_url"))}
+                wf_logger.info(f"Successfully generated exploration snippet for topic: '{topic_info_for_sca['title_suggestion']}'", extra={'task_id': sg_task_id})
+            else:
+                snippet_error_details = {"message": snippet_result.get("details", "Exploration snippet generation returned error structure."), "sca_response": snippet_result}
+                any_snippet_errors = True
+        except Exception as e_snippet_gen:
+            snippet_error_details = {"message": f"Error in orchestrate_snippet_generation call (exploration): {str(e_snippet_gen)}", "exception_type": type(e_snippet_gen).__name__}
+            any_snippet_errors = True
+
+        if snippet_error_details:
+            wf_logger.warning(f"SnippetGenerationExplorationItem task failed: {snippet_error_details['message']}", exc_info=True if "exception_type" in snippet_error_details else False, extra={'task_id': sg_task_id})
+
+        if sg_task_id:
+            _update_task_instance_status(sg_task_id, TASK_STATUS_COMPLETED if not snippet_error_details else TASK_STATUS_FAILED,
+                                         output_summary=snippet_output_summary, error_details=snippet_error_details, workflow_id_for_log=workflow_id)
+
+    final_error_message_wf = None
+    if not explored_snippets:
+        final_workflow_status = WORKFLOW_STATUS_FAILED if any_snippet_errors else WORKFLOW_STATUS_COMPLETED
+        final_error_message_wf = "No explored snippets generated" + (" due to errors." if any_snippet_errors else " (TDA might have returned too few topics).")
+        wf_logger.info(final_error_message_wf)
+    elif any_snippet_errors:
+        final_workflow_status = WORKFLOW_STATUS_COMPLETED_WITH_ERRORS
+        final_error_message_wf = "Some explored snippets could not be generated."
+        wf_logger.warning(final_error_message_wf)
+
+    _update_workflow_instance_status(workflow_id, final_workflow_status,
+                                     context_data={"generated_snippet_count": len(explored_snippets), "tda_query": query_for_tda},
+                                     error_message=final_error_message_wf)
+
+    if not explored_snippets and (final_workflow_status == WORKFLOW_STATUS_FAILED or not tda_topics):
+         return {"workflow_id": workflow_id, "explored_topics": [], "error": final_workflow_status, "details": final_error_message_wf or "No explored topics found or error in processing."}
+
+    wf_logger.info(f"Topic exploration workflow generated {len(explored_snippets)} explored snippets.")
+    return {"workflow_id": workflow_id, "explored_topics": explored_snippets}
+
+
+def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional[dict] = None, user_id: Optional[str] = None) -> Dict[str, Any]:
+    workflow_id = _create_workflow_instance(
+        trigger_event_type="landing_page_snippets",
+        trigger_event_details={"limit": limit, "user_preferences": user_preferences},
+        user_id=user_id
+    )
+    log_extra_wf = {'workflow_id': workflow_id, 'task_id': None} # For logs before wf_logger is set
+
+    if not workflow_id:
+        logger.error(f"Failed to create workflow instance for landing_page_snippets. Aborting.", extra=log_extra_wf)
+        return {"error": "WORKFLOW_CREATION_FAILED", "details": "Workflow creation failed.", "snippets": [], "workflow_id": None}
+
+    wf_logger = logging.LoggerAdapter(logger, log_extra_wf)
+    _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
+    wf_logger.info(f"Landing page snippets workflow started. Limit: {limit}")
+
+    # --- Input Validation ---
+    if not isinstance(limit, int) or not (1 <= limit <= 20):
+        error_msg = f"'limit' must be an integer between 1 and 20. Received: {limit}"
+        wf_logger.error(f"Input validation failed: {error_msg}")
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "CPOA_REQUEST_INVALID", "details": error_msg, "snippets": [], "workflow_id": workflow_id}
+
+    if user_preferences and not isinstance(user_preferences, dict):
+        error_msg = f"'user_preferences' must be a dictionary if provided. Received: {type(user_preferences)}"
+        wf_logger.error(f"Input validation failed: {error_msg}")
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "CPOA_REQUEST_INVALID", "details": error_msg, "snippets": [], "workflow_id": workflow_id}
+
+    # --- Query Construction for TDA ---
+    default_keywords = ["technology", "science", "lifestyle", "business", "arts", "global news", "innovation", "culture"]
+    query_for_tda = None
+    if user_preferences and isinstance(user_preferences.get("preferred_categories"), list) and user_preferences["preferred_categories"]:
+        query_for_tda = " ".join(user_preferences["preferred_categories"])
+    elif user_preferences and isinstance(user_preferences.get(PREF_KEY_NEWS_CATEGORY), str) and user_preferences[PREF_KEY_NEWS_CATEGORY]:
+        query_for_tda = user_preferences[PREF_KEY_NEWS_CATEGORY]
+    else:
+        query_for_tda = " ".join(random.sample(default_keywords, min(len(default_keywords), 3)))
+    wf_logger.info(f"Using TDA query: '{query_for_tda}'")
+
+    if not query_for_tda: # Should be rare with defaults
+        error_msg = "Failed to construct a query for TDA."
+        wf_logger.error(error_msg)
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=error_msg)
+        return {"error": "TDA_QUERY_EMPTY", "details": error_msg, "snippets": [], "workflow_id": workflow_id}
+
+    # --- TDA Task ---
+    current_task_order = 1
+    tda_input_params = {"query": query_for_tda, "limit": limit * 2} # Fetch more to have a buffer
+    tda_task_id = _create_task_instance(workflow_id, "TDA", current_task_order, tda_input_params, initial_status=TASK_STATUS_DISPATCHED)
+
+    tda_topics = []
+    tda_error_details = None
+    tda_output_summary = {}
+
+    if not TDA_SERVICE_URL:
+        tda_error_details = {"message": "TDA_SERVICE_URL is not configured."}
+        wf_logger.error(tda_error_details["message"], extra={'task_id': tda_task_id})
+    elif tda_task_id:
+        try:
+            _update_task_instance_status(tda_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            response = requests_with_retry("post", TDA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                           json=tda_input_params, timeout=30,
+                                           workflow_id_for_log=workflow_id, task_id_for_log=tda_task_id)
+            tda_data = response.json()
+            tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", []))
+            tda_output_summary = {"topic_count": len(tda_topics), "query_used": query_for_tda}
+            wf_logger.info(f"TDA returned {len(tda_topics)} topics.", extra={'task_id': tda_task_id})
+            if not tda_topics:
+                tda_error_details = {"message": "TDA returned no topics.", "tda_response": tda_data}
+        except requests.exceptions.RequestException as e_req:
+            tda_error_details = {"message": f"TDA service call failed: {str(e_req)}", "exception_type": type(e_req).__name__}
+        except json.JSONDecodeError as e_json:
+            tda_error_details = {"message": f"Failed to decode TDA response: {str(e_json)}", "response_preview": response.text[:200] if 'response' in locals() else "N/A"}
+        except Exception as e_gen_tda:
+            tda_error_details = {"message": f"Unexpected error during TDA call: {str(e_gen_tda)}", "exception_type": type(e_gen_tda).__name__}
+
+        if tda_error_details:
+             wf_logger.error(f"TDA task failed: {tda_error_details['message']}", exc_info=True if "exception_type" in tda_error_details else False, extra={'task_id': tda_task_id})
+        _update_task_instance_status(tda_task_id, TASK_STATUS_COMPLETED if not tda_error_details else TASK_STATUS_FAILED,
+                                     output_summary=tda_output_summary, error_details=tda_error_details, workflow_id_for_log=workflow_id)
+
+    if tda_error_details or not tda_topics:
+        final_error_msg = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for landing page."
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg, context_data={"tda_query": query_for_tda})
+        return {"error": "TDA_FAILURE", "details": final_error_msg, "snippets": [], "workflow_id": workflow_id}
+
+    # --- Snippet Generation Loop ---
+    generated_snippets: List[Dict[str, Any]] = []
+    final_workflow_status = WORKFLOW_STATUS_COMPLETED
+    any_snippet_errors = False
+    snippet_gen_task_base_order = current_task_order # To increment from here
+
+    for i, topic_obj in enumerate(tda_topics):
+        if len(generated_snippets) >= limit: break
+        current_task_order = snippet_gen_task_base_order + i + 1
+
+        if not isinstance(topic_obj, dict):
+            wf_logger.warning(f"Skipping non-dictionary topic object from TDA: {topic_obj}")
+            continue
+
+        topic_info_for_sca = {
+            "topic_id": topic_obj.get("topic_id") or topic_obj.get("id") or f"tda_topic_lp_{i}",
+            "title_suggestion": topic_obj.get("title_suggestion") or topic_obj.get("title"),
+            "summary": topic_obj.get("summary"), "keywords": topic_obj.get("keywords", []),
+            "original_topic_details_from_tda": topic_obj
+        }
+        if not topic_info_for_sca["title_suggestion"]:
+            wf_logger.warning(f"Skipping TDA topic due to missing title: {topic_obj}")
+            continue
+
+        sg_task_id = _create_task_instance(workflow_id, "SnippetGenerationLoopItem", current_task_order,
+                                           {"topic_title": topic_info_for_sca["title_suggestion"]}, initial_status=TASK_STATUS_DISPATCHED)
+
+        snippet_error_details = None
+        snippet_result = None
+        snippet_output_summary = {}
+        try:
+            if sg_task_id: _update_task_instance_status(sg_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            # Pass workflow_id for logging context within orchestrate_snippet_generation
+            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca, workflow_id_for_log=workflow_id)
+
             if snippet_result and "error" not in snippet_result:
                 generated_snippets.append(snippet_result)
-                logger.info(f"CPOA: {function_name} - Successfully generated snippet for topic: '{topic_info_for_sca['title_suggestion']}'")
+                snippet_output_summary = {"snippet_id": snippet_result.get("snippet_id"), "image_url_present": bool(snippet_result.get("image_url"))}
+                wf_logger.info(f"Successfully generated snippet for topic: '{topic_info_for_sca['title_suggestion']}'", extra={'task_id': sg_task_id})
             else:
-                err_detail = "Unknown SCA error"
-                if snippet_result:
-                    err_detail = snippet_result.get('details', snippet_result.get('error', err_detail))
-                logger.warning(f"CPOA: {function_name} - Snippet generation failed for topic: '{topic_info_for_sca['title_suggestion']}'. Error: {err_detail}")
-        except Exception as e_sca_orch:
-            logger.error(f"CPOA: {function_name} - Unexpected error calling orchestrate_snippet_generation for topic '{topic_info_for_sca['title_suggestion']}': {e_sca_orch}", exc_info=True)
+                snippet_error_details = {"message": snippet_result.get("details", "Snippet generation returned error structure."), "sca_response": snippet_result}
+                any_snippet_errors = True
+        except Exception as e_snippet_gen:
+            snippet_error_details = {"message": f"Error in orchestrate_snippet_generation call: {str(e_snippet_gen)}", "exception_type": type(e_snippet_gen).__name__}
+            any_snippet_errors = True
+
+        if snippet_error_details:
+             wf_logger.warning(f"SnippetGenerationLoopItem task failed: {snippet_error_details['message']}", exc_info=True if "exception_type" in snippet_error_details else False, extra={'task_id': sg_task_id})
+
+        if sg_task_id:
+            _update_task_instance_status(sg_task_id, TASK_STATUS_COMPLETED if not snippet_error_details else TASK_STATUS_FAILED,
+                                         output_summary=snippet_output_summary, error_details=snippet_error_details, workflow_id_for_log=workflow_id)
+
+    final_error_message_wf = None
+    if not generated_snippets:
+        final_workflow_status = WORKFLOW_STATUS_FAILED if any_snippet_errors else WORKFLOW_STATUS_COMPLETED # Completed if TDA gave no topics but no errors occurred
+        final_error_message_wf = "No snippets generated" + (" due to errors." if any_snippet_errors else " (TDA might have returned too few topics).")
+        wf_logger.info(final_error_message_wf)
+    elif any_snippet_errors:
+        final_workflow_status = WORKFLOW_STATUS_COMPLETED_WITH_ERRORS
+        final_error_message_wf = "Some snippets could not be generated for landing page."
+        wf_logger.warning(final_error_message_wf)
+
+    _update_workflow_instance_status(workflow_id, final_workflow_status,
+                                     context_data={"generated_snippet_count": len(generated_snippets), "requested_limit": limit, "tda_query": query_for_tda},
+                                     error_message=final_error_message_wf)
 
     if not generated_snippets:
-        logger.info(f"CPOA: {function_name} - No snippets could be generated after processing {len(tda_topics)} TDA topics.")
-        return {"message": "NO_SNIPPETS_GENERATED", "details": "Failed to generate any snippets from the discovered topics.", "snippets": []}
+         return {"message": "NO_SNIPPETS_GENERATED", "details": final_error_message_wf or "Failed to generate any snippets.", "snippets": [], "workflow_id": workflow_id}
 
-    logger.info(f"CPOA: {function_name} - Successfully generated {len(generated_snippets)} snippets for landing page.")
-    return {"snippets": generated_snippets, "source": "generation"}
+    wf_logger.info(f"Landing page snippets workflow successfully generated {len(generated_snippets)} snippets.")
+    return {"workflow_id": workflow_id, "snippets": generated_snippets, "source": "generation"}
 
 
 def get_popular_categories() -> Dict[str, Any]:

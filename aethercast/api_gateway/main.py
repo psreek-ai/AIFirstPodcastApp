@@ -106,6 +106,45 @@ CREATE TABLE IF NOT EXISTS users (
     hashed_password TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL
 );
+
+-- Schema for CPOA State Management --
+CREATE TABLE IF NOT EXISTS workflow_instances (
+    workflow_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    trigger_event_type VARCHAR(255) NOT NULL,
+    trigger_event_details_json JSONB,
+    overall_status VARCHAR(50) NOT NULL,
+    start_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+    end_timestamp TIMESTAMPTZ,
+    last_updated_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+    context_data_json JSONB,
+    error_message TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_workflow_user_id ON workflow_instances (user_id) WHERE user_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_workflow_status ON workflow_instances (overall_status);
+CREATE INDEX IF NOT EXISTS idx_workflow_start_time ON workflow_instances (start_timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_workflow_trigger_event_type ON workflow_instances (trigger_event_type);
+
+CREATE TABLE IF NOT EXISTS task_instances (
+    task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workflow_id UUID NOT NULL REFERENCES workflow_instances(workflow_id) ON DELETE CASCADE,
+    agent_name VARCHAR(255) NOT NULL,
+    task_order INTEGER NOT NULL,
+    status VARCHAR(50) NOT NULL,
+    input_params_json JSONB,
+    output_result_summary_json JSONB,
+    error_details_json JSONB,
+    start_timestamp TIMESTAMPTZ,
+    end_timestamp TIMESTAMPTZ,
+    last_updated_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+    retry_count INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_workflow_id ON task_instances (workflow_id);
+CREATE INDEX IF NOT EXISTS idx_task_agent_name ON task_instances (agent_name);
+CREATE INDEX IF NOT EXISTS idx_task_status ON task_instances (status);
+CREATE INDEX IF NOT EXISTS idx_task_order ON task_instances (workflow_id, task_order);
 """
 
 # --- API Gateway Specific Configurations ---
@@ -143,27 +182,35 @@ def init_db():
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        current_tables_to_check = ["podcasts", "topics_snippets", "generated_scripts", "user_sessions", "users", "workflow_instances", "task_instances"]
+
         if DATABASE_TYPE == "postgres":
             # For PostgreSQL, check for table existence using information_schema
-            tables_to_check = ["podcasts", "topics_snippets", "generated_scripts", "user_sessions", "users"]
-            for table_name in tables_to_check:
+            for table_name in current_tables_to_check:
                 cursor.execute(f"SELECT to_regclass('public.{table_name}');")
-                if not cursor.fetchone()[0]: # to_regclass returns NULL if table doesn't exist
-                    app.logger.info(f"Table '{table_name}' not found in PostgreSQL. It will be created.")
+                # fetchone() will return a tuple like (None,) if table doesn't exist, or ('table_name',) if it does.
+                result = cursor.fetchone()
+                if not result or result[0] is None:
+                    app.logger.info(f"Table '{table_name}' not found in PostgreSQL. It will be created as per DB_SCHEMA_SQL.")
                 else:
-                    app.logger.info(f"Table '{table_name}' already exists in PostgreSQL.")
+                    app.logger.info(f"Table '{table_name}' already exists or was just checked in PostgreSQL.")
         else: # SQLite check (original logic)
-            tables_to_check = ["podcasts", "topics_snippets", "generated_scripts", "user_sessions", "users"]
-            for table_name in tables_to_check:
+            for table_name in current_tables_to_check:
                 cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';")
                 if not cursor.fetchone():
-                    app.logger.info(f"Table '{table_name}' not found in SQLite. It will be created.")
+                    app.logger.info(f"Table '{table_name}' not found in SQLite. It will be created as per DB_SCHEMA_SQL.")
                 else:
-                    app.logger.info(f"Table '{table_name}' already exists in SQLite.")
+                    app.logger.info(f"Table '{table_name}' already exists or was just checked in SQLite.")
 
-        cursor.executescript(DB_SCHEMA_SQL) # This might need adjustment if complex PG features are used not compatible with executescript
+        # For psycopg2, cursor.execute can handle multi-statement SQL strings directly if they are semicolon-separated.
+        # The executescript method is specific to sqlite3.
+        if DATABASE_TYPE == "postgres":
+            cursor.execute(DB_SCHEMA_SQL)
+        else:
+            cursor.executescript(DB_SCHEMA_SQL)
+
         conn.commit()
-        app.logger.info(f"Database initialization processed. Tables ensured for {DATABASE_TYPE}.")
+        app.logger.info(f"Database initialization processed. Tables ensured for {DATABASE_TYPE}: {', '.join(current_tables_to_check)}.")
     except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e:
         log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
         log_func(f"Database initialization error ({DATABASE_TYPE}): {e}")
@@ -271,6 +318,39 @@ def _update_session_preferences(db_conn, session_id: str, preferences: dict) -> 
         app.logger.error(f"Failed to update preferences for session {session_id} ({DATABASE_TYPE}): {e}")
         db_conn.rollback() if DATABASE_TYPE == "postgres" else None
         raise
+
+# --- User Helper Functions ---
+def _get_user_by_id(user_id_str: str) -> Optional[Dict[str, Any]]:
+    """Fetches a user by user_id from the database."""
+    if not user_id_str:
+        return None
+    # Validate if user_id_str is a valid UUID string if your DB uses UUID type strictly for IDs
+    try:
+        # Attempt to parse as UUID to validate format.
+        # This is important if user_id in DB is strictly UUID type.
+        uuid.UUID(user_id_str)
+    except ValueError:
+        app.logger.warning(f"_get_user_by_id: Invalid UUID format for user_id: {user_id_str}")
+        return None
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = "SELECT * FROM users WHERE user_id = %s;" if DATABASE_TYPE == "postgres" else "SELECT * FROM users WHERE user_id = ?;"
+        cursor.execute(sql, (user_id_str,))
+        user_row = cursor.fetchone() # Returns dict (RealDictCursor) or sqlite3.Row or None
+
+        # Convert sqlite3.Row to dict if necessary, RealDictCursor already returns dict
+        if user_row and not isinstance(user_row, dict) and hasattr(user_row, 'keys'): # Check if it's row-like and not dict
+             user_row = dict(zip(user_row.keys(), user_row))
+
+        return user_row
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e:
+        app.logger.error(f"Database error fetching user by ID {user_id_str} ({DATABASE_TYPE}): {e}", exc_info=True)
+        return None
+    finally:
+        if conn: conn.close()
 
 # --- CPOA Import (Remains largely the same, logging adapted) ---
 _pre_init_logger = print # Use print before app.logger is available
@@ -717,21 +797,65 @@ def get_dynamic_snippets():
         return jsonify({"error_code": "API_GW_CPOA_SNIPPET_SERVICE_UNAVAILABLE", "message": "Snippet service unavailable."}), 503
     try:
         limit_str = request.args.get('limit', default="6")
-        try: limit = int(limit_str); limit = 6 if not (1 <= limit <= 20) else limit
-        except ValueError: limit = 6
+        try:
+            limit = int(limit_str)
+            if not (1 <= limit <= 20): limit = 6
+        except ValueError:
+            limit = 6
 
-        cpoa_response = orchestrate_landing_page_snippets(limit=limit) # Assuming CPOA returns list of dicts
+        user_id_for_cpoa = None
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header.split(" ")[1]
+            if token: # Ensure token is not empty after split
+                # Use app.config['SECRET_KEY'] for decoding
+                decoded_data = decode_jwt(token, app.config['SECRET_KEY'])
+                if decoded_data and 'user_id' in decoded_data:
+                    # Verify user exists in DB to prevent using stale tokens for non-critical features
+                    # _get_user_by_id requires a db connection, so handle it carefully or assume valid if decoded.
+                    # For this optional case, just decoding might be enough, or add DB check if critical.
+                    # For now, let's assume a decoded 'user_id' is tentatively usable for CPOA's optional param.
+                    user_exists = _get_user_by_id(decoded_data['user_id']) # Added DB check
+                    if user_exists:
+                        user_id_for_cpoa = decoded_data['user_id']
+                        app.logger.info(f"Optional user_id {user_id_for_cpoa} obtained for get_dynamic_snippets via token.")
+                    else:
+                        app.logger.info(f"User {decoded_data['user_id']} from optional token not found in DB for get_dynamic_snippets.")
+                elif decoded_data is None: # E.g. token expired or invalid
+                     app.logger.info("Optional token provided for get_dynamic_snippets was invalid or expired.")
 
-        if "error" in cpoa_response:
-            # ... (error handling as before)
-            return jsonify({"error_code": f"API_GW_CPOA_SNIPPET_ERROR", "message": "Failed to get snippets."}), 500 # Simplified
 
-        snippets_list = cpoa_response.get("snippets", [])
-        cpoa_response["snippets"] = _process_snippets_for_signed_urls(snippets_list)
+        cpoa_response_dict = orchestrate_landing_page_snippets(limit=limit, user_id=user_id_for_cpoa)
 
-        return jsonify(cpoa_response), 200
-    except ImportError: return jsonify({"error_code": "API_GW_CPOA_SNIPPET_MODULE_UNAVAILABLE", "message": "Snippet module unavailable."}), 503
-    except Exception as e: app.logger.error(f"Unexpected error in get_dynamic_snippets: {e}", exc_info=True); return jsonify({"error_code": "API_GW_SNIPPETS_UNEXPECTED_ERROR", "message": "Unexpected error."}), 500
+        workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
+
+        if cpoa_response_dict.get("error"):
+            error_code = str(cpoa_response_dict.get("error", "CPOA_ERROR")).upper()
+            error_details = cpoa_response_dict.get("details", "Failed to get snippets from CPOA.")
+            app.logger.error(f"CPOA error in get_dynamic_snippets: {error_code} - {error_details}. Workflow ID: {workflow_id_from_cpoa}")
+            status_code = 503 if "TDA_" in error_code or "SCA_" in error_code or "WORKFLOW_CREATION_FAILED" in error_code else 500
+            return jsonify({"error_code": f"API_GW_CPOA_SNIPPET_ERROR_{error_code}", "message": error_details, "workflow_id": workflow_id_from_cpoa}), status_code
+
+        snippets_list = cpoa_response_dict.get("snippets", [])
+        processed_snippets = _process_snippets_for_signed_urls(snippets_list)
+
+        response_payload = {
+            "workflow_id": workflow_id_from_cpoa,
+            "snippets": processed_snippets,
+            "source": cpoa_response_dict.get("source", "generation")
+        }
+        if "message" in cpoa_response_dict:
+            response_payload["message"] = cpoa_response_dict["message"]
+
+        return jsonify(response_payload), 200
+
+    except ImportError:
+        app.logger.error("CPOA module import error in get_dynamic_snippets.", exc_info=True)
+        return jsonify({"error_code": "API_GW_CPOA_SNIPPET_MODULE_UNAVAILABLE", "message": "Snippet service module unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in get_dynamic_snippets: {e}", exc_info=True)
+        wf_id_for_error = locals().get('cpoa_response_dict', {}).get('workflow_id')
+        return jsonify({"error_code": "API_GW_SNIPPETS_UNEXPECTED_ERROR", "message": "An unexpected error occurred while fetching snippets.", "workflow_id": wf_id_for_error}), 500
 
 # --- Categories Endpoint ---
 @app.route('/api/v1/categories', methods=['GET'])
@@ -777,19 +901,50 @@ def explore_topic():
         pass
 
     try:
-        cpoa_response_list = orchestrate_topic_exploration(current_topic_id=current_topic_id, keywords=keywords, depth_mode=depth_mode, user_preferences=user_preferences)
+        current_user_id = g.current_user['user_id'] if hasattr(g, 'current_user') and g.current_user else None
+        # Note: @token_required should ensure g.current_user exists. This is an extra check.
+        if not current_user_id:
+            app.logger.error("explore_topic: Critical error - g.current_user not set despite @token_required.")
+            return jsonify({"error_code": "AUTH_INTERNAL_ERROR", "message": "Authentication context not found."}), 500
 
-        # Assuming cpoa_response_list is a list of snippet dicts or an error dict from CPOA
-        if isinstance(cpoa_response_list, dict) and "error" in cpoa_response_list:
-            # ... (error handling as before)
-            return jsonify({"error_code": "API_GW_CPOA_EXPLORE_ERROR", "message": "Exploration failed."}), 500
+        cpoa_response_dict = orchestrate_topic_exploration(
+            current_topic_id=current_topic_id,
+            keywords=keywords,
+            depth_mode=depth_mode,
+            user_preferences=user_preferences,
+            user_id=current_user_id
+        )
 
-        processed_response = _process_snippets_for_signed_urls(cpoa_response_list)
-        return jsonify({"explored_topics": processed_response}), 200
+        workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
 
-    except ImportError: return jsonify({"error_code": "API_GW_CPOA_EXPLORE_MODULE_UNAVAILABLE_RUNTIME", "message": "Exploration module unavailable."}), 503
-    except ValueError as ve: return jsonify({"error_code": "API_GW_EXPLORE_INVALID_INPUT_OR_STATE", "message": str(ve)}), 400 # CPOA might raise ValueError
-    except Exception as e: app.logger.error(f"Unexpected error in /explore: {e}", exc_info=True); return jsonify({"error_code": "API_GW_EXPLORE_UNEXPECTED_ERROR", "message": "Unexpected error."}), 500
+        if cpoa_response_dict.get("error"): # Check for CPOA-specific error field
+            error_code = str(cpoa_response_dict.get("error", "CPOA_ERROR")).upper()
+            error_details = cpoa_response_dict.get("details", "Exploration failed via CPOA.")
+            app.logger.error(f"CPOA error in explore_topic: {error_code} - {error_details}. Workflow ID: {workflow_id_from_cpoa}")
+            status_code = 503 if "TDA_" in error_code or "SCA_" in error_code or "WORKFLOW_CREATION_FAILED" in error_code else 500
+            return jsonify({"error_code": f"API_GW_CPOA_EXPLORE_ERROR_{error_code}", "message": error_details, "workflow_id": workflow_id_from_cpoa}), status_code
+
+        explored_topics_list = cpoa_response_dict.get("explored_topics", [])
+        processed_explored_topics = _process_snippets_for_signed_urls(explored_topics_list)
+
+        return jsonify({
+            "workflow_id": workflow_id_from_cpoa,
+            "explored_topics": processed_explored_topics
+        }), 200
+
+    except ImportError:
+        app.logger.error("CPOA module import error in explore_topic.", exc_info=True)
+        return jsonify({"error_code": "API_GW_CPOA_EXPLORE_MODULE_UNAVAILABLE_RUNTIME", "message": "Exploration module unavailable."}), 503
+    except ValueError as ve:
+        app.logger.warning(f"ValueError in explore_topic (likely from CPOA input validation): {ve}")
+        # CPOA's orchestrate_topic_exploration now returns a dict with workflow_id even for input errors if workflow was created.
+        # However, if ValueError is raised before CPOA workflow creation, workflow_id might not be present.
+        return jsonify({"error_code": "API_GW_EXPLORE_INVALID_INPUT_OR_STATE", "message": str(ve)}), 400
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /explore: {e}", exc_info=True)
+        # Attempt to get workflow_id if cpoa_response_dict was formed before the exception
+        wf_id_for_error = locals().get('cpoa_response_dict', {}).get('workflow_id')
+        return jsonify({"error_code": "API_GW_EXPLORE_UNEXPECTED_ERROR", "message": "An unexpected error occurred during topic exploration.", "workflow_id": wf_id_for_error}), 500
 
 # --- Search Endpoint (Updated for Signed URLs) ---
 @app.route('/api/v1/search/podcasts', methods=['POST'])
@@ -812,18 +967,45 @@ def search_podcasts_endpoint():
     user_preferences = None # Placeholder for brevity
 
     try:
-        cpoa_search_response_dict = orchestrate_search_results_generation(query=query, user_preferences=user_preferences)
+        current_user_id = g.current_user['user_id'] if hasattr(g, 'current_user') and g.current_user else None
+        if not current_user_id: # Safeguard
+            app.logger.error("search_podcasts_endpoint: Critical error - g.current_user not set despite @token_required.")
+            return jsonify({"error_code": "AUTH_INTERNAL_ERROR", "message": "Authentication context not found."}), 500
 
-        if "error" in cpoa_search_response_dict:
-            # ... (error handling as before)
-            return jsonify({"error_code": "API_GW_CPOA_SEARCH_ERROR", "message": "Search failed."}), 500
+        cpoa_response_dict = orchestrate_search_results_generation(
+            query=query,
+            user_preferences=user_preferences,
+            user_id=current_user_id
+        )
 
-        search_results_list = cpoa_search_response_dict.get("search_results", [])
-        cpoa_search_response_dict["search_results"] = _process_snippets_for_signed_urls(search_results_list)
+        workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
 
-        return jsonify(cpoa_search_response_dict), 200
-    except ImportError: return jsonify({"error_code": "API_GW_CPOA_SEARCH_MODULE_UNAVAILABLE", "message": "Search module unavailable."}), 503
-    except Exception as e: app.logger.error(f"Unexpected error in /search: {e}", exc_info=True); return jsonify({"error_code": "API_GW_SEARCH_UNEXPECTED_ERROR", "message": "Unexpected error."}), 500
+        if cpoa_response_dict.get("error"): # Check for CPOA-specific error field
+            error_code = str(cpoa_response_dict.get("error", "CPOA_SEARCH_ERROR")).upper()
+            error_details = cpoa_response_dict.get("details", "Search failed via CPOA.")
+            app.logger.error(f"CPOA error in search_podcasts_endpoint: {error_code} - {error_details}. Workflow ID: {workflow_id_from_cpoa}")
+            status_code = 503 if "TDA_" in error_code or "SCA_" in error_code or "WORKFLOW_CREATION_FAILED" in error_code else 500
+            return jsonify({"error_code": f"API_GW_CPOA_SEARCH_ERROR_{error_code}", "message": error_details, "workflow_id": workflow_id_from_cpoa}), status_code
+
+        search_results_list = cpoa_response_dict.get("search_results", [])
+        processed_search_results = _process_snippets_for_signed_urls(search_results_list)
+
+        # Ensure other potential fields from CPOA response are passed through if they exist
+        response_payload = {
+            "workflow_id": workflow_id_from_cpoa,
+            "search_results": processed_search_results
+        }
+        if "message" in cpoa_response_dict: # e.g. for NO_RESULTS_FOUND from CPOA
+            response_payload["message"] = cpoa_response_dict["message"]
+
+        return jsonify(response_payload), 200
+    except ImportError:
+        app.logger.error("CPOA module import error in search_podcasts_endpoint.", exc_info=True)
+        return jsonify({"error_code": "API_GW_CPOA_SEARCH_MODULE_UNAVAILABLE", "message": "Search module unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /search: {e}", exc_info=True)
+        wf_id_for_error = locals().get('cpoa_response_dict', {}).get('workflow_id')
+        return jsonify({"error_code": "API_GW_SEARCH_UNEXPECTED_ERROR", "message": "An unexpected error occurred during search.", "workflow_id": wf_id_for_error}), 500
 
 
 # --- Podcast Generation Endpoint (No direct changes for GCS signed URLs here, CPOA handles GCS URIs) ---
@@ -856,10 +1038,7 @@ def create_podcast_generation_task():
         try:
             conn_task = get_db_connection()
             cursor = conn_task.cursor()
-            # Prepare tts_settings_used for JSONB or TEXT
-            tts_settings_to_save = None
-            if voice_params_from_request:
-                tts_settings_to_save = json.dumps(voice_params_from_request) if DATABASE_TYPE == "sqlite" else voice_params_from_request
+            tts_settings_to_save = json.dumps(voice_params_from_request) if voice_params_from_request and DATABASE_TYPE == "sqlite" else (voice_params_from_request if voice_params_from_request else None)
 
             sql_insert_task = """
                 INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp, tts_settings_used)

@@ -145,9 +145,23 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Snippets & Categories
 
 -   **`GET /api/v1/snippets`**
-    -   **Description:** Fetches dynamically generated podcast snippets via CPOA, suitable for a landing page. CPOA orchestrates topic discovery (TDA), snippet text generation (SCA), and image generation (IGA). `image_url`s for snippets (originally GCS URIs from IGA via CPOA) are converted to short-lived signed GCS HTTP URLs by the API Gateway before being sent to the client.
+    -   **Description:** Fetches dynamically generated podcast snippets via CPOA, suitable for a landing page. CPOA orchestrates topic discovery (TDA), snippet text generation (SCA), and image generation (IGA). `image_url`s for snippets (originally GCS URIs from IGA via CPOA) are converted to short-lived signed GCS HTTP URLs by the API Gateway before being sent to the client. If a valid `Authorization: Bearer <token>` is provided, the `user_id` is opportunistically passed to CPOA for potential personalization and is associated with the created workflow.
     -   **Query Parameters:** `limit` (optional, integer, default 6, max 20): Number of snippets.
-    -   **Success Response (200 OK):** `{"snippets": [...], "source": "generation"}` (content from CPOA, where each snippet object's `image_url` is a signed HTTP URL).
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "workflow_id": "uuid-of-the-cpoa-workflow",
+            "snippets": [
+                {
+                    "snippet_id": "...",
+                    "title": "...",
+                    "image_url": "https://signed-gcs-url-for-image...",
+                    "..."
+                }
+            ],
+            "source": "generation"
+        }
+        ```
     -   **Error Responses:** 503 (CPOA/downstream unavailable), 500 (other errors, including signed URL generation failure).
 
 -   **`GET /api/v1/categories`**
@@ -156,7 +170,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
     -   **Error Responses:** 503 (CPOA unavailable), 500 (CPOA error).
 
 -   **`POST /api/v1/topics/explore`**
-    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration`. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration`. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -167,7 +181,20 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
         }
         ```
         *Note: At least `current_topic_id` or `keywords` must be provided.*
-    -   **Success Response (200 OK):** `{"explored_topics": [...]}` (list of snippet objects from CPOA, with `image_url`s as signed HTTP URLs).
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "workflow_id": "uuid-of-the-cpoa-workflow",
+            "explored_topics": [
+                {
+                    "snippet_id": "...",
+                    "title": "...",
+                    "image_url": "https://signed-gcs-url-for-image...",
+                    "..."
+                }
+            ]
+        }
+        ```
     -   **Error Responses:**
         -   **400 Bad Request:** For issues like:
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
@@ -181,7 +208,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Podcast Task Management
 
 -   **`POST /api/v1/podcasts`**
-    -   **Description:** (**Authentication Required.**) Initiates a new podcast generation task. Calls CPOA to orchestrate generation. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Initiates a new podcast generation task. Calls CPOA to orchestrate generation. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -191,7 +218,18 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
             "test_scenarios": { /* Optional: For CPOA test scenarios */ }
         }
         ```
-    -   **Success Response (201 Created or 200 OK):** Includes `podcast_id`, `topic`, `generation_status`, `audio_url` (if successful), and `details` (full CPOA result). Status code depends on CPOA outcome.
+    -   **Success Response (201 Created or 200 OK):** Includes `podcast_id` (original task ID for CPOA), `workflow_id` (from CPOA state management), `topic`, `generation_status`, `audio_url` (if successful), and `details` (full CPOA result). Status code depends on CPOA outcome.
+        ```json
+        // Example Success Response
+        {
+            "podcast_id": "uuid-of-the-podcast-task",
+            "workflow_id": "uuid-of-the-cpoa-workflow",
+            "topic": "The History of Podcasting",
+            "generation_status": "completed", // Or other CPOA status
+            "audio_url": "/api/v1/podcasts/uuid-of-the-podcast-task/audio.mp3",
+            "details": { /* Full CPOA result object */ }
+        }
+        ```
     -   **Error Responses:**
         -   **400 Bad Request:** For issues like:
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
@@ -220,7 +258,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Search
 
 -   **`POST /api/v1/search/podcasts`**
-    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -228,7 +266,20 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
             "client_id": "your_session_id" // Optional, for fetching user preferences for CPOA
         }
         ```
-    -   **Success Response (200 OK):** `{"search_results": [...]}` (content from CPOA, with `image_url`s as signed HTTP URLs).
+    -   **Success Response (200 OK):**
+        ```json
+        {
+            "workflow_id": "uuid-of-the-cpoa-workflow",
+            "search_results": [
+                {
+                    "snippet_id": "...",
+                    "title": "...",
+                    "image_url": "https://signed-gcs-url-for-image...",
+                    "..."
+                }
+            ]
+        }
+        ```
     -   **Error Responses:**
         -   **400 Bad Request:** For issues like:
             -   Missing or malformed JSON payload (`API_GW_PAYLOAD_REQUIRED`, `API_GW_MALFORMED_JSON`).
