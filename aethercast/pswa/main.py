@@ -53,13 +53,32 @@ return a JSON object with an error field:
   "error": "Insufficient content",
   "message": "The provided content was not sufficient to generate a full podcast script for the topic: [topic_name_here]."
 }"""
-    pswa_config['PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE'] = os.getenv("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", default_system_message_json)
-    default_user_template_json = """Generate a podcast script for topic '{topic}' using the following content:
+    # Old system message removed
+    # pswa_config['PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE'] = os.getenv("PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", default_system_message_json)
+
+    # New prompt configurations
+    pswa_config['PSWA_DEFAULT_PROMPT_USER_TEMPLATE'] = os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE",
+        """Generate a podcast script for topic '{topic}' using the following content:
 ---
 {content}
 ---
-Remember, your entire response must be a single JSON object conforming to the schema provided in the system message."""
-    pswa_config['PSWA_DEFAULT_PROMPT_USER_TEMPLATE'] = os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE", default_user_template_json)
+{narrative_guidance}
+Remember, your entire response must be a single JSON object conforming to the schema provided in the system message.""")
+
+    pswa_config['PSWA_DEFAULT_PERSONA'] = os.getenv("PSWA_DEFAULT_PERSONA", "InformativeHost")
+
+    persona_prompts_json_str = os.getenv("PSWA_PERSONA_PROMPTS_JSON", '{}')
+    try:
+        pswa_config['PSWA_PERSONA_PROMPTS_MAP_PARSED'] = json.loads(persona_prompts_json_str)
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse PSWA_PERSONA_PROMPTS_JSON: {e}. Using empty map. JSON string was: {persona_prompts_json_str}")
+        pswa_config['PSWA_PERSONA_PROMPTS_MAP_PARSED'] = {}
+
+    pswa_config['PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION'] = os.getenv("PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION",
+        """Your output MUST be a single, valid JSON object. Do not include any text outside of this JSON object, not even markdown tags like ```json. The JSON object should conform to the following schema: {"title": "string (The main title of the podcast)", "intro": "string (The introductory part of the podcast script, 2-3 sentences)", "segments": [{"segment_title": "string (Title of this segment, e.g., 'Segment 1: The Core Idea')", "content": "string (Content of this segment, several sentences or paragraphs)"}], "outro": "string (The concluding part of the podcast script, 2-3 sentences)"}. Ensure all script content is engaging and based on the provided topic and source content. There should be at least an intro, one segment, and an outro. If the provided source content is insufficient to generate a meaningful script with at least one segment, return a JSON object with an error field: {"error": "Insufficient content", "message": "The provided content was not sufficient to generate a full podcast script for the topic: [topic_name_here]."}""")
+
+    pswa_config['PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION'] = os.getenv("PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION",
+        "When writing the segments, ensure you start with a compelling hook in the intro, develop key points logically with smooth transitions, and end with a satisfying conclusion in the outro. Vary sentence structure for engagement. Ensure the overall script is coherent and engaging for the listener.")
 
     pswa_config['PSWA_HOST'] = os.getenv("PSWA_HOST", "0.0.0.0")
     pswa_config['PSWA_PORT'] = int(os.getenv("PSWA_PORT", 5004))
@@ -82,8 +101,10 @@ Remember, your entire response must be a single JSON object conforming to the sc
     for key, value in pswa_config.items():
         if "PASSWORD" in key and value:
             logger.info(f"  {key}: ********")
-        elif key in ["PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE", "PSWA_DEFAULT_PROMPT_USER_TEMPLATE"]:
-            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{value[:50].replace('\n', ' ')}...')")
+        elif key == "PSWA_PERSONA_PROMPTS_MAP_PARSED":
+            logger.info(f"  {key}: Loaded {len(value)} personas: {list(value.keys())}")
+        elif key in ["PSWA_DEFAULT_PROMPT_USER_TEMPLATE", "PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION", "PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION"]:
+            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{str(value)[:50].replace('\n', ' ')}...')")
         else:
             logger.info(f"  {key}: {value}")
     logger.info("--- End PSWA Configuration ---")
@@ -416,13 +437,43 @@ def weave_script(content: str, topic: str) -> dict:
     logger.info(f"[PSWA_MAIN_LOGIC] No cache for topic '{topic}'. Calling AIMS service.")
     current_topic = topic or "an interesting subject"
     current_content = content or "No specific content provided. Generate general script based on topic."
+
+    # Determine Persona and Construct Prompts
+    default_persona_id = pswa_config.get('PSWA_DEFAULT_PERSONA', 'InformativeHost')
+    # Allow persona_id to be passed in the request in the future, for now, use default from config
+    # For this implementation, we'll assume persona_id comes from config or defaults to InformativeHost.
+    # If CPOA were to send it, it would be like: persona_id_from_request = data.get("persona_id", default_persona_id)
+    current_persona_id = default_persona_id # Placeholder for potential future request-driven persona
+
+    persona_prompts_map = pswa_config.get('PSWA_PERSONA_PROMPTS_MAP_PARSED', {})
+
+    persona_specific_system_message = persona_prompts_map.get(current_persona_id)
+    if not persona_specific_system_message:
+        logger.warning(f"Persona ID '{current_persona_id}' not found in PSWA_PERSONA_PROMPTS_MAP_PARSED. Falling back to 'InformativeHost'.")
+        persona_specific_system_message = persona_prompts_map.get('InformativeHost', "You are a helpful AI podcast scriptwriter.") # Final fallback
+
+    base_schema_instruction = pswa_config.get('PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION', '')
+    final_system_message = f"{persona_specific_system_message.strip()} {base_schema_instruction.strip()}".strip()
+
+    narrative_guidance = pswa_config.get('PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION', '')
     user_prompt_template = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE')
-    try: user_prompt = user_prompt_template.format(topic=current_topic, content=current_content)
-    except KeyError as e: logger.error(f"Error formatting user prompt: {e}. Using basic prompt."); user_prompt = f"Topic: {current_topic}\nContent: {current_content}\nPlease generate script."
-    system_message = pswa_config.get('PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE')
-    full_prompt_for_aims = f"{system_message}\n\nUser Request:\n{user_prompt}"
+
+    try:
+        user_prompt = user_prompt_template.format(
+            topic=current_topic,
+            content=current_content,
+            narrative_guidance=narrative_guidance
+        )
+    except KeyError as e:
+        logger.error(f"Error formatting user prompt template: {e}. Using basic prompt. Template was: '{user_prompt_template}'")
+        user_prompt = f"Topic: {current_topic}\nContent: {current_content}\nNarrative Guidance: {narrative_guidance}\nPlease generate script."
+
+    # The AIMS service expects a single "prompt" field that combines system and user messages.
+    # This might need adjustment if AIMS later supports separate system/user prompt fields.
+    full_prompt_for_aims = f"{final_system_message}\n\nUser Request:\n{user_prompt}"
+
     aims_payload = {
-        "prompt": full_prompt_for_aims,
+        "prompt": full_prompt_for_aims, # This now contains the combined system (persona + schema) and user (topic + content + narrative guidance) prompts
         "model_id_override": pswa_config.get('PSWA_LLM_MODEL'),
         "max_tokens": pswa_config.get('PSWA_LLM_MAX_TOKENS'),
         "temperature": pswa_config.get('PSWA_LLM_TEMPERATURE'),
