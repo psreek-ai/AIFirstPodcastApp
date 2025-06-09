@@ -18,18 +18,37 @@ The system consists of several microservices that work together:
 
 -   **AIMS Service (`aims_service`):** Provides access to general-purpose AI models (e.g., Large Language Models) used by other agents like SCA and PSWA.
 -   **AIMS TTS Service (`aims_tts_service`):** Handles Text-to-Speech synthesis, converting scripts from VFA into audio. It's used by the VFA.
--   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen, based on prompts.
+-   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen, based on prompts, storing them in GCS.
 
-## Features (Conceptual)
+## Implemented Features
 
--   Automated topic discovery and suggestion.
--   AI-driven script generation.
--   Customizable voice synthesis.
--   Real-time audio streaming.
--   Snippet generation for content previews.
+-   Automated topic discovery and suggestion (via TDA).
+-   AI-driven script generation (via PSWA with AIMS).
+-   Customizable voice synthesis (via VFA with AIMS_TTS using Google Cloud TTS, output to GCS).
+-   Real-time audio streaming (via ASF, sourcing from GCS signed URLs).
+-   Dynamic snippet generation for content previews (via SCA with AIMS, and IGA for images).
 -   Topic exploration and "go deeper" functionalities.
--   Caching mechanisms for scripts and snippets.
--   Advanced error diagnostics UI.
+-   **Header search functionality for discovering podcasts.**
+-   **Email subscription option for users to receive updates.**
+-   User authentication (registration and login with JWT).
+-   User session management and basic preferences persistence.
+-   Storage of media files (audio, images) in Google Cloud Storage.
+-   Serving of GCS media files via short-lived signed URLs through the API Gateway.
+-   Internal API in API Gateway for services to request signed URLs.
+-   CPOA workflow and task state management in PostgreSQL database.
+-   Centralized logging format including `workflow_id` and `task_id`.
+-   Comprehensive error handling and retry mechanisms in CPOA service calls.
+-   Advanced error diagnostics UI for tracing podcast generation.
+
+## Features (Conceptual / Future Enhancements)
+
+-   Enhanced caching mechanisms for scripts and snippets (beyond current direct DB storage).
+-   More sophisticated user preference models and personalization.
+-   User feedback mechanisms for content quality.
+-   Adaptive/interactive podcast elements based on real-time user feedback.
+-   Scalable deployment on Kubernetes or serverless platforms.
+-   More advanced AI model selection and fine-tuning capabilities within AIMS.
+-   Support for multiple languages.
 
 ## Project Structure
 

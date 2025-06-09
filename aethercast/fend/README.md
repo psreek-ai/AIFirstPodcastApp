@@ -2,13 +2,22 @@
 
 ## Purpose
 
-The Aethercast Frontend provides a web-based user interface for interacting with the Aethercast system. It allows users to:
--   View suggested podcast snippets and search for content.
+The Aethercast Frontend provides a web-based user interface for interacting with the Aethercast system.
+
+## Features
+
+The frontend allows users to:
+-   View suggested podcast snippets.
+-   **Search:**
+    -   Search for content using the main search bar in the site header (activated by pressing 'Enter').
+    -   Search within "Latest Episodes" using a dedicated search input and button.
+    -   Both search methods utilize the `/api/v1/search/podcasts` endpoint (which requires user authentication) and display results in the main snippet area.
 -   Explore popular podcast categories.
 -   Initiate the generation of full podcast episodes based on chosen topics or snippets.
 -   Receive status updates on podcast generation, including real-time progress via WebSockets.
 -   Play back generated podcast audio, either through direct file links or real-time streaming via WebSockets and MediaSource Extensions (MSE).
--   Manage basic user preferences.
+-   Manage basic user preferences (e.g., preferred news category).
+-   **Subscription:** A 'Subscribe' button in the site header opens a modal. Users can enter their email address to subscribe for updates. This functionality interacts with the public `/api/v1/subscribe` endpoint.
 
 It is a single-page application (SPA) built with HTML, CSS, and vanilla JavaScript.
 
@@ -26,9 +35,11 @@ The core client-side logic resides in `aethercast/fend/app.js`.
     *   **Display Categories:** It dynamically renders these categories, typically as clickable links or buttons, into the `.category-list-container` within the `#popular-categories-section` of `index.html`. This allows users to browse or filter content by category.
 
 3.  **Search Functionality:**
-    *   **User Input:** `app.js` captures search queries from the input field `#episodes-search-input` (located within the "Latest Episodes" section). The `#header-search-input` in the main site header is also available for potential future wiring.
-    *   **API Call:** When a search is triggered, it makes a `POST` request to the API Gateway's `/api/v1/search/podcasts` endpoint with the search query (and `client_id` if available).
-    *   **Display Results:** The search results, which are formatted as snippets, are rendered into the main `#snippet-list-container`, replacing any existing snippets. Status messages related to the search (e.g., "Searching...", "No results found...") are displayed in `#snippet-status-message`.
+    *   **User Inputs:** `app.js` handles search queries from two main sources:
+        *   The dedicated search bar within the "Latest Episodes" section (`#episodes-search-input` and `#episodes-search-btn`).
+        *   The site-wide search bar in the header (`#header-search-input`), which triggers a search when the 'Enter' key is pressed.
+    *   **API Call:** For both search inputs, a `POST` request is made to the `/api/v1/search/podcasts` endpoint. This request includes the search query and, if available, the `client_id` for session context. This endpoint requires user authentication.
+    *   **Display Results:** Search results (a list of snippets) are rendered into the `#snippet-list-container`. The `#snippet-status-message` is updated to reflect the search context (e.g., "Search Results for: '[query]'") and the outcome (number of results, "No results found," or errors).
 
 4.  **Podcast Generation (from Topic Input or Snippet):**
     *   **User Input:** Allows users to enter a topic directly into an input field (`#topic-input` - though this specific ID might be deprecated if search/snippet interaction is primary).
@@ -64,6 +75,12 @@ The core client-side logic resides in `aethercast/fend/app.js`.
     *   Fetches and populates preferences (e.g., `#pref-news-category`).
     *   Saves preferences with `POST /api/v1/session/preferences`.
     *   Includes `client_id` in podcast generation requests, allowing CPOA to use saved preferences.
+10. **Subscription Modal:**
+    *   Handles the display and closing of the `#subscribe-modal`.
+    *   Captures email input from `#subscribe-email-input`.
+    *   Performs client-side validation of the email format.
+    *   Submits the email to the `/api/v1/subscribe` backend endpoint.
+    *   Displays success or error messages from the subscription attempt in `#subscribe-modal-status`.
 
 ## HTML Structure (`index.html`)
 

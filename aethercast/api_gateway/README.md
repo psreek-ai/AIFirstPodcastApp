@@ -258,7 +258,7 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Search
 
 -   **`POST /api/v1/search/podcasts`**
-    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header. This endpoint is used by the header search bar and the search within the "Latest Episodes" section.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -318,6 +318,31 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
         -   **404 Not Found:** If the session for the given `client_id` does not exist.
         -   **500 Internal Server Error:** For database errors.
 
+### Subscription Endpoint
+
+-   **`POST /api/v1/subscribe`**
+    -   **Description:** Allows users to subscribe with their email address for updates. This is a public endpoint.
+    -   **Request Payload (JSON):**
+        ```json
+        {
+            "email": "user@example.com"
+        }
+        ```
+        - `email` (string, required): Must be a valid email format.
+    -   **Success Response (201 Created):**
+        ```json
+        {
+            "message": "Successfully subscribed! Thank you."
+        }
+        ```
+    -   **Error Responses:**
+        -   400 Bad Request:
+            -   `{"error_code": "SUBSCRIBE_PAYLOAD_REQUIRED", "message": "JSON payload is required."}` (If payload is missing/malformed)
+            -   `{"error_code": "SUBSCRIBE_EMAIL_REQUIRED", "message": "Email is required."}`
+            -   `{"error_code": "SUBSCRIBE_INVALID_EMAIL_FORMAT", "message": "Invalid email format."}`
+        -   409 Conflict: `{"error_code": "SUBSCRIBE_EMAIL_EXISTS", "message": "This email is already subscribed."}`
+        -   500 Internal Server Error: `{"error_code": "SUBSCRIBE_DB_ERROR", "message": "Could not process subscription due to a database issue."}` or `{"error_code": "SUBSCRIBE_UNEXPECTED_ERROR", ...}`
+
 ### Internal Endpoints (Primarily for Service-to-Service Communication)
 
 -   **`GET /api/v1/internal/media_access_url`**
@@ -356,4 +381,10 @@ The API Gateway, CPOA, and other services may utilize a shared database (Postgre
 
 ### `users` Table
 -   **Purpose:** Stores user account information for authentication.
--   **Key Columns:** `user_id` (PK), `username` (UNIQUE), `email` (UNIQUE), `hashed_password`, `created_at`.
+-   **Key Columns (PostgreSQL types):** `user_id` (UUID PK), `username` (TEXT UNIQUE), `email` (TEXT UNIQUE), `hashed_password` (TEXT), `created_at` (TIMESTAMPTZ).
+
+### `subscribers` Table
+-   **Purpose:** Stores email addresses of users who have subscribed for updates.
+-   **Key Columns (PostgreSQL types):**
+    -   `email` (VARCHAR(255) PK): User's email address.
+    -   `subscribed_at` (TIMESTAMPTZ): Timestamp of subscription.

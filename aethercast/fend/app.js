@@ -405,7 +405,8 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        updateStatus(`Searching for '${query}'...`, 'info', snippetStatusMessage);
+        const searchResultTitle = `Search Results for: "${query}"`;
+        updateStatus(`${searchResultTitle}<br>Searching...`, 'info', snippetStatusMessage);
         snippetListContainer.innerHTML = ''; // Clear previous results
 
         const payload = { query: query };
@@ -439,19 +440,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (data.search_results && Array.isArray(data.search_results) && data.search_results.length > 0) {
                 data.search_results.forEach(snippet => renderSnippetCard(snippet, snippetListContainer));
-                updateStatus(`Found ${data.search_results.length} results for '${query}'.`, 'success', snippetStatusMessage);
+                updateStatus(`${searchResultTitle}<br>Found ${data.search_results.length} results.`, 'success', snippetStatusMessage);
             } else if (data.search_results && Array.isArray(data.search_results) && data.search_results.length === 0) {
-                 updateStatus(`No results found for '${query}'.`, 'info', snippetStatusMessage);
+                 updateStatus(`${searchResultTitle}<br>No results found.`, 'info', snippetStatusMessage);
             }
-            else { // Handle cases where search_results key might be missing or not an array
+            else {
                 console.warn("Search response format unexpected:", data);
-                updateStatus(`Unexpected response format from server for query '${query}'.`, 'error', snippetStatusMessage);
+                updateStatus(`${searchResultTitle}<br>Unexpected response format from server.`, 'error', snippetStatusMessage);
             }
 
         } catch (error) {
             console.error('Error fetching or rendering search results:', error);
-            // error.message here will be the one thrown from (!response.ok) block or from fetch/json parse failures
-            updateStatus(`An error occurred while fetching search results: ${error.message}`, 'error', snippetStatusMessage);
+            updateStatus(`${searchResultTitle}<br>An error occurred: ${error.message}`, 'error', snippetStatusMessage);
         }
     }
 
@@ -460,8 +460,8 @@ document.addEventListener('DOMContentLoaded', () => {
             console.warn("Snippet UI elements not found, skipping snippet fetch.");
             return;
         }
-        snippetStatusMessage.textContent = 'Loading fresh snippets...';
-        snippetStatusMessage.className = 'status-messages status-info';
+        // This is for the default view, so clear any search-related title.
+        updateStatus('Loading fresh snippets...', 'info', snippetStatusMessage);
         snippetListContainer.innerHTML = ''; // Clear existing snippets
 
         try {
@@ -613,7 +613,106 @@ document.addEventListener('DOMContentLoaded', () => {
     // generateOrGetClientId will call initSessionAndPreferences, which calls populatePreferencesForm
     generateOrGetClientId();
     updateStatus("Enter a topic and click 'Generate Podcast', explore keywords, or choose a snippet below.", "info", statusMessagesDiv);
-    fetchAndRenderSnippets();
+    fetchAndRenderSnippets(); // Initial load of default snippets
     fetchAndRenderPopularCategories(); // Added call
     cleanupMSE();
+
+    // --- Header Search Input Functionality ---
+    if (headerSearchInput) {
+        headerSearchInput.addEventListener('keypress', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault(); // Prevent default form submission if it's part of a form
+                const query = headerSearchInput.value.trim();
+                if (!query) {
+                    if (snippetStatusMessage) { // Use snippetStatusMessage for consistency with other search
+                        updateStatus("Please enter a search term in the header.", "warn", snippetStatusMessage);
+                    } else if (statusMessagesDiv) { // Fallback to main status if snippet one isn't there
+                        updateStatus("Please enter a search term in the header.", "warn", statusMessagesDiv);
+                    }
+                    return;
+                }
+                fetchAndRenderSearchResults(query);
+            }
+        });
+    } else {
+        console.warn("Header search input element (#header-search-input) not found.");
+    }
+
+    // --- Subscribe Modal Functionality ---
+    const subscribeModal = document.getElementById('subscribe-modal');
+    const subscribeButton = document.querySelector('.site-header .subscribe-button');
+    const subscribeModalCloseBtn = document.getElementById('subscribe-modal-close-btn');
+    const subscribeEmailInput = document.getElementById('subscribe-email-input');
+    const subscribeSubmitBtn = document.getElementById('subscribe-submit-btn');
+    const subscribeModalStatus = document.getElementById('subscribe-modal-status');
+    const EMAIL_REGEX_VALIDATION = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+
+    if (subscribeButton && subscribeModal && subscribeModalCloseBtn && subscribeEmailInput && subscribeSubmitBtn && subscribeModalStatus) {
+        subscribeButton.addEventListener('click', () => {
+            subscribeModal.style.display = 'block';
+            subscribeEmailInput.value = ''; // Clear previous input
+            subscribeModalStatus.textContent = '';
+            subscribeModalStatus.style.display = 'none';
+            subscribeEmailInput.focus();
+        });
+
+        subscribeModalCloseBtn.addEventListener('click', () => {
+            subscribeModal.style.display = 'none';
+        });
+
+        subscribeSubmitBtn.addEventListener('click', async () => {
+            const email = subscribeEmailInput.value.trim();
+
+            if (!email) {
+                updateStatus("Email is required.", "error", subscribeModalStatus);
+                return;
+            }
+            if (!EMAIL_REGEX_VALIDATION.test(email)) {
+                updateStatus("Invalid email format.", "error", subscribeModalStatus);
+                return;
+            }
+
+            updateStatus("Subscribing...", "info", subscribeModalStatus);
+            subscribeSubmitBtn.disabled = true;
+
+            try {
+                const response = await fetch('/api/v1/subscribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ email: email })
+                });
+
+                const data = await response.json(); // Attempt to parse JSON regardless of response.ok
+
+                if (response.ok) { // Status 200-299
+                    updateStatus(data.message || "Successfully subscribed!", "success", subscribeModalStatus);
+                    subscribeEmailInput.value = ''; // Clear input on success
+                    setTimeout(() => {
+                        if (subscribeModal.style.display === 'block') { // Only hide if still open
+                           subscribeModal.style.display = 'none';
+                        }
+                    }, 2500); // Hide modal after 2.5 seconds on success
+                } else {
+                    // Handle specific error codes or use the message from server
+                    const errorMessage = data.message || `Subscription failed. Status: ${response.status}`;
+                    updateStatus(errorMessage, "error", subscribeModalStatus);
+                    console.error("Subscription error:", data);
+                }
+            } catch (error) {
+                console.error('Error submitting subscription:', error);
+                updateStatus("An error occurred. Please try again later.", "error", subscribeModalStatus);
+            } finally {
+                subscribeSubmitBtn.disabled = false;
+            }
+        });
+
+        window.addEventListener('click', (event) => {
+            if (event.target === subscribeModal) {
+                subscribeModal.style.display = 'none';
+            }
+        });
+    } else {
+        console.warn("One or more subscribe modal elements not found. Subscribe functionality will be unavailable.");
+    }
+
 });
