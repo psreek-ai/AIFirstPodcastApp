@@ -14,6 +14,8 @@ import re # For email validation in /subscribe
 from werkzeug.security import generate_password_hash, check_password_hash
 from google.cloud import storage # Added for GCS
 # from google.oauth2 import service_account # Not strictly needed if using ADC
+import logging # Added for JSON logging
+from python_json_logger import jsonlogger # Added for JSON logging
 
 # --- Path Setup for CPOA Import ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,6 +26,48 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 load_dotenv()
+
+# --- Logging Setup ---
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="api-gateway"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        # Ensure workflow_id and task_id are present, defaulting to N/A if not
+        record.workflow_id = getattr(record, 'workflow_id', 'N/A')
+        record.task_id = getattr(record, 'task_id', 'N/A')
+        return True
+
+def setup_json_logging():
+    # Configure root logger
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers(): # Clear existing handlers from other modules if any
+        root_logger.handlers.clear()
+
+    logHandler = logging.StreamHandler()
+
+    # Add the service_name filter to the handler
+    service_filter = ServiceNameFilter("api-gateway")
+    logHandler.addFilter(service_filter)
+
+    # Format includes common fields, service_name, and placeholders for workflow/task IDs
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(workflow_id)s %(task_id)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+
+    root_logger.addHandler(logHandler)
+    root_logger.setLevel(logging.INFO)
+
+    # Test log
+    initial_logger = logging.getLogger(__name__) # Use a logger for this specific module
+    initial_logger.info("JSON logging configured for API Gateway.")
+
+setup_json_logging() # Call early to configure logging
 
 # --- Service URLs ---
 TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
@@ -350,6 +394,16 @@ get_popular_categories = _cpoa_placeholder_categories
 
 # --- Flask App Initialization & Config ---
 app = Flask(__name__)
+# Ensure Flask app's logger uses the configured root logger level
+app.logger.setLevel(logging.INFO)
+# Note: Flask's app.logger usually propagates to the root logger by default,
+# so handlers added to root_logger should apply unless explicitly overridden on app.logger.
+# If Flask's default handlers were still present and not cleared from app.logger,
+# you might get duplicate logs. Clearing root_logger.handlers helps prevent this.
+
+app.logger.info("API Gateway Flask app initialized and logger configured to use root settings.")
+
+
 # ... (Flask app config as before) ...
 
 # --- Auth Helper Functions & Decorator ---
@@ -639,5 +693,9 @@ def handle_subscribe():
 # ... (if __name__ == '__main__' as before) ...
 # Placeholder for Flask app run
 if __name__ == '__main__':
-    init_db()
-    app.run(debug=True)
+    # init_db() is called by CPOA or individual services now, or on first request in some cases.
+    # For standalone API Gateway run, ensure it's called if needed or relies on auto-init.
+    # For this logging change, the key is that logging is set up before app.run.
+    app.logger.info("Starting API Gateway service directly for development.")
+    init_db() # Ensure DB is ready if running standalone
+    app.run(debug=True, host=os.getenv("API_GATEWAY_HOST", "0.0.0.0"), port=int(os.getenv("API_GATEWAY_PORT", "5001")))

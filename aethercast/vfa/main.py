@@ -14,12 +14,37 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- Logging Configuration ---
-if app.logger and app.logger.name != 'root':
-    logger = app.logger
-else:
-    logger = logging.getLogger(__name__)
-    if not logger.hasHandlers():
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - VFA - %(message)s')
+from python_json_logger import jsonlogger # Added for JSON logging
+
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="vfa"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("vfa")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for VFA service.")
+
+setup_json_logging(app)
+
+# Make the global logger use the configured app.logger
+logger = app.logger
 
 # --- VFA Configuration ---
 vfa_config = {}
@@ -41,7 +66,8 @@ def load_vfa_configuration():
 
     # VFA_SHARED_AUDIO_DIR might still be used if AIMS_TTS returns a path on a shared volume
     # Or it might be where VFA downloads/stores a file if AIMS_TTS returns raw audio data (not current plan for AIMS_TTS)
-    vfa_config['VFA_SHARED_AUDIO_DIR'] = os.getenv("VFA_SHARED_AUDIO_DIR", "/srv/aethercast/generated_audio/") # Keep for test mode file saving
+    # For test mode, it's where dummy files are created.
+    vfa_config['VFA_SHARED_AUDIO_DIR'] = os.getenv("VFA_SHARED_AUDIO_DIR", "/app/tests/output/vfa_generated_audio/") # Adjusted for consistency
 
     vfa_config['VFA_MIN_SCRIPT_LENGTH'] = int(os.getenv("VFA_MIN_SCRIPT_LENGTH", "20"))
     vfa_config['VFA_TEST_MODE_ENABLED'] = os.getenv("VFA_TEST_MODE_ENABLED", "False").lower() == 'true'
@@ -325,7 +351,7 @@ if __name__ == "__main__":
     host = vfa_config.get("VFA_HOST", "0.0.0.0")
     port = vfa_config.get("VFA_PORT", 5005)
     debug_mode = vfa_config.get("VFA_DEBUG_MODE", True)
-    print(f"\n--- VFA Service (AIMS_TTS Client) starting on {host}:{port} (Debug: {debug_mode}) ---")
+    logger.info(f"--- VFA Service (AIMS_TTS Client) starting on {host}:{port} (Debug: {debug_mode}) ---")
     if not vfa_config.get("AIMS_TTS_SERVICE_URL") and not vfa_config.get("VFA_TEST_MODE_ENABLED"):
-        print("CRITICAL ERROR: AIMS_TTS_SERVICE_URL is not set and VFA is not in test mode. VFA will not function correctly.")
+        logger.critical("CRITICAL ERROR: AIMS_TTS_SERVICE_URL is not set and VFA is not in test mode. VFA will not function correctly.")
     app.run(host=host, port=port, debug=debug_mode)

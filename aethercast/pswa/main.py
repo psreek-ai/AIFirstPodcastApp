@@ -13,9 +13,44 @@ import time
 import psycopg2 # Added
 from psycopg2.extras import RealDictCursor # Added
 from typing import Optional, Dict, Any # Added for type hinting
+from python_json_logger import jsonlogger # Added for JSON logging
 
 # --- Load Environment Variables ---
 load_dotenv()
+
+# --- Logging Setup ---
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="pswa"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Initialize Flask app early so app.logger can be configured
+app = Flask(__name__)
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("pswa")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for PSWA service.")
+
+setup_json_logging(app)
+
+# Make the global logger use the configured app.logger
+logger = app.logger
 
 # --- PSWA Configuration ---
 pswa_config = {}
@@ -150,10 +185,10 @@ SCENARIO_DEFAULT_SCRIPT_CONTENT = { KEY_TITLE: "Test Mode Default Title", KEY_IN
 SCENARIO_INSUFFICIENT_CONTENT_SCRIPT_CONTENT = { KEY_TITLE: "Error: Test Scenario Insufficient Content", KEY_SEGMENTS: [{KEY_SEGMENT_TITLE: SEGMENT_TITLE_ERROR, KEY_CONTENT: "[ERROR] Insufficient content for test topic."}],}
 SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT = { KEY_TITLE: "Test Mode Title - Empty Segments", KEY_INTRO: "This intro leads to no actual content segments.", KEY_SEGMENTS: [], KEY_OUTRO: "This outro follows no actual content segments."}
 
-app = Flask(__name__)
-logger = logging.getLogger(__name__) # Use Flask's logger if available, else basicConfig
-if not logger.hasHandlers(): logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - PSWA - %(message)s')
-if not pswa_config: load_pswa_configuration()
+# Flask app is initialized earlier for logging setup.
+# Global logger is now an alias to app.logger.
+# The basicConfig call is removed as setup_json_logging handles root/app logger.
+if not pswa_config: load_pswa_configuration() # load_pswa_configuration will now use the aliased app.logger
 
 # --- Database Helper Functions for Script Caching ---
 def _get_db_connection():
@@ -545,17 +580,18 @@ def handle_weave_script():
     return jsonify(result_data)
 
 if __name__ == "__main__":
+    # Logging calls here will use the configured app.logger via the global logger alias
     if pswa_config.get("DATABASE_TYPE") == "sqlite" and not pswa_config.get("SHARED_DATABASE_PATH") and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        logging.warning("SHARED_DATABASE_PATH not configured for PSWA SQLite mode with caching. Caching may fail.")
+        logger.warning("SHARED_DATABASE_PATH not configured for PSWA SQLite mode with caching. Caching may fail.")
     elif pswa_config.get("DATABASE_TYPE") == "postgres" and not all(pswa_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]) and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        logging.warning("PostgreSQL is cache DB_TYPE, but connection vars missing. Caching may fail.")
+        logger.warning("PostgreSQL is cache DB_TYPE, but connection vars missing. Caching may fail.")
 
     init_pswa_db() # Call init_db based on configured DB_TYPE
 
     host = pswa_config.get("PSWA_HOST", "0.0.0.0")
     port = pswa_config.get("PSWA_PORT", 5004)
     debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
-    logging.info(f"--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}, DB: {pswa_config.get('DATABASE_TYPE')}) ---")
+    logger.info(f"--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}, DB: {pswa_config.get('DATABASE_TYPE')}) ---")
     app.run(host=host, port=port, debug=debug_mode)
 
 [end of aethercast/pswa/main.py]

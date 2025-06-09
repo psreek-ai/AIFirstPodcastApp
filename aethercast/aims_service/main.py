@@ -16,12 +16,37 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- Logging Configuration ---
-if app.logger and app.logger.name != 'root':
-    logger = app.logger
-else:
-    logger = logging.getLogger(__name__)
-    if not logger.hasHandlers():
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - AIMS - %(message)s')
+from python_json_logger import jsonlogger # Added for JSON logging
+
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="aims-llm-service"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("aims-llm-service")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for AIMS (LLM) service.")
+
+setup_json_logging(app)
+
+# Make the global logger use the configured app.logger
+logger = app.logger
 
 # --- AIMS Configuration for Google Cloud Vertex AI ---
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -224,5 +249,5 @@ if __name__ == '__main__':
     debug_mode = debug_mode_str == 'true'
 
     # Startup checks for GCP variables are done above and will raise ValueError if missing.
-    print(f"--- AIMS Service (Vertex AI) starting on {host}:{port} (Debug: {debug_mode}) ---")
+    logger.info(f"--- AIMS Service (Vertex AI) starting on {host}:{port} (Debug: {debug_mode}) ---")
     app.run(host=host, port=port, debug=debug_mode)

@@ -10,6 +10,40 @@ import requests # For calling AIMS (LLM)
 # --- Load Environment Variables ---
 load_dotenv()
 
+# --- Logging Setup ---
+import logging # Moved up
+from python_json_logger import jsonlogger # Moved up
+
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="sca"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Initialize Flask app early so app.logger can be configured
+app = flask.Flask(__name__)
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("sca")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for SCA service.")
+
+setup_json_logging(app)
+
 # --- Global SCA Configuration ---
 sca_config = {}
 
@@ -26,9 +60,9 @@ def load_sca_configuration():
     
     sca_config['USE_REAL_LLM_SERVICE'] = os.getenv('USE_REAL_LLM_SERVICE', 'false').lower() == 'true'
 
-    logging.info("SCA Configuration Loaded:")
+    app.logger.info("SCA Configuration Loaded:") # Use app.logger
     for key, value in sca_config.items():
-        logging.info(f"  {key}: {value}")
+        app.logger.info(f"  {key}: {value}") # Use app.logger
 
     if sca_config['USE_REAL_LLM_SERVICE']:
         missing_configs = []
@@ -39,16 +73,16 @@ def load_sca_configuration():
         
         if missing_configs:
             error_message = f"CRITICAL: USE_REAL_LLM_SERVICE is true, but required configurations are missing: {', '.join(missing_configs)}."
-            logging.critical(error_message)
+            app.logger.critical(error_message) # Use app.logger
             raise ValueError(error_message)
         else:
-            logging.info("SCA is configured to use a REAL LLM service via AIMS.")
+            app.logger.info("SCA is configured to use a REAL LLM service via AIMS.") # Use app.logger
     else:
-        logging.info("SCA is configured to use the SIMULATED/PLACEHOLDER LLM response (bypassing AIMS).")
+        app.logger.info("SCA is configured to use the SIMULATED/PLACEHOLDER LLM response (bypassing AIMS).") # Use app.logger
 
 load_sca_configuration()
 
-app = flask.Flask(__name__)
+# Flask app initialized earlier for logging
 
 AIMS_LLM_PLACEHOLDER_URL = "http://localhost:8000/v1/generate" # Kept for placeholder, though not used if USE_REAL_LLM_SERVICE=true
 AIMS_LLM_HARDCODED_RESPONSE = {
@@ -73,8 +107,8 @@ def generate_snippet_id() -> str:
 def call_aims_llm_placeholder(prompt: str, topic_info: dict) -> dict:
     # This function remains for USE_REAL_LLM_SERVICE=false, unchanged internally
     if sca_config['USE_REAL_LLM_SERVICE']:
-        logging.warning("[SCA_AIMS_CALL] call_aims_llm_placeholder invoked while USE_REAL_LLM_SERVICE is true. This indicates a logic path needs review. Using dynamic placeholder as fallback.")
-    logging.info("[SCA_AIMS_CALL] Dynamically generating SIMULATED AIMS LLM response for snippet.")
+        app.logger.warning("[SCA_AIMS_CALL] call_aims_llm_placeholder invoked while USE_REAL_LLM_SERVICE is true. This indicates a logic path needs review. Using dynamic placeholder as fallback.")
+    app.logger.info("[SCA_AIMS_CALL] Dynamically generating SIMULATED AIMS LLM response for snippet.")
     # ... (rest of existing placeholder logic remains the same) ...
     title_suggestion = topic_info.get("title_suggestion", "Interesting Developments")
     keywords = topic_info.get("keywords", [])
@@ -110,10 +144,10 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
     temperature = sca_config.get('SCA_LLM_TEMPERATURE_SNIPPET')
     timeout = sca_config.get('AIMS_REQUEST_TIMEOUT_SECONDS')
 
-    logging.info(f"[SCA_AIMS_CALL] Preparing to call AIMS. URL: {aims_url}, Model: {model_id_to_request}")
+    app.logger.info(f"[SCA_AIMS_CALL] Preparing to call AIMS. URL: {aims_url}, Model: {model_id_to_request}")
 
     if not aims_url: # Should be caught by load_sca_configuration, but as safeguard
-        logging.error("[SCA_AIMS_CALL] AIMS_SERVICE_URL is not configured.")
+        app.logger.error("[SCA_AIMS_CALL] AIMS_SERVICE_URL is not configured.")
         return {"error_code": "SCA_AIMS_CONFIG_MISSING", "message": "AIMS_SERVICE_URL not configured.", "details": "AIMS service URL is missing."}
 
     aims_payload = {
@@ -124,24 +158,24 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
         # "response_format": {"type": "text"} # AIMS default is text, explicit if needed
     }
     
-    logging.debug(f"  AIMS Request Payload: {json.dumps(aims_payload)}")
+    app.logger.debug(f"  AIMS Request Payload: {json.dumps(aims_payload)}")
 
     try:
         response = requests.post(aims_url, json=aims_payload, timeout=timeout)
-        logging.info(f"[SCA_AIMS_CALL] AIMS Response Status Code: {response.status_code}")
+        app.logger.info(f"[SCA_AIMS_CALL] AIMS Response Status Code: {response.status_code}")
         response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
 
         aims_response_data = response.json()
-        logging.debug(f"  Parsed AIMS JSON response: {json.dumps(aims_response_data, indent=2)}")
+        app.logger.debug(f"  Parsed AIMS JSON response: {json.dumps(aims_response_data, indent=2)}")
 
         if not aims_response_data.get("choices") or not aims_response_data["choices"][0].get("text"):
-            logging.error(f"[SCA_AIMS_CALL] AIMS response missing 'choices[0].text'. Response: {aims_response_data}")
+            app.logger.error(f"[SCA_AIMS_CALL] AIMS response missing 'choices[0].text'. Response: {aims_response_data}")
             return {"error_code": "SCA_AIMS_BAD_RESPONSE_STRUCTURE", "message": "AIMS response structure invalid.", "details": "Missing 'choices[0].text' in AIMS response."}
 
         full_generated_text = aims_response_data['choices'][0]['text'].strip()
         model_used_from_aims = aims_response_data.get('model_id', model_id_to_request) # Use model reported by AIMS
 
-        logging.info(f"[SCA_AIMS_CALL] Extracted text (length {len(full_generated_text)}) from AIMS (model: '{model_used_from_aims}'): '{full_generated_text[:100]}...'")
+        app.logger.info(f"[SCA_AIMS_CALL] Extracted text (length {len(full_generated_text)}) from AIMS (model: '{model_used_from_aims}'): '{full_generated_text[:100]}...'")
 
         # Parse Title and Content (existing logic for newline separation)
         snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
@@ -153,13 +187,13 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
                 snippet_title = potential_title
                 snippet_text_content = parts[1].strip() if len(parts) > 1 else ""
                 if not snippet_text_content:
-                    logging.warning("Snippet content empty after title extraction. Using full text as content.")
+                    app.logger.warning("Snippet content empty after title extraction. Using full text as content.")
                     snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
                     snippet_text_content = full_generated_text
             else:
-                logging.warning(f"Newline found, but first line invalid as title. Using full text as content.")
+                app.logger.warning(f"Newline found, but first line invalid as title. Using full text as content.")
         else:
-            logging.warning("No newline in AIMS output to separate title. Using full text as content.")
+            app.logger.warning("No newline in AIMS output to separate title. Using full text as content.")
         if snippet_title == snippet_text_content and snippet_text_content == full_generated_text:
              snippet_title = f"AI-Generated Title for {topic_info.get('title_suggestion', 'Topic')}"
         if not snippet_text_content:
@@ -177,22 +211,22 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
         error_details = f"AIMS HTTP Error {e_http.response.status_code}: {e_http.response.reason}."
         try: error_payload = e_http.response.json(); error_details += f" AIMS Service Msg: {error_payload}"
         except json.JSONDecodeError: error_details += f" Raw AIMS Service Response: {e_http.response.text[:200]}"
-        logging.error(f"[SCA_AIMS_CALL] {error_details}", exc_info=True)
+        app.logger.error(f"[SCA_AIMS_CALL] {error_details}", exc_info=True)
         return {"error_code": "SCA_AIMS_HTTP_ERROR", "message": "AIMS request failed with HTTP error.", "details": error_details, "status_code": e_http.response.status_code}
     except requests.exceptions.Timeout:
-        logging.error(f"[SCA_AIMS_CALL] Timeout error after {timeout}s for URL: {aims_url}", exc_info=True)
+        app.logger.error(f"[SCA_AIMS_CALL] Timeout error after {timeout}s for URL: {aims_url}", exc_info=True)
         return {"error_code": "SCA_AIMS_REQUEST_TIMEOUT", "message": "Request to AIMS timed out.", "details": f"Timeout after {timeout}s.", "status_code": 408}
     except requests.exceptions.RequestException as e_req:
-        logging.error(f"[SCA_AIMS_CALL] AIMS request exception: {e_req}", exc_info=True)
+        app.logger.error(f"[SCA_AIMS_CALL] AIMS request exception: {e_req}", exc_info=True)
         return {"error_code": "SCA_AIMS_REQUEST_EXCEPTION", "message": "Exception during AIMS request.", "details": str(e_req), "status_code": 500}
     except json.JSONDecodeError as e_json:
-        logging.error(f"[SCA_AIMS_CALL] JSONDecodeError parsing AIMS response: {e_json}. Raw: {response.text[:500] if 'response' in locals() else 'N/A'}", exc_info=True)
+        app.logger.error(f"[SCA_AIMS_CALL] JSONDecodeError parsing AIMS response: {e_json}. Raw: {response.text[:500] if 'response' in locals() else 'N/A'}", exc_info=True)
         return {"error_code": "SCA_AIMS_RESPONSE_JSON_DECODE_ERROR", "message": "Failed to decode JSON from AIMS.", "details": str(e_json), "status_code": 502}
     except (KeyError, IndexError, TypeError) as e_extract:
-        logging.error(f"[SCA_AIMS_CALL] Error extracting content from AIMS JSON: {e_extract}. Response: {aims_response_data if 'aims_response_data' in locals() else 'N/A'}", exc_info=True)
+        app.logger.error(f"[SCA_AIMS_CALL] Error extracting content from AIMS JSON: {e_extract}. Response: {aims_response_data if 'aims_response_data' in locals() else 'N/A'}", exc_info=True)
         return {"error_code": "SCA_AIMS_RESPONSE_STRUCTURE_ERROR", "message": "Invalid structure in AIMS response.", "details": str(e_extract)}
     except Exception as e_unexpected:
-        logging.error(f"[SCA_AIMS_CALL] Unexpected error: {e_unexpected}", exc_info=True)
+        app.logger.error(f"[SCA_AIMS_CALL] Unexpected error: {e_unexpected}", exc_info=True)
         return {"error_code": "SCA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected error with AIMS.", "details": str(e_unexpected)}
 
 # parse_llm_response_for_snippet function is removed as it's no longer needed.
@@ -203,10 +237,10 @@ def craft_snippet_endpoint():
         try:
             request_data = flask.request.get_json()
             if not request_data: # Handles cases where request_data is None (e.g. empty body with correct content-type)
-                logging.warning("[SCA_REQUEST] /craft_snippet: Invalid or empty JSON payload received.")
+                app.logger.warning("[SCA_REQUEST] /craft_snippet: Invalid or empty JSON payload received.")
                 return flask.jsonify({"error_code": "SCA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
         except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
-            logging.warning(f"[SCA_REQUEST] /craft_snippet: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
+            app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
             return flask.jsonify({"error_code": "SCA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
 
         topic_id = request_data.get("topic_id")
@@ -216,27 +250,27 @@ def craft_snippet_endpoint():
 
         # Validate topic_id
         if not topic_id or not isinstance(topic_id, str) or not topic_id.strip():
-            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_id' must be a non-empty string. Received: '{topic_id}'")
+            app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_id' must be a non-empty string. Received: '{topic_id}'")
             return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_ID", "message": "Validation failed: 'topic_id' must be a non-empty string."}), 400
 
         # Validate content_brief
         if not content_brief or not isinstance(content_brief, str) or not content_brief.strip():
-            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' must be a non-empty string. Received: '{content_brief}'")
+            app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' must be a non-empty string. Received: '{content_brief}'")
             return flask.jsonify({"error_code": "SCA_INVALID_CONTENT_BRIEF", "message": "Validation failed: 'content_brief' must be a non-empty string."}), 400
         # Optional: Max length for content_brief, e.g., 1000 chars
         CONTENT_BRIEF_MAX_LENGTH = 1000
         if len(content_brief) > CONTENT_BRIEF_MAX_LENGTH:
-            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' length ({len(content_brief)}) exceeds max ({CONTENT_BRIEF_MAX_LENGTH}).")
+            app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' length ({len(content_brief)}) exceeds max ({CONTENT_BRIEF_MAX_LENGTH}).")
             return flask.jsonify({"error_code": "SCA_CONTENT_BRIEF_TOO_LONG", "message": f"Validation failed: 'content_brief' exceeds maximum length of {CONTENT_BRIEF_MAX_LENGTH} characters."}), 400
 
         # Validate topic_info
         if topic_info is None or not isinstance(topic_info, dict): # Must be present and a dictionary
-            logging.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_info' must be a valid JSON object (dictionary). Received: {topic_info}")
+            app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_info' must be a valid JSON object (dictionary). Received: {topic_info}")
             return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_INFO", "message": "Validation failed: 'topic_info' must be a valid JSON object (dictionary)."}), 400
 
         # error_trigger is optional and for testing, no specific validation needed for its value
 
-        logging.info(f"[SCA_REQUEST] /craft_snippet. TopicID: '{topic_id}', Brief: '{content_brief}', Trigger: '{error_trigger}'")
+        app.logger.info(f"[SCA_REQUEST] /craft_snippet. TopicID: '{topic_id}', Brief: '{content_brief}', Trigger: '{error_trigger}'")
         if error_trigger == "sca_error":
             return flask.jsonify({"error_code": "SCA_SIMULATED_ERROR", "message": "Simulated SCA error."}), 500
 
@@ -255,7 +289,7 @@ def craft_snippet_endpoint():
         
         llm_model_used = "unknown"; llm_prompt_used = prompt
         if sca_config['USE_REAL_LLM_SERVICE']:
-            logging.info("Using REAL LLM service via AIMS.")
+            app.logger.info("Using REAL LLM service via AIMS.") # Use app.logger
             llm_result = call_real_llm_service(prompt, topic_info)
             if "error_code" in llm_result:
                 return flask.jsonify(llm_result), llm_result.get("status_code", 500)
@@ -263,7 +297,7 @@ def craft_snippet_endpoint():
             llm_model_used = llm_result.get("llm_model_used", sca_config['SCA_LLM_MODEL_ID'])
             llm_prompt_used = llm_result.get("llm_prompt_sent", prompt)
         else:
-            logging.info("Using SIMULATED/PLACEHOLDER LLM response.")
+            app.logger.info("Using SIMULATED/PLACEHOLDER LLM response.") # Use app.logger
             placeholder_result = call_aims_llm_placeholder(prompt, topic_info)
             # Directly use title and text_content from the placeholder_result
             snippet_title = placeholder_result.get("title", "Default Placeholder Title")
@@ -280,11 +314,13 @@ def craft_snippet_endpoint():
             "generation_timestamp": timestamp, "llm_prompt_used": llm_prompt_used,
             "llm_model_used": llm_model_used, "original_topic_details_from_tda": topic_info
         }
-        logging.info(f"[SCA_RESPONSE] Snippet crafted: {snippet_id}. Title: '{snippet_title}'")
+        app.logger.info(f"[SCA_RESPONSE] Snippet crafted: {snippet_id}. Title: '{snippet_title}'") # Use app.logger
         return flask.jsonify(snippet_data_object), 200
     except Exception as e:
-        logging.error(f"Error in /craft_snippet: {e}", exc_info=True)
+        app.logger.error(f"Error in /craft_snippet: {e}", exc_info=True) # Use app.logger
         return flask.jsonify({"error_code": "SCA_INTERNAL_SERVER_ERROR", "message": "Unexpected SCA error.", "details": str(e)}), 500
 
 if __name__ == "__main__":
+    # Initial "JSON logging configured..." message is now part of setup_json_logging
+    app.logger.info(f"--- SCA Service starting on {os.getenv('SCA_HOST', '0.0.0.0')}:{int(os.getenv('SCA_PORT', 5002))} (Debug: {(os.getenv('FLASK_DEBUG', 'True').lower()=='true')}) ---")
     app.run(host=os.getenv("SCA_HOST", "0.0.0.0"), port=int(os.getenv("SCA_PORT", 5002)), debug=(os.getenv("FLASK_DEBUG", "True").lower()=='true'))

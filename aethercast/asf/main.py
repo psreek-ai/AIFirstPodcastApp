@@ -11,17 +11,44 @@ import requests # Ensure requests is imported
 # --- Load Environment Variables ---
 load_dotenv()
 
+# --- Logging Setup ---
+from python_json_logger import jsonlogger # Added for JSON logging
+
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="asf"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Initialize Flask app early so app.logger can be configured
+app = flask.Flask(__name__) # Moved Flask app initialization up
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("asf")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO) # Default level, can be adjusted by config
+    flask_app.logger.info("JSON logging configured for ASF service.")
+
+setup_json_logging(app)
+
+# Make the global logger use the configured app.logger
+logger = app.logger
+
 # --- ASF Configuration ---
 asf_config = {}
-
-# --- Logging Configuration (must be set up before load_asf_configuration uses logger) ---
-_temp_app_for_logger = flask.Flask(__name__)
-if _temp_app_for_logger.logger and _temp_app_for_logger.logger.name != 'root':
-    logger = _temp_app_for_logger.logger
-    logger.setLevel(logging.INFO) # Default to INFO, can be overridden by FLASK_DEBUG later
-else:
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - ASF - %(message)s')
-    logger = logging.getLogger(__name__)
 
 def load_asf_configuration():
     """Loads ASF configurations from environment variables with defaults."""
@@ -76,9 +103,17 @@ UI_EVENT_ERROR = 'ui_error'
 UI_EVENT_SUBSCRIBED = 'subscribed_ui_updates'
 
 # --- Flask App and SocketIO Setup ---
-app = flask.Flask(__name__)
+# app is initialized earlier for logging
 app.config['SECRET_KEY'] = asf_config['ASF_SECRET_KEY']
-socketio = SocketIO(app, cors_allowed_origins=asf_config['ASF_CORS_ALLOWED_ORIGINS'])
+socketio = SocketIO(app, cors_allowed_origins=asf_config['ASF_CORS_ALLOWED_ORIGINS'], logger=True, engineio_logger=True)
+# Explicitly set SocketIO loggers to use app.logger's level and handlers if desired,
+# or they might log to stderr with their own format.
+# For now, focusing on app.logger for Flask routes and our direct logs.
+# If socketio/engineio logs become noisy or unformatted, address them:
+# logging.getLogger('socketio').setLevel(logging.INFO if not asf_config['ASF_DEBUG_MODE'] else logging.DEBUG)
+# logging.getLogger('engineio').setLevel(logging.INFO if not asf_config['ASF_DEBUG_MODE'] else logging.DEBUG)
+# For them to use JSON format, they'd need their handlers replaced too.
+# This is out of scope for the current subtask if app.logger itself is JSON.
 
 ASF_UI_UPDATES_NAMESPACE = asf_config['ASF_UI_UPDATES_NAMESPACE'] # Set from loaded config
 

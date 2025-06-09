@@ -12,10 +12,38 @@ from google.api_core import exceptions as google_exceptions
 
 load_dotenv()
 
+# --- Logging Setup ---
+from python_json_logger import jsonlogger # Added for JSON logging
+
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="iga"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
 app = Flask(__name__)
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - IGA - %(message)s')
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("iga")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for IGA service.")
+
+setup_json_logging(app)
+
 
 iga_config = {}
 
@@ -42,49 +70,49 @@ def load_iga_configuration():
 
     iga_config['GOOGLE_APPLICATION_CREDENTIALS'] = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
 
-    logging.info("--- IGA Configuration (Vertex AI & GCS) ---")
+    app.logger.info("--- IGA Configuration (Vertex AI & GCS) ---")
     for key, value in iga_config.items():
         if "CREDENTIALS" in key and value:
-            logging.info(f"  {key}: Path Set ('{os.path.basename(value) if value else 'Not Set'}')")
+            app.logger.info(f"  {key}: Path Set ('{os.path.basename(value) if value else 'Not Set'}')")
         elif "PASSWORD" in key and value: # Example if any passwords were here
-            logging.info(f"  {key}: ********")
+            app.logger.info(f"  {key}: ********")
         else:
-            logging.info(f"  {key}: {value}")
-    logging.info("--- End IGA Configuration ---")
+            app.logger.info(f"  {key}: {value}")
+    app.logger.info("--- End IGA Configuration ---")
 
     # Critical startup checks
     if not iga_config['IGA_VERTEXAI_PROJECT_ID']:
-        logging.critical("CRITICAL: IGA_VERTEXAI_PROJECT_ID is not set.")
+        app.logger.critical("CRITICAL: IGA_VERTEXAI_PROJECT_ID is not set.")
         raise ValueError("IGA_VERTEXAI_PROJECT_ID is not set.")
     if not iga_config['IGA_VERTEXAI_LOCATION']:
-        logging.critical("CRITICAL: IGA_VERTEXAI_LOCATION is not set.")
+        app.logger.critical("CRITICAL: IGA_VERTEXAI_LOCATION is not set.")
         raise ValueError("IGA_VERTEXAI_LOCATION is not set.")
     if not iga_config['GCS_BUCKET_NAME']: # Check for GCS bucket name
-        logging.critical("CRITICAL: GCS_BUCKET_NAME is not set for IGA. Image uploads will fail.")
+        app.logger.critical("CRITICAL: GCS_BUCKET_NAME is not set for IGA. Image uploads will fail.")
         raise ValueError("GCS_BUCKET_NAME is not set for IGA.")
     if not iga_config['GOOGLE_APPLICATION_CREDENTIALS']:
-        logging.warning("IGA WARNING: GOOGLE_APPLICATION_CREDENTIALS not explicitly set. Using ADC if configured.")
+        app.logger.warning("IGA WARNING: GOOGLE_APPLICATION_CREDENTIALS not explicitly set. Using ADC if configured.")
 
 load_iga_configuration()
 
 # --- Vertex AI Initialization ---
 try:
-    logging.info(f"Initializing Vertex AI for project '{iga_config['IGA_VERTEXAI_PROJECT_ID']}' in location '{iga_config['IGA_VERTEXAI_LOCATION']}'...")
+    app.logger.info(f"Initializing Vertex AI for project '{iga_config['IGA_VERTEXAI_PROJECT_ID']}' in location '{iga_config['IGA_VERTEXAI_LOCATION']}'...")
     aiplatform.init(project=iga_config['IGA_VERTEXAI_PROJECT_ID'], location=iga_config['IGA_VERTEXAI_LOCATION'])
-    logging.info("Vertex AI initialized successfully for IGA.")
+    app.logger.info("Vertex AI initialized successfully for IGA.")
 except Exception as e:
-    logging.error(f"Failed to initialize Vertex AI for IGA: {e}", exc_info=True)
+    app.logger.error(f"Failed to initialize Vertex AI for IGA: {e}", exc_info=True)
     raise ValueError(f"IGA Critical Error: Failed to initialize Vertex AI: {e}")
 
 
 @app.route("/generate_image", methods=["POST"])
 def generate_image_endpoint():
     request_id = f"iga_req_{uuid.uuid4().hex[:8]}"
-    logging.info(f"IGA Request {request_id}: Received /generate_image request.")
+    app.logger.info(f"IGA Request {request_id}: Received /generate_image request.")
 
     # Configuration check (GCS bucket is essential now)
     if not iga_config.get("GCS_BUCKET_NAME"):
-        logging.error(f"IGA Request {request_id}: GCS_BUCKET_NAME not configured.")
+        app.logger.error(f"IGA Request {request_id}: GCS_BUCKET_NAME not configured.")
         return jsonify({"error_code": "IGA_CONFIG_ERROR_GCS_BUCKET", "message": "IGA service GCS bucket not configured."}), 503
 
     try:
@@ -98,7 +126,7 @@ def generate_image_endpoint():
     if not prompt or not isinstance(prompt, str) or not prompt.strip():
         return jsonify({"error_code": "IGA_BAD_REQUEST_PROMPT_MISSING", "message": "Prompt is required."}), 400
 
-    logging.info(f"IGA Request {request_id}: Processing prompt: '{prompt}' with model {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
+    app.logger.info(f"IGA Request {request_id}: Processing prompt: '{prompt}' with model {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
 
     try:
         model = ImageGenerationModel.from_pretrained(iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
@@ -109,15 +137,15 @@ def generate_image_endpoint():
             aspect_ratio=iga_config['IGA_DEFAULT_ASPECT_RATIO'],
             add_watermark=iga_config['IGA_ADD_WATERMARK']
         )
-        logging.info(f"IGA Request {request_id}: Vertex AI call completed.")
+        app.logger.info(f"IGA Request {request_id}: Vertex AI call completed.")
 
         if not images_response or not images_response.images:
-            logging.error(f"IGA Request {request_id}: No images from Vertex AI for prompt: '{prompt}'")
+            app.logger.error(f"IGA Request {request_id}: No images from Vertex AI for prompt: '{prompt}'")
             return jsonify({"error_code": "IGA_VERTEXAI_NO_IMAGES_RETURNED", "message": "Image generation failed."}), 500
 
         image_object = images_response.images[0]
         if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
-            logging.error(f"IGA Request {request_id}: Vertex AI image bytes missing for prompt: '{prompt}'")
+            app.logger.error(f"IGA Request {request_id}: Vertex AI image bytes missing for prompt: '{prompt}'")
             return jsonify({"error_code": "IGA_VERTEXAI_EMPTY_IMAGE_BYTES", "message": "Image generation produced empty image."}), 500
 
         # Upload to GCS
@@ -136,10 +164,10 @@ def generate_image_endpoint():
         # if file_extension == "jpeg" or file_extension == "jpg":
         #     gcs_content_type = 'image/jpeg'
 
-        logging.info(f"IGA Request {request_id}: Uploading to GCS. Bucket: {iga_config['GCS_BUCKET_NAME']}, Object: {gcs_object_name}")
+        app.logger.info(f"IGA Request {request_id}: Uploading to GCS. Bucket: {iga_config['GCS_BUCKET_NAME']}, Object: {gcs_object_name}")
         blob.upload_from_string(image_object._image_bytes, content_type=gcs_content_type)
         image_gcs_uri = f"gs://{iga_config['GCS_BUCKET_NAME']}/{gcs_object_name}"
-        logging.info(f"IGA Request {request_id}: Image uploaded to GCS: {image_gcs_uri}")
+        app.logger.info(f"IGA Request {request_id}: Image uploaded to GCS: {image_gcs_uri}")
 
         response_data = {
             "image_url": image_gcs_uri,
@@ -149,16 +177,16 @@ def generate_image_endpoint():
         return jsonify(response_data), 200
 
     except google_exceptions.InvalidArgument as e:
-        logging.error(f"IGA Request {request_id}: Vertex AI Invalid Argument: {e}", exc_info=True)
+        app.logger.error(f"IGA Request {request_id}: Vertex AI Invalid Argument: {e}", exc_info=True)
         return jsonify({"error_code": "IGA_VERTEXAI_INVALID_ARGUMENT", "message": f"Invalid argument for Vertex AI: {e}"}), 400
     except google_exceptions.PermissionDenied as e:
-        logging.error(f"IGA Request {request_id}: Vertex AI Permission Denied: {e}", exc_info=True)
+        app.logger.error(f"IGA Request {request_id}: Vertex AI Permission Denied: {e}", exc_info=True)
         return jsonify({"error_code": "IGA_VERTEXAI_PERMISSION_DENIED", "message": f"Vertex AI Permission Denied: {e}"}), 403
     except google_exceptions.ResourceExhausted as e:
-        logging.error(f"IGA Request {request_id}: Vertex AI Resource Exhausted: {e}", exc_info=True)
+        app.logger.error(f"IGA Request {request_id}: Vertex AI Resource Exhausted: {e}", exc_info=True)
         return jsonify({"error_code": "IGA_VERTEXAI_RESOURCE_EXHAUSTED", "message": f"Vertex AI Resource Exhausted (quota): {e}"}), 429
     except google_exceptions.FailedPrecondition as e:
-        logging.warning(f"IGA Request {request_id}: Vertex AI Failed Precondition (often safety filters): {e}", exc_info=True)
+        app.logger.warning(f"IGA Request {request_id}: Vertex AI Failed Precondition (often safety filters): {e}", exc_info=True)
         error_message = f"Vertex AI: {e}"
         error_code = "IGA_VERTEXAI_FAILED_PRECONDITION"
         if "blocked" in str(e).lower() and ("safety" in str(e).lower() or "policy" in str(e).lower()):
@@ -166,32 +194,32 @@ def generate_image_endpoint():
             error_message = f"Prompt blocked by safety filters: {e}"
         return jsonify({"error_code": error_code, "message": error_message}), 400
     except google_exceptions.GoogleCloudError as e: # Catch other GCS or general Google API errors
-        logging.error(f"IGA Request {request_id}: Google Cloud API Error (Vertex AI or GCS): {e}", exc_info=True)
+        app.logger.error(f"IGA Request {request_id}: Google Cloud API Error (Vertex AI or GCS): {e}", exc_info=True)
         return jsonify({"error_code": "IGA_GOOGLE_CLOUD_ERROR", "message": f"Google Cloud API error: {e}"}), 500
     except IOError as e: # Should be less likely now with direct GCS upload
-        logging.error(f"IGA Request {request_id}: I/O Error (unexpected if not saving locally): {e}", exc_info=True)
+        app.logger.error(f"IGA Request {request_id}: I/O Error (unexpected if not saving locally): {e}", exc_info=True)
         return jsonify({"error_code": "IGA_IO_ERROR", "message": f"I/O error: {e}"}), 500
     except Exception as e:
-        logging.error(f"IGA Request {request_id}: Unexpected error in /generate_image: {e}", exc_info=True)
+        app.logger.error(f"IGA Request {request_id}: Unexpected error in /generate_image: {e}", exc_info=True)
         return jsonify({"error_code": "IGA_INTERNAL_SERVER_ERROR", "message": f"Unexpected error: {e}"}), 500
 
 if __name__ == "__main__":
     if not iga_config.get('GOOGLE_APPLICATION_CREDENTIALS') and not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):
-        logging.warning("GOOGLE_APPLICATION_CREDENTIALS not set. Vertex AI/GCS will use ADC if available.")
+        app.logger.warning("GOOGLE_APPLICATION_CREDENTIALS not set. Vertex AI/GCS will use ADC if available.")
     if not iga_config.get('GCS_BUCKET_NAME'):
-         logging.warning("GCS_BUCKET_NAME not set. IGA will fail to upload images.")
+         app.logger.warning("GCS_BUCKET_NAME not set. IGA will fail to upload images.")
 
     # Local temp dir creation is no longer essential for primary flow
     # local_image_dir = iga_config.get('IGA_GENERATED_IMAGE_DIR')
     # if local_image_dir: # Only create if configured (e.g. for temp files)
-    #     try: os.makedirs(local_image_dir, exist_ok=True); logging.info(f"Ensured local dir exists (for temp): {local_image_dir}")
-    #     except OSError as e: logging.error(f"Could not create local dir {local_image_dir}: {e}")
+    #     try: os.makedirs(local_image_dir, exist_ok=True); app.logger.info(f"Ensured local dir exists (for temp): {local_image_dir}")
+    #     except OSError as e: app.logger.error(f"Could not create local dir {local_image_dir}: {e}")
 
     host = iga_config.get("IGA_HOST")
     port = iga_config.get("IGA_PORT")
     is_debug_mode = iga_config.get("IGA_DEBUG_MODE")
 
-    logging.info(f"--- IGA Service (Vertex AI & GCS) starting on {host}:{port} (Debug: {is_debug_mode}) ---")
+    app.logger.info(f"--- IGA Service (Vertex AI & GCS) starting on {host}:{port} (Debug: {is_debug_mode}) ---")
     app.run(host=host, port=port, debug=is_debug_mode)
 
 [end of aethercast/iga/main.py]

@@ -15,12 +15,37 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- Logging Configuration ---
-if app.logger and app.logger.name != 'root':
-    logger = app.logger
-else:
-    logger = logging.getLogger(__name__)
-    if not logger.hasHandlers():
-        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - AIMS_TTS - %(message)s')
+from python_json_logger import jsonlogger # Added for JSON logging
+
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="aims-tts-service"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    flask_app.logger.handlers.clear() # Clear existing default Flask handlers
+    logHandler = logging.StreamHandler()
+    service_filter = ServiceNameFilter("aims-tts-service")
+    logHandler.addFilter(service_filter)
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for AIMS_TTS service.")
+
+setup_json_logging(app)
+
+# Make the global logger use the configured app.logger
+logger = app.logger
 
 # --- AIMS_TTS Configuration ---
 AIMS_TTS_HOST = os.getenv('AIMS_TTS_HOST', '0.0.0.0')

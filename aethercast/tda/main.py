@@ -14,6 +14,44 @@ from datetime import datetime
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=dotenv_path)
 
+# --- Logging Setup ---
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="tda"):
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        return True
+
+# Initialize Flask app early so app.logger can be configured
+app = flask.Flask(__name__)
+
+# Configure JSON logging for the Flask app
+def setup_json_logging(flask_app):
+    # Clear existing default handlers from Flask app's logger
+    flask_app.logger.handlers.clear()
+
+    logHandler = logging.StreamHandler()
+
+    # Add the service_name filter to the handler
+    service_filter = ServiceNameFilter("tda") # Service name for TDA
+    logHandler.addFilter(service_filter)
+
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
+        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    )
+    logHandler.setFormatter(formatter)
+
+    flask_app.logger.addHandler(logHandler)
+    flask_app.logger.setLevel(logging.INFO)
+    flask_app.logger.info("JSON logging configured for TDA service.")
+
+setup_json_logging(app)
+
+
 # --- Application Configuration ---
 tda_config = {
     "TDA_NEWS_API_KEY": os.getenv("TDA_NEWS_API_KEY"),
@@ -42,23 +80,23 @@ tda_config = {
 
 
 # --- Configuration & Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - TDA - %(message)s') # Changed logger name
+# Old basicConfig removed, app.logger is now used.
 
-# Log loaded configuration
-logging.info("--- TDA Configuration ---")
+# Log loaded configuration using app.logger
+app.logger.info("--- TDA Configuration ---")
 for key, value in tda_config.items():
     if "API_KEY" in key and value:
-        logging.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
+        app.logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:] if len(value) > 4 else '****'}")
     elif "PASSWORD" in key and value:
-        logging.info(f"  {key}: ********")
+        app.logger.info(f"  {key}: ********")
     else:
-        logging.info(f"  {key}: {value}")
-logging.info("--- End TDA Configuration ---")
+        app.logger.info(f"  {key}: {value}")
+app.logger.info("--- End TDA Configuration ---")
 
 # Startup Check for API Key
 if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
     error_message = "CRITICAL: USE_REAL_NEWS_API is True, but TDA_NEWS_API_KEY is not set. Real News API calls will fail. Please set TDA_NEWS_API_KEY."
-    logging.critical(error_message) # Use critical for startup failures
+    app.logger.critical(error_message) # Use critical for startup failures
     raise ValueError(error_message)
 
 # Startup check for DB config
@@ -67,16 +105,16 @@ if tda_config["DATABASE_TYPE"] == "postgres":
     missing_pg_vars = [var for var in required_pg_vars if not tda_config.get(var)]
     if missing_pg_vars:
         error_msg = f"CRITICAL: DATABASE_TYPE is 'postgres' but required PostgreSQL config is missing: {', '.join(missing_pg_vars)}"
-        logging.critical(error_msg)
+        app.logger.critical(error_msg)
         raise ValueError(error_msg)
 elif tda_config["DATABASE_TYPE"] == "sqlite":
     if not tda_config.get("SHARED_DATABASE_PATH"):
         error_msg = "CRITICAL: DATABASE_TYPE is 'sqlite' but SHARED_DATABASE_PATH is not set."
-        logging.critical(error_msg)
+        app.logger.critical(error_msg)
         raise ValueError(error_msg)
 else:
     error_msg = f"CRITICAL: Invalid DATABASE_TYPE: {tda_config['DATABASE_TYPE']}. Must be 'sqlite' or 'postgres'."
-    logging.critical(error_msg)
+    app.logger.critical(error_msg)
     raise ValueError(error_msg)
 
 
@@ -104,7 +142,7 @@ SOURCE_FEED_NEWS_API = "news_api_org"
 ENDPOINT_ERROR_INTERNAL_SERVER_TDA = "INTERNAL_SERVER_ERROR_TDA"
 NEWS_API_STATUS_OK = "ok"
 
-app = flask.Flask(__name__)
+# Flask app is initialized earlier now for logging setup
 
 # --- Database Helper Functions ---
 def _get_db_connection():
@@ -122,25 +160,25 @@ def _get_db_connection():
             )
             return conn
         except psycopg2.Error as e:
-            logging.error(f"Error connecting to PostgreSQL database: {e}")
+            app.logger.error(f"Error connecting to PostgreSQL database: {e}")
             raise
     elif db_type == "sqlite":
         # This part will become obsolete once fully migrated and SQLite code is removed
         # For now, keeping it for potential phased rollout or testing.
         db_path = tda_config.get("SHARED_DATABASE_PATH")
         if not db_path:
-            logging.error("SHARED_DATABASE_PATH not configured for SQLite.")
+            app.logger.error("SHARED_DATABASE_PATH not configured for SQLite.")
             raise ValueError("SHARED_DATABASE_PATH not configured for SQLite.")
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row # For dict-like access if needed by other SQLite parts
         return conn
     else:
-        logging.error(f"Unsupported DATABASE_TYPE: {db_type}")
+        app.logger.error(f"Unsupported DATABASE_TYPE: {db_type}")
         raise ValueError(f"Unsupported DATABASE_TYPE: {db_type}")
 
 def init_tda_db():
     """Initializes the TDA database table if it doesn't exist."""
-    logging.info(f"[TDA_DB_INIT] Ensuring TDA database schema exists (DB Type: {tda_config.get('DATABASE_TYPE')})...")
+    app.logger.info(f"[TDA_DB_INIT] Ensuring TDA database schema exists (DB Type: {tda_config.get('DATABASE_TYPE')})...")
     conn = None
     cursor = None
     try:
@@ -157,27 +195,27 @@ def init_tda_db():
             """)
             table_exists = cursor.fetchone()['exists']
             if not table_exists:
-                logging.info("Table 'topics_snippets' not found in PostgreSQL. Creating now...")
+                app.logger.info("Table 'topics_snippets' not found in PostgreSQL. Creating now...")
                 cursor.execute(DB_SCHEMA_TDA_TABLES)
                 conn.commit()
-                logging.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' created.")
+                app.logger.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' created.")
             else:
-                logging.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' already exists.")
+                app.logger.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' already exists.")
         elif tda_config.get("DATABASE_TYPE") == "sqlite":
             # SQLite table check (less critical now but kept for completeness if needed)
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='topics_snippets';")
             if not cursor.fetchone():
-                 logging.info("Table 'topics_snippets' not found in SQLite. Creating now...")
+                 app.logger.info("Table 'topics_snippets' not found in SQLite. Creating now...")
                  cursor.executescript(DB_SCHEMA_TDA_TABLES) # executescript for SQLite
                  conn.commit()
-                 logging.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' ensured.")
+                 app.logger.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' ensured.")
             else:
-                logging.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' already exists.")
+                app.logger.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' already exists.")
 
     except (psycopg2.Error, sqlite3.Error) as e: # Catch both error types
-        logging.error(f"[TDA_DB_INIT] Database error during schema initialization: {e}", exc_info=True)
+        app.logger.error(f"[TDA_DB_INIT] Database error during schema initialization: {e}", exc_info=True)
     except Exception as e_unexp:
-        logging.error(f"[TDA_DB_INIT] Unexpected error during schema initialization: {e_unexp}", exc_info=True)
+        app.logger.error(f"[TDA_DB_INIT] Unexpected error during schema initialization: {e_unexp}", exc_info=True)
     finally:
         if cursor:
             cursor.close()
@@ -243,7 +281,7 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
         # For SQLite, this would need ? and json.dumps for JSON fields.
         # Assuming for now this function is primarily for PostgreSQL path.
         # If SQLite path is still needed, conditional SQL and param formatting would be required.
-
+        # Using app.logger for consistency
         params = (
             topic_id_str,
             DB_TYPE_TOPIC,
@@ -273,13 +311,13 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
             cursor.execute(sql_insert, params)
 
         conn.commit()
-        logging.info(f"Saved/Replaced topic {topic_id_str} to DB: {topic_object.get('title_suggestion')}")
+        app.logger.info(f"Saved/Replaced topic {topic_id_str} to DB: {topic_object.get('title_suggestion')}")
 
     except (psycopg2.Error, sqlite3.Error) as e:
-        logging.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
+        app.logger.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
         if conn: conn.rollback() # Rollback on error for PG
     except Exception as e_unexp:
-        logging.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e_unexp}", exc_info=True)
+        app.logger.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e_unexp}", exc_info=True)
         if conn and tda_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
     finally:
         if cursor:
@@ -295,7 +333,7 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
     if not tda_config.get("USE_REAL_NEWS_API"):
         return []
     if not tda_config.get("TDA_NEWS_API_KEY"):
-        logging.error("call_real_news_api: TDA_NEWS_API_KEY not configured. Cannot make request.")
+        app.logger.error("call_real_news_api: TDA_NEWS_API_KEY not configured. Cannot make request.")
         return []
 
     base_url = tda_config["TDA_NEWS_API_BASE_URL"]
@@ -321,14 +359,14 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
         "User-Agent": tda_config.get("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1")
     }
     request_timeout = tda_config.get("TDA_NEWS_REQUEST_TIMEOUT", 15)
-    logging.info(f"Calling NewsAPI: URL={api_url}, Params={params}, Timeout={request_timeout}s")
+    app.logger.info(f"Calling NewsAPI: URL={api_url}, Params={params}, Timeout={request_timeout}s")
     topic_objects = []
     try:
         response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
         response.raise_for_status()
         response_json = response.json()
         if response_json.get("status") != NEWS_API_STATUS_OK:
-            logging.error(f"NewsAPI returned error status: {response_json.get('status')}. Message: {response_json.get('message')}")
+            app.logger.error(f"NewsAPI returned error status: {response_json.get('status')}. Message: {response_json.get('message')}")
             return [] # Return empty list on API error status
         articles = response_json.get("articles", [])
 
@@ -363,10 +401,10 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
             topic_objects.append(topic_object)
             _save_topic_to_db(topic_object) # Call updated save function
         
-        logging.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI.")
+        app.logger.info(f"Transformed {len(topic_objects)} articles into TopicObjects from NewsAPI.")
         return topic_objects
     except requests.exceptions.RequestException as req_err:
-        logging.error(f"NewsAPI request error: {req_err}", exc_info=True)
+        app.logger.error(f"NewsAPI request error: {req_err}", exc_info=True)
         return [] # Return empty list on request failure, CPOA/caller handles "no topics"
 
 SIMULATED_DATA_SOURCES = [
@@ -382,7 +420,7 @@ SIMULATED_DATA_SOURCES = [
 def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
     identified_topics = []
     all_articles = []
-    logging.info(f"[TDA_LOGIC] Scanning simulated data sources. Query: '{query}', Limit: {limit}")
+    app.logger.info(f"[TDA_LOGIC] Scanning simulated data sources. Query: '{query}', Limit: {limit}")
     for data_source in SIMULATED_DATA_SOURCES:
         for article in data_source["articles"]:
             all_articles.append({
@@ -403,7 +441,7 @@ def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
         identified_topics.append(topic_object)
         _save_topic_to_db(topic_object)
     identified_topics.sort(key=lambda x: x["relevance_score"], reverse=True)
-    logging.info(f"[TDA_LOGIC] Identified {len(identified_topics)} potential topics from simulated sources. Returning top {min(limit, len(identified_topics))}.")
+    app.logger.info(f"[TDA_LOGIC] Identified {len(identified_topics)} potential topics from simulated sources. Returning top {min(limit, len(identified_topics))}.")
     return identified_topics[:limit]
 
 # --- Other helper functions (generate_topic_id, generate_summary_from_title, calculate_relevance_score) ---
@@ -429,7 +467,7 @@ def discover_topics_endpoint():
         try:
             request_data = flask.request.get_json() if flask.request.content_length else {}
         except Exception as e_json_decode:
-            logging.warning(f"/discover_topics: Failed to decode JSON: {e_json_decode}", exc_info=True)
+            app.logger.warning(f"/discover_topics: Failed to decode JSON: {e_json_decode}", exc_info=True)
             return flask.jsonify({"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON."}), 400
         query = request_data.get("query")
         limit_raw = request_data.get("limit")
@@ -444,7 +482,7 @@ def discover_topics_endpoint():
                     return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "limit must be 1-50."}), 400
             except ValueError:
                 return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "limit must be integer."}), 400
-        logging.info(f"POST /discover_topics. Query: '{query}', Limit: {limit}, Trigger: '{error_trigger}'")
+        app.logger.info(f"POST /discover_topics. Query: '{query}', Limit: {limit}, Trigger: '{error_trigger}'")
         if error_trigger == "tda_error":
             return flask.jsonify({"error_code": "TDA_SIMULATED_ERROR", "message": "Simulated TDA error."}), 500
         
@@ -462,21 +500,22 @@ def discover_topics_endpoint():
             return flask.jsonify({"message": "No topics discovered.", "topics": []}), 200
         return flask.jsonify({"discovered_topics": discovered_topics}), 200
     except Exception as e:
-        logging.error(f"Error in /discover_topics: {e}", exc_info=True)
+        app.logger.error(f"Error in /discover_topics: {e}", exc_info=True)
         return flask.jsonify({"error_code": ENDPOINT_ERROR_INTERNAL_SERVER_TDA, "message": "Unexpected error."}), 500
 
 if __name__ == "__main__":
     if tda_config.get("DATABASE_TYPE") == "sqlite" and not tda_config.get("SHARED_DATABASE_PATH"):
-        logging.warning("SHARED_DATABASE_PATH not configured for TDA SQLite mode. Topic saving to DB will fail if not using Postgres.")
+        app.logger.warning("SHARED_DATABASE_PATH not configured for TDA SQLite mode. Topic saving to DB will fail if not using Postgres.")
     elif tda_config.get("DATABASE_TYPE") == "postgres" and not all(tda_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]):
-        logging.warning("PostgreSQL is configured as DATABASE_TYPE, but one or more connection variables are missing. DB operations might fail.")
+        app.logger.warning("PostgreSQL is configured as DATABASE_TYPE, but one or more connection variables are missing. DB operations might fail.")
 
     init_tda_db() # Call init_db based on configured DB_TYPE
 
     host = tda_config.get("TDA_HOST")
     port = tda_config.get("TDA_PORT")
     debug_mode = tda_config.get("TDA_DEBUG_MODE")
-    logging.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: {tda_config.get('DATABASE_TYPE')}) ---")
+    # The initial "JSON logging configured..." message is now part of setup_json_logging
+    app.logger.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: {tda_config.get('DATABASE_TYPE')}) ---")
     app.run(host=host, port=port, debug=debug_mode)
 
 [end of aethercast/tda/main.py]

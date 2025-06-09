@@ -2,3 +2,4 @@ Flask>=2.0
 python-dotenv>=0.15
 google-cloud-aiplatform>=1.0.0
 google-cloud-storage>=1.30.0
+python-json-logger>=2.0.0

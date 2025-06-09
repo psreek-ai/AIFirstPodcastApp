@@ -25,6 +25,11 @@ services:
     networks:
       - aethercast_network
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   api_gateway:
     build:
@@ -56,6 +61,11 @@ services:
       - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
     networks: # Example: assuming a custom network for all backend services
       - aethercast_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   aims_service:
     build:
@@ -75,6 +85,11 @@ services:
     networks:
       - aethercast_network
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   aims_tts_service:
     build:
@@ -111,6 +126,11 @@ services:
     networks:
       - aethercast_network
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   tda:
     build:
@@ -137,6 +157,11 @@ services:
         condition: service_healthy
     networks:
       - aethercast_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   sca:
     build:
@@ -153,6 +178,11 @@ services:
       - aims_service
     networks:
       - aethercast_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   pswa:
     build:
@@ -180,6 +210,11 @@ services:
         condition: service_healthy
     networks:
       - aethercast_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   vfa:
     build:
@@ -199,6 +234,11 @@ services:
       - aims_tts_service
     networks:
       - aethercast_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   asf:
     build:
@@ -220,6 +260,11 @@ services:
       - api_gateway
     networks:
       - aethercast_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
   iga:
     build:
@@ -258,6 +303,11 @@ services:
     networks:
       - aethercast_network
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 # Define the custom network
 networks:
