@@ -83,11 +83,17 @@ The CPOA executes several key workflows. These workflows are dynamic and may evo
             * (Optional) Briefly consults `WebContentHarvesterAgent` for a small piece of contextual data if the topic alone is insufficient.
             * Utilizes LLMs (via `AIMS`) to generate a compelling text snippet, a catchy title, and potentially prompts for cover art.
             * `SnippetCraftAgent`: Returns the generated snippet (title, text, metadata like art prompt, topic ID) to CPOA.
-    5.  **CPOA: Aggregate Snippets:** CPOA collects all generated snippets.
-    6.  **CPOA: Instruct UI Update:**
-        * CPOA sends the aggregated list of snippet data to the `Frontend UI (FEND)` (likely via API Gateway response or a WebSocket push).
-        * The `DynamicUIAgent` (which could be a logical part of the FEND or a backend service called by CPOA) ensures the frontend renders these snippets.
-        * (Optional) If cover art is generated, CPOA might task an `ImageGenerationAgent` (not explicitly listed before, but a natural extension) using the prompt from `SnippetCraftAgent`.
+    5.  **CPOA: Aggregate Snippets:** CPOA collects all generated `SnippetDataObjects`.
+    6.  **CPOA: Generate UI Definition:**
+        *   CPOA takes the aggregated list of `SnippetDataObjects` and any other relevant context (e.g., user preferences, application state).
+        *   CPOA calls the `DynamicUIAgent (DUIA)` logic/module with this content and context, requesting a UI definition for the "landingPage" view (or equivalent).
+        *   `DynamicUIAgent`: Constructs the UI Definition JSON based on the provided data and defined strategies (e.g., programmatic construction using the schema from `docs/architecture/Dynamic_UI_Schema.md`).
+        *   `DynamicUIAgent`: Returns the UI Definition JSON to CPOA.
+    7.  **CPOA: Send UI Definition to Frontend:**
+        *   CPOA sends the UI Definition JSON to the `API Gateway (APIGW)`.
+        *   `API Gateway`: Forwards the UI Definition JSON as the response to the `Frontend UI (FEND)`.
+        *   `Frontend UI`: Parses this JSON and renders the UI components dynamically.
+        *   *(Note: The optional image generation via IGA would typically occur as part of step 4, where SnippetCraftAgent provides a prompt, and CPOA orchestrates the IGA call before calling DUIA).*
 
 * **Diagrammatic Representation (Conceptual Sequence):**
     ```mermaid
@@ -98,26 +104,36 @@ The CPOA executes several key workflows. These workflows are dynamic and may evo
         participant CPOA as Central Podcast Orchestrator
         participant TDA as TopicDiscoveryAgent
         participant SCA as SnippetCraftAgent
+        participant IGA as ImageGenerationAgent %% Added IGA
+        participant DUIA as DynamicUIAgent %% Added DUIA
         participant AIMS as AI Model Serving (LLM)
+        participant AIMS_IMG as AI Models (Image) %% Added AIMS_IMG for IGA
         participant DS as Data Stores
 
         User->>FEND: Load Landing Page
-        FEND->>APIGW: GET /home
-        APIGW->>CPOA: Request for landing page content
+        FEND->>APIGW: GET /api/v1/snippets
+        APIGW->>CPOA: Request for landing page content (passing user_id if available)
 
-        CPOA->>TDA: Discover Topics (Optional/Async)
-        TDA-->>CPOA: List of Topics
-        CPOA->>DS: Store/Update Topics
+        CPOA->>TDA: Discover Topics
+        TDA-->>CPOA: List of TopicObjects
+        CPOA->>DS: Store/Update TopicObjects
 
         loop For Each Snippet Needed
             CPOA->>SCA: Generate Snippet for Topic X
-            SCA->>AIMS: Generate Text (Title, Snippet)
-            AIMS-->>SCA: Generated Text
-            SCA-->>CPOA: Snippet Data (Text, Metadata)
+            SCA->>AIMS: Generate Text (Title, Snippet, Image Prompt)
+            AIMS-->>SCA: Generated Text & Image Prompt
+            SCA-->>CPOA: SnippetDataObject (with image_prompt)
+
+            CPOA->>IGA: Generate Image (using image_prompt)
+            IGA->>AIMS_IMG: Call image generation model
+            AIMS_IMG-->>IGA: Image GCS URI
+            IGA-->>CPOA: SnippetDataObject updated with image GCS URI
         end
 
-        CPOA-->>APIGW: Aggregated Snippet List
-        APIGW-->>FEND: Snippet Data
+        CPOA->>DUIA: Aggregated SnippetDataObjects + Context
+        DUIA-->>CPOA: UI Definition JSON
+        CPOA-->>APIGW: UI Definition JSON (including workflow_id)
+        APIGW-->>FEND: UI Definition JSON
         FEND->>User: Display Landing Page with Snippets
     ```
 

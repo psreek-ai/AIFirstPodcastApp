@@ -23,6 +23,7 @@ graph TD
     WCHA["WebContentHarvesterAgent"]
     PSWA["PodcastScriptWeaverAgent"]
     VFA["VoiceForgeAgent"]
+    DUIA["DynamicUIAgent (DUIA)"]
     AIMS["AI Models - LLM"]
     AIMS_TTS["AI Models - TTS"]
     Internet["External Web and APIs"]
@@ -42,7 +43,10 @@ graph TD
         CPOA -- "Task Delegation" --> WCHA
         CPOA -- "Task Delegation" --> PSWA
         CPOA -- "Task Delegation" --> VFA
-        CPOA -- "UI Updates" --> FEND
+
+        CPOA -- "Content/Context for UI" --> DUIA
+        DUIA -- "UI Definition JSON" --> APIGW
+        %% APIGW then sends UI Definition to FEND
 
         SCA --> AIMS
         PSWA --> AIMS
@@ -75,6 +79,7 @@ graph TD
     style WCHA fill:#ff9,stroke:#333,stroke-width:2px
     style PSWA fill:#ff9,stroke:#333,stroke-width:2px
     style VFA fill:#ff9,stroke:#333,stroke-width:2px
+    style DUIA fill:#f9c,stroke:#333,stroke-width:2px %% Style for DUIA
     style AIMS fill:#9cf,stroke:#333,stroke-width:2px
     style AIMS_TTS fill:#9cf,stroke:#333,stroke-width:2px
     style DS fill:#9c9,stroke:#333,stroke-width:2px
@@ -151,6 +156,11 @@ Below are descriptions of the major components depicted in the architecture diag
         * **Description:** A state-of-the-art Text-to-Speech (TTS) agent that renders the script from PSWA into a natural, high-quality audio stream. Manages voice selection, tone, and pacing.
         * **Interaction:** Receives script from CPOA, uses TTS models from AIMS_TTS, produces audio stream delivered to the user (potentially chunked for real-time streaming).
         * **Potential Technologies:** Python, TTS SDKs/APIs (e.g., ElevenLabs, Azure TTS, Google TTS, Coqui TTS).
+
+    * **`DynamicUIAgent` (DUIA) (Conceptual):**
+        * **Description:** Responsible for generating a structured UI Definition JSON based on data from CPOA and user context. This schema instructs the frontend on how to render components, layout, and styles.
+        * **Interaction:** Receives content and context from CPOA, outputs UI Definition JSON (which CPOA forwards to APIGW, then to FEND).
+        * **Potential Technologies:** Python, logic for programmatic schema construction, (future) rule engines or LLM integration for parts of the schema.
 
 ### 3.3. Supporting Infrastructure
 

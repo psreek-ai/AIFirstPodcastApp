@@ -331,52 +331,7 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ---
 
-### 3.6. Agent Name: `DynamicUIAgent` (DUIA)
-
-* **Purpose/Mission:** To manage the dynamic aspects of the Aethercast user interface, translating backend state and content into renderable UI components or instructions for the frontend.
-* **Note:** This agent's role can vary. It might be a backend agent preparing structured UI data, or its logic could be tightly coupled with the CPOA or even distributed to the Frontend with a backend-for-frontend (BFF) pattern. For this overview, we'll treat it as a conceptual agent whose responsibilities ensure the UI is dynamic.
-* **Key Responsibilities:**
-    * Receive data from CPOA (e.g., list of generated snippets, podcast playback status, error messages).
-    * Transform this data into a structure or set of commands that the `Frontend UI (FEND)` can easily consume and render.
-    * Manage the layout and presentation logic for dynamically generated content (e.g., how snippets are arranged, how podcast player state is shown).
-    * (If backend-driven) Send UI update instructions to the FEND via API responses or real-time messaging (e.g., WebSockets).
-    * Ensure UI updates are timely and reflect the current state of the system and content generation processes.
-* **Core AI Models/Techniques Relied Upon:**
-    * Typically not directly AI-driven itself, but rather consumes AI-generated content.
-    * May use templating engines or UI frameworks.
-    * (Future) Could use AI for personalized layout suggestions, but this is an advanced feature.
-* **Inputs:**
-    * Data payloads from CPOA:
-        * `SnippetDataObjects` for the landing page.
-        * Podcast metadata (title, cover art URL) for the player.
-        * Playback status (playing, paused, buffering, error).
-        * User-specific UI preferences (future).
-* **Outputs:**
-    * To `Frontend UI (FEND)`:
-        * Structured data (e.g., JSON) to populate UI components.
-        * Specific commands for UI updates (if using a real-time channel like WebSockets).
-* **Primary Interactions:**
-    * Receives data/instructions from: CPOA.
-    * Provides data/instructions to: `Frontend UI (FEND)`.
-* **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Speed and responsiveness of UI updates.
-    * Correctness and consistency of displayed information.
-    * Ease of integration for the frontend developers.
-* **Error Scenarios & Handling:**
-    * Receiving malformed data from CPOA: Log error, potentially display a fallback UI state.
-    * Failure to communicate updates to FEND: Retry mechanisms if applicable (for WebSocket pushes).
-* **Scalability Considerations:**
-    * If it's a backend service, it needs to scale with the number of connected users and the frequency of UI updates.
-    * Efficient data serialization and transfer to the frontend are important.
-* **Security Considerations:**
-    * Sanitizing any data received from the backend before rendering it in the UI to prevent XSS attacks (primarily a frontend responsibility, but DUIA should provide clean data).
-* **Future Enhancements:**
-    * More adaptive and personalized UI layouts.
-    * AI-driven A/B testing of UI elements.
-
----
-
-### 3.7. Agent Name: `ImageGenerationAgent` (IGA) (Optional/Future)
+### 3.6. Agent Name: `ImageGenerationAgent` (IGA) (Optional/Future)
 
 * **Purpose/Mission:** To dynamically generate relevant and aesthetically pleasing cover art or accompanying images for podcast snippets or episodes based on textual prompts.
 * **Key Responsibilities:**
@@ -419,4 +374,51 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
     * User ability to influence image generation.
     * Generating short animated visuals or audiograms.
 
+---
+
+### 3.7. Agent Name: `DynamicUIAgent` (DUIA) - Conceptual
+
+* **Purpose/Mission:** To translate backend-aggregated content, application state, and user context into a structured UI Definition JSON that the frontend can render. It acts as the bridge between backend data/logic and frontend presentation.
+* **Note:** While documented as a separate agent for clarity of function, the initial implementation of DUIA's logic might reside as a module within the CPOA or be part of a Backend-for-Frontend (BFF) pattern within the API Gateway. The key is the *functionality* of generating the UI schema.
+* **Key Responsibilities:**
+    * Receive requests for UI views, typically from CPOA, along with necessary content payloads (e.g., lists of snippets, podcast details, search results) and context (e.g., user preferences, application state).
+    * Utilize defined strategies (initially programmatic construction, potentially rule-based or LLM-assisted in the future) to assemble a UI Definition JSON object according to the schema defined in `docs/architecture/Dynamic_UI_Schema.md`.
+    * Map content data to appropriate UI components (e.g., text, images, lists, cards).
+    * Determine and apply layout properties (flexbox, grid, spacing) to components.
+    * Select and apply styling properties (colors, typography, themes) based on context or predefined rules.
+    * Define interactivity (e.g., `onClick` actions) for components.
+    * Ensure the generated UI schema is valid and complete for the requested view.
+* **Core AI Models/Techniques Relied Upon:**
+    * **Primarily Programmatic Logic (Initial):** Python functions and data structures to build the JSON schema.
+    * **(Future) Rule Engines:** For more complex conditional UI adaptations.
+    * **(Future - Advanced) LLMs:** Could be used to generate parts of the UI schema or suggest layout/style variations based on high-level prompts, but would require strict output validation against the UI schema.
+* **Inputs:**
+    * `view_identifier` (string): Specifies the target view (e.g., "landingPage", "searchResultsView").
+    * `content_payload` (object/array): Data to be displayed (e.g., snippets, podcast details).
+    * `user_context` (object, optional): User-specific information (preferences, auth state).
+    * `application_state` (object, optional): Global application state relevant to UI.
+* **Outputs:**
+    * To CPOA (or directly to API Gateway): A UI Definition JSON object that conforms to the schema in `docs/architecture/Dynamic_UI_Schema.md`.
+* **Primary Interactions:**
+    * Tasked by/Receives data from: CPOA.
+    * Outputs to: CPOA (which then passes it to the API Gateway for the frontend).
+* **Key Performance Indicators (KPIs)/Success Metrics:**
+    * Correctness and validity of the generated UI Definition JSON against the schema.
+    * Performance: Speed of UI schema generation.
+    * Adaptability: Ease with which new UI components or view types can be supported.
+    * Consistency: Ensuring generated UIs are consistent in style and behavior where intended.
+* **Error Scenarios & Handling:**
+    * Missing or invalid input data from CPOA: Return an error state or a fallback UI schema.
+    * Internal errors during programmatic construction: Log errors, potentially return a standardized error UI schema.
+    * (Future - LLM) LLM failing to produce valid schema: Fallback to a default/template-based programmatic construction for that view or component.
+* **Scalability Considerations:**
+    * If implemented as a module within CPOA, scales with CPOA.
+    * If a separate service, needs to be scalable according to the rate of UI generation requests.
+    * Efficiency of the programmatic construction logic is key.
+* **Security Considerations:**
+    * Ensure that any data passed into the UI schema (especially from user-generated content if ever applicable) is properly sanitized before being included in structures that might be interpreted as executable by the frontend (though the schema itself is data, not code).
+* **Future Enhancements:**
+    * Integration with a rules engine for more sophisticated layout/style choices.
+    * Experimentation with LLMs for generating specific UI component configurations or suggesting A/B test variations for UI elements.
+    * Versioning of UI generation strategies.
 ---
