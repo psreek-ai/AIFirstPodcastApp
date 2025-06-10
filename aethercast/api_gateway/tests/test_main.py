@@ -2,6 +2,12 @@ import unittest
 from unittest.mock import patch, MagicMock
 import os
 import sys
+# Explicitly add user site-packages to sys.path
+user_site_packages = '/home/swebot/.local/lib/python3.10/site-packages'
+if user_site_packages not in sys.path:
+    sys.path.insert(0, user_site_packages)
+print(f"PYTHON SYS PATH: {sys.path}")
+import sys
 import json
 import sqlite3 # For direct DB assertions
 from datetime import datetime, timedelta # Added timedelta for session tests

@@ -115,33 +115,34 @@ POSTGRES_DB = os.getenv("POSTGRES_DB")
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
     # New format to include workflow_id and task_id, which will be added via LoggerAdapter
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(workflow_id)s - %(task_id)s - %(message)s')
+    # Added default "N/A" for workflow_id and task_id if not provided in the log record.
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(workflow_id:-N/A)s - %(task_id:-N/A)s - %(message)s')
 
 # Log loaded configuration (initial logging without workflow/task IDs)
 # Create a temporary adapter for these initial logs if needed, or log directly.
 initial_log_extra = {'workflow_id': 'N/A', 'task_id': 'N/A'}
 logger.info("--- CPOA Configuration ---", extra=initial_log_extra)
-logger.info(f"DATABASE_TYPE: {DATABASE_TYPE}")
+logger.info(f"DATABASE_TYPE: {DATABASE_TYPE}", extra=initial_log_extra)
 if DATABASE_TYPE == "sqlite":
-    logger.info(f"SHARED_DATABASE_PATH (SQLite): {CPOA_DATABASE_PATH}")
+    logger.info(f"SHARED_DATABASE_PATH (SQLite): {CPOA_DATABASE_PATH}", extra=initial_log_extra)
 elif DATABASE_TYPE == "postgres":
-    logger.info(f"POSTGRES_HOST: {POSTGRES_HOST}")
-    logger.info(f"POSTGRES_PORT: {POSTGRES_PORT}")
-    logger.info(f"POSTGRES_USER: {POSTGRES_USER}")
+    logger.info(f"POSTGRES_HOST: {POSTGRES_HOST}", extra=initial_log_extra)
+    logger.info(f"POSTGRES_PORT: {POSTGRES_PORT}", extra=initial_log_extra)
+    logger.info(f"POSTGRES_USER: {POSTGRES_USER}", extra=initial_log_extra)
     # Do not log password
-    logger.info(f"POSTGRES_DB: {POSTGRES_DB}")
+    logger.info(f"POSTGRES_DB: {POSTGRES_DB}", extra=initial_log_extra)
 
-logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}")
-logger.info(f"PSWA_SERVICE_URL: {PSWA_SERVICE_URL}")
-logger.info(f"VFA_SERVICE_URL: {VFA_SERVICE_URL}")
-logger.info(f"ASF_NOTIFICATION_URL: {ASF_NOTIFICATION_URL}")
-logger.info(f"ASF_WEBSOCKET_BASE_URL: {ASF_WEBSOCKET_BASE_URL}")
-logger.info(f"SCA_SERVICE_URL: {SCA_SERVICE_URL}")
-logger.info(f"IGA_SERVICE_URL: {IGA_SERVICE_URL}")
-logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}")
-logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}")
-logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}")
-logger.info("--- End CPOA Configuration ---")
+logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}", extra=initial_log_extra)
+logger.info(f"PSWA_SERVICE_URL: {PSWA_SERVICE_URL}", extra=initial_log_extra)
+logger.info(f"VFA_SERVICE_URL: {VFA_SERVICE_URL}", extra=initial_log_extra)
+logger.info(f"ASF_NOTIFICATION_URL: {ASF_NOTIFICATION_URL}", extra=initial_log_extra)
+logger.info(f"ASF_WEBSOCKET_BASE_URL: {ASF_WEBSOCKET_BASE_URL}", extra=initial_log_extra)
+logger.info(f"SCA_SERVICE_URL: {SCA_SERVICE_URL}", extra=initial_log_extra)
+logger.info(f"IGA_SERVICE_URL: {IGA_SERVICE_URL}", extra=initial_log_extra)
+logger.info(f"CPOA_ASF_SEND_UI_UPDATE_URL: {CPOA_ASF_SEND_UI_UPDATE_URL}", extra=initial_log_extra)
+logger.info(f"CPOA_SERVICE_RETRY_COUNT: {CPOA_SERVICE_RETRY_COUNT}", extra=initial_log_extra)
+logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FACTOR}", extra=initial_log_extra)
+logger.info("--- End CPOA Configuration ---", extra=initial_log_extra)
 
 
 # --- Database Connection Helper (New for PostgreSQL, adaptable) ---

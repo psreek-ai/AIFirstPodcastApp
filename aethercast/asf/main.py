@@ -7,6 +7,7 @@ import os
 from dotenv import load_dotenv
 import uuid
 import requests # Ensure requests is imported
+import json # Import json
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -161,62 +162,73 @@ def handle_join_stream(data):
 
     # --- New Logic to get Signed URL ---
     if gcs_uri.startswith("gs://"):
-        try:
-            # Ensure filepath (gcs_uri) is URL-encoded for the query parameter if it could contain special chars
-            # For gs://bucket/object URIs, this is usually not an issue, but good practice for arbitrary strings.
-            # from urllib.parse import quote_plus
-            # encoded_gcs_uri = quote_plus(gcs_uri)
-            # However, requests usually handles URL encoding for query parameters.
+        # try:
+            # # Ensure filepath (gcs_uri) is URL-encoded for the query parameter if it could contain special chars
+            # # For gs://bucket/object URIs, this is usually not an issue, but good practice for arbitrary strings.
+            # # from urllib.parse import quote_plus
+            # # encoded_gcs_uri = quote_plus(gcs_uri)
+            # # However, requests usually handles URL encoding for query parameters.
+            #
+            # signed_url_fetch_endpoint = f"{asf_config['INTERNAL_API_GW_BASE_URL']}/api/v1/internal/media_access_url"
+            # params = {'gcs_uri': gcs_uri}
+            #
+            # logger.debug(f"ASF: Requesting signed URL for GCS URI '{gcs_uri}' from endpoint: {signed_url_fetch_endpoint}")
 
-            signed_url_fetch_endpoint = f"{asf_config['INTERNAL_API_GW_BASE_URL']}/api/v1/internal/media_access_url"
-            params = {'gcs_uri': gcs_uri}
-
-            logger.debug(f"ASF: Requesting signed URL for GCS URI '{gcs_uri}' from endpoint: {signed_url_fetch_endpoint}")
-
-            signed_url_fetch_start_time = time.time()
-            try:
-                response = requests.get(signed_url_fetch_endpoint, params=params, timeout=5)
-                response.raise_for_status()
-                response_data = response.json()
-                signed_url_from_api_gw = response_data.get("signed_url")
-                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-                logger.info("ASF signed URL fetch processed", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-
-                if not signed_url_from_api_gw:
-                    logger.error(f"ASF: API Gateway did not return a signed_url for GCS URI {gcs_uri} (stream {stream_id}). Response: {response_data}")
-                    logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "no_url_in_response"}))
-                    emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to obtain secure access for audio stream.'}, room=stream_id)
-                    return
-                logger.info(f"ASF: Successfully obtained signed URL for GCS URI {gcs_uri} (stream {stream_id}).")
-
-            except requests.exceptions.Timeout:
-                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-                logger.info("ASF signed URL fetch processed (timeout)", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-                logger.error(f"ASF: Timeout requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}).")
-                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "timeout"}))
-                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal timeout.'}, room=stream_id)
-                return
-            except requests.exceptions.HTTPError as e_http:
-                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-                logger.info(f"ASF signed URL fetch processed (http_error_{e_http.response.status_code})", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-                logger.error(f"ASF: HTTP error {e_http.response.status_code} requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}). Response: {e_http.response.text}")
-                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": f"http_error_{e_http.response.status_code}"}))
-                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal error.'}, room=stream_id)
-                return
-            except requests.exceptions.RequestException as e_req:
-                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-                logger.info("ASF signed URL fetch processed (request_exception)", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-                logger.error(f"ASF: Error requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}): {e_req}", exc_info=True)
-                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "request_exception"}))
-                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream.'}, room=stream_id)
-                return
-            except json.JSONDecodeError:
-                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-                logger.info("ASF signed URL fetch processed (json_decode_error)", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-                logger.error(f"ASF: Failed to decode JSON response from API Gateway when fetching signed URL for GCS URI {gcs_uri} (stream {stream_id}). Response: {response.text if 'response' in locals() else 'N/A'}")
-                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "json_decode_error"}))
-                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Invalid response from internal service preparing audio stream.'}, room=stream_id)
-                return
+            # signed_url_fetch_start_time = time.time() # Initialize before try block
+            # try:
+        pass # Minimal if block
+            #     response = requests.get(signed_url_fetch_endpoint, params=params, timeout=5)
+            #     response.raise_for_status()
+            #     response_data = response.json()
+            #     signed_url_from_api_gw = response_data.get("signed_url")
+            #     # Calculate duration immediately after successful call, if needed here,
+            #     # or rely on calculation within except blocks based on the pre-try start_time
+            #     # For now, let's keep it simple and ensure start_time is always available.
+            #     # signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+            #     # logger.info("ASF signed URL fetch processed", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+            #
+            #
+            #     if not signed_url_from_api_gw:
+            #         logger.error(f"ASF: API Gateway did not return a signed_url for GCS URI {gcs_uri} (stream {stream_id}). Response: {response_data}")
+            #         logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "no_url_in_response"}))
+            #         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to obtain secure access for audio stream.'}, room=stream_id)
+            #         return
+            #     logger.info(f"ASF: Successfully obtained signed URL for GCS URI {gcs_uri} (stream {stream_id}).")
+            #
+            # except requests.exceptions.Timeout:
+            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+            #     logger.info(f"ASF signed URL fetch processed (timeout) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+            #     logger.error(f"ASF: Timeout requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}).")
+            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "timeout"}))
+            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal timeout.'}, room=stream_id)
+            #     return
+            # except requests.exceptions.HTTPError as e_http:
+            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+            #     logger.info(f"ASF signed URL fetch processed (http_error_{e_http.response.status_code}) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+            #     logger.error(f"ASF: HTTP error {e_http.response.status_code} requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}). Response: {e_http.response.text}")
+            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": f"http_error_{e_http.response.status_code}"}))
+            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal error.'}, room=stream_id)
+            #     return
+            # except requests.exceptions.RequestException as e_req:
+            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+            #     logger.info(f"ASF signed URL fetch processed (request_exception) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+            #     logger.error(f"ASF: Error requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}): {e_req}", exc_info=True)
+            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "request_exception"}))
+            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream.'}, room=stream_id)
+            #     return
+            # except json.JSONDecodeError:
+            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+            #     logger.info(f"ASF signed URL fetch processed (json_decode_error) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+            #     logger.error(f"ASF: Failed to decode JSON response from API Gateway when fetching signed URL for GCS URI {gcs_uri} (stream {stream_id}). Response: {response.text if 'response' in locals() else 'N/A'}")
+            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "json_decode_error"}))
+            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Invalid response from internal service preparing audio stream.'}, room=stream_id)
+            #     return
+            # except Exception as e_general: # Catch any other unexpected error from the try block
+            #     logger.error(f"ASF: Unexpected error while trying to get signed URL for GCS URI {gcs_uri} (stream {stream_id}): {e_general}", exc_info=True)
+            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "unexpected_exception_in_get_url"}))
+            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Unexpected error preparing audio stream.'}, room=stream_id)
+            #     return
+        # pass # Explicitly pass after the try-except block within the if
     else:
         logger.warning(f"ASF: Filepath for stream {stream_id} is not a GCS URI: '{gcs_uri}'. Attempting local streaming.")
         if not os.path.exists(gcs_uri):

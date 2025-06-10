@@ -10,6 +10,7 @@ import psycopg2 # Added
 from psycopg2.extras import RealDictCursor # Added
 from datetime import datetime
 import time # Added for metric logging
+from python_json_logger import jsonlogger # Added for JSON logging
 
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -564,5 +565,3 @@ if __name__ == "__main__":
     # The initial "JSON logging configured..." message is now part of setup_json_logging
     app.logger.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: {tda_config.get('DATABASE_TYPE')}) ---")
     app.run(host=host, port=port, debug=debug_mode)
-
-[end of aethercast/tda/main.py]

@@ -3,6 +3,7 @@ from unittest.mock import patch, MagicMock, call
 import os
 import sys
 import json
+import sqlite3 # Import sqlite3
 
 # Adjust path to import CPOA main module
 # Assuming this test file is in aethercast/cpoa/tests/
@@ -725,8 +726,9 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation(
             topic="Cached Topic",
-            task_id="task_cache_hit_001",
+            original_task_id="task_cache_hit_001", # Corrected kwarg
             db_path="dummy_cache_test.db"
+            # user_id, client_id, user_preferences, test_scenarios are optional and default to None
         )
 
         self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
@@ -805,8 +807,9 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation(
             topic="VFA Skipped Scenario",
-            task_id="task_vfa_skipped_json_001",
+            original_task_id="task_vfa_skipped_json_001", # Corrected kwarg
             db_path="dummy_vfa_skip.db"
+            # user_id, client_id, user_preferences, test_scenarios are optional and default to None
         )
 
         self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED_WITH_VFA_SKIPPED)
@@ -851,8 +854,9 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation(
             topic="VFA Error in JSON Scenario",
-            task_id="task_vfa_error_json_001",
+            original_task_id="task_vfa_error_json_001", # Corrected kwarg
             db_path="dummy_vfa_error.db"
+            # user_id, client_id, user_preferences, test_scenarios are optional and default to None
         )
 
         # This path in CPOA currently leads to CPOA_STATUS_FAILED_VFA_REPORTED_ERROR
@@ -1114,7 +1118,7 @@ class TestOrchestrateTopicExploration(unittest.TestCase):
 
         mock_orch_snippet.return_value = {"snippet_id": "snip1", "title": "Snippet for Explored Topic 1"}
 
-        result = cpoa_main.orchestrate_topic_exploration(keywords=["new keyword"], user_preferences=None, test_scenarios=None)
+        result = cpoa_main.orchestrate_topic_exploration(keywords=["new keyword"], user_preferences=None)
 
         mock_requests_retry.assert_called_once()
         self.assertEqual(mock_requests_retry.call_args[0][1], cpoa_main.TDA_SERVICE_URL)
@@ -1139,7 +1143,7 @@ class TestOrchestrateTopicExploration(unittest.TestCase):
 
         mock_orch_snippet.return_value = {"snippet_id": "snip2", "title": "Snippet for Deeper Dive"}
 
-        result = cpoa_main.orchestrate_topic_exploration(current_topic_id="orig_topic", user_preferences=None, test_scenarios=None)
+        result = cpoa_main.orchestrate_topic_exploration(current_topic_id="orig_topic", user_preferences=None)
 
         mock_get_details.assert_called_once_with(cpoa_main.CPOA_DATABASE_PATH, "orig_topic")
         mock_requests_retry.assert_called_once()
@@ -1153,13 +1157,13 @@ class TestOrchestrateTopicExploration(unittest.TestCase):
 
     def test_exploration_no_identifier_raises_error(self):
         with self.assertRaises(ValueError) as context:
-            cpoa_main.orchestrate_topic_exploration(user_preferences=None, test_scenarios=None)
+            cpoa_main.orchestrate_topic_exploration(user_preferences=None)
         self.assertIn("Cannot explore topic without a valid current_topic_id or keywords", str(context.exception))
 
     @patch.object(cpoa_main, '_get_topic_details_from_db', return_value=None)
     def test_exploration_topic_id_not_found(self, mock_get_details):
         # If only topic_id is provided and it's not found, and no keywords.
-        result = cpoa_main.orchestrate_topic_exploration(current_topic_id="unknown_topic", user_preferences=None, test_scenarios=None)
+        result = cpoa_main.orchestrate_topic_exploration(current_topic_id="unknown_topic", user_preferences=None)
         mock_get_details.assert_called_once_with(cpoa_main.CPOA_DATABASE_PATH, "unknown_topic")
         self.assertEqual(result, []) # Returns empty list as per current logic
 
@@ -1168,7 +1172,7 @@ class TestOrchestrateTopicExploration(unittest.TestCase):
     def test_exploration_tda_fails(self, mock_get_details, mock_requests_retry):
         mock_requests_retry.side_effect = requests.exceptions.RequestException("TDA down")
         with patch.object(cpoa_main.logger, 'error') as mock_logger_error:
-            result = cpoa_main.orchestrate_topic_exploration(keywords=["test"], user_preferences=None, test_scenarios=None)
+            result = cpoa_main.orchestrate_topic_exploration(keywords=["test"], user_preferences=None)
             self.assertEqual(result, [])
             self.assertTrue(any("TDA service call failed during exploration" in call_arg[0][0] for call_arg in mock_logger_error.call_args_list))
 
@@ -1179,7 +1183,7 @@ class TestOrchestrateTopicExploration(unittest.TestCase):
         mock_tda_response.json.return_value = {"topics": []} # TDA found nothing
         mock_requests_retry.return_value = mock_tda_response
 
-        result = cpoa_main.orchestrate_topic_exploration(keywords=["obscure"], user_preferences=None, test_scenarios=None)
+        result = cpoa_main.orchestrate_topic_exploration(keywords=["obscure"], user_preferences=None)
         self.assertEqual(result, [])
 
     @patch.object(cpoa_main, 'requests_with_retry')
@@ -1202,7 +1206,7 @@ class TestOrchestrateTopicExploration(unittest.TestCase):
                 return {"error": "SCA failed", "details": "SCA could not process Bad Topic"}
         mock_orch_snippet.side_effect = snippet_side_effect
 
-        result = cpoa_main.orchestrate_topic_exploration(keywords=["mixed results"], user_preferences=None, test_scenarios=None)
+        result = cpoa_main.orchestrate_topic_exploration(keywords=["mixed results"], user_preferences=None)
         self.assertEqual(len(result), 1)
         self.assertEqual(result[0]["snippet_id"], "snip_good")
         self.assertEqual(mock_orch_snippet.call_count, 2)

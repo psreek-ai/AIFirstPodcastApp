@@ -4,6 +4,12 @@ import os
 import sys
 import json
 
+# Explicitly add user site-packages to sys.path
+# This is a workaround for potential PYTHONPATH issues in the execution environment.
+user_site_packages = '/home/swebot/.local/lib/python3.10/site-packages'
+if user_site_packages not in sys.path:
+    sys.path.insert(0, user_site_packages)
+
 # Adjust path to import PSWA main module
 current_dir = os.path.dirname(os.path.abspath(__file__))
 pswa_dir = os.path.dirname(current_dir)

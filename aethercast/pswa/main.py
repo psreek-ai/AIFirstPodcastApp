@@ -139,7 +139,8 @@ Remember, your entire response must be a single JSON object conforming to the sc
         elif key == "PSWA_PERSONA_PROMPTS_MAP_PARSED":
             logger.info(f"  {key}: Loaded {len(value)} personas: {list(value.keys())}")
         elif key in ["PSWA_DEFAULT_PROMPT_USER_TEMPLATE", "PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION", "PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION"]:
-            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{str(value)[:50].replace('\n', ' ')}...')")
+            log_value_snippet = str(value)[:50].replace('\n', ' ')
+            logger.info(f"  {key}: Loaded (length: {len(value)}, first 50 chars: '{log_value_snippet}...')")
         else:
             logger.info(f"  {key}: {value}")
     logger.info("--- End PSWA Configuration ---")
@@ -668,5 +669,3 @@ if __name__ == "__main__":
     debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
     logger.info(f"--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}, DB: {pswa_config.get('DATABASE_TYPE')}) ---")
     app.run(host=host, port=port, debug=debug_mode)
-
-[end of aethercast/pswa/main.py]

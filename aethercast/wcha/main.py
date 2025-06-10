@@ -29,7 +29,13 @@ def load_wcha_configuration():
 # Moved this block before load_wcha_configuration to ensure logger is available
 logger = logging.getLogger(__name__)
 if not logger.hasHandlers():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - WCHA - %(message)s')
+    # Explicitly configure WCHA logger to prevent interference from other module's basicConfig
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - WCHA - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False # Prevent messages from also being handled by the root logger
 
 # Load configuration at startup
 load_wcha_configuration()
