@@ -1114,24 +1114,369 @@ This ensures that only explicitly authorized services can invoke your internal b
 
 ## 10. Frontend Deployment
 
-*(Placeholder: Options for deploying the frontend (e.g., using Firebase Hosting, Google Cloud Storage with a Load Balancer, or serving from the API Gateway Cloud Run instance).)*
+The Aethercast frontend consists of static HTML, CSS, and JavaScript files located in the `aethercast/fend/` directory. These files need to be deployed to a web hosting solution so users can access the Aethercast application through their browsers. There are several options for deploying these static assets on Google Cloud Platform.
+
+### 10.1. Option 1: Google Cloud Storage (GCS) with Cloud Load Balancing (Recommended for Flexibility)
+
+This approach involves hosting the static frontend files in a Google Cloud Storage bucket and using Cloud Load Balancing to serve them globally, optionally with Cloud CDN for caching.
+
+**Overview:**
+Host static files in a GCS bucket, configure it for web serving, and front it with an HTTP(S) Load Balancer for custom domain support, SSL, and CDN.
+
+**Steps:**
+
+1.  **Create a GCS Bucket for Frontend Assets:**
+    *   This bucket should be separate from the one used for media assets (`aethercast-media`).
+    *   Choose a globally unique name, e.g., `aethercast-frontend-assets-YOUR_UNIQUE_ID`.
+    *   **Make the bucket publicly accessible for website hosting:**
+        *   Grant the `roles/storage.objectViewer` IAM role to `allUsers` on this bucket.
+        *   Alternatively, for more fine-grained control (though more complex for purely static assets), keep the bucket private and use the Load Balancer to serve content, potentially with signed URLs if needed (uncommon for typical web frontends). For simplicity, public read is often used for static site buckets.
+    *   Enable website configuration on the bucket:
+        ```bash
+        gcloud storage buckets update gs://YOUR_FRONTEND_BUCKET_NAME --website-set-main-page-suffix=index.html --website-set-error-page=404.html
+        ```
+
+2.  **Upload Frontend Files:**
+    *   Use `gsutil` to upload the contents of your `aethercast/fend/` directory to the root of the bucket:
+        ```bash
+        gsutil rsync -R aethercast/fend/ gs://YOUR_FRONTEND_BUCKET_NAME/
+        ```
+    *   Ensure `index.html` is present for the main page. You might want a custom `404.html` as well.
+
+3.  **Set up HTTP(S) Load Balancer:**
+    1.  **Create an HTTP(S) Load Balancer:** Navigate to "Network Services" > "Load balancing" in the GCP Console.
+    2.  **Backend Configuration:**
+        *   Create a "Backend bucket".
+        *   Select the GCS bucket you created for frontend assets.
+        *   **Enable Cloud CDN** (optional but highly recommended for performance and caching).
+    3.  **Frontend Configuration:**
+        *   Choose HTTP/2 and HTTPS.
+        *   Reserve a static external IP address.
+        *   Create or select an SSL certificate (Google-managed certificates are free and auto-renewing).
+    4.  **Review and Create:** Finalize the load balancer setup.
+
+4.  **DNS Configuration:**
+    *   Once the load balancer is provisioned and you have its external IP address, go to your DNS provider.
+    *   Create an `A` record for your custom domain (e.g., `app.aethercast.yourdomain.com`) pointing to the load balancer's IP address.
+
+**Pros:**
+*   Highly scalable and reliable.
+*   Can leverage Google's global CDN for fast content delivery.
+*   Full support for custom domains with SSL/TLS certificates.
+*   More control over caching, headers, and routing rules via the Load Balancer.
+
+**Cons:**
+*   More complex to set up initially compared to options like Firebase Hosting.
+*   Potentially higher cost if traffic is very high (though CDN can mitigate this).
+
+### 10.2. Option 2: Firebase Hosting (Recommended for Simplicity)
+
+Firebase Hosting is a Google service specifically designed for hosting static web applications, offering a streamlined experience with built-in CDN and SSL.
+
+**Overview:**
+Use the Firebase CLI to deploy your static frontend files directly to Firebase Hosting.
+
+**Steps:**
+
+1.  **Set up a Firebase Project:**
+    *   Go to the [Firebase Console](https://console.firebase.google.com/).
+    *   Click "Add project". You can either:
+        *   Select your existing GCP project (if it's not already a Firebase project).
+        *   Create a new Firebase project (which will also create a corresponding GCP project or link to an existing one).
+
+2.  **Install Firebase CLI:**
+    If you don't have it already, install the Firebase Command Line Interface:
+    ```bash
+    npm install -g firebase-tools
+    ```
+
+3.  **Login and Initialize Firebase:**
+    *   Login to Firebase:
+        ```bash
+        firebase login
+        ```
+    *   Navigate to your Aethercast project's root directory (or `aethercast/fend/` if you want to initialize Firebase there).
+        ```bash
+        cd /path/to/aethercast # Or cd aethercast/fend
+        firebase init hosting
+        ```
+    *   Follow the prompts:
+        *   Select your Firebase project.
+        *   **Configure `firebase.json`:**
+            *   Specify your public directory. If you initialized from the root of the Aethercast project, you might set it to `aethercast/fend`. If you initialized from within `aethercast/fend`, you can set it to `.` (current directory) or just `public` if you move files there.
+                Example `firebase.json` (if initialized from Aethercast root):
+                ```json
+                {
+                  "hosting": {
+                    "public": "aethercast/fend",
+                    "ignore": [
+                      "firebase.json",
+                      "**/.*",
+                      "**/node_modules/**"
+                    ]
+                  }
+                }
+                ```
+            *   Configure as a single-page app (SPA): Say "No" if asked, as Aethercast's current frontend is not strictly an SPA needing client-side routing for all paths. `index.html` will be the entry point.
+            *   Set up automatic builds and deploys with GitHub: Choose "No" for now (can be set up later).
+
+4.  **Deploy to Firebase Hosting:**
+    After configuration, deploy your frontend:
+    ```bash
+    firebase deploy --only hosting
+    ```
+    Firebase CLI will provide you with the hosting URL(s) (e.g., `your-project-id.web.app` and `your-project-id.firebaseapp.com`). You can also easily add custom domains via the Firebase Console.
+
+**Pros:**
+*   Extremely simple and fast to set up and deploy.
+*   Generous free tier.
+*   Global CDN by default.
+*   Automatic SSL certificate provisioning for custom domains.
+*   Good integration with other Firebase services.
+
+**Cons:**
+*   May offer less granular control over caching and headers compared to a full Cloud Load Balancer setup, but sufficient for most static sites.
+
+### 10.3. Option 3: Serving from API Gateway (Cloud Run)
+
+The API Gateway service (running on Cloud Run) could continue to serve the static frontend files from its `aethercast/fend/` subdirectory, similar to how it operates in the local Docker Compose setup.
+
+**Overview:**
+Include the `aethercast/fend/` static files within the Docker image for the `api-gateway` service. The existing Flask routes in `api_gateway/main.py` for `/`, `/app.js`, `/style.css` would serve these files.
+
+**How:**
+1.  Ensure the `api_gateway/Dockerfile` correctly copies the `aethercast/fend/` directory into the image (e.g., into a location like `/app/fend` inside the container).
+2.  The Flask application in `api_gateway/main.py` would use `send_from_directory` or similar to serve these files.
+
+**Pros:**
+*   Simplest deployment if frontend files are already managed and built as part of the API Gateway's image; no additional services or configuration needed beyond the API Gateway's Cloud Run deployment.
+*   Fewer moving parts initially.
+
+**Cons:**
+*   **Not Ideal for Performance/Scale:** Cloud Run is optimized for dynamic compute, not for serving static assets at high volume. Each request for a static file would hit a Cloud Run instance.
+*   **Larger Container Image:** Including frontend assets increases the size of the `api-gateway` container image, potentially leading to slower deployments and cold starts.
+*   **Less Efficient Caching:** You lose the benefits of dedicated CDNs and optimized static asset hosting provided by GCS+LB or Firebase Hosting.
+*   **Coupling:** Tightly couples the frontend deployment lifecycle with the API Gateway backend.
+
+**Recommendation:**
+While this option mirrors the local setup, **Options 1 (GCS + Load Balancer) or 2 (Firebase Hosting) are generally recommended for production frontend hosting** due to better performance, scalability, and separation of concerns.
+
+### 10.4. Final Configuration: Pointing Frontend to API Gateway
+
+Regardless of the chosen frontend hosting method (unless serving from the API Gateway itself on the same domain), your frontend JavaScript (`aethercast/fend/app.js`) needs to know the public URL of your deployed `aethercast-api-gateway` Cloud Run service to make API calls.
+
+**Steps:**
+
+1.  **Obtain API Gateway Public URL:**
+    After deploying the `aethercast-api-gateway` service to Cloud Run (Section 7.4.1) with `--ingress=all` and `--allow-unauthenticated` (or setting up a Load Balancer in front of it), it will have a public URL like:
+    `https://aethercast-api-gateway-YOUR_PROJECT_HASH-YOUR_REGION_CODE.a.run.app`
+    Or, if you've configured a custom domain for it, use that.
+
+2.  **Update Frontend Configuration:**
+    The `aethercast/fend/app.js` file likely has a placeholder or a hardcoded URL for API calls (e.g., `const API_BASE_URL = '/api/v1';` for local proxying, or a full local URL). This needs to be updated to point to your deployed API Gateway's public URL.
+
+    *   **Manual Update (Simple):** Before uploading/deploying the frontend files, manually edit `app.js` and set a global JavaScript variable or a constant:
+        ```javascript
+        // In app.js
+        const API_BASE_URL = 'https://aethercast-api-gateway-YOUR_PROJECT_HASH-YOUR_REGION_CODE.a.run.app/api/v1';
+        // Ensure all fetch/XHR calls use this API_BASE_URL
+        ```
+    *   **Build-time Configuration (Better):** For more robust deployments, especially with CI/CD, you would typically:
+        *   Use a placeholder in your source `app.js` (e.g., `__API_BASE_URL__`).
+        *   Have a build step (e.g., using `sed`, `envsubst`, or a JavaScript bundler's environment variable injection) that replaces this placeholder with the actual API Gateway URL during the frontend build or deployment pipeline.
+        *   Alternatively, the frontend could load a `config.json` file that contains the API URL, and this `config.json` could be generated at deploy time.
+
+Ensure that Cross-Origin Resource Sharing (CORS) is correctly configured on your `aethercast-api-gateway` if the frontend is served from a different domain than the API Gateway. The Flask-CORS extension in the API Gateway should handle this, but the allowed origins might need to be updated via environment variables if not already set to be permissive (e.g., `CORS_ALLOWED_ORIGINS` or similar in the API Gateway's configuration).
 
 ## 11. Accessing the Application
 
-*(Placeholder: How to access the deployed application, including setting up DNS if a custom domain is used, and ensuring the API Gateway is publicly accessible.)*
+Once all Aethercast services and the frontend are deployed, the primary way to access the application is through the public URL of your deployed frontend.
+
+*   **Frontend URL:** This will be the URL provided by your chosen frontend hosting option:
+    *   **GCS with Cloud Load Balancing:** The custom domain you configured (e.g., `app.aethercast.yourdomain.com`) or the Load Balancer's IP address if a custom domain isn't set up yet.
+    *   **Firebase Hosting:** The URL provided by Firebase (e.g., `your-project-id.web.app` or `your-project-id.firebaseapp.com`) or any custom domain configured through Firebase.
+    *   **Serving from API Gateway:** The public URL of your `aethercast-api-gateway` Cloud Run service (e.g., `https://aethercast-api-gateway-xxxxxx-uc.a.run.app`).
+
+*   **API Interaction:** The deployed frontend should be configured (as per Section 10.4) to make API calls to the public URL of your `aethercast-api-gateway` Cloud Run service.
+
+*   **Direct API Testing:** You can also interact directly with the `aethercast-api-gateway` service's public URL (e.g., `https://aethercast-api-gateway-xxxxxx-uc.a.run.app`) using tools like Postman or `curl` for testing API endpoints. Remember that many endpoints will require JWT authentication (see API Gateway README and Section 7.4.1 Authentication Note).
 
 ## 12. Logging and Monitoring
 
-*(Placeholder: Utilizing Google Cloud's operations suite (Cloud Logging, Cloud Monitoring) to monitor the health and performance of deployed services.)*
+Google Cloud Platform provides integrated tools for logging and monitoring your deployed services, which are crucial for understanding application behavior, debugging issues, and ensuring reliability.
+
+*   **Cloud Logging:**
+    *   Cloud Run services automatically stream `stdout` and `stderr` from your containers to [Cloud Logging](https://console.cloud.google.com/logs/viewer).
+    *   You can view logs per service, filter by severity (INFO, ERROR, DEBUG), search by keywords, and view structured JSON logs if your application emits them (as Aethercast services are configured to do).
+    *   This is the primary place to look for application errors or unexpected behavior.
+
+*   **Cloud Monitoring:**
+    *   [Cloud Monitoring](https://console.cloud.google.com/monitoring) provides metrics for your Cloud Run services, including request count, latency, error rates, and container CPU/memory utilization.
+    *   It also collects metrics for other GCP services used by Aethercast, such as Cloud SQL (database connections, CPU/storage utilization), Google Cloud Storage (bucket size, requests), and Vertex AI.
+    *   You can create custom dashboards to visualize key metrics and set up alerting policies to be notified of issues (e.g., high error rates, high latency, low instance count).
+
+**Further Information:**
+Refer to the official GCP documentation for [Cloud Logging](https://cloud.google.com/logging/docs) and [Cloud Monitoring](https://cloud.google.com/monitoring/docs) for more detailed information on their features and capabilities.
 
 ## 13. CI/CD Pipeline (Conceptual Outline)
 
-*(Placeholder: A conceptual outline for setting up a CI/CD pipeline using services like Cloud Build and Artifact Registry to automate building and deploying Aethercast services.)*
+A Continuous Integration/Continuous Deployment (CI/CD) pipeline automates the process of building, testing, and deploying your application, ensuring consistency and speed. While a detailed CI/CD setup is beyond the scope of this guide, here's a conceptual outline for Aethercast on GCP:
+
+1.  **Source Control Repository:**
+    *   Use a Git repository to host your Aethercast source code (e.g., GitHub, GitLab, Bitbucket, or Google Cloud Source Repositories).
+
+2.  **Cloud Build Triggers:**
+    *   Set up [Cloud Build triggers](https://cloud.google.com/build/docs/automating-builds/create-manage-triggers) that listen for changes in your Git repository (e.g., pushes to a `main` or `production` branch, or on pull request creation/merges).
+
+3.  **Build Stage (Cloud Build using `cloudbuild.yaml`):**
+    *   When a trigger fires, Cloud Build executes a build defined in a `cloudbuild.yaml` file at the root of your repository or within each service directory.
+    *   **For each Aethercast microservice:**
+        *   A build step builds the Docker image using the service's `Dockerfile`.
+            ```yaml
+            steps:
+            - name: 'gcr.io/cloud-builders/docker'
+              args: ['build', '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/aethercast-services/${_SERVICE_NAME}:${SHORT_SHA}', '.']
+              dir: 'aethercast/${_SERVICE_NAME}' # Path to the service directory
+            ```
+        *   Another build step pushes the built image to Google Artifact Registry, tagged appropriately (e.g., with the commit SHA (`SHORT_SHA`) or a semantic version).
+            ```yaml
+            images:
+            - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/aethercast-services/${_SERVICE_NAME}:${SHORT_SHA}'
+            ```
+    *   (Optional) Include steps for running unit tests or linters before building images.
+
+4.  **Deploy Stage (Cloud Build using `cloudbuild.yaml`):**
+    *   After successful image builds and pushes, subsequent steps in the `cloudbuild.yaml` can deploy the new images to their respective Cloud Run services.
+        ```yaml
+        steps:
+        # ... (previous build and push steps)
+        - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+          entrypoint: gcloud
+          args:
+            - 'run'
+            - 'deploy'
+            - 'aethercast-${_SERVICE_NAME}' # Cloud Run service name
+            - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/aethercast-services/${_SERVICE_NAME}:${SHORT_SHA}'
+            - '--region=${_REGION}'
+            - '--platform=managed'
+            # ... include other necessary flags like service account, secrets, env vars
+        ```
+    *   **Database Migrations:** If your application requires database schema migrations, you could add a step to run these (e.g., using a Cloud Run job or a utility container) before deploying services that depend on the new schema.
+    *   **Frontend Deployment:** A step can deploy the static frontend assets to GCS, Firebase Hosting, or update the API Gateway image if serving from there.
+
+**Benefits:**
+*   **Automation:** Reduces manual effort and the risk of human error in deployments.
+*   **Consistency:** Ensures every deployment follows the same process.
+*   **Speed:** Enables faster iteration and delivery of new features or fixes.
+
+Google Cloud Build is the recommended GCP-native tool for implementing such a pipeline.
 
 ## 14. Cost Considerations
 
-*(Placeholder: Discussion of potential costs associated with the used GCP services and tips for managing and optimizing expenses.)*
+Running the Aethercast application on Google Cloud Platform will incur costs. It's important to be aware of how different services are priced and to monitor your expenses.
+
+**Main Services and Their Cost Drivers:**
+
+*   **Cloud Run:**
+    *   Priced based on vCPU-seconds, memory-seconds, number of requests, and outbound data transfer.
+    *   Offers a generous [free tier](https://cloud.google.com/run/pricing#free-tier) which might cover light usage or development.
+*   **Cloud SQL for PostgreSQL:**
+    *   Priced based on instance uptime (per hour), number of vCPUs, amount of memory, storage provisioned (per GB/month), network egress, and backup storage.
+    *   No significant free tier beyond initial GCP credits.
+*   **Google Cloud Storage (GCS):**
+    *   Priced based on the amount of data stored (per GB/month), data processing (operations like GET, PUT), and network egress.
+    *   Offers a [free tier](https://cloud.google.com/storage/pricing#Standard-Storage) for standard storage.
+*   **Artifact Registry:**
+    *   Priced based on storage for container images and network egress.
+    *   Offers a [free tier](https://cloud.google.com/artifact-registry/pricing#free-tier) for storage.
+*   **Secret Manager:**
+    *   Priced based on the number of active secret versions and access operations.
+    *   Offers a [free tier](https://cloud.google.com/secret-manager/pricing#free-tier).
+*   **Vertex AI (Imagen, LLMs, TTS):**
+    *   Pricing is usage-based and specific to each AI model/service.
+        *   **Imagen (Image Generation):** Typically per image generated, potentially varying by resolution.
+        *   **LLMs (e.g., Gemini via AIMS):** Typically per 1,000 characters or tokens of input and output.
+        *   **Cloud Text-to-Speech (via AIMS_TTS):** Typically per 1 million characters synthesized.
+    *   **This can be a significant cost component** depending on usage levels. Monitor closely.
+*   **Cloud Build:**
+    *   Priced per build minute consumed beyond the [free tier](https://cloud.google.com/build/pricing#free-tier).
+*   **Cloud Load Balancing:**
+    *   If used for the frontend, costs are based on forwarding rules, data processed, and other networking aspects.
+*   **Firebase Hosting:**
+    *   Offers a generous [free Spark plan](https://firebase.google.com/pricing) for storage and data transfer, with paid plans (Blaze) for higher usage.
+
+**Recommendations:**
+
+*   **Review GCP Pricing Documentation:** Always refer to the official [Google Cloud pricing documentation](https://cloud.google.com/pricing/) for the most up-to-date details for each service.
+*   **Use the GCP Pricing Calculator:** Estimate your costs using the [Google Cloud Pricing Calculator](https://cloud.google.com/products/calculator).
+*   **Set Up Budgets and Billing Alerts:** In the GCP Billing console, create [budgets and alerts](https://cloud.google.com/billing/docs/how-to/budgets) to be notified when costs exceed certain thresholds.
+*   **Stop or Delete Resources:** For development and testing environments, stop Cloud SQL instances when not in use (if possible, though this means data isn't accessible) and delete Cloud Run services, GCS buckets, and other resources that are not actively needed to avoid unnecessary charges. Set Cloud Run services to `--min-instances=0` to allow them to scale to zero.
 
 ## 15. Cleanup
 
-*(Placeholder: Instructions on how to delete the deployed resources to avoid ongoing charges after testing or decommissioning the application.)*
+To avoid ongoing charges after you've finished deploying, testing, or using your Aethercast deployment, it's important to delete the GCP resources you created.
+
+**Steps to Delete Resources:**
+
+*   **Cloud Run Services:**
+    Delete each deployed Cloud Run service:
+    ```bash
+    gcloud run services delete aethercast-api-gateway --region=YOUR_REGION --platform=managed
+    gcloud run services delete aethercast-aims-service --region=YOUR_REGION --platform=managed
+    # ... repeat for all other Aethercast services (tda, sca, pswa, vfa, asf, aims-tts, iga)
+    ```
+    Alternatively, delete them from the [Cloud Run page](https://console.cloud.google.com/run) in the GCP Console.
+
+*   **Cloud SQL Instance:**
+    Delete the Cloud SQL for PostgreSQL instance:
+    ```bash
+    gcloud sql instances delete aethercast-postgres-instance
+    ```
+    Or delete it from the [Cloud SQL Instances page](https://console.cloud.google.com/sql/instances) in the GCP Console. **Note:** Deleting the instance will delete all data within it. Ensure you have backups if needed.
+
+*   **Google Cloud Storage (GCS) Buckets:**
+    Delete the GCS buckets created for media assets and potentially for the frontend:
+    ```bash
+    gsutil rm -r gs://YOUR_AETHERCAST_MEDIA_BUCKET_NAME/
+    gsutil rm -r gs://YOUR_AETHERCAST_FRONTEND_ASSETS_BUCKET_NAME/ # If you created a separate one
+    ```
+    Ensure buckets are empty first, or use the `-f` flag with `gsutil rm -r` to force deletion (use with caution). Buckets can also be deleted from the [Cloud Storage browser](https://console.cloud.google.com/storage/browser).
+
+*   **Artifact Registry Repository:**
+    Delete the Docker repository created for Aethercast images:
+    ```bash
+    gcloud artifacts repositories delete aethercast-services --location=YOUR_REGION
+    ```
+    Or delete from the [Artifact Registry page](https://console.cloud.google.com/artifacts) in the GCP Console. This will delete all container images stored within it.
+
+*   **Secret Manager Secrets:**
+    Delete each secret created in Secret Manager:
+    ```bash
+    gcloud secrets delete aethercast-db-password --project=YOUR_PROJECT_ID
+    gcloud secrets delete aethercast-flask-secret-key --project=YOUR_PROJECT_ID
+    # ... repeat for all other secrets
+    ```
+    Or delete them from the [Secret Manager page](https://console.cloud.google.com/security/secret-manager).
+
+*   **Cloud Build Triggers & History:**
+    If you set up Cloud Build triggers, delete them from the [Cloud Build Triggers page](https://console.cloud.google.com/cloud-build/triggers) in the GCP Console. Build history can also be managed or cleared if necessary.
+
+*   **Firebase Hosting Site:**
+    If you used Firebase Hosting for the frontend:
+    ```bash
+    firebase hosting:disable -P YOUR_FIREBASE_PROJECT_ID
+    ```
+    You might also want to clean up the Firebase project itself if it's not used for anything else.
+
+*   **Serverless VPC Access Connector:**
+    If you created a Serverless VPC Access connector, delete it from the [VPC network > Serverless VPC Access page](https://console.cloud.google.com/networking/connectors) in the GCP Console.
+
+*   **HTTP(S) Load Balancer:**
+    If you set up a Load Balancer for the GCS frontend bucket, delete it from the [Network Services > Load balancing page](https://console.cloud.google.com/net-services/loadbalancing/loadBalancers/list) in the GCP Console. This includes deleting forwarding rules, target proxies, URL maps, and backend services/buckets associated with it. Also, release the static IP address if you reserved one.
+
+**Final Step - Project Deletion:**
+If the GCP project was created solely for this Aethercast deployment and you no longer need any resources within it, you can delete the entire project:
+```bash
+gcloud projects delete YOUR_PROJECT_ID
+```
+Or delete it from the [IAM & Admin > Settings page](https://console.cloud.google.com/iam-admin/settings) in the GCP Console. **This is irreversible and will delete all resources within the project.**
