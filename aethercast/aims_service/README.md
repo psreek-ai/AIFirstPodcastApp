@@ -44,22 +44,18 @@ Configuration is managed via environment variables, typically set in an `.env` f
 
 Key environment variables:
 
+This service requires Google Cloud Platform credentials and configuration to interact with Vertex AI. Please refer to the main project README's section on **'## GCP Prerequisites and Setup for Local Development'** for comprehensive instructions. This includes setting up your GCP project, enabling necessary APIs (especially Vertex AI API), and configuring a service account. You will need to download the service account's JSON key, name it `gcp-credentials.json`, and place it in the `aethercast/aims_service/` directory. Ensure `GCP_PROJECT_ID` and `GCP_LOCATION` are set in your `common.env` file (or in this service's `.env` file if you need to override). The `GOOGLE_APPLICATION_CREDENTIALS` variable in the `.env` file for this service must be set to `/app/gcp-credentials.json`, which is the path where the key will be mounted inside the Docker container.
+
 -   `AIMS_HOST`: Host address for the Flask server to bind to.
     -   *Default:* `0.0.0.0`
 -   `AIMS_PORT`: Port on which the AIMS service will listen.
     -   *Default:* `8000`
 -   `FLASK_DEBUG`: Enables or disables Flask's debug mode.
     -   *Default:* `True` (for development)
--   `GOOGLE_APPLICATION_CREDENTIALS`: **Required.** Path to your Google Cloud service account key JSON file. This file grants the service permission to access Vertex AI.
-    -   *Example when running locally:* `GOOGLE_APPLICATION_CREDENTIALS=./your-gcp-service-account-key.json` (place the key file in the `aims_service` directory).
-    -   *Example when running in Docker (as configured in `docker-compose.yml`):* `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (the local key file is mounted to this path in the container).
--   `GCP_PROJECT_ID`: **Required.** Your Google Cloud Project ID where Vertex AI is enabled.
-    -   *Example:* `GCP_PROJECT_ID=my-gcp-project-123`
--   `GCP_LOCATION`: **Required.** The Google Cloud location/region for Vertex AI operations (e.g., where your models are or where you want to run jobs).
-    -   *Example:* `GCP_LOCATION=us-central1`
 -   `AIMS_GOOGLE_LLM_MODEL_ID`: The default Google LLM model ID to be used if not specified in the request.
     -   *Default:* `gemini-1.0-pro`
     -   *Examples:* `gemini-1.5-pro-preview-0409`, `text-bison@001` (though Gemini is preferred for chat-like completions)
+    Details for `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_PROJECT_ID`, and `GCP_LOCATION` are covered in the paragraph above and the main project README.
 
 ## Dependencies
 
@@ -89,9 +85,7 @@ To run the AIMS service directly for development or testing:
 The AIMS service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
 
 -   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build aims_service`.
--   **Credentials in Docker:** The `docker-compose.yml` is configured to mount a local Google Cloud credentials file into the container. You must:
-    1.  Place your downloaded GCP service account key JSON file into the `./aethercast/aims_service/` directory (e.g., name it `gcp-credentials.json`).
-    2.  In your `aethercast/aims_service/.env` file, set `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json`. This path corresponds to where the file is mounted inside the container.
+-   **Credentials in Docker:** The `docker-compose.yml` file is configured to mount your GCP service account key (`gcp-credentials.json` located in `aethercast/aims_service/`) into the container at `/app/gcp-credentials.json`. Ensure your `aethercast/aims_service/.env` file has `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` set. For detailed steps on creating and placing the `gcp-credentials.json` file, see the main project README's section '## GCP Prerequisites and Setup for Local Development'.
 -   **Running with Docker Compose:**
     ```bash
     docker-compose up -d aims_service

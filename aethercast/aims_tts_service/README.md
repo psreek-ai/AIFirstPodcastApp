@@ -46,15 +46,14 @@ Configuration is managed via environment variables, typically set in an `.env` f
 
 Key environment variables:
 
+This service requires Google Cloud Platform credentials and configuration for both Google Cloud Text-to-Speech and Google Cloud Storage (for saving the generated audio files). Please refer to the main project README's section on **'## GCP Prerequisites and Setup for Local Development'** for comprehensive instructions. This includes setting up your GCP project, enabling necessary APIs (Text-to-Speech API and Cloud Storage API), creating a GCS bucket, and configuring a service account. You will need to download the service account's JSON key, name it `gcp-credentials.json`, and place it in the `aethercast/aims_tts_service/` directory. Ensure `GCP_PROJECT_ID`, `GCP_LOCATION` (for API regional endpoints if applicable), and `GCS_BUCKET_NAME` are set in your `common.env` file (or in this service's `.env` file if you need to override). The `GOOGLE_APPLICATION_CREDENTIALS` variable in the `.env` file for this service must be set to `/app/gcp-credentials.json`, which is the path where the key will be mounted inside the Docker container.
+
 -   `AIMS_TTS_HOST`: Host address for the Flask server to bind to.
     -   *Default:* `0.0.0.0`
 -   `AIMS_TTS_PORT`: Port on which the AIMS TTS service will listen.
     -   *Default:* `9000`
 -   `FLASK_DEBUG`: Enables or disables Flask's debug mode.
     -   *Default:* `False` (as per `main.py`, but `Dockerfile` sets to `True`; `main.py` value takes precedence if `.env` is used)
--   `GOOGLE_APPLICATION_CREDENTIALS`: **Required.** Path to your Google Cloud service account key JSON file. This file grants the service permission to access Google Cloud Text-to-Speech.
-    -   *Example (local):* `GOOGLE_APPLICATION_CREDENTIALS=./your-gcp-service-account-key.json`
-    -   *Example (Docker Compose):* `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (mounted path)
 -   `AIMS_TTS_DEFAULT_VOICE_ID`: Default Google TTS voice name if not specified in the request.
     -   *Default:* `en-US-Wavenet-D`
 -   `AIMS_TTS_DEFAULT_LANGUAGE_CODE`: Default language code if not specified in the request.
@@ -65,12 +64,11 @@ Key environment variables:
     -   *Default:* `1.0`
 -   `AIMS_TTS_DEFAULT_PITCH`: Default speaking pitch if not specified.
     -   *Default:* `0.0`
--   `SHARED_AUDIO_DIR_CONTAINER`: **Deprecated.** This was previously used for saving files to a shared volume. Audio is now saved directly to Google Cloud Storage (GCS). A local temporary directory might still be used internally before uploading to GCS.
-    -   *Default:* `/shared_audio/aims_tts` (but its role has changed to a temporary location if used at all).
--   `GCS_BUCKET_NAME`: **Required.** The name of the Google Cloud Storage bucket where generated audio files will be uploaded.
-    -   *Example:* `GCS_BUCKET_NAME=your-aethercast-audio-bucket`
+-   `SHARED_AUDIO_DIR_CONTAINER`: Path for temporary local audio file storage before upload to Google Cloud Storage. Primary storage for generated audio is GCS. This directory might be used for intermediate files or if local fallback is ever implemented.
+    -   *Default:* `/shared_audio/aims_tts` (its role is now primarily for temporary files).
 -   `AIMS_TTS_GCS_AUDIO_PREFIX`: **Required.** The prefix (folder path) within the GCS bucket where AIMS_TTS audio files will be stored.
     -   *Default:* `audio/aims_tts/` (Ensure it ends with a `/`).
+    Details for `GOOGLE_APPLICATION_CREDENTIALS` and `GCS_BUCKET_NAME` are covered in the paragraph above and the main project README.
 
 ## Dependencies
 
@@ -101,12 +99,7 @@ To run the AIMS TTS service directly for development or testing:
 The AIMS TTS service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
 
 -   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build aims_tts_service`.
--   **Credentials and Configuration in Docker:**
-    1.  Place your GCP service account key JSON file (e.g., `gcp-credentials.json`) into the `./aethercast/aims_tts_service/` directory.
-    2.  In your `aethercast/aims_tts_service/.env` file (or `common.env` if sourced from there), ensure:
-        -   `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path inside the container where the file will be mounted).
-        -   `GCS_BUCKET_NAME` is set to your bucket name.
-        -   `AIMS_TTS_GCS_AUDIO_PREFIX` is configured as desired.
+-   **Credentials and Configuration in Docker:** The `docker-compose.yml` file is configured to mount your GCP service account key (`gcp-credentials.json` located in `aethercast/aims_tts_service/`) into the container at `/app/gcp-credentials.json`. Ensure your `aethercast/aims_tts_service/.env` file has `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` set. Also, `GCS_BUCKET_NAME` (usually from `common.env`) and `AIMS_TTS_GCS_AUDIO_PREFIX` must be correctly configured in the environment for GCS uploads. For detailed steps on creating and placing the `gcp-credentials.json` file and setting up GCS, see the main project README's section '## GCP Prerequisites and Setup for Local Development'.
 -   **Shared Volume for Audio:** The shared volume `aethercast_audio_data` (mounted to `/shared_audio`) is no longer the primary storage for AIMS_TTS outputs. Audio is uploaded to GCS. The volume might still be used for temporary files or by other services that haven't fully migrated.
 -   **Running with Docker Compose:**
     ```bash

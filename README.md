@@ -73,6 +73,91 @@ docker-compose.yml  # Docker Compose configuration
 README.md           # This file
 ```
 
+## GCP Prerequisites and Setup for Local Development
+
+This section details the Google Cloud Platform (GCP) resources and configurations required for local development and testing of Aethercast services that interact with GCP, specifically AIMS, AIMS_TTS, IGA, and the API Gateway (for GCS operations).
+
+**A. GCP Project:**
+
+1.  **Create or Select a Project:**
+    *   If you don't have one, create a new GCP project through the [Google Cloud Console](https://console.cloud.google.com/projectcreate).
+    *   Alternatively, you can use an existing GCP project.
+2.  **Identify your Project ID (`GCP_PROJECT_ID`):**
+    *   Your Project ID is a unique string that identifies your project. You can find it on the project dashboard in the Google Cloud Console.
+    *   Ensure this is the ID, not the project name or number.
+3.  **Update `common.env`:**
+    *   Open the `common.env` file at the root of the project.
+    *   Set the `GCP_PROJECT_ID` variable to your actual GCP Project ID.
+        ```env
+        GCP_PROJECT_ID="your-gcp-project-id"
+        ```
+
+**B. Enable APIs:**
+
+For Aethercast services to function correctly, you need to enable the following APIs in your GCP project. You can enable them from the [API Library](https://console.cloud.google.com/apis/library) in the Google Cloud Console:
+
+*   Vertex AI API (`aiplatform.googleapis.com`)
+*   Cloud Storage API (`storage.googleapis.com`)
+*   Cloud SQL Admin API (`sqladmin.googleapis.com`) (Primarily for CPOA database if using Cloud SQL in future, good to enable)
+*   Artifact Registry API (`artifactregistry.googleapis.com`) (If you plan to store Docker images in GCP)
+*   Cloud Build API (`cloudbuild.googleapis.com`) (If you plan to use Cloud Build for CI/CD)
+*   Secret Manager API (`secretmanager.googleapis.com`) (If you plan to manage secrets in GCP)
+
+**C. GCS Bucket:**
+
+A Google Cloud Storage (GCS) bucket is required for storing generated media files (audio, images).
+
+1.  **Create a GCS Bucket:**
+    *   Navigate to the [Cloud Storage browser](https://console.cloud.google.com/storage/browser) in the GCP console.
+    *   Create a new bucket. The name must be globally unique.
+    *   Choose a suitable region for your bucket (e.g., `us-central1`).
+2.  **Get GCS Bucket Name (`GCS_BUCKET_NAME`):**
+    *   This is the name you assigned to your bucket in the previous step.
+3.  **Update `common.env`:**
+    *   Open the `common.env` file.
+    *   Set the `GCS_BUCKET_NAME` variable to your bucket's name.
+        ```env
+        GCS_BUCKET_NAME="your-globally-unique-bucket-name"
+        ```
+    *   Also, ensure the `GCP_LOCATION` variable in `common.env` is set. This typically corresponds to the region where you created your GCS bucket and plan to run Vertex AI jobs (e.g., `us-central1`).
+        ```env
+        GCP_LOCATION="us-central1"
+        ```
+
+**D. Service Account for Local Docker Development:**
+
+This service account (SA) and its key are primarily used for local Dockerized development and testing. They allow the services running in Docker containers on your local machine to authenticate to GCP services.
+
+1.  **Purpose:** Allows local Docker containers to impersonate a service account and access GCP resources as if they were running in GCP.
+2.  **Create a Service Account:**
+    *   In the GCP Console, navigate to "IAM & Admin" > "Service Accounts".
+    *   Click "Create Service Account".
+    *   Give it a name (e.g., `aethercast-local-dev-sa`) and an optional description.
+3.  **Download JSON Key:**
+    *   After creating the service account, select it from the list.
+    *   Go to the "Keys" tab.
+    *   Click "Add Key" > "Create new key".
+    *   Choose "JSON" as the key type and click "Create".
+    *   A JSON file will be downloaded. **Rename this file to `gcp-credentials.json`**.
+4.  **Grant IAM Roles:**
+    Grant the following minimum required IAM roles to this service account. You can do this from the "IAM" page in the GCP Console by adding the service account as a new principal:
+    *   `Vertex AI User`: Required by AIMS, AIMS_TTS, and IGA services to interact with Vertex AI models.
+    *   `Storage Object Admin`: Required by AIMS_TTS and IGA to write objects to GCS, and potentially by the API Gateway if it needs to manage objects directly (though its primary GCS interaction is generating signed URLs).
+        *   *Alternative (more granular)*: You can use `Storage Object Creator` (to allow creating/uploading files) and `Storage Object Viewer` (to allow reading files) instead of `Storage Object Admin` if you prefer stricter permissions.
+    *   `Service Account Token Creator`: This role must be granted *on the service account itself*. It is needed if this service account is used to generate signed URLs directly, which is a common pattern in local Docker setups where the application code (e.g., in API Gateway) running with these credentials creates signed URLs for client-side GCS access.
+5.  **Place `gcp-credentials.json`:**
+    Copy the downloaded and renamed `gcp-credentials.json` file into the following service directories:
+    *   `aethercast/aims_service/gcp-credentials.json`
+    *   `aethercast/aims_tts_service/gcp-credentials.json`
+    *   `aethercast/iga/gcp-credentials.json`
+    *   `aethercast/api_gateway/gcp-credentials.json`
+6.  **Configure `.env` Files:**
+    The `GOOGLE_APPLICATION_CREDENTIALS` environment variable in each service's specific `.env` file tells the Google Cloud client libraries where to find the credentials key. This variable must be set to point to the path where the key will be mounted inside the Docker containers. As per the `docker-compose.yml` configuration, this path is typically `/app/gcp-credentials.json`.
+    *   Ensure that in `aethercast/aims_service/.env`, `aethercast/aims_tts_service/.env`, `aethercast/iga/.env`, and `aethercast/api_gateway/.env`, the following line is present and correctly set:
+        ```env
+        GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json
+        ```
+
 ## Running with Docker Compose
 
 This project uses Docker Compose to manage and run the suite of microservices in a containerized environment. This is the recommended way to run the application for development and testing.
@@ -98,20 +183,9 @@ This project uses Docker Compose to manage and run the suite of microservices in
                     *   In `aethercast/vfa/.env`: `VFA_TEST_MODE_ENABLED=True` (bypasses TTS)
                     *   In `aethercast/tda/.env`: `USE_REAL_NEWS_API=False` (uses simulated news)
                     The `common.env` file sets these test modes to `True` by default, but service-specific `.env` files can override them if needed.
-            *   **Google Cloud Platform (GCP) Setup for AIMS, AIMS_TTS, IGA, and API Gateway (GCS):**
-                *   AIMS, AIMS_TTS, and IGA utilize Google Cloud Vertex AI.
-                *   AIMS_TTS, IGA, and the API Gateway interact with Google Cloud Storage (GCS).
-                *   In `common.env`, you **must** set your actual `GCP_PROJECT_ID`, `GCP_LOCATION`, and `GCS_BUCKET_NAME`.
-                *   **Create a GCS Bucket:** You need to create a Google Cloud Storage bucket. The name you choose must be globally unique. Update `GCS_BUCKET_NAME` in `common.env` with this name.
-                *   **Service Account Key:**
-                    *   Create a GCP service account.
-                    *   Grant this service account the following roles (or more fine-grained permissions):
-                        *   `Vertex AI User` (for AIMS, AIMS_TTS, IGA).
-                        *   `Storage Object Admin` (for AIMS_TTS and IGA to write objects, and API Gateway to manage them if needed). Or, more granularly: `Storage Object Creator` and `Storage Object Viewer`.
-                        *   If the service account itself will be generating signed URLs (common for local/Docker setup where ADC isn't a K8s SA), it needs `Service Account Token Creator` on itself or on a relevant Google-managed service account if using impersonation (advanced). Simpler for local dev is to ensure the SA key used has rights to sign blobs.
-                    *   Download the JSON key file for this service account.
-                    *   For **each** of the services (`aims_service`, `aims_tts_service`, `iga`, and `api_gateway` if it needs to directly manipulate GCS beyond signed URLs, though currently it only signs), place this GCP service account key JSON file (e.g., named `gcp-credentials.json`) inside their respective directories (e.g., `aethercast/aims_service/gcp-credentials.json`).
-                    *   Ensure the `.env` file for each of these services correctly sets `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` (this is the path where the key file will be mounted inside their containers as per `docker-compose.yml`).
+            *   **For Google Cloud Platform (GCP) configuration details (required for AIMS, AIMS_TTS, IGA, and GCS operations), please refer to the new '## GCP Prerequisites and Setup for Local Development' section.**
+            *   You will need to update `common.env` with your `GCP_PROJECT_ID`, `GCP_LOCATION`, and `GCS_BUCKET_NAME` as described in that section.
+            *   For services using GCP (AIMS, AIMS_TTS, IGA, API Gateway), ensure `GOOGLE_APPLICATION_CREDENTIALS` in their respective `.env` files is set as detailed in the GCP setup section.
 
 2.  **Build and Run Services:**
     Open a terminal at the project root (where `docker-compose.yml` is located) and run:

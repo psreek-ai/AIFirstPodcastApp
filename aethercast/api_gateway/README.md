@@ -53,10 +53,10 @@ Key Environment Variables:
     -   *Default in `main.py` if run directly:* `True`
 -   `FEND_DIR`: (Optional) Path to the frontend static files directory.
     -   *Note:* This is typically derived in `main.py` relative to its own location (e.g., `../fend`). Setting this environment variable can override the derivation.
--   `GCS_BUCKET_NAME`: (Optional) The name of the Google Cloud Storage bucket. While the signed URL generation can derive the bucket name from the `gs://` URI, this can be used for validation or as a default. Required if such validation is active.
+-   `GCS_BUCKET_NAME`: The name of the Google Cloud Storage bucket used for Aethercast media assets. While the signed URL generation functionality within the API Gateway can often derive the bucket name from the full `gs://` URI provided by other services, this variable can be used for validation or as a default bucket if only an object path is provided. The setup of this bucket (creation, obtaining the name) is detailed in the main project README's section **'## GCP Prerequisites and Setup for Local Development'**.
     -   *Example:* `GCS_BUCKET_NAME=your-aethercast-gcs-bucket`
--   `GOOGLE_APPLICATION_CREDENTIALS`: Path to the GCP service account key file. This is essential for the API Gateway to authenticate with GCS and generate signed URLs.
-    -   *Example (in Docker):* `/app/gcp-credentials.json` (assuming the key file is mounted there).
+-   `GOOGLE_APPLICATION_CREDENTIALS`: Path to the GCP service account key JSON file. This is essential for the API Gateway to authenticate with Google Cloud Storage (GCS) and generate signed URLs for accessing media files. The setup of the service account and the `gcp-credentials.json` key file, including its placement in the `aethercast/api_gateway/` directory for local Docker development, is detailed in the main project README's section **'## GCP Prerequisites and Setup for Local Development'**.
+    -   *Example (in Docker):* `/app/gcp-credentials.json` (assuming the key file is mounted there from `aethercast/api_gateway/gcp-credentials.json`).
 
 **Deprecated Environment Variables (for Snippet Fetching):**
 The following variables were previously used for API Gateway-level snippet caching but are no longer utilized by the `/api/v1/snippets` endpoint, as this logic is now handled by CPOA:

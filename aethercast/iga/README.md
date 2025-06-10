@@ -126,15 +126,20 @@ Key environment variables:
 -   `IGA_HOST`: Host address for the Flask server. Defaults to `0.0.0.0`.
 -   `IGA_PORT`: Port for the IGA service. Defaults to `5007`.
 -   `IGA_DEBUG_MODE`: Enables or disables Flask's debug mode (e.g., "True" or "False"). Defaults to `True`.
--   `GOOGLE_APPLICATION_CREDENTIALS`: (Optional but Recommended for explicit auth) Path to your Google Cloud service account key JSON file. If not set, Vertex AI SDK attempts to use Application Default Credentials (ADC).
--   `IGA_VERTEXAI_PROJECT_ID`: **Required.** Your Google Cloud Project ID where Vertex AI is enabled. Can fallback to `GCP_PROJECT_ID` if that env var is set.
--   `IGA_VERTEXAI_LOCATION`: **Required.** The Google Cloud location/region for Vertex AI operations (e.g., `us-central1`). Can fallback to `GCP_LOCATION` if that env var is set.
+
+This service interacts with Google Cloud Vertex AI (for image generation using Imagen models) and Google Cloud Storage (for storing the generated images). For comprehensive instructions on setting up your GCP project, enabling necessary APIs (Vertex AI API and Cloud Storage API), creating a GCS bucket, and configuring a service account, please refer to the main project README's section on **'## GCP Prerequisites and Setup for Local Development'**.
+
+Key GCP-related environment variables:
+*   `GOOGLE_APPLICATION_CREDENTIALS`: For local Docker development, if you choose to use a service account key file directly, set this to the path where the key will be mounted inside the container (e.g., `/app/gcp-credentials.json`). The `gcp-credentials.json` file (downloaded as per the main README's instructions) should be placed in the `aethercast/iga/` directory. In true cloud environments (like Cloud Run or GKE), Application Default Credentials (ADC) derived from the service's identity are preferred and this variable might not be needed.
+*   `IGA_VERTEXAI_PROJECT_ID`: Your Google Cloud Project ID where Vertex AI is enabled. This can be set specifically for IGA or will fallback to the `GCP_PROJECT_ID` defined in `common.env` if available.
+*   `IGA_VERTEXAI_LOCATION`: The Google Cloud location/region for Vertex AI operations (e.g., `us-central1`). This can be set specifically for IGA or will fallback to the `GCP_LOCATION` defined in `common.env` if available.
+*   `GCS_BUCKET_NAME`: The name of the Google Cloud Storage bucket where generated images will be uploaded. This is typically set in `common.env` as per the main GCP setup guide.
+
+Service-specific variables:
 -   `IGA_VERTEXAI_IMAGE_MODEL_ID`: The Vertex AI Imagen model ID to use.
     -   *Default:* `imagegeneration@006`
--   `IGA_GENERATED_IMAGE_DIR`: **Deprecated.** Directory path *inside the container* where generated images were temporarily saved. Images are now uploaded directly to Google Cloud Storage (GCS). A local temporary directory might still be used internally before uploading.
-    -   *Default:* `/shared_audio/iga_images` (but its role has changed to a temporary location if used at all).
--   `GCS_BUCKET_NAME`: **Required.** The name of the Google Cloud Storage bucket where generated images will be uploaded.
-    -   *Example:* `GCS_BUCKET_NAME=your-aethercast-image-bucket`
+-   `IGA_GENERATED_IMAGE_DIR`: Local path for temporary image file storage before upload to Google Cloud Storage. Primary storage for generated images is GCS. This directory might be used for intermediate files.
+    -   *Default:* `/shared_audio/iga_images` (its role is now primarily for temporary files if used at all).
 -   `IGA_GCS_IMAGE_PREFIX`: **Required.** The prefix (folder path) within the GCS bucket where IGA images will be stored.
     -   *Default:* `images/iga/` (Ensure it ends with a `/`).
 -   `IGA_DEFAULT_ASPECT_RATIO`: Default aspect ratio for generated images.
@@ -174,14 +179,7 @@ To run the IGA service directly for development or testing:
 The IGA service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
 
 -   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build iga_service`.
--   **Credentials and Configuration in Docker:**
-    *   The recommended way for services running in Google Cloud (like Cloud Run, GKE) is to use service account identity.
-    *   For local Docker development, you can mount your GCP service account key JSON file into the container.
-    *   Ensure your `.env` file for IGA (or `common.env` if sourced) sets:
-        -   `GOOGLE_APPLICATION_CREDENTIALS` to the path where this key will be mounted inside the container (e.g., `/app/gcp-credentials.json`).
-        -   `GCS_BUCKET_NAME` to your target bucket.
-        -   `IGA_GCS_IMAGE_PREFIX` as desired.
-    *   The `docker-compose.yml` should handle the mounting of credentials.
+-   **Credentials and Configuration in Docker:** For local Docker development, if using explicit service account keys, the `docker-compose.yml` file is configured to mount your GCP service account key (`gcp-credentials.json` placed in `aethercast/iga/`) into the container at `/app/gcp-credentials.json`. Ensure your `aethercast/iga/.env` file has `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` set. Also, `GCS_BUCKET_NAME` (usually from `common.env`), `IGA_VERTEXAI_PROJECT_ID`, and `IGA_VERTEXAI_LOCATION` must be correctly configured. For detailed steps on creating and placing the `gcp-credentials.json` file and setting up GCP resources, see the main project README's section '## GCP Prerequisites and Setup for Local Development'. In cloud environments, prefer Application Default Credentials.
 -   **Shared Volume for Images:** The shared volume (`aethercast_audio_data` or similar) is no longer the primary storage for IGA outputs. Images are uploaded directly to GCS. The volume might still be used for temporary files.
 -   **Running with Docker Compose:**
     ```bash
