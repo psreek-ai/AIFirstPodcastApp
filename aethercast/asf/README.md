@@ -197,3 +197,9 @@ ASF exposes internal HTTP endpoints for other services.
     -   **500 Internal Server Error:** If ASF server configuration is missing (e.g., UI namespace not loaded) or if the SocketIO emit fails internally.
         -   Example: `{"error_code": "ASF_CONFIG_ERROR_UI_NAMESPACE", "message": "...", "details": "..."}`
         -   Example: `{"error_code": "ASF_SOCKETIO_EMIT_FAILED", "message": "...", "details": "..."}`
+
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as WebSocket connection counts, audio stream lifecycle events (started, completed, errors), signed URL fetch performance, and UI update relay statistics, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs asf`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.

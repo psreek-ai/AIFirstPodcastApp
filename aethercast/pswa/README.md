@@ -174,6 +174,12 @@ flask run --host=0.0.0.0 --port=5004
             "details": "The LLM (via AIMS) indicated content was insufficient for topic: ..."
         }
         ```
+
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, AIMS (LLM) call performance, and cache utilization, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs pswa`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
     -   **50X Errors (AIMS Service Error or Parsing Failure):**
         - If AIMS call fails (e.g., timeout, AIMS returns HTTP error, AIMS response unparsable):
         ```json

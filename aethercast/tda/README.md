@@ -124,3 +124,9 @@ flask run --host=0.0.0.0 --port=5000
 ```
 **Note on Ports:** The `main.py` for TDA defaults to port 5000 in its configuration. Ensure ports are distinct for each service in a running Aethercast deployment. This README reflects the code's current default.
 ```
+
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, and NewsAPI call performance, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs tda`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.

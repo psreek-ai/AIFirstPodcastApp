@@ -118,3 +118,9 @@ The AIMS TTS service is designed to be run as a Docker container and is included
     ```
 
 The service will then be accessible to other Dockerized services (like VFA) via its service name and internal port (e.g., `http://aims_tts_service:9000`).
+
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, Google Cloud TTS call performance, and GCS upload times, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs aims_tts_service`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.

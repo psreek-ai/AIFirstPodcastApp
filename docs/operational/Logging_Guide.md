@@ -1,0 +1,97 @@
+# Logging Guide for Aethercast
+
+## 1. Introduction
+
+This guide provides an overview of the logging strategy implemented across the Aethercast microservices. Consistent, structured logging is crucial for debugging, monitoring, and understanding the behavior of the distributed system. All Python-based services in Aethercast are configured to output logs in a JSON format.
+
+## 2. Log Format (JSON)
+
+All Python services utilize the `python-json-logger` library to produce structured JSON logs. Each log entry will typically contain a set of standard fields, along with custom fields specific to the service or context of the log message.
+
+**Standard Fields (derived from `python-json-logger` and common practice):**
+
+*   `timestamp` (string): ISO 8601 formatted timestamp of when the log record was created (e.g., "2024-03-18T12:34:56.789Z"). (Renamed from `asctime`).
+*   `level` (string): Log level (e.g., "INFO", "WARNING", "ERROR", "DEBUG"). (Renamed from `levelname`).
+*   `message` (string): The main log message.
+*   `logger_name` (string): The name of the logger that emitted the record (e.g., "aethercast.api_gateway.main"). (Renamed from `name`).
+*   `module` (string): The name of the module where the logging call was made (e.g., "main").
+*   `funcName` (string): The name of the function where the logging call was made (e.g., "generate_text").
+*   `lineno` (integer): The line number in the source file where the logging call was made.
+
+**Custom Fields (added via filters or `extra` parameter):**
+
+*   `service_name` (string): Identifies the microservice that generated the log (e.g., "api-gateway", "tda", "aims-llm-service"). This is added by a custom `ServiceNameFilter`.
+*   `workflow_id` (string, optional): A unique identifier for an end-to-end CPOA orchestration workflow. Present in logs related to CPOA operations and often in logs from services called by CPOA. Defaults to "N/A" if not applicable.
+*   `task_id` (string, optional): A unique identifier for a specific task within a CPOA workflow (e.g., a call to a particular agent). Present in CPOA task-related logs. Defaults to "N/A" if not applicable.
+*   Additional custom fields (e.g., metric data) can be added via the `extra` parameter in logging calls.
+
+**Example Log Line (General):**
+```json
+{
+    "timestamp": "2024-03-18T10:00:00.123Z",
+    "level": "INFO",
+    "logger_name": "aethercast.api_gateway.main",
+    "service_name": "api-gateway",
+    "module": "main",
+    "funcName": "get_dynamic_snippets",
+    "lineno": 250,
+    "message": "Request received for /api/v1/snippets (dynamic generation)",
+    "workflow_id": "N/A",
+    "task_id": "N/A"
+}
+```
+
+## 3. General Metric Logging
+
+Key operational metrics are logged as part of the structured JSON logs for most services. This allows for metrics to be extracted, aggregated, and visualized using log analytics platforms.
+
+*   **Strategy:** Metrics are logged as distinct log entries, typically at the INFO level.
+*   **Fields:**
+    *   `metric_name` (string): The specific name of the metric (e.g., "endpoint_latency_ms", "aims_request_count").
+    *   `value` (numeric): The measured value of the metric.
+    *   `tags` (object): A nested JSON object containing key-value pairs (dimensions) that provide context for the metric. Examples: `{"endpoint": "/api/v1/generate", "status": "success"}`.
+*   **Reference:** For a complete list of defined metrics, their descriptions, and associated tags for each service, please refer to [Metrics_Definition.md](./Metrics_Definition.md).
+
+**Example Log Line (Including a Metric):**
+```json
+{
+    "timestamp": "2024-03-18T12:34:56.789Z",
+    "level": "INFO",
+    "logger_name": "aethercast.aims_service.main",
+    "service_name": "aims-llm-service",
+    "module": "main",
+    "funcName": "generate_text",
+    "lineno": 185,
+    "message": "AIMS request processed",
+    "metric_name": "aims_request_latency_ms",
+    "value": 150.75,
+    "tags": {"model_id_requested": "gemini-1.0-pro"},
+    "workflow_id": "N/A",
+    "task_id": "N/A"
+}
+```
+*Note: `workflow_id` and `task_id` are "N/A" in this example because the AIMS service itself is not directly aware of CPOA workflows. If AIMS were called as part of a CPOA workflow, the `workflow_id` and `task_id` might be propagated and logged if the calling service (e.g., CPOA via API Gateway) passed them in the `extra` field for its logs related to that AIMS call.*
+
+## 4. Viewing Logs
+
+When running the Aethercast system using `docker-compose`, logs for all services (or specific services) can be viewed using:
+
+```bash
+docker-compose logs <optional_service_name_1> <optional_service_name_2> ...
+```
+For example, to view logs for the API Gateway:
+```bash
+docker-compose logs api_gateway
+```
+To follow logs in real-time:
+```bash
+docker-compose logs -f api_gateway
+```
+Since logs are in JSON format, they can be piped to tools like `jq` for pretty-printing or further processing.
+
+## 5. Correlation
+
+*   **`workflow_id`**: This ID is generated by CPOA when a new orchestration workflow begins (e.g., generating a full podcast, fetching landing page snippets). It is passed down through `extra` in logging calls within CPOA and potentially to subsequent services if propagated. This allows tracing an entire user-facing operation across multiple internal steps and agent calls.
+*   **`task_id`**: This ID is generated by CPOA for each specific task instance it creates within a workflow (e.g., a call to TDA, then a call to SCA). It's used for logging details about individual agent interactions.
+
+These correlation IDs are crucial for debugging and understanding the flow of operations in a distributed environment. The `JsonFormatter` in each service is configured to include `%(workflow_id)s` and `%(task_id)s` in the output format, defaulting to "N/A" if not provided in the log record's `extra` data.

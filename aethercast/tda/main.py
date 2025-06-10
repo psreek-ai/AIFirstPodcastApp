@@ -9,6 +9,7 @@ import requests
 import psycopg2 # Added
 from psycopg2.extras import RealDictCursor # Added
 from datetime import datetime
+import time # Added for metric logging
 
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -463,44 +464,90 @@ def calculate_relevance_score(article: dict, query: str = None) -> float:
 # --- API Endpoint ---
 @app.route("/discover_topics", methods=["POST"])
 def discover_topics_endpoint():
+    request_start_time = time.time()
+    final_status_str = "unknown_error"
+    discovered_topics_count = 0
+
     try:
         try:
             request_data = flask.request.get_json() if flask.request.content_length else {}
         except Exception as e_json_decode:
             app.logger.warning(f"/discover_topics: Failed to decode JSON: {e_json_decode}", exc_info=True)
+            final_status_str = "validation_error_bad_json"
+            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+
         query = request_data.get("query")
         limit_raw = request_data.get("limit")
         error_trigger = request_data.get("error_trigger")
+
         if query is not None and (not isinstance(query, str) or not query.strip()):
+            final_status_str = "validation_error_query"
+            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "TDA_INVALID_QUERY", "message": "query must be non-empty string."}), 400
+
         limit = 5
         if limit_raw is not None:
             try:
                 limit = int(limit_raw)
                 if not (1 <= limit <= 50):
+                    final_status_str = "validation_error_limit_range"
+                    app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
                     return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "limit must be 1-50."}), 400
             except ValueError:
+                final_status_str = "validation_error_limit_type"
+                app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
                 return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "limit must be integer."}), 400
+
         app.logger.info(f"POST /discover_topics. Query: '{query}', Limit: {limit}, Trigger: '{error_trigger}'")
+
         if error_trigger == "tda_error":
+            final_status_str = "simulated_error"
+            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "TDA_SIMULATED_ERROR", "message": "Simulated TDA error."}), 500
         
         discovered_topics = []
         if tda_config["USE_REAL_NEWS_API"]:
             request_keywords = [k.strip() for k in query.split(',')] if query else None
+            newsapi_call_start_time = time.time()
             raw_topics_from_api = call_real_news_api(keywords=request_keywords, language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE"))
-            if raw_topics_from_api is None: # Explicit check for None indicating API call failure
-                return flask.jsonify({"error_code": "TDA_NEWSAPI_FAILURE", "message": "Failed to get topics from NewsAPI."}), 502
+            newsapi_duration_ms = (time.time() - newsapi_call_start_time) * 1000
+            app.logger.info("TDA NewsAPI call processed", extra=dict(metric_name="tda_newsapi_call_latency_ms", value=round(newsapi_duration_ms, 2)))
+
+            if raw_topics_from_api == []: # call_real_news_api returns [] on error or no results
+                 # Check logs from call_real_news_api to confirm if it was an actual error
+                app.logger.warning("NewsAPI call returned empty list, potentially an error or no results.")
+                # To definitively log tda_newsapi_error_count, call_real_news_api would need to return an error status
+                # For now, we can't distinguish easily here if [] means error or just no articles.
+                # Assuming if it's empty, it's a "no results" rather than API error for status_str here.
+                # If an error was logged inside call_real_news_api, it would be a separate log.
+                # To log tda_newsapi_error_count, we'd need a clearer error signal from call_real_news_api
             discovered_topics = raw_topics_from_api[:limit] if limit > 0 else raw_topics_from_api
         else:
             discovered_topics = identify_topics_from_sources(query=query, limit=limit)
-        
+
+        discovered_topics_count = len(discovered_topics)
+        app.logger.info("TDA topics discovered", extra=dict(metric_name="tda_topics_discovered_count", value=discovered_topics_count))
+
+        overall_latency_ms = (time.time() - request_start_time) * 1000
+        app.logger.info("TDA discover topics latency", extra=dict(metric_name="tda_discover_topics_latency_ms", value=round(overall_latency_ms, 2)))
+
         if not discovered_topics:
+            final_status_str = "success_no_topics"
+            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"message": "No topics discovered.", "topics": []}), 200
+
+        final_status_str = "success"
+        app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
         return flask.jsonify({"discovered_topics": discovered_topics}), 200
+
     except Exception as e:
         app.logger.error(f"Error in /discover_topics: {e}", exc_info=True)
+        final_status_str = "internal_server_error"
+        # Log overall latency even on error, if possible
+        overall_latency_ms_err = (time.time() - request_start_time) * 1000
+        app.logger.info("TDA discover topics latency", extra=dict(metric_name="tda_discover_topics_latency_ms", value=round(overall_latency_ms_err, 2)))
+        app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
         return flask.jsonify({"error_code": ENDPOINT_ERROR_INTERNAL_SERVER_TDA, "message": "Unexpected error."}), 500
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ import requests # For calling AIMS (LLM)
 # --- Load Environment Variables ---
 load_dotenv()
 
+import time # Added for metric logging
+
 # --- Logging Setup ---
 import logging # Moved up
 from python_json_logger import jsonlogger # Moved up
@@ -233,45 +235,57 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
 
 @app.route("/craft_snippet", methods=["POST"])
 def craft_snippet_endpoint():
+    request_start_time = time.time()
+    final_status_str = "unknown_error" # Default status
+
     try:
         try:
             request_data = flask.request.get_json()
-            if not request_data: # Handles cases where request_data is None (e.g. empty body with correct content-type)
+            if not request_data:
                 app.logger.warning("[SCA_REQUEST] /craft_snippet: Invalid or empty JSON payload received.")
+                final_status_str = "validation_error_payload"
+                app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
                 return flask.jsonify({"error_code": "SCA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
-        except Exception as e_json_decode: # Catches Werkzeug's BadRequest for malformed JSON
+        except Exception as e_json_decode:
             app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Failed to decode JSON payload: {e_json_decode}", exc_info=True)
+            final_status_str = "validation_error_bad_json"
+            app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "SCA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
 
         topic_id = request_data.get("topic_id")
         content_brief = request_data.get("content_brief")
-        topic_info = request_data.get("topic_info") # Will check type later
+        topic_info = request_data.get("topic_info")
         error_trigger = request_data.get("error_trigger")
 
-        # Validate topic_id
         if not topic_id or not isinstance(topic_id, str) or not topic_id.strip():
             app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_id' must be a non-empty string. Received: '{topic_id}'")
+            final_status_str = "validation_error_topic_id"
+            app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_ID", "message": "Validation failed: 'topic_id' must be a non-empty string."}), 400
 
-        # Validate content_brief
         if not content_brief or not isinstance(content_brief, str) or not content_brief.strip():
             app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' must be a non-empty string. Received: '{content_brief}'")
+            final_status_str = "validation_error_content_brief"
+            app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "SCA_INVALID_CONTENT_BRIEF", "message": "Validation failed: 'content_brief' must be a non-empty string."}), 400
-        # Optional: Max length for content_brief, e.g., 1000 chars
+
         CONTENT_BRIEF_MAX_LENGTH = 1000
         if len(content_brief) > CONTENT_BRIEF_MAX_LENGTH:
             app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'content_brief' length ({len(content_brief)}) exceeds max ({CONTENT_BRIEF_MAX_LENGTH}).")
+            final_status_str = "validation_error_content_brief_length"
+            app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "SCA_CONTENT_BRIEF_TOO_LONG", "message": f"Validation failed: 'content_brief' exceeds maximum length of {CONTENT_BRIEF_MAX_LENGTH} characters."}), 400
 
-        # Validate topic_info
-        if topic_info is None or not isinstance(topic_info, dict): # Must be present and a dictionary
+        if topic_info is None or not isinstance(topic_info, dict):
             app.logger.warning(f"[SCA_REQUEST] /craft_snippet: Validation failed: 'topic_info' must be a valid JSON object (dictionary). Received: {topic_info}")
+            final_status_str = "validation_error_topic_info"
+            app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_INFO", "message": "Validation failed: 'topic_info' must be a valid JSON object (dictionary)."}), 400
-
-        # error_trigger is optional and for testing, no specific validation needed for its value
 
         app.logger.info(f"[SCA_REQUEST] /craft_snippet. TopicID: '{topic_id}', Brief: '{content_brief}', Trigger: '{error_trigger}'")
         if error_trigger == "sca_error":
+            final_status_str = "simulated_sca_error"
+            app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
             return flask.jsonify({"error_code": "SCA_SIMULATED_ERROR", "message": "Simulated SCA error."}), 500
 
         prompt_parts = [f"Generate a short, engaging podcast snippet title and content (around 2-3 sentences). Subject: '{content_brief}'."]
@@ -288,22 +302,32 @@ def craft_snippet_endpoint():
         prompt = " ".join(prompt_parts)
         
         llm_model_used = "unknown"; llm_prompt_used = prompt
+
         if sca_config['USE_REAL_LLM_SERVICE']:
-            app.logger.info("Using REAL LLM service via AIMS.") # Use app.logger
+            app.logger.info("Using REAL LLM service via AIMS.")
+            aims_call_start_time = time.time()
             llm_result = call_real_llm_service(prompt, topic_info)
+            aims_duration_ms = (time.time() - aims_call_start_time) * 1000
+            app.logger.info("SCA AIMS call processed", extra=dict(metric_name="sca_aims_call_latency_ms", value=round(aims_duration_ms, 2)))
+
             if "error_code" in llm_result:
+                app.logger.error("SCA AIMS call failure", extra=dict(metric_name="sca_aims_call_failure_count", value=1, tags={"error_code": llm_result.get("error_code")}))
+                final_status_str = "aims_error"
+                app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
                 return flask.jsonify(llm_result), llm_result.get("status_code", 500)
+
             snippet_title = llm_result.get("title"); snippet_text_content = llm_result.get("text_content")
             llm_model_used = llm_result.get("llm_model_used", sca_config['SCA_LLM_MODEL_ID'])
             llm_prompt_used = llm_result.get("llm_prompt_sent", prompt)
+            final_status_str = "success" # Will be overridden if placeholder is used later, but set here for real LLM success
         else:
-            app.logger.info("Using SIMULATED/PLACEHOLDER LLM response.") # Use app.logger
+            app.logger.info("Using SIMULATED/PLACEHOLDER LLM response.")
             placeholder_result = call_aims_llm_placeholder(prompt, topic_info)
-            # Directly use title and text_content from the placeholder_result
             snippet_title = placeholder_result.get("title", "Default Placeholder Title")
             snippet_text_content = placeholder_result.get("text_content", "Default placeholder content.")
             llm_model_used = placeholder_result.get("llm_model_used", "Placeholder-v0.2")
             llm_prompt_used = placeholder_result.get("llm_prompt_sent", prompt)
+            final_status_str = "placeholder_used"
         
         snippet_id = generate_snippet_id(); timestamp = datetime.datetime.utcnow().isoformat() + "Z"
         audio_url_placeholder = f"https://aethercast.com/placeholder_audio/{snippet_id}.mp3"
@@ -314,10 +338,21 @@ def craft_snippet_endpoint():
             "generation_timestamp": timestamp, "llm_prompt_used": llm_prompt_used,
             "llm_model_used": llm_model_used, "original_topic_details_from_tda": topic_info
         }
-        app.logger.info(f"[SCA_RESPONSE] Snippet crafted: {snippet_id}. Title: '{snippet_title}'") # Use app.logger
+
+        overall_latency_ms = (time.time() - request_start_time) * 1000
+        app.logger.info("SCA craft_snippet latency", extra=dict(metric_name="sca_craft_snippet_latency_ms", value=round(overall_latency_ms, 2)))
+
+        # final_status_str would be 'success' or 'placeholder_used' here
+        app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
+        app.logger.info(f"[SCA_RESPONSE] Snippet crafted: {snippet_id}. Title: '{snippet_title}'")
         return flask.jsonify(snippet_data_object), 200
     except Exception as e:
-        app.logger.error(f"Error in /craft_snippet: {e}", exc_info=True) # Use app.logger
+        app.logger.error(f"Error in /craft_snippet: {e}", exc_info=True)
+        final_status_str = "internal_server_error"
+        # Log overall latency even on error, if possible
+        overall_latency_ms_err = (time.time() - request_start_time) * 1000
+        app.logger.info("SCA craft_snippet latency", extra=dict(metric_name="sca_craft_snippet_latency_ms", value=round(overall_latency_ms_err, 2)))
+        app.logger.info("SCA craft_snippet request completed", extra=dict(metric_name="sca_craft_snippet_request_count", value=1, tags={"status": final_status_str}))
         return flask.jsonify({"error_code": "SCA_INTERNAL_SERVER_ERROR", "message": "Unexpected SCA error.", "details": str(e)}), 500
 
 if __name__ == "__main__":

@@ -194,4 +194,10 @@ The IGA service is designed to be run as a Docker container and is included in t
 
 The service will then be accessible to other Dockerized services (like CPOA) via its service name and internal port (e.g., `http://iga_service:5007`).
 
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, Vertex AI Imagen call performance, and GCS upload times, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs iga`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+
 [end of aethercast/iga/README.md]

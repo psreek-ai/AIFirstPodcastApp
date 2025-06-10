@@ -11,6 +11,8 @@ from google.api_core import exceptions as google_exceptions
 # --- Load Environment Variables ---
 load_dotenv()
 
+import time # Added for metric logging
+
 # --- Flask App Setup ---
 app = Flask(__name__)
 
@@ -107,44 +109,70 @@ def estimate_audio_duration(text_length: int, rate: float = 1.0) -> float:
 
 @app.route('/v1/synthesize', methods=['POST'])
 def synthesize_speech():
+    request_start_time = time.time()
     request_id = f"aims-tts-req-{uuid.uuid4().hex}"
+    final_status_str = "unknown_error" # Default status for request count metric
+    # Initialize tags for the final request_count log, to be updated after parsing
+    voice_id_for_status_tag = "unknown"
+    output_format_str_for_status_tag = "unknown"
+
     logger.info(f"Request {request_id}: Received /v1/synthesize request.")
 
-    # Config checks (already done at startup, but good for belt-and-suspenders or if config could change)
     if not GOOGLE_APPLICATION_CREDENTIALS or not GCS_BUCKET_NAME:
         logger.error(f"Request {request_id}: Service not configured. GOOGLE_APPLICATION_CREDENTIALS or GCS_BUCKET_NAME is missing.")
+        final_status_str = "config_error"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "configuration_error", "message": "TTS service not fully configured."}}), 503
 
     try:
         data = request.get_json()
         if not data:
+            final_status_str = "validation_error_no_payload"
+            logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
             return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "No JSON payload."}}), 400
     except Exception as e:
+        final_status_str = "validation_error_bad_json"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}}), 400
 
     text_to_synthesize = data.get("text")
     if not text_to_synthesize or not isinstance(text_to_synthesize, str) or not text_to_synthesize.strip():
+        final_status_str = "validation_error_text"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "'text' must be non-empty string."}}), 400
+
     TEXT_MAX_LENGTH = 5000
     if len(text_to_synthesize) > TEXT_MAX_LENGTH:
+        final_status_str = "validation_error_text_length"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"'text' exceeds max length {TEXT_MAX_LENGTH}."}}), 400
 
     voice_id = data.get("voice_id", AIMS_TTS_DEFAULT_VOICE_ID)
+    voice_id_for_status_tag = voice_id # Update for final log
     if data.get("voice_id") is not None and not isinstance(data.get("voice_id"), str):
+        final_status_str = "validation_error_voice_id"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "'voice_id' must be string."}}), 400
 
     language_code = data.get("language_code", AIMS_TTS_DEFAULT_LANGUAGE_CODE)
     if data.get("language_code") is not None and (not isinstance(data.get("language_code"), str) or not data.get("language_code").strip()):
+        final_status_str = "validation_error_lang_code"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": "'language_code' must be non-empty string."}}), 400
 
     output_format_str = data.get("audio_format", AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR).upper()
+    output_format_str_for_status_tag = output_format_str # Update for final log
     if output_format_str not in AUDIO_ENCODING_MAP:
+        final_status_str = "validation_error_audio_format"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Unsupported audio_format. Supported: {list(AUDIO_ENCODING_MAP.keys())}"}}), 400
 
     try:
         speech_rate = float(data.get("speech_rate", AIMS_TTS_DEFAULT_SPEAKING_RATE))
         pitch = float(data.get("pitch", AIMS_TTS_DEFAULT_PITCH))
     except ValueError as ve:
+        final_status_str = "validation_error_rate_pitch"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "invalid_request_error", "message": f"Invalid speech_rate or pitch: {ve}"}}), 400
 
     speech_rate = max(0.25, min(speech_rate, 4.0))
@@ -164,7 +192,11 @@ def synthesize_speech():
             pitch=pitch
         )
         logger.info(f"Request {request_id}: Calling Google TTS. Voice: {voice_id}, Lang: {language_code}, Rate: {speech_rate}, Pitch: {pitch}, Format: {output_format_str}")
+
+        gcp_tts_call_start_time = time.time()
         tts_response = client.synthesize_speech(request={"input": synthesis_input, "voice": voice_params, "audio_config": audio_config})
+        gcp_tts_call_duration_ms = (time.time() - gcp_tts_call_start_time) * 1000
+        logger.info("AIMS_TTS GCP TTS call processed", extra=dict(metric_name="aims_tts_gcp_tts_call_latency_ms", value=round(gcp_tts_call_duration_ms, 2), tags={"voice_id_used": voice_id}))
 
         # Upload to GCS
         storage_client = storage.Client()
@@ -185,43 +217,57 @@ def synthesize_speech():
 
 
         logger.info(f"Request {request_id}: Uploading to GCS. Bucket: {GCS_BUCKET_NAME}, Object: {gcs_object_name}, Content-Type: {gcs_content_type}")
+        gcs_upload_start_time = time.time()
         blob.upload_from_string(tts_response.audio_content, content_type=gcs_content_type)
+        gcs_upload_duration_ms = (time.time() - gcs_upload_start_time) * 1000
+        logger.info("AIMS_TTS GCS upload processed", extra=dict(metric_name="aims_tts_gcs_upload_latency_ms", value=round(gcs_upload_duration_ms, 2)))
         logger.info(f"Request {request_id}: Successfully uploaded audio to GCS: gs://{GCS_BUCKET_NAME}/{gcs_object_name}")
 
         audio_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_object_name}"
         estimated_duration = estimate_audio_duration(len(text_to_synthesize), speech_rate)
 
-        # Optionally, save locally for debugging or if direct GCS upload fails as a fallback (not implemented here)
-        # if SHARED_AUDIO_DIR_CONTAINER:
-        #     os.makedirs(SHARED_AUDIO_DIR_CONTAINER, exist_ok=True)
-        #     local_filename = f"temp_{request_id}.{file_extension}"
-        #     local_filepath = os.path.join(SHARED_AUDIO_DIR_CONTAINER, local_filename)
-        #     with open(local_filepath, "wb") as out_file:
-        #         out_file.write(tts_response.audio_content)
-        #     logger.info(f"Request {request_id}: Audio content temporarily saved locally to: {local_filepath}")
-
+        logger.info("AIMS_TTS characters synthesized", extra=dict(metric_name="aims_tts_synthesized_chars_count", value=len(text_to_synthesize), tags={"voice_id_used": voice_id}))
 
         response_data = {
             "request_id": request_id,
             "voice_id": voice_id,
-            "audio_url": audio_gcs_uri, # GCS URI is the new audio_url
+            "audio_url": audio_gcs_uri,
             "audio_duration_seconds": estimated_duration,
             "audio_format": file_extension
         }
+
+        overall_latency_ms = (time.time() - request_start_time) * 1000
+        logger.info("AIMS_TTS request processed", extra=dict(metric_name="aims_tts_request_latency_ms", value=round(overall_latency_ms, 2), tags={"voice_id_requested": voice_id, "audio_format_requested": output_format_str}))
+        final_status_str = "success"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify(response_data), 200
 
-    except google_exceptions.GoogleAPIError as e: # Catches GCS and TTS API errors
+    except google_exceptions.GoogleAPIError as e:
         logger.error(f"Request {request_id}: Google Cloud API Error (TTS or GCS): {e}", exc_info=True)
-        error_type = "tts_failure"
-        if isinstance(e, google_exceptions.NotFound): error_type = "gcs_bucket_not_found"
-        elif isinstance(e, google_exceptions.Forbidden): error_type = "gcs_permission_denied"
-        # Add more specific GCS error mapping if needed
-        return jsonify({"request_id": request_id, "error": {"type": error_type, "message": f"Google Cloud API error: {str(e)}" }}), 500
-    except IOError as e: # For local file operations if any were re-enabled
+        error_type_tag = "gcp_api_error" # Default tag for general GCP API errors
+        is_gcs_error = False
+        if "storage.googleapis.com" in str(e).lower() or isinstance(e, (google_exceptions.NotFound, google_exceptions.Forbidden)): # Heuristic for GCS
+             is_gcs_error = True
+             if isinstance(e, google_exceptions.NotFound): error_type_tag = "gcs_bucket_not_found"
+             elif isinstance(e, google_exceptions.Forbidden): error_type_tag = "gcs_permission_denied"
+             else: error_type_tag = "gcs_other_error"
+             logger.error("AIMS_TTS GCS upload error", extra=dict(metric_name="aims_tts_gcs_upload_failure_count", value=1, tags={"error_detail": str(e)[:100]})) # Log GCS specific failure
+             final_status_str = f"gcs_upload_error_{error_type_tag}"
+        else: # Assume TTS error
+             logger.error("AIMS_TTS GCP TTS API error", extra=dict(metric_name="aims_tts_gcp_error_count", value=1, tags={"error_type": "gcp_api_error_tts"}))
+             final_status_str = "gcp_tts_error"
+
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
+        return jsonify({"request_id": request_id, "error": {"type": error_type_tag, "message": f"Google Cloud API error: {str(e)}" }}), 500
+    except IOError as e:
         logger.error(f"Request {request_id}: File system I/O Error: {e}", exc_info=True)
+        final_status_str = "io_error"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "file_system_error", "message": f"I/O error: {str(e)}" }}), 500
     except Exception as e:
         logger.error(f"Request {request_id}: Unexpected error during TTS/GCS processing: {e}", exc_info=True)
+        # final_status_str is already "unknown_error"
+        logger.info("AIMS_TTS request completed", extra=dict(metric_name="aims_tts_request_count", value=1, tags={"voice_id_requested": voice_id_for_status_tag, "audio_format_requested": output_format_str_for_status_tag, "status": final_status_str}))
         return jsonify({"request_id": request_id, "error": {"type": "internal_server_error", "message": f"An unexpected error occurred: {str(e)}" }}), 500
 
 if __name__ == '__main__':

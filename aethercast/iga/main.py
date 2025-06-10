@@ -9,6 +9,7 @@ from google.cloud import aiplatform
 from vertexai.preview.vision_models import ImageGenerationModel
 from google.cloud import storage # Added for GCS
 from google.api_core import exceptions as google_exceptions
+import time # Added for metric logging
 
 load_dotenv()
 
@@ -107,23 +108,32 @@ except Exception as e:
 
 @app.route("/generate_image", methods=["POST"])
 def generate_image_endpoint():
+    request_start_time = time.time()
+    final_status_str = "unknown_error"
     request_id = f"iga_req_{uuid.uuid4().hex[:8]}"
     app.logger.info(f"IGA Request {request_id}: Received /generate_image request.")
 
-    # Configuration check (GCS bucket is essential now)
     if not iga_config.get("GCS_BUCKET_NAME"):
         app.logger.error(f"IGA Request {request_id}: GCS_BUCKET_NAME not configured.")
+        final_status_str = "config_error_gcs_bucket"
+        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_CONFIG_ERROR_GCS_BUCKET", "message": "IGA service GCS bucket not configured."}), 503
 
     try:
         data = request.get_json()
         if not data:
+            final_status_str = "validation_error_payload"
+            app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
             return jsonify({"error_code": "IGA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload."}), 400
     except Exception as e_json_decode:
+        final_status_str = "validation_error_bad_json"
+        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_MALFORMED_JSON", "message": f"Malformed JSON: {str(e_json_decode)}"}), 400
 
     prompt = data.get("prompt")
     if not prompt or not isinstance(prompt, str) or not prompt.strip():
+        final_status_str = "validation_error_prompt_missing"
+        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_BAD_REQUEST_PROMPT_MISSING", "message": "Prompt is required."}), 400
 
     app.logger.info(f"IGA Request {request_id}: Processing prompt: '{prompt}' with model {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
@@ -131,24 +141,31 @@ def generate_image_endpoint():
     try:
         model = ImageGenerationModel.from_pretrained(iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
 
+        vertex_call_start_time = time.time()
         images_response = model.generate_images(
             prompt=prompt,
             number_of_images=1,
             aspect_ratio=iga_config['IGA_DEFAULT_ASPECT_RATIO'],
             add_watermark=iga_config['IGA_ADD_WATERMARK']
         )
+        vertex_duration_ms = (time.time() - vertex_call_start_time) * 1000
+        app.logger.info("IGA Vertex AI call processed", extra=dict(metric_name="iga_vertexai_call_latency_ms", value=round(vertex_duration_ms, 2)))
         app.logger.info(f"IGA Request {request_id}: Vertex AI call completed.")
 
         if not images_response or not images_response.images:
             app.logger.error(f"IGA Request {request_id}: No images from Vertex AI for prompt: '{prompt}'")
+            final_status_str = "vertexai_no_images"
+            # No specific vertexai_error_count here as it's not a direct API error but lack of content
+            app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
             return jsonify({"error_code": "IGA_VERTEXAI_NO_IMAGES_RETURNED", "message": "Image generation failed."}), 500
 
         image_object = images_response.images[0]
         if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
             app.logger.error(f"IGA Request {request_id}: Vertex AI image bytes missing for prompt: '{prompt}'")
+            final_status_str = "vertexai_empty_image_bytes"
+            app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
             return jsonify({"error_code": "IGA_VERTEXAI_EMPTY_IMAGE_BYTES", "message": "Image generation produced empty image."}), 500
 
-        # Upload to GCS
         storage_client = storage.Client()
         bucket = storage_client.bucket(iga_config['GCS_BUCKET_NAME'])
 
@@ -165,7 +182,10 @@ def generate_image_endpoint():
         #     gcs_content_type = 'image/jpeg'
 
         app.logger.info(f"IGA Request {request_id}: Uploading to GCS. Bucket: {iga_config['GCS_BUCKET_NAME']}, Object: {gcs_object_name}")
+        gcs_upload_start_time = time.time()
         blob.upload_from_string(image_object._image_bytes, content_type=gcs_content_type)
+        gcs_duration_ms = (time.time() - gcs_upload_start_time) * 1000
+        app.logger.info("IGA GCS upload processed", extra=dict(metric_name="iga_gcs_upload_latency_ms", value=round(gcs_duration_ms, 2)))
         image_gcs_uri = f"gs://{iga_config['GCS_BUCKET_NAME']}/{gcs_object_name}"
         app.logger.info(f"IGA Request {request_id}: Image uploaded to GCS: {image_gcs_uri}")
 
@@ -174,33 +194,64 @@ def generate_image_endpoint():
             "prompt_used": prompt,
             "model_version": f"vertex-ai-{iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}"
         }
+
+        overall_latency_ms = (time.time() - request_start_time) * 1000
+        app.logger.info("IGA generate_image latency", extra=dict(metric_name="iga_generate_image_latency_ms", value=round(overall_latency_ms, 2)))
+        final_status_str = "success"
+        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify(response_data), 200
 
     except google_exceptions.InvalidArgument as e:
         app.logger.error(f"IGA Request {request_id}: Vertex AI Invalid Argument: {e}", exc_info=True)
+        app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "invalid_argument"}))
+        final_status_str = "vertexai_error_invalid_argument"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_VERTEXAI_INVALID_ARGUMENT", "message": f"Invalid argument for Vertex AI: {e}"}), 400
     except google_exceptions.PermissionDenied as e:
         app.logger.error(f"IGA Request {request_id}: Vertex AI Permission Denied: {e}", exc_info=True)
+        app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "permission_denied"}))
+        final_status_str = "vertexai_error_permission_denied"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_VERTEXAI_PERMISSION_DENIED", "message": f"Vertex AI Permission Denied: {e}"}), 403
     except google_exceptions.ResourceExhausted as e:
         app.logger.error(f"IGA Request {request_id}: Vertex AI Resource Exhausted: {e}", exc_info=True)
+        app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "resource_exhausted"}))
+        final_status_str = "vertexai_error_resource_exhausted"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_VERTEXAI_RESOURCE_EXHAUSTED", "message": f"Vertex AI Resource Exhausted (quota): {e}"}), 429
     except google_exceptions.FailedPrecondition as e:
         app.logger.warning(f"IGA Request {request_id}: Vertex AI Failed Precondition (often safety filters): {e}", exc_info=True)
         error_message = f"Vertex AI: {e}"
         error_code = "IGA_VERTEXAI_FAILED_PRECONDITION"
+        error_type_tag = "failed_precondition"
         if "blocked" in str(e).lower() and ("safety" in str(e).lower() or "policy" in str(e).lower()):
             error_code = "IGA_VERTEXAI_PROMPT_BLOCKED_SAFETY"
             error_message = f"Prompt blocked by safety filters: {e}"
+            error_type_tag = "safety_blocked"
+        app.logger.warning("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": error_type_tag}))
+        final_status_str = f"vertexai_error_{error_type_tag}"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": error_code, "message": error_message}), 400
     except google_exceptions.GoogleCloudError as e: # Catch other GCS or general Google API errors
         app.logger.error(f"IGA Request {request_id}: Google Cloud API Error (Vertex AI or GCS): {e}", exc_info=True)
+        # Determine if it's more likely GCS or Vertex and log specific failure count
+        if "storage.googleapis.com" in str(e).lower(): # Heuristic for GCS
+            app.logger.error("IGA GCS upload error", extra=dict(metric_name="iga_gcs_upload_failure_count", value=1, tags={"error_detail": str(e)[:100]}))
+            final_status_str = "gcs_upload_error"
+        else: # Assume Vertex error if not clearly GCS
+            app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "general_google_cloud_error"}))
+            final_status_str = "vertexai_error_google_cloud"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_GOOGLE_CLOUD_ERROR", "message": f"Google Cloud API error: {e}"}), 500
-    except IOError as e: # Should be less likely now with direct GCS upload
+    except IOError as e:
         app.logger.error(f"IGA Request {request_id}: I/O Error (unexpected if not saving locally): {e}", exc_info=True)
+        final_status_str = "io_error"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_IO_ERROR", "message": f"I/O error: {e}"}), 500
     except Exception as e:
         app.logger.error(f"IGA Request {request_id}: Unexpected error in /generate_image: {e}", exc_info=True)
+        # final_status_str is already "unknown_error"
+        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_INTERNAL_SERVER_ERROR", "message": f"Unexpected error: {e}"}), 500
 
 if __name__ == "__main__":

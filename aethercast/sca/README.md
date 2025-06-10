@@ -142,4 +142,10 @@ While SCA is typically called by CPOA, its Flask application can be run as a sta
         }
         ```
 
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, and AIMS (LLM) call performance, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs sca`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+
 [end of aethercast/sca/README.md]

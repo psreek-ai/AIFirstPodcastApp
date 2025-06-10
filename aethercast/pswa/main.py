@@ -438,13 +438,16 @@ def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
 
 # --- Main Script Weaving Logic ---
 def weave_script(content: str, topic: str) -> dict:
-    # (Function content largely remains the same, except for DB calls)
     logger.info(f"[PSWA_MAIN_LOGIC] weave_script called for topic: '{topic}'")
-    script_id_base = f"pswa_script_{str(uuid.uuid4())}" # Use full UUID for script_id
+    script_id_base = f"pswa_script_{str(uuid.uuid4())}"
+    status_for_metric = "unknown_error" # Default status for metrics
+    aims_call_latency_ms = None # Initialize
 
     if pswa_config.get('PSWA_TEST_MODE_ENABLED'):
         scenario = request.headers.get('X-Test-Scenario', 'default')
         logger.info(f"[PSWA_MAIN_LOGIC] Test mode enabled. Scenario: '{scenario}' for topic '{topic}'.")
+        status_for_metric = f"test_mode_scenario_{scenario}"
+
         script_content_to_return = SCENARIO_DEFAULT_SCRIPT_CONTENT.copy()
         source_info = f"test_mode_scenario_{scenario}"
         if scenario == 'insufficient_content':
@@ -454,20 +457,26 @@ def weave_script(content: str, topic: str) -> dict:
             script_content_to_return[KEY_SEGMENTS][0][KEY_CONTENT] = f"[ERROR] Insufficient content for test topic: {topic}"
         elif scenario == 'empty_segments': script_content_to_return = SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT.copy()
         else: script_content_to_return[KEY_TITLE] = f"Test Mode: {topic}"; script_content_to_return.get(KEY_INTRO, f"This is the intro for test topic: {topic}.")
+
         final_test_script = {"script_id": f"{script_id_base}_test_{scenario}", "topic": topic, "llm_model_used": "test-mode-model", "source": source_info}
         final_test_script.update(script_content_to_return)
         if KEY_SEGMENTS not in final_test_script: final_test_script[KEY_SEGMENTS] = []
         raw_script_output = {"error": "Insufficient content", "message": f"The provided content was not sufficient... topic: {topic}"} if scenario == 'insufficient_content' else script_content_to_return
         final_test_script["full_raw_script"] = json.dumps(raw_script_output)
-        return final_test_script
+        return {"script_data": final_test_script, "status_for_metric": status_for_metric}
 
     topic_hash = _calculate_content_hash(topic, content)
     if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        # _get_cached_script no longer takes db_path
         cached_script = _get_cached_script(topic_hash, pswa_config['PSWA_SCRIPT_CACHE_MAX_AGE_HOURS'])
         if cached_script:
             logger.info(f"[PSWA_MAIN_LOGIC] Returning cached script for topic '{topic}', hash {topic_hash}")
-            return cached_script # source is already in cached_script
+            logger.info("PSWA cache hit", extra=dict(metric_name="pswa_cache_hit_count", value=1, tags={"topic_hash": topic_hash}))
+            status_for_metric = "success_cache_hit"
+            # Ensure the 'source' key is present as expected by downstream if it's from cache
+            if 'source' not in cached_script: cached_script['source'] = "cache"
+            return {"script_data": cached_script, "status_for_metric": status_for_metric}
+        else:
+            logger.info("PSWA cache miss", extra=dict(metric_name="pswa_cache_miss_count", value=1, tags={"topic_hash": topic_hash}))
 
     logger.info(f"[PSWA_MAIN_LOGIC] No cache for topic '{topic}'. Calling AIMS service.")
     current_topic = topic or "an interesting subject"
@@ -516,56 +525,117 @@ def weave_script(content: str, topic: str) -> dict:
     if pswa_config.get('PSWA_LLM_JSON_MODE'): aims_payload["response_format"] = {"type": "json_object"}
     aims_url = pswa_config.get('AIMS_SERVICE_URL'); aims_timeout = pswa_config.get('AIMS_REQUEST_TIMEOUT_SECONDS')
     logger.info(f"[PSWA_MAIN_LOGIC] Sending request to AIMS. URL: {aims_url}, Payload: {json.dumps(aims_payload)}")
+
+    aims_call_start_time = time.time()
     try:
         response = requests.post(aims_url, json=aims_payload, timeout=aims_timeout)
         response.raise_for_status()
         aims_response_data = response.json()
+        aims_call_latency_ms = (time.time() - aims_call_start_time) * 1000
+        logger.info("PSWA AIMS call processed", extra=dict(metric_name="pswa_aims_call_latency_ms", value=round(aims_call_latency_ms, 2)))
+
         if not aims_response_data.get("choices") or not aims_response_data["choices"][0].get("text"):
             raise ValueError("AIMS response missing 'choices[0].text'.")
         raw_script_text_from_aims = aims_response_data["choices"][0]["text"].strip()
         llm_model_reported_by_aims = aims_response_data.get("model_id", pswa_config.get('PSWA_LLM_MODEL'))
         if "usage" in aims_response_data: logger.info(f"AIMS usage: {aims_response_data['usage']}")
         logger.info(f"Received script from AIMS (model: {llm_model_reported_by_aims}). Length: {len(raw_script_text_from_aims)}")
+
         parsed_script = parse_llm_script_output(raw_script_text_from_aims, current_topic)
         parsed_script["llm_model_used"] = llm_model_reported_by_aims
         parsed_script["source"] = "generation_via_aims"
-        # Ensure script_id in parsed_script is a UUID string for DB
         parsed_script["script_id"] = str(uuid.UUID(parsed_script.get("script_id", uuid.uuid4())))
 
-
         if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED') and not (parsed_script.get("segments") and parsed_script["segments"][0].get("segment_title") == "ERROR"):
-            # _save_script_to_cache no longer takes db_path
             _save_script_to_cache(parsed_script["script_id"], topic_hash, parsed_script, llm_model_reported_by_aims)
-        return parsed_script
-    except requests.exceptions.Timeout as e_timeout: err_msg = f"AIMS request timed out: {e_timeout}"; logger.error(err_msg); return {"error_code": "PSWA_AIMS_TIMEOUT", "message": "AIMS request timed out.", "details": err_msg, "source": "error"}
-    except requests.exceptions.HTTPError as e_http: err_msg = f"AIMS HTTP error {e_http.response.status_code}: {e_http.response.text}"; logger.error(err_msg); return {"error_code": "PSWA_AIMS_HTTP_ERROR", "message": f"AIMS HTTP error {e_http.response.status_code}.", "details": e_http.response.text, "source": "error"}
-    except requests.exceptions.RequestException as e_req: err_msg = f"AIMS request error: {e_req}"; logger.error(err_msg); return {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "AIMS communication failed.", "details": err_msg, "source": "error"}
-    except (json.JSONDecodeError, ValueError) as e_parse: err_msg = f"Could not decode/parse AIMS response: {e_parse}."; logger.error(err_msg); return {"error_code": "PSWA_AIMS_BAD_RESPONSE", "message": "AIMS response invalid.", "details": err_msg, "source": "error"}
-    except Exception as e: err_msg = f"Unexpected error with AIMS: {e}"; logger.error(err_msg, exc_info=True); return {"error_code": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected AIMS error.", "details": err_msg, "source": "error"}
+
+        status_for_metric = "success_generation"
+        return {"script_data": parsed_script, "status_for_metric": status_for_metric, "aims_call_latency_ms": aims_call_latency_ms}
+
+    except requests.exceptions.Timeout as e_timeout:
+        aims_call_latency_ms = (time.time() - aims_call_start_time) * 1000 # Log latency even on timeout
+        logger.info("PSWA AIMS call processed (timeout)", extra=dict(metric_name="pswa_aims_call_latency_ms", value=round(aims_call_latency_ms, 2)))
+        logger.error(f"AIMS request timed out: {e_timeout}")
+        logger.error("PSWA AIMS call failure", extra=dict(metric_name="pswa_aims_call_failure_count", value=1, tags={"error_type": "timeout"}))
+        status_for_metric = "aims_timeout_error"
+        return {"error_data": {"error_code": "PSWA_AIMS_TIMEOUT", "message": "AIMS request timed out.", "details": str(e_timeout), "source": "error"}, "status_for_metric": status_for_metric}
+    except requests.exceptions.HTTPError as e_http:
+        aims_call_latency_ms = (time.time() - aims_call_start_time) * 1000
+        logger.info("PSWA AIMS call processed (http_error)", extra=dict(metric_name="pswa_aims_call_latency_ms", value=round(aims_call_latency_ms, 2)))
+        logger.error(f"AIMS HTTP error {e_http.response.status_code}: {e_http.response.text}")
+        logger.error("PSWA AIMS call failure", extra=dict(metric_name="pswa_aims_call_failure_count", value=1, tags={"error_type": f"http_error_{e_http.response.status_code}"}))
+        status_for_metric = f"aims_http_error_{e_http.response.status_code}"
+        return {"error_data": {"error_code": "PSWA_AIMS_HTTP_ERROR", "message": f"AIMS HTTP error {e_http.response.status_code}.", "details": e_http.response.text, "source": "error"}, "status_for_metric": status_for_metric}
+    except requests.exceptions.RequestException as e_req:
+        aims_call_latency_ms = (time.time() - aims_call_start_time) * 1000
+        logger.info("PSWA AIMS call processed (request_exception)", extra=dict(metric_name="pswa_aims_call_latency_ms", value=round(aims_call_latency_ms, 2)))
+        logger.error(f"AIMS request error: {e_req}")
+        logger.error("PSWA AIMS call failure", extra=dict(metric_name="pswa_aims_call_failure_count", value=1, tags={"error_type": "request_exception"}))
+        status_for_metric = "aims_request_error"
+        return {"error_data": {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "AIMS communication failed.", "details": str(e_req), "source": "error"}, "status_for_metric": status_for_metric}
+    except (json.JSONDecodeError, ValueError) as e_parse:
+        # Latency might not be fully accurate if error is in parsing response, but log what we have
+        if aims_call_start_time: aims_call_latency_ms = (time.time() - aims_call_start_time) * 1000
+        if aims_call_latency_ms: logger.info("PSWA AIMS call processed (parse_error)", extra=dict(metric_name="pswa_aims_call_latency_ms", value=round(aims_call_latency_ms, 2)))
+        logger.error(f"Could not decode/parse AIMS response: {e_parse}.")
+        logger.error("PSWA AIMS call failure", extra=dict(metric_name="pswa_aims_call_failure_count", value=1, tags={"error_type": "parse_error"}))
+        status_for_metric = "aims_bad_response"
+        return {"error_data": {"error_code": "PSWA_AIMS_BAD_RESPONSE", "message": "AIMS response invalid.", "details": str(e_parse), "source": "error"}, "status_for_metric": status_for_metric}
+    except Exception as e:
+        if aims_call_start_time: aims_call_latency_ms = (time.time() - aims_call_start_time) * 1000
+        if aims_call_latency_ms: logger.info("PSWA AIMS call processed (unknown_error)", extra=dict(metric_name="pswa_aims_call_latency_ms", value=round(aims_call_latency_ms, 2)))
+        logger.error(f"Unexpected error with AIMS: {e}", exc_info=True)
+        logger.error("PSWA AIMS call failure", extra=dict(metric_name="pswa_aims_call_failure_count", value=1, tags={"error_type": "unknown_aims_error"}))
+        status_for_metric = "aims_unknown_error"
+        return {"error_data": {"error_code": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected AIMS error.", "details": str(e), "source": "error"}, "status_for_metric": status_for_metric}
 
 # --- Flask Endpoint ---
-# (Remains the same, validation and error handling are already robust)
 @app.route('/weave_script', methods=['POST'])
 def handle_weave_script():
+    request_start_time = time.time()
+    final_status_str = "unknown_error" # For request_count metric
+
     logger.info("[PSWA_FLASK_ENDPOINT] Received request for /weave_script")
     try:
         data = request.get_json()
         if not data:
+            final_status_str = "validation_error_payload"
+            logger.info("PSWA request completed", extra=dict(metric_name="pswa_weave_script_request_count", value=1, tags={"status": final_status_str}))
             return jsonify({"error_code": "PSWA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload."}), 400
     except Exception as e_json_decode:
+        final_status_str = "validation_error_bad_json"
+        logger.info("PSWA request completed", extra=dict(metric_name="pswa_weave_script_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "PSWA_MALFORMED_JSON", "message": f"Malformed JSON: {e_json_decode}"}), 400
 
     content = data.get(KEY_CONTENT); topic = data.get(KEY_TOPIC)
     if not content or not isinstance(content, str) or not content.strip():
+        final_status_str = "validation_error_content"
+        logger.info("PSWA request completed", extra=dict(metric_name="pswa_weave_script_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "PSWA_INVALID_CONTENT", "message": f"'{KEY_CONTENT}' must be non-empty string."}), 400
+
     CONTENT_MIN_LENGTH = 50; CONTENT_MAX_LENGTH = 50000
-    if len(content) < CONTENT_MIN_LENGTH: logger.warning(f"Content length ({len(content)}) < min ({CONTENT_MIN_LENGTH}).")
-    if len(content) > CONTENT_MAX_LENGTH: return jsonify({"error_code": "PSWA_CONTENT_TOO_LONG", "message": f"Content exceeds max length {CONTENT_MAX_LENGTH}."}), 400
+    if len(content) < CONTENT_MIN_LENGTH:
+        logger.warning(f"Content length ({len(content)}) < min ({CONTENT_MIN_LENGTH}).")
+        # Not treating as a validation error for status, but good to know.
+    if len(content) > CONTENT_MAX_LENGTH:
+        final_status_str = "validation_error_content_length"
+        logger.info("PSWA request completed", extra=dict(metric_name="pswa_weave_script_request_count", value=1, tags={"status": final_status_str}))
+        return jsonify({"error_code": "PSWA_CONTENT_TOO_LONG", "message": f"Content exceeds max length {CONTENT_MAX_LENGTH}."}), 400
+
     if not topic or not isinstance(topic, str) or not topic.strip():
+        final_status_str = "validation_error_topic"
+        logger.info("PSWA request completed", extra=dict(metric_name="pswa_weave_script_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "PSWA_INVALID_TOPIC", "message": f"'{KEY_TOPIC}' must be non-empty string."}), 400
 
     logger.info(f"[PSWA_FLASK_ENDPOINT] Calling weave_script for topic: '{topic}'")
-    result_data = weave_script(content, topic)
+    weave_result = weave_script(content, topic)
+
+    result_data = weave_result.get("script_data", weave_result.get("error_data"))
+    final_status_str = weave_result.get("status_for_metric", "unknown_weave_script_status")
+
+    overall_latency_ms = (time.time() - request_start_time) * 1000
+    logger.info("PSWA weave_script latency", extra=dict(metric_name="pswa_weave_script_latency_ms", value=round(overall_latency_ms, 2)))
+    logger.info("PSWA request completed", extra=dict(metric_name="pswa_weave_script_request_count", value=1, tags={"status": final_status_str}))
 
     if "error_code" in result_data:
         error_code = result_data["error_code"]; message = result_data.get("message", "Error processing script.")
@@ -573,10 +643,15 @@ def handle_weave_script():
         if error_code == "PSWA_AIMS_TIMEOUT": http_status = 504
         elif error_code in ["PSWA_AIMS_HTTP_ERROR", "PSWA_AIMS_BAD_RESPONSE", "PSWA_AIMS_BAD_RESPONSE_JSON"]: http_status = 502
         return jsonify({"error_code": error_code, "message": message, "details": result_data.get("details")}), http_status
+
     if result_data.get(KEY_SEGMENTS) and result_data[KEY_SEGMENTS][0].get(KEY_SEGMENT_TITLE) == SEGMENT_TITLE_ERROR:
+        # This indicates insufficient content as per LLM's structured error
         return jsonify({"error_code": "PSWA_INSUFFICIENT_CONTENT", "message": "Content insufficient (LLM reported).", "details": result_data[KEY_SEGMENTS][0].get(KEY_CONTENT) }), 400
+
     if not result_data.get(KEY_TITLE) or not any(s.get(KEY_SEGMENT_TITLE) == SEGMENT_TITLE_INTRO for s in result_data.get(KEY_SEGMENTS,[])):
+         # This indicates a failure in parsing or LLM not adhering to structure
          return jsonify({ "error_code": "PSWA_SCRIPT_PARSING_FAILURE", "message": "Failed to parse script structure from AIMS."}), 500
+
     return jsonify(result_data)
 
 if __name__ == "__main__":

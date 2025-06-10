@@ -124,15 +124,19 @@ stream_id_to_filepath_map = {} # Stores mapping from stream_id to GCS URI or loc
 @socketio.on('connect', namespace='/api/v1/podcasts/stream')
 def handle_connect():
     logger.info(f"ASF: Client connected with sid: {flask.request.sid} to audio namespace.")
+    logger.info("ASF WebSocket connection", extra=dict(metric_name="asf_websocket_connection_count", value=1, tags={"namespace": "/api/v1/podcasts/stream", "status": "connected"}))
     emit(AUDIO_EVENT_CONNECT_ACK, {'message': 'Connected to ASF. Please send join_stream with your stream_id.'})
 
 @socketio.on('join_stream', namespace='/api/v1/podcasts/stream')
 def handle_join_stream(data):
     stream_id = data.get('stream_id')
     client_sid = flask.request.sid
+    stream_id_prefix_tag = stream_id[:8] if stream_id else "unknown"
+
     if not stream_id:
         logger.warning(f"ASF: Client {client_sid} tried to join stream without stream_id.")
         emit(AUDIO_EVENT_ERROR, {'message': 'stream_id is required for join_stream.'})
+        # Could log an error count here if desired, but it's more of a client protocol error
         return
 
     join_room(stream_id)
@@ -140,13 +144,16 @@ def handle_join_stream(data):
 
     gcs_uri = stream_id_to_filepath_map.get(stream_id)
 
-    if not gcs_uri: # Filepath is now GCS URI
+    if not gcs_uri:
         logger.error(f"ASF: Stream ID {stream_id} not found in map. Cannot stream audio.")
+        logger.error("ASF audio stream error", extra=dict(metric_name="asf_audio_stream_error_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag, "reason": "stream_id_not_found_in_map"}))
         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio stream ID not found or not yet processed.'}, room=stream_id)
         return
 
     emit(AUDIO_EVENT_STREAM_STATUS, {'status': 'joined', 'stream_id': stream_id, 'message': f'Successfully joined stream {stream_id}. Preparing to stream audio.'}, room=stream_id)
     logger.info(f"ASF: Starting audio stream for {stream_id} from GCS URI: {gcs_uri}")
+    logger.info("ASF audio stream started", extra=dict(metric_name="asf_audio_stream_started_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag}))
+
 
     chunk_size = asf_config.get('ASF_CHUNK_SIZE', 4096)
     stream_sleep_interval = asf_config.get('ASF_STREAM_SLEEP_INTERVAL', 0.01)
@@ -166,43 +173,58 @@ def handle_join_stream(data):
 
             logger.debug(f"ASF: Requesting signed URL for GCS URI '{gcs_uri}' from endpoint: {signed_url_fetch_endpoint}")
 
-            # Using a short timeout for this internal call
-            response = requests.get(signed_url_fetch_endpoint, params=params, timeout=5)
-            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            signed_url_fetch_start_time = time.time()
+            try:
+                response = requests.get(signed_url_fetch_endpoint, params=params, timeout=5)
+                response.raise_for_status()
+                response_data = response.json()
+                signed_url_from_api_gw = response_data.get("signed_url")
+                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+                logger.info("ASF signed URL fetch processed", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
 
-            response_data = response.json()
-            signed_url_from_api_gw = response_data.get("signed_url")
+                if not signed_url_from_api_gw:
+                    logger.error(f"ASF: API Gateway did not return a signed_url for GCS URI {gcs_uri} (stream {stream_id}). Response: {response_data}")
+                    logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "no_url_in_response"}))
+                    emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to obtain secure access for audio stream.'}, room=stream_id)
+                    return
+                logger.info(f"ASF: Successfully obtained signed URL for GCS URI {gcs_uri} (stream {stream_id}).")
 
-            if not signed_url_from_api_gw:
-                logger.error(f"ASF: API Gateway did not return a signed_url for GCS URI {gcs_uri} (stream {stream_id}). Response: {response_data}")
-                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to obtain secure access for audio stream.'}, room=stream_id)
+            except requests.exceptions.Timeout:
+                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+                logger.info("ASF signed URL fetch processed (timeout)", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+                logger.error(f"ASF: Timeout requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}).")
+                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "timeout"}))
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal timeout.'}, room=stream_id)
                 return
-            logger.info(f"ASF: Successfully obtained signed URL for GCS URI {gcs_uri} (stream {stream_id}).")
-
-        except requests.exceptions.Timeout:
-            logger.error(f"ASF: Timeout requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}).")
-            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal timeout.'}, room=stream_id)
-            return
-        except requests.exceptions.HTTPError as e_http:
-            logger.error(f"ASF: HTTP error {e_http.response.status_code} requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}). Response: {e_http.response.text}")
-            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal error.'}, room=stream_id)
-            return
-        except requests.exceptions.RequestException as e_req:
-            logger.error(f"ASF: Error requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}): {e_req}", exc_info=True)
-            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream.'}, room=stream_id)
-            return
-        except json.JSONDecodeError:
-            logger.error(f"ASF: Failed to decode JSON response from API Gateway when fetching signed URL for GCS URI {gcs_uri} (stream {stream_id}). Response: {response.text if 'response' in locals() else 'N/A'}")
-            emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Invalid response from internal service preparing audio stream.'}, room=stream_id)
-            return
-    else: # If it's not a GCS URI, assume it's a local path (legacy or testing)
+            except requests.exceptions.HTTPError as e_http:
+                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+                logger.info(f"ASF signed URL fetch processed (http_error_{e_http.response.status_code})", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+                logger.error(f"ASF: HTTP error {e_http.response.status_code} requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}). Response: {e_http.response.text}")
+                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": f"http_error_{e_http.response.status_code}"}))
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal error.'}, room=stream_id)
+                return
+            except requests.exceptions.RequestException as e_req:
+                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+                logger.info("ASF signed URL fetch processed (request_exception)", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+                logger.error(f"ASF: Error requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}): {e_req}", exc_info=True)
+                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "request_exception"}))
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream.'}, room=stream_id)
+                return
+            except json.JSONDecodeError:
+                signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
+                logger.info("ASF signed URL fetch processed (json_decode_error)", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
+                logger.error(f"ASF: Failed to decode JSON response from API Gateway when fetching signed URL for GCS URI {gcs_uri} (stream {stream_id}). Response: {response.text if 'response' in locals() else 'N/A'}")
+                logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "json_decode_error"}))
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Invalid response from internal service preparing audio stream.'}, room=stream_id)
+                return
+    else:
         logger.warning(f"ASF: Filepath for stream {stream_id} is not a GCS URI: '{gcs_uri}'. Attempting local streaming.")
         if not os.path.exists(gcs_uri):
             logger.error(f"ASF: Local audio file not found for stream ID {stream_id} at path: {gcs_uri}")
+            logger.error("ASF audio stream error", extra=dict(metric_name="asf_audio_stream_error_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag, "reason": "local_file_not_found"}))
             emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Audio file unavailable for this stream.'}, room=stream_id)
             return
-        # For local files, the "signed URL" is just the path itself for the subsequent logic
-        signed_url_from_api_gw = gcs_uri # This will make the 'requests.get' logic below fail for local files. This needs to be handled.
+        signed_url_from_api_gw = gcs_uri
 
     # --- Streaming Logic ---
     try:
@@ -242,23 +264,27 @@ def handle_join_stream(data):
 
         emit(AUDIO_EVENT_AUDIO_CONTROL, {'event': AUDIO_EVENT_END_OF_STREAM, 'stream_id': stream_id, 'timestamp': time.time()}, room=stream_id)
         logger.info(f"ASF: Sent {AUDIO_EVENT_END_OF_STREAM} for stream_id: {stream_id}")
+        logger.info("ASF audio stream completed", extra=dict(metric_name="asf_audio_stream_completed_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag}))
 
-    except requests.exceptions.HTTPError as e_gcs_http: # Specifically for GCS GET errors
+    except requests.exceptions.HTTPError as e_gcs_http:
         logger.error(f"ASF: HTTP error when streaming from GCS URL for stream {stream_id} (URL might be expired or invalid): {e_gcs_http}", exc_info=True)
+        logger.error("ASF audio stream error", extra=dict(metric_name="asf_audio_stream_error_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag, "reason": "gcs_streaming_http_error"}))
         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to stream audio from source (access denied or link expired).'}, room=stream_id)
-    except requests.exceptions.RequestException as e_req_stream: # Other requests errors (network, etc.)
+    except requests.exceptions.RequestException as e_req_stream:
         logger.error(f"ASF: Error streaming audio for stream {stream_id}: {e_req_stream}", exc_info=True)
+        logger.error("ASF audio stream error", extra=dict(metric_name="asf_audio_stream_error_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag, "reason": "gcs_streaming_request_exception"}))
         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to stream audio from source.'}, room=stream_id)
-    except Exception as e_stream: # General errors during streaming
+    except Exception as e_stream:
         logger.error(f"ASF: General error during audio streaming for stream_id {stream_id}: {e_stream}", exc_info=True)
+        logger.error("ASF audio stream error", extra=dict(metric_name="asf_audio_stream_error_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag, "reason": "unknown_streaming_error"}))
         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'An unexpected error occurred during streaming.'}, room=stream_id)
     finally:
-        # Clean up or other actions after streaming finishes or errors
-        pass
+        pass # No specific cleanup needed here now
 
 @socketio.on('disconnect', namespace='/api/v1/podcasts/stream')
 def handle_disconnect():
     logger.info(f"ASF: Client disconnected sid: {flask.request.sid} from audio namespace.")
+    logger.info("ASF WebSocket connection", extra=dict(metric_name="asf_websocket_connection_count", value=1, tags={"namespace": "/api/v1/podcasts/stream", "status": "disconnected"}))
 
 @app.route('/asf/health', methods=['GET'])
 def health_check():
@@ -321,11 +347,13 @@ def notify_new_audio():
 @socketio.on('connect', namespace=ASF_UI_UPDATES_NAMESPACE)
 def handle_ui_connect():
     logger.info(f"ASF: Client {request.sid} connected to UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
+    logger.info("ASF WebSocket connection", extra=dict(metric_name="asf_websocket_connection_count", value=1, tags={"namespace": ASF_UI_UPDATES_NAMESPACE, "status": "connected"}))
     emit(UI_EVENT_CONNECT_ACK, {'message': f'Connected to ASF UI updates on namespace {ASF_UI_UPDATES_NAMESPACE}.'})
 
 @socketio.on('disconnect', namespace=ASF_UI_UPDATES_NAMESPACE)
 def handle_ui_disconnect():
     logger.info(f"ASF: Client {request.sid} disconnected from UI updates namespace: {ASF_UI_UPDATES_NAMESPACE}")
+    logger.info("ASF WebSocket connection", extra=dict(metric_name="asf_websocket_connection_count", value=1, tags={"namespace": ASF_UI_UPDATES_NAMESPACE, "status": "disconnected"}))
 
 @socketio.on('subscribe_to_ui_updates', namespace=ASF_UI_UPDATES_NAMESPACE)
 def handle_subscribe_ui_updates(data):
@@ -362,9 +390,11 @@ def send_ui_update():
     try:
         logger.info(f"ASF_SEND_UI: Emitting '{event_name}' to client_id '{client_id}' in namespace '{ASF_UI_UPDATES_NAMESPACE}' with data: {event_data}")
         socketio.emit(event_name, event_data, room=client_id, namespace=ASF_UI_UPDATES_NAMESPACE)
+        logger.info("ASF UI update relayed", extra=dict(metric_name="asf_ui_update_relayed_count", value=1, tags={"event_name": event_name}))
         return jsonify({"status": "success", "message": "UI update sent."}), 200
     except Exception as e:
         logger.error(f"ASF_SEND_UI: Failed to emit SocketIO event for client_id '{client_id}': {e}", exc_info=True)
+        logger.error("ASF UI update relay failed", extra=dict(metric_name="asf_ui_update_relay_failed_count", value=1, tags={"event_name": event_name}))
         return jsonify({"error_code": "ASF_SOCKETIO_EMIT_FAILED", "message": "Failed to emit SocketIO event for UI update."}), 500
 
 if __name__ == '__main__':

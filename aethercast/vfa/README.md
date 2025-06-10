@@ -155,4 +155,10 @@ This includes `Flask`, `requests` (for AIMS_TTS calls), and `python-dotenv`. The
         }
         ```
 
+## Monitoring and Logging
+
+This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, AIMS_TTS call performance, and synthesized character counts, are also logged as part of these structured logs.
+
+For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs vfa`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+
 [end of aethercast/vfa/README.md]
