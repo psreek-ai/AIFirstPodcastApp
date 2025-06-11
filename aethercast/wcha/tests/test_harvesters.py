@@ -83,7 +83,7 @@ class TestHarvestFromUrl(unittest.TestCase):
             self.assertIsNotNone(result)
             self.assertIsNone(result["content"])
             self.assertEqual(result["error_type"], wcha_logic.WCHA_ERROR_TYPE_NO_CONTENT)
-            mock_requests_get.assert_called_once_with("http://example.com/failextract", headers=unittest.mock.ANY, timeout=unittest.mock.ANY)
+            mock_requests_get.assert_called_once_with("http://example.com/failextract", headers=unittest.mock.ANY, timeout=unittest.mock.ANY, allow_redirects=False)
             mock_extract_text.assert_called_once()
             # Corrected log assertion format
             mock_log_warning.assert_any_call(f"[WCHA_LOGIC_WEB] Trafilatura extracted no content from URL: http://example.com/failextract.")

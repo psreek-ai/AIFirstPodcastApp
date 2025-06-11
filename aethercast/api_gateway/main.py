@@ -412,6 +412,12 @@ app.logger.info("API Gateway Flask app initialized and logger configured to use 
 # --- Static Frontend & Health Check ---
 # ... (serve_index, serve_style, serve_script, health_check, IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS as before) ...
 
+@app.route('/health', methods=['GET'])
+def health_check_endpoint():
+    """Provides a simple health check endpoint."""
+    # Additional checks could be added here (e.g., DB connectivity)
+    return jsonify({"status": "healthy", "service": "API Gateway", "timestamp": datetime.utcnow().isoformat()}), 200
+
 # --- Session Management Endpoints ---
 # ... (session_init, get_session_preferences, update_session_preferences_endpoint as before) ...
 
