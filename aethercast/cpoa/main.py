@@ -12,6 +12,9 @@ import time # Added for retry logic
 import psycopg2 # Added for PostgreSQL
 from psycopg2.extras import RealDictCursor # Added for PostgreSQL
 import random # Added for landing page snippet keyword randomization
+from celery import Celery
+from celery.result import AsyncResult
+from flask import Flask, jsonify as flask_jsonify # To avoid conflict if jsonify is used elsewhere
 
 # Ensure the 'aethercast' directory is in the Python path.
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -86,6 +89,24 @@ DB_TYPE_TOPIC = "topic"
 DB_TYPE_SNIPPET = "snippet"
 
 
+# --- Celery Configuration ---
+CPOA_CELERY_BROKER_URL = os.getenv('CPOA_CELERY_BROKER_URL', 'redis://redis:6379/0')
+CPOA_CELERY_RESULT_BACKEND = os.getenv('CPOA_CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+
+celery_app = Celery(
+    'cpoa_tasks',
+    broker=CPOA_CELERY_BROKER_URL,
+    backend=CPOA_CELERY_RESULT_BACKEND,
+    include=['aethercast.cpoa.main'] # Ensure tasks are discoverable
+)
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+)
+
 # --- Service URLs ---
 PSWA_SERVICE_URL = os.getenv("PSWA_SERVICE_URL", "http://localhost:5004/weave_script")
 VFA_SERVICE_URL = os.getenv("VFA_SERVICE_URL", "http://localhost:5005/forge_voice")
@@ -95,7 +116,8 @@ SCA_SERVICE_URL = os.getenv("SCA_SERVICE_URL", "http://localhost:5002/craft_snip
 CPOA_ASF_SEND_UI_UPDATE_URL = os.getenv("CPOA_ASF_SEND_UI_UPDATE_URL", "http://localhost:5006/asf/internal/send_ui_update")
 IGA_SERVICE_URL = os.getenv("IGA_SERVICE_URL", "http://localhost:5007")
 TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
-WCHA_ASYNC_CONTENT_URL = os.getenv("WCHA_ASYNC_CONTENT_URL", "http://wcha:5003/v1/async_get_content_for_topic") # New
+# WCHA_ASYNC_CONTENT_URL = os.getenv("WCHA_ASYNC_CONTENT_URL", "http://wcha:5003/v1/async_get_content_for_topic") # Old, to be removed
+WCHA_SERVICE_BASE_URL = os.getenv("WCHA_SERVICE_BASE_URL", "http://wcha:5003") # New base URL for WCHA
 
 # Retry Configuration
 CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3"))
@@ -582,11 +604,20 @@ def orchestrate_podcast_generation(
     voice_params_input: Optional[dict] = None,
     client_id: Optional[str] = None,
     user_preferences: Optional[dict] = None,
-    test_scenarios: Optional[dict] = None
+    test_scenarios: Optional[dict] = None,
+    # Add Celery task context if needed, e.g., self for bind=True
 ) -> Dict[str, Any]:
+    # This is the core logic, to be run by the Celery task.
+    # The 'original_task_id' here is the Celery task's own ID if bind=True, or a passed-in ID.
+    # For simplicity, let's assume original_task_id is passed in if this function is called directly,
+    # or can be derived from self.request.id if this becomes the task body itself.
+    # For now, keeping it as a parameter.
+
+    # If this function is directly decorated as a task, 'original_task_id' might be self.request.id
+    # For now, let's assume it's a distinct ID for the conceptual podcast operation.
 
     workflow_id = _create_workflow_instance(
-        trigger_event_type="podcast_generation",
+        trigger_event_type="podcast_generation_celery_task", # Modified trigger type
         trigger_event_details={
             "topic": topic, "original_task_id": original_task_id,
             "voice_params_input": voice_params_input, "client_id": client_id,
@@ -651,34 +682,170 @@ def orchestrate_podcast_generation(
         try:
             if wcha_task_id: _update_task_instance_status(wcha_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
 
-            wcha_payload = {"topic": topic} # Max results can be part of WCHA's default config for this task
-            # Assuming WCHA_ASYNC_CONTENT_URL is the endpoint in WCHA that starts the Celery task
-            initial_wcha_response = requests_with_retry("post", WCHA_ASYNC_CONTENT_URL,
+            # Construct WCHA /harvest URL and payload
+            wcha_harvest_url = f"{WCHA_SERVICE_BASE_URL.rstrip('/')}/harvest"
+            wcha_payload = {"topic": topic, "use_search": True}
+            # min_length could be added if CPOA needs to specify it, e.g. from config
+            # wcha_payload["min_length"] = int(os.getenv("CPOA_WCHA_MIN_CONTENT_LENGTH", "150"))
+
+
+            initial_wcha_response = requests_with_retry("post", wcha_harvest_url,
                                                         CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                                        json=wcha_payload, timeout=30, # Timeout for task dispatch
+                                                        json=wcha_payload, timeout=30,
                                                         workflow_id_for_log=workflow_id, task_id_for_log=wcha_task_id)
 
             if initial_wcha_response.status_code != 202:
-                wcha_error_details = {"message": f"WCHA service did not accept task. Status: {initial_wcha_response.status_code}", "response_text": initial_wcha_response.text[:200]}
+                # Handle cases where WCHA might return content synchronously (if not using NewsAPI and DDGS path is sync)
+                if initial_wcha_response.status_code == 200:
+                    wf_logger.info(f"WCHA returned synchronous response for topic '{topic}'. Processing directly.", extra={'task_id': wcha_task_id})
+                    wcha_sync_result = initial_wcha_response.json()
+                    if wcha_sync_result.get("status") == "success" and wcha_sync_result.get("content"):
+                        wcha_content = wcha_sync_result.get("content")
+                        source_urls = wcha_sync_result.get("source_urls", [])
+                        context_data_for_workflow["wcha_source_urls"] = source_urls
+                        wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": wcha_sync_result.get("message", "WCHA synchronous success.")}
+                        log_step_cpoa("WCHA synchronous success, content received.", data=wcha_output_summary)
+                        # Skip polling logic by breaking the outer loop effectively or setting wcha_internal_task_id to None
+                        wcha_internal_task_id = None # This will prevent polling loop
+                    else:
+                        wcha_error_details = {"message": "WCHA synchronous response indicates failure or no content.", "wcha_response": wcha_sync_result}
+                        raise Exception(wcha_error_details["message"])
+                else:
+                    wcha_error_details = {"message": f"WCHA service did not accept task. Status: {initial_wcha_response.status_code}", "response_text": initial_wcha_response.text[:200]}
+                    raise Exception(wcha_error_details["message"])
+            else: # Status is 202, proceed with polling
+                wcha_task_init_data = initial_wcha_response.json()
+                wcha_internal_task_id = wcha_task_init_data.get("task_id")
+                wcha_status_url_suffix = wcha_task_init_data.get("status_url")
+
+                if not wcha_internal_task_id or not wcha_status_url_suffix:
+                    wcha_error_details = {"message": "WCHA task submission response missing task_id or status_url.", "response_data": wcha_task_init_data}
+                    raise Exception(wcha_error_details["message"])
+
+                # Construct poll URL based on WCHA_SERVICE_BASE_URL and the suffix from WCHA
+                wcha_poll_url = f"{WCHA_SERVICE_BASE_URL.rstrip('/')}{wcha_status_url_suffix}"
+                log_step_cpoa(f"WCHA task {wcha_internal_task_id} submitted. Polling at {wcha_poll_url}", data=wcha_task_init_data)
+                wf_logger.info(f"WCHA task {wcha_internal_task_id} submitted. Polling status at {wcha_poll_url}", extra={'task_id': wcha_task_id})
+
+            # Polling Loop - only if wcha_internal_task_id is set (i.e. got 202)
+            if wcha_internal_task_id:
+                polling_start_time = time.time()
+                while True:
+                    if time.time() - polling_start_time > CPOA_WCHA_POLLING_TIMEOUT_SECONDS:
+                        wcha_error_details = {"message": f"Polling WCHA task {wcha_internal_task_id} timed out."}
+                        raise Exception(wcha_error_details["message"])
+                    try:
+                        poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
+                        poll_response_wcha.raise_for_status()
+                        wcha_task_status_data = poll_response_wcha.json()
+                        wcha_task_state = wcha_task_status_data.get("status")
+                        log_step_cpoa(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", data=wcha_task_status_data)
+                        wf_logger.info(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", extra={'task_id': wcha_task_id})
+
+                        if wcha_task_state == "SUCCESS":
+                            wcha_result_dict = wcha_task_status_data.get("result")
+                            # WCHA's harvest_url_content_task returns: {"url": url, "content": extracted_text, "error_type": None, "error_message": None}
+                            # WCHA's fetch_news_articles_task returns: {"status": "success", "articles": articles, "message": ...}
+                            # The new conceptual 'get_content_for_topic_task' (if WCHA were updated) should return something like:
+                            # {"status": "success", "content": "...", "source_urls": [...]}
+                            # For now, let's assume the result from WCHA task (if successful) will have a 'content' field.
+                            # This might need adjustment based on what task WCHA's /harvest actually triggers for topics.
+                            if wcha_result_dict and wcha_result_dict.get("content"): # Assuming direct content
+                                wcha_content = wcha_result_dict.get("content")
+                                source_urls = wcha_result_dict.get("source_urls", []) # If WCHA returns this
+                                context_data_for_workflow["wcha_source_urls"] = source_urls
+                                wcha_output_summary = {"content_length": len(wcha_content), "source_urls": source_urls, "message": "WCHA task content received."}
+                                log_step_cpoa("WCHA task polling successful, content received.", data=wcha_output_summary)
+                            # If WCHA returned articles (from NewsAPI path), CPOA would need to harvest each one.
+                            # This part is simplified for now, assuming direct content or a single content blob.
+                            elif wcha_result_dict and wcha_result_dict.get("articles"): # NewsAPI path
+                                 wcha_error_details = {"message": "WCHA returned articles, but CPOA expected aggregated content. Further processing needed.", "wcha_response": wcha_result_dict}
+                                 # For now, this is an error. A more robust CPOA would handle this by dispatching individual URL harvests.
+                            else:
+                                 wcha_error_details = {"message": "WCHA task succeeded but result format unexpected or content missing.", "wcha_response": wcha_result_dict}
+                            break # Exit polling loop on SUCCESS
+                        elif wcha_task_state == "FAILURE":
+                            wcha_error_details = {"message": "WCHA task execution failed.", "wcha_celery_response": wcha_task_status_data.get("result")}
+                            log_step_cpoa(wcha_error_details["message"], data=wcha_error_details, is_error_payload=True)
+                            break # Exit polling loop on FAILURE
+                        time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
+                    except requests.exceptions.RequestException as e_poll_wcha:
+                        log_step_cpoa(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", is_error_payload=True)
+                        wf_logger.warning(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", extra={'task_id': wcha_task_id})
+                        time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
+            # End of polling loop / synchronous handling block
+        except Exception as e_wcha: # Catch errors from initial dispatch or polling logic
+            wcha_error_details = wcha_error_details or {"message": f"WCHA stage error: {str(e_wcha)}", "exception_type": type(e_wcha).__name__}
+            wf_logger.error(f"WCHA stage error: {wcha_error_details['message']}", exc_info=True, extra={'task_id': wcha_task_id})
+
+        if wcha_task_id:
+            _update_task_instance_status(wcha_task_id, TASK_STATUS_COMPLETED if not wcha_error_details and wcha_content else TASK_STATUS_FAILED,
+                                         output_summary=wcha_output_summary, error_details=wcha_error_details, workflow_id_for_log=workflow_id)
+
+        if wcha_error_details or not wcha_content: # If any error occurred or content is still None
+            final_error_message = (wcha_error_details.get("message") if wcha_error_details else None) or "WCHA critical failure: No content after polling."
+            final_cpoa_status_legacy = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
+            raise Exception(final_error_message)
+
+
+        # --- PSWA Stage ---
+        current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
                 raise Exception(wcha_error_details["message"])
 
-            wcha_task_init_data = initial_wcha_response.json()
-            wcha_internal_task_id = wcha_task_init_data.get("task_id")
-            wcha_status_url_suffix = wcha_task_init_data.get("status_url")
+            # This block was part of the original polling logic, keep it for when wcha_internal_task_id is valid (got 202)
+            # The SEARCH block above duplicated it, so this is the correct placement.
+            # if wcha_internal_task_id: # This check is now done before starting the loop.
+            #    polling_start_time = time.time()
+            #    while True:
+            #        if time.time() - polling_start_time > CPOA_WCHA_POLLING_TIMEOUT_SECONDS:
+            #            wcha_error_details = {"message": f"Polling WCHA task {wcha_internal_task_id} timed out."}
+            #            raise Exception(wcha_error_details["message"])
+            #        try:
+            #            poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
+            #            poll_response_wcha.raise_for_status()
+            #            wcha_task_status_data = poll_response_wcha.json()
+            #            wcha_task_state = wcha_task_status_data.get("status")
+            #            log_step_cpoa(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", data=wcha_task_status_data)
+            #            wf_logger.info(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", extra={'task_id': wcha_task_id})
 
-            if not wcha_internal_task_id or not wcha_status_url_suffix:
-                wcha_error_details = {"message": "WCHA task submission response missing task_id or status_url.", "response_data": wcha_task_init_data}
-                raise Exception(wcha_error_details["message"])
+            #            if wcha_task_state == "SUCCESS":
+            #                wcha_result_dict = wcha_task_status_data.get("result")
+            #                if not wcha_result_dict or wcha_result_dict.get("status") != "success":
+            #                     wcha_error_details = {"message": "WCHA task succeeded but reported internal failure or invalid result.", "wcha_response": wcha_result_dict}
+            #                else: # Success
+            #                    wcha_content = wcha_result_dict.get("content")
+            #                    source_urls = wcha_result_dict.get("source_urls", [])
+            #                    context_data_for_workflow["wcha_source_urls"] = source_urls
+            #                    wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": wcha_result_dict.get("message", "WCHA success.")}
+            #                    log_step_cpoa("WCHA task polling successful, content received.", data=wcha_output_summary)
+            #                    if not wcha_content: wcha_error_details = {"message": wcha_output_summary.get("message") or "WCHA success but no content."}
+            #                break
+            #            elif wcha_task_state == "FAILURE":
+            #                wcha_error_details = {"message": "WCHA task execution failed.", "wcha_celery_response": wcha_task_status_data.get("result")}
+            #                log_step_cpoa(wcha_error_details["message"], data=wcha_error_details, is_error_payload=True)
+            #                break
+            #            time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
+            #        except requests.exceptions.RequestException as e_poll_wcha:
+            #            log_step_cpoa(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", is_error_payload=True)
+            #            wf_logger.warning(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", extra={'task_id': wcha_task_id})
+            #            time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
 
-            wcha_base_url = '/'.join(WCHA_ASYNC_CONTENT_URL.split('/')[:-1])
-            wcha_poll_url = f"{wcha_base_url}{wcha_status_url_suffix}"
-            log_step_cpoa(f"WCHA task {wcha_internal_task_id} submitted. Polling at {wcha_poll_url}", data=wcha_task_init_data)
-            wf_logger.info(f"WCHA task {wcha_internal_task_id} submitted. Polling status at {wcha_poll_url}", extra={'task_id': wcha_task_id})
+        except Exception as e_wcha: # Catch errors from initial dispatch or polling logic
+            wcha_error_details = wcha_error_details or {"message": f"WCHA stage error: {str(e_wcha)}", "exception_type": type(e_wcha).__name__}
+            wf_logger.error(f"WCHA stage error: {wcha_error_details['message']}", exc_info=True, extra={'task_id': wcha_task_id})
 
-            polling_start_time = time.time()
-            while True:
-                if time.time() - polling_start_time > CPOA_WCHA_POLLING_TIMEOUT_SECONDS:
-                    wcha_error_details = {"message": f"Polling WCHA task {wcha_internal_task_id} timed out."}
+        if wcha_task_id:
+            _update_task_instance_status(wcha_task_id, TASK_STATUS_COMPLETED if not wcha_error_details and wcha_content else TASK_STATUS_FAILED,
+                                         output_summary=wcha_output_summary, error_details=wcha_error_details, workflow_id_for_log=workflow_id)
+
+        if wcha_error_details or not wcha_content: # If any error occurred or content is still None
+            final_error_message = (wcha_error_details.get("message") if wcha_error_details else None) or "WCHA critical failure: No content after polling."
+            final_cpoa_status_legacy = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
+            raise Exception(final_error_message)
+
+
+        # --- PSWA Stage ---
+        current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
                     raise Exception(wcha_error_details["message"])
                 try:
                     poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
@@ -1025,6 +1192,84 @@ def orchestrate_podcast_generation(
          vfa_result_dict["tts_settings_used"] = context_data_for_workflow["tts_settings_used"]
 
     return cpoa_final_result
+
+@celery_app.task(bind=True, name='cpoa.orchestrate_podcast_task')
+def cpoa_orchestrate_podcast_task(self,
+                                 topic: str,
+                                 original_task_id_from_caller: str, # ID from API Gateway or initial call
+                                 user_id: Optional[str] = None,
+                                 voice_params_input: Optional[dict] = None,
+                                 client_id: Optional[str] = None,
+                                 user_preferences: Optional[dict] = None,
+                                 test_scenarios: Optional[dict] = None) -> Dict[str, Any]:
+    """
+    Celery task wrapper for orchestrate_podcast_generation.
+    'self.request.id' will be the Celery task_id for this orchestration.
+    'original_task_id_from_caller' is the ID API Gateway might have created for its tracking.
+    We can use self.request.id as the primary 'original_task_id' for the internal logic if desired,
+    or pass it along. For now, let's use self.request.id as the main identifier for this run.
+    """
+    logger.info(f"CPOA Celery Task {self.request.id} started for topic: '{topic}'. Original caller ID: {original_task_id_from_caller}")
+
+    # Update workflow instance if it was created by the calling function, using self.request.id
+    # This assumes the calling function (new orchestrate_podcast_generation_entrypoint)
+    # might create a placeholder workflow_instance or task_instance tied to original_task_id_from_caller.
+    # Or, the Celery task itself is responsible for the definitive workflow instance.
+    # For this refactor, let orchestrate_podcast_generation handle the workflow instance creation,
+    # passing self.request.id as the 'original_task_id' to it.
+
+    result = orchestrate_podcast_generation(
+        topic=topic,
+        original_task_id=self.request.id, # Use Celery's task ID for internal tracking
+        user_id=user_id,
+        voice_params_input=voice_params_input,
+        client_id=client_id,
+        user_preferences=user_preferences,
+        test_scenarios=test_scenarios
+    )
+    logger.info(f"CPOA Celery Task {self.request.id} completed. Final status: {result.get('status')}")
+    return result # This result will be stored in the Celery backend
+
+
+def trigger_podcast_orchestration(
+    topic: str,
+    user_id: Optional[str] = None,
+    voice_params_input: Optional[dict] = None,
+    client_id: Optional[str] = None,
+    user_preferences: Optional[dict] = None,
+    test_scenarios: Optional[dict] = None
+) -> Dict[str, Any]:
+    """
+    This is the new entry point that API Gateway will call.
+    It dispatches the Celery task and returns task information.
+    """
+    # Minimal validation before dispatching
+    if not topic or not isinstance(topic, str):
+        return {"error": "INVALID_TOPIC", "message": "Topic must be a non-empty string.", "task_id": None, "status_url": None}
+
+    # This ID is just for the initial request before Celery task_id is known.
+    # The Celery task (cpoa_orchestrate_podcast_task) will have its own unique ID (self.request.id).
+    initial_request_id = str(uuid.uuid4())
+    logger.info(f"CPOA: Received trigger for podcast orchestration. Topic: '{topic}'. Initial Req ID: {initial_request_id}")
+
+    task = cpoa_orchestrate_podcast_task.delay(
+        topic=topic,
+        original_task_id_from_caller=initial_request_id, # Pass the initial ID for logging/correlation
+        user_id=user_id,
+        voice_params_input=voice_params_input,
+        client_id=client_id,
+        user_preferences=user_preferences,
+        test_scenarios=test_scenarios
+    )
+
+    status_url = f"/v1/cpoa_tasks/{task.id}" # Conceptual URL, actual endpoint on API GW or CPOA if run as service
+    logger.info(f"CPOA: Dispatched podcast orchestration task {task.id} for topic '{topic}'. Status URL: {status_url}")
+
+    return {
+        "message": "Podcast orchestration task accepted.",
+        "cpoa_task_id": task.id,
+        "status_url": status_url # This URL would be relative to CPOA if it's a service, or API GW
+    }
 
 
 # --- Snippet DB Interaction ---
@@ -1526,6 +1771,42 @@ if __name__ == "__main__":
     pretty_print_orchestration_result(snippet_result_no_brief)
 
     print("\n--- CPOA All Tests Complete ---")
+
+# --- Flask App for Task Status (Minimal) ---
+# This makes CPOA potentially runnable as a service for status checks.
+cpoa_flask_app = Flask(__name__)
+
+@cpoa_flask_app.route('/v1/cpoa_tasks/<task_id>', methods=['GET'])
+def get_cpoa_task_status(task_id: str):
+    logger.info(f"CPOA Flask: Received request for CPOA task status: {task_id}")
+    # Use the globally defined celery_app instance
+    task_result = AsyncResult(task_id, app=celery_app)
+
+    response_data = {
+        "task_id": task_id,
+        "status": task_result.status,
+        "result": None
+    }
+    http_status_code = 200
+
+    if task_result.successful():
+        response_data["result"] = task_result.result
+    elif task_result.failed():
+        response_data["result"] = {
+            "error": {"type": "task_failed", "message": str(task_result.info)}
+        }
+        # If the result itself contains a CPOA error structure, propagate that
+        if isinstance(task_result.info, dict) and task_result.info.get("error_message"):
+             response_data["result"]["cpoa_error"] = task_result.info # task_result.info is the actual result dict from failed task
+        http_status_code = 200 # Or 500 if preferred for task failure
+    else: # PENDING, STARTED, RETRY
+        http_status_code = 202
+
+    return flask_jsonify(response_data), http_status_code
+
+@cpoa_flask_app.route('/cpoa/health', methods=['GET'])
+def cpoa_health_check():
+    return flask_jsonify({"status": "CPOA Flask health check OK"}), 200
 
 
 # --- Topic Exploration Orchestration ---
