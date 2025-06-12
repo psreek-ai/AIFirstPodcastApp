@@ -3,7 +3,6 @@ import sys
 import os
 from dotenv import load_dotenv # Added
 import json
-import sqlite3 # Will be conditionally used or removed later
 from datetime import datetime
 import uuid
 from typing import Optional, Dict, Any, List
