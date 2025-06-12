@@ -3,6 +3,8 @@ import logging
 import uuid
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from celery import Celery
+from celery.result import AsyncResult
 
 # --- Google Cloud specific imports ---
 from google.cloud import aiplatform
@@ -13,9 +15,24 @@ import time # Added for metric logging
 
 load_dotenv()
 
-# --- Logging Setup ---
-from python_json_logger import jsonlogger # Added for JSON logging
+# --- Celery Configuration ---
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
 
+celery_app = Celery(
+    'iga_tasks',
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND
+)
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+)
+
+# --- Logging Setup ---
 # Custom filter to add service_name to log records
 class ServiceNameFilter(logging.Filter):
     def __init__(self, service_name="iga"):
@@ -34,14 +51,13 @@ def setup_json_logging(flask_app):
     logHandler = logging.StreamHandler()
     service_filter = ServiceNameFilter("iga")
     logHandler.addFilter(service_filter)
-    formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
-        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
     )
     logHandler.setFormatter(formatter)
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("JSON logging configured for IGA service.")
+    flask_app.logger.info("Standard logging configured for IGA service.")
 
 setup_json_logging(app)
 
@@ -105,154 +121,113 @@ except Exception as e:
     app.logger.error(f"Failed to initialize Vertex AI for IGA: {e}", exc_info=True)
     raise ValueError(f"IGA Critical Error: Failed to initialize Vertex AI: {e}")
 
+@celery_app.task(bind=True, name='generate_image_vertex_ai_task')
+def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_ratio: str, add_watermark: bool, model_id: str, gcs_bucket_name: str, gcs_image_prefix: str):
+    """
+    Celery task to generate an image using Vertex AI and upload to GCS.
+    """
+    app.logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting image generation. Prompt: '{prompt[:50]}...'")
+
+    try:
+        model = ImageGenerationModel.from_pretrained(model_id)
+        images_response = model.generate_images(
+            prompt=prompt,
+            number_of_images=1,
+            aspect_ratio=aspect_ratio,
+            add_watermark=add_watermark
+        )
+
+        if not images_response or not images_response.images:
+            app.logger.error(f"Celery Task {self.request.id}: No images from Vertex AI for prompt: '{prompt}'")
+            raise ValueError("Vertex AI returned no images.")
+
+        image_object = images_response.images[0]
+        if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
+            app.logger.error(f"Celery Task {self.request.id}: Vertex AI image bytes missing for prompt: '{prompt}'")
+            raise ValueError("Vertex AI produced empty image bytes.")
+
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(gcs_bucket_name)
+        file_extension = "png"
+        gcs_object_name = f"{gcs_image_prefix.strip('/')}/{request_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
+        blob = bucket.blob(gcs_object_name)
+        gcs_content_type = 'image/png'
+
+        blob.upload_from_string(image_object._image_bytes, content_type=gcs_content_type)
+        image_gcs_uri = f"gs://{gcs_bucket_name}/{gcs_object_name}"
+        app.logger.info(f"Celery Task {self.request.id}: Image uploaded to GCS: {image_gcs_uri}")
+
+        return {
+            "image_url": image_gcs_uri,
+            "prompt_used": prompt,
+            "model_version": f"vertex-ai-{model_id}"
+        }
+    except google_exceptions.GoogleAPIError as e:
+        app.logger.error(f"Celery Task {self.request.id}: Google Vertex AI/GCS API Error: {e}", exc_info=True)
+        raise self.retry(exc=e, countdown=10, max_retries=2) # Retry for Google API errors
+    except Exception as e:
+        app.logger.error(f"Celery Task {self.request.id}: Unexpected error in image generation: {e}", exc_info=True)
+        raise self.retry(exc=e, countdown=10, max_retries=2)
+
 
 @app.route("/generate_image", methods=["POST"])
-def generate_image_endpoint():
-    request_start_time = time.time()
-    final_status_str = "unknown_error"
+def generate_image_async_endpoint():
     request_id = f"iga_req_{uuid.uuid4().hex[:8]}"
-    app.logger.info(f"IGA Request {request_id}: Received /generate_image request.")
+    app.logger.info(f"IGA Request {request_id}: Received async /generate_image request.")
 
-    if not iga_config.get("GCS_BUCKET_NAME"):
+    if not iga_config.get("GCS_BUCKET_NAME"): # Basic config check
         app.logger.error(f"IGA Request {request_id}: GCS_BUCKET_NAME not configured.")
-        final_status_str = "config_error_gcs_bucket"
-        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_CONFIG_ERROR_GCS_BUCKET", "message": "IGA service GCS bucket not configured."}), 503
 
     try:
         data = request.get_json()
         if not data:
-            final_status_str = "validation_error_payload"
-            app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
             return jsonify({"error_code": "IGA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload."}), 400
     except Exception as e_json_decode:
-        final_status_str = "validation_error_bad_json"
-        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_MALFORMED_JSON", "message": f"Malformed JSON: {str(e_json_decode)}"}), 400
 
     prompt = data.get("prompt")
     if not prompt or not isinstance(prompt, str) or not prompt.strip():
-        final_status_str = "validation_error_prompt_missing"
-        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
         return jsonify({"error_code": "IGA_BAD_REQUEST_PROMPT_MISSING", "message": "Prompt is required."}), 400
 
-    app.logger.info(f"IGA Request {request_id}: Processing prompt: '{prompt}' with model {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
+    # Parameters for the task, using defaults from iga_config if not provided in request
+    # (Assuming for now the request structure for async matches direct call, or is simplified)
+    aspect_ratio = data.get("aspect_ratio", iga_config['IGA_DEFAULT_ASPECT_RATIO'])
+    add_watermark = data.get("add_watermark", iga_config['IGA_ADD_WATERMARK'])
+    model_id_to_use = data.get("model_id_override", iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
 
-    try:
-        model = ImageGenerationModel.from_pretrained(iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
 
-        vertex_call_start_time = time.time()
-        images_response = model.generate_images(
-            prompt=prompt,
-            number_of_images=1,
-            aspect_ratio=iga_config['IGA_DEFAULT_ASPECT_RATIO'],
-            add_watermark=iga_config['IGA_ADD_WATERMARK']
-        )
-        vertex_duration_ms = (time.time() - vertex_call_start_time) * 1000
-        app.logger.info("IGA Vertex AI call processed", extra=dict(metric_name="iga_vertexai_call_latency_ms", value=round(vertex_duration_ms, 2)))
-        app.logger.info(f"IGA Request {request_id}: Vertex AI call completed.")
+    app.logger.info(f"IGA Request {request_id}: Dispatching image generation to Celery task. Prompt: '{prompt[:50]}...'")
 
-        if not images_response or not images_response.images:
-            app.logger.error(f"IGA Request {request_id}: No images from Vertex AI for prompt: '{prompt}'")
-            final_status_str = "vertexai_no_images"
-            # No specific vertexai_error_count here as it's not a direct API error but lack of content
-            app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-            return jsonify({"error_code": "IGA_VERTEXAI_NO_IMAGES_RETURNED", "message": "Image generation failed."}), 500
+    task = generate_image_vertex_ai_task.delay(
+        request_id=request_id,
+        prompt=prompt,
+        aspect_ratio=aspect_ratio,
+        add_watermark=add_watermark,
+        model_id=model_id_to_use,
+        gcs_bucket_name=iga_config['GCS_BUCKET_NAME'],
+        gcs_image_prefix=iga_config['IGA_GCS_IMAGE_PREFIX']
+    )
 
-        image_object = images_response.images[0]
-        if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
-            app.logger.error(f"IGA Request {request_id}: Vertex AI image bytes missing for prompt: '{prompt}'")
-            final_status_str = "vertexai_empty_image_bytes"
-            app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-            return jsonify({"error_code": "IGA_VERTEXAI_EMPTY_IMAGE_BYTES", "message": "Image generation produced empty image."}), 500
+    return jsonify({"task_id": task.id, "status_url": f"/v1/tasks/{task.id}"}), 202
 
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(iga_config['GCS_BUCKET_NAME'])
 
-        # Assuming PNG format from Vertex AI Imagen default. Could be made configurable or detected.
-        file_extension = "png"
-        gcs_object_name = f"{iga_config['IGA_GCS_IMAGE_PREFIX'].strip('/')}/{request_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
+@app.route('/v1/tasks/<task_id>', methods=['GET'])
+def get_task_status(task_id: str):
+    app.logger.info(f"Received request for IGA task status: {task_id}")
+    task_result = AsyncResult(task_id, app=celery_app)
+    response_data = {"task_id": task_id, "status": task_result.status, "result": None}
 
-        blob = bucket.blob(gcs_object_name)
-
-        # Determine content type for GCS (image/png for .png)
-        gcs_content_type = 'image/png'
-        # Add other types if image format can vary:
-        # if file_extension == "jpeg" or file_extension == "jpg":
-        #     gcs_content_type = 'image/jpeg'
-
-        app.logger.info(f"IGA Request {request_id}: Uploading to GCS. Bucket: {iga_config['GCS_BUCKET_NAME']}, Object: {gcs_object_name}")
-        gcs_upload_start_time = time.time()
-        blob.upload_from_string(image_object._image_bytes, content_type=gcs_content_type)
-        gcs_duration_ms = (time.time() - gcs_upload_start_time) * 1000
-        app.logger.info("IGA GCS upload processed", extra=dict(metric_name="iga_gcs_upload_latency_ms", value=round(gcs_duration_ms, 2)))
-        image_gcs_uri = f"gs://{iga_config['GCS_BUCKET_NAME']}/{gcs_object_name}"
-        app.logger.info(f"IGA Request {request_id}: Image uploaded to GCS: {image_gcs_uri}")
-
-        response_data = {
-            "image_url": image_gcs_uri,
-            "prompt_used": prompt,
-            "model_version": f"vertex-ai-{iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}"
-        }
-
-        overall_latency_ms = (time.time() - request_start_time) * 1000
-        app.logger.info("IGA generate_image latency", extra=dict(metric_name="iga_generate_image_latency_ms", value=round(overall_latency_ms, 2)))
-        final_status_str = "success"
-        app.logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
+    if task_result.successful():
+        response_data["result"] = task_result.result
         return jsonify(response_data), 200
+    elif task_result.failed():
+        error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
+        response_data["result"] = error_info
+        return jsonify(response_data), 500 # Or 200
+    else: # PENDING, STARTED, RETRY
+        return jsonify(response_data), 202
 
-    except google_exceptions.InvalidArgument as e:
-        app.logger.error(f"IGA Request {request_id}: Vertex AI Invalid Argument: {e}", exc_info=True)
-        app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "invalid_argument"}))
-        final_status_str = "vertexai_error_invalid_argument"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": "IGA_VERTEXAI_INVALID_ARGUMENT", "message": f"Invalid argument for Vertex AI: {e}"}), 400
-    except google_exceptions.PermissionDenied as e:
-        app.logger.error(f"IGA Request {request_id}: Vertex AI Permission Denied: {e}", exc_info=True)
-        app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "permission_denied"}))
-        final_status_str = "vertexai_error_permission_denied"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": "IGA_VERTEXAI_PERMISSION_DENIED", "message": f"Vertex AI Permission Denied: {e}"}), 403
-    except google_exceptions.ResourceExhausted as e:
-        app.logger.error(f"IGA Request {request_id}: Vertex AI Resource Exhausted: {e}", exc_info=True)
-        app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "resource_exhausted"}))
-        final_status_str = "vertexai_error_resource_exhausted"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": "IGA_VERTEXAI_RESOURCE_EXHAUSTED", "message": f"Vertex AI Resource Exhausted (quota): {e}"}), 429
-    except google_exceptions.FailedPrecondition as e:
-        app.logger.warning(f"IGA Request {request_id}: Vertex AI Failed Precondition (often safety filters): {e}", exc_info=True)
-        error_message = f"Vertex AI: {e}"
-        error_code = "IGA_VERTEXAI_FAILED_PRECONDITION"
-        error_type_tag = "failed_precondition"
-        if "blocked" in str(e).lower() and ("safety" in str(e).lower() or "policy" in str(e).lower()):
-            error_code = "IGA_VERTEXAI_PROMPT_BLOCKED_SAFETY"
-            error_message = f"Prompt blocked by safety filters: {e}"
-            error_type_tag = "safety_blocked"
-        app.logger.warning("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": error_type_tag}))
-        final_status_str = f"vertexai_error_{error_type_tag}"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": error_code, "message": error_message}), 400
-    except google_exceptions.GoogleCloudError as e: # Catch other GCS or general Google API errors
-        app.logger.error(f"IGA Request {request_id}: Google Cloud API Error (Vertex AI or GCS): {e}", exc_info=True)
-        # Determine if it's more likely GCS or Vertex and log specific failure count
-        if "storage.googleapis.com" in str(e).lower(): # Heuristic for GCS
-            app.logger.error("IGA GCS upload error", extra=dict(metric_name="iga_gcs_upload_failure_count", value=1, tags={"error_detail": str(e)[:100]}))
-            final_status_str = "gcs_upload_error"
-        else: # Assume Vertex error if not clearly GCS
-            app.logger.error("IGA Vertex AI error", extra=dict(metric_name="iga_vertexai_error_count", value=1, tags={"error_type": "general_google_cloud_error"}))
-            final_status_str = "vertexai_error_google_cloud"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": "IGA_GOOGLE_CLOUD_ERROR", "message": f"Google Cloud API error: {e}"}), 500
-    except IOError as e:
-        app.logger.error(f"IGA Request {request_id}: I/O Error (unexpected if not saving locally): {e}", exc_info=True)
-        final_status_str = "io_error"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": "IGA_IO_ERROR", "message": f"I/O error: {e}"}), 500
-    except Exception as e:
-        app.logger.error(f"IGA Request {request_id}: Unexpected error in /generate_image: {e}", exc_info=True)
-        # final_status_str is already "unknown_error"
-        logger.info("IGA request completed", extra=dict(metric_name="iga_generate_image_request_count", value=1, tags={"status": final_status_str}))
-        return jsonify({"error_code": "IGA_INTERNAL_SERVER_ERROR", "message": f"Unexpected error: {e}"}), 500
 
 if __name__ == "__main__":
     if not iga_config.get('GOOGLE_APPLICATION_CREDENTIALS') and not os.getenv('GOOGLE_APPLICATION_CREDENTIALS'):

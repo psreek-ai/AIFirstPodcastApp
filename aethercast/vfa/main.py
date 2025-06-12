@@ -14,8 +14,6 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- Logging Configuration ---
-from python_json_logger import jsonlogger # Added for JSON logging
-
 # Custom filter to add service_name to log records
 class ServiceNameFilter(logging.Filter):
     def __init__(self, service_name="vfa"):
@@ -32,14 +30,13 @@ def setup_json_logging(flask_app):
     logHandler = logging.StreamHandler()
     service_filter = ServiceNameFilter("vfa")
     logHandler.addFilter(service_filter)
-    formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
-        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
     )
     logHandler.setFormatter(formatter)
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("JSON logging configured for VFA service.")
+    flask_app.logger.info("Standard logging configured for VFA service.")
 
 setup_json_logging(app)
 

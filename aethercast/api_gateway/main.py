@@ -15,7 +15,6 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from google.cloud import storage # Added for GCS
 # from google.oauth2 import service_account # Not strictly needed if using ADC
 import logging # Added for JSON logging
-from python_json_logger import jsonlogger # Added for JSON logging
 
 # --- Path Setup for CPOA Import ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -54,9 +53,10 @@ def setup_json_logging():
     logHandler.addFilter(service_filter)
 
     # Format includes common fields, service_name, and placeholders for workflow/task IDs
-    formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(workflow_id)s %(task_id)s",
-        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    # Standard formatter, fields like levelname, name, asctime are standard
+    # Custom fields service_name, workflow_id, task_id are added by ServiceNameFilter
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(workflow_id)s %(task_id)s"
     )
     logHandler.setFormatter(formatter)
 
@@ -65,7 +65,7 @@ def setup_json_logging():
 
     # Test log
     initial_logger = logging.getLogger(__name__) # Use a logger for this specific module
-    initial_logger.info("JSON logging configured for API Gateway.")
+    initial_logger.info("Standard logging configured for API Gateway.")
 
 setup_json_logging() # Call early to configure logging
 
@@ -404,13 +404,114 @@ app.logger.setLevel(logging.INFO)
 app.logger.info("API Gateway Flask app initialized and logger configured to use root settings.")
 
 
-# ... (Flask app config as before) ...
+# --- Flask App Configuration ---
+app.config['SECRET_KEY'] = os.getenv('API_GATEWAY_FLASK_SECRET_KEY', 'a_default_fallback_secret_key_for_dev')
+app.config['JWT_EXPIRATION_DAYS'] = int(os.getenv('API_GATEWAY_JWT_EXPIRATION_DAYS', '7'))
+if app.config['SECRET_KEY'] == 'a_default_fallback_secret_key_for_dev':
+    app.logger.warning("Using default Flask SECRET_KEY. Please set API_GATEWAY_FLASK_SECRET_KEY for production.")
+
 
 # --- Auth Helper Functions & Decorator ---
-# ... (hash_password, check_password, generate_jwt, decode_jwt, token_required as before) ...
+def hash_password(password: str) -> str:
+    return generate_password_hash(password)
+
+def check_password(hashed_password: str, password_to_check: str) -> bool:
+    return check_password_hash(hashed_password, password_to_check)
+
+def generate_jwt(payload: dict, secret_key: str) -> str:
+    return jwt.encode(payload, secret_key, algorithm="HS256")
+
+def decode_jwt(token: str, secret_key: str) -> Optional[dict]:
+    try:
+        return jwt.decode(token, secret_key, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        app.logger.warning("JWT decode error: Token has expired.")
+        return None # Or raise specific exception
+    except jwt.InvalidTokenError as e:
+        app.logger.warning(f"JWT decode error: Invalid token - {e}")
+        return None # Or raise specific exception
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            auth_header = request.headers['Authorization']
+            if auth_header.startswith("Bearer "):
+                token = auth_header.split(" ")[1]
+
+        if not token:
+            return jsonify({"error_code": "API_GW_TOKEN_MISSING", "message": "Token is missing!"}), 401
+
+        try:
+            data = decode_jwt(token, app.config['SECRET_KEY'])
+            if data is None: # decode_jwt now returns None for expired/invalid instead of raising custom
+                # This condition might be redundant if decode_jwt raises, but good for clarity
+                # Or, if decode_jwt returns specific error objects, handle them here.
+                # For now, assuming None means some kind of invalid/expired token.
+                app.logger.warning("Token decoding failed (likely expired or invalid as per decode_jwt).")
+                # Defaulting to generic invalid token, specific error handled by decode_jwt logging.
+                return jsonify({"error_code": "API_GW_TOKEN_INVALID", "message": "Token is invalid or expired."}), 401
+
+            # Ensure essential claims are present (e.g. user_id or session_id depending on token type)
+            if 'user_id' not in data and 'session_id' not in data : # Example check
+                 app.logger.warning("Token missing required claims (user_id or session_id).")
+                 return jsonify({"error_code": "API_GW_TOKEN_CLAIMS_MISSING", "message": "Token missing required information."}), 401
+
+            g.current_user = data # Store decoded JWT payload in g
+
+        # Removed specific jwt exception handling here as decode_jwt now handles and logs them, returning None.
+        # except jwt.ExpiredSignatureError:
+        #     return jsonify({"error_code": "API_GW_TOKEN_EXPIRED", "message": "Token has expired!"}), 401
+        # except jwt.InvalidTokenError:
+        #     return jsonify({"error_code": "API_GW_TOKEN_INVALID", "message": "Token is invalid!"}), 401
+        except Exception as e_token_unexpected: # Catch any other unexpected error during token processing
+            app.logger.error(f"Unexpected error during token validation: {e_token_unexpected}", exc_info=True)
+            return jsonify({"error_code": "API_GW_TOKEN_VALIDATION_ERROR", "message": "Error validating token."}), 500
+
+        return f(*args, **kwargs)
+    return decorated
 
 # --- Static Frontend & Health Check ---
-# ... (serve_index, serve_style, serve_script, health_check, IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS as before) ...
+@app.route('/')
+def serve_index():
+    return send_from_directory('aethercast/fend', 'index.html')
+
+@app.route('/style.css')
+def serve_style():
+    return send_from_directory('aethercast/fend', 'style.css')
+
+@app.route('/app.js')
+def serve_script():
+    return send_from_directory('aethercast/fend', 'app.js')
+
+# --- CPOA Import Check ---
+cpoa_podcast_func_imported = callable(getattr(sys.modules.get('aethercast.cpoa.main'), 'orchestrate_podcast_generation', None))
+cpoa_snippet_func_imported = callable(getattr(sys.modules.get('aethercast.cpoa.main'), 'orchestrate_snippet_generation', None))
+cpoa_exploration_func_imported = callable(getattr(sys.modules.get('aethercast.cpoa.main'), 'orchestrate_topic_exploration', None))
+cpoa_search_func_imported = callable(getattr(sys.modules.get('aethercast.cpoa.main'), 'orchestrate_search_results_generation', None))
+cpoa_landing_snippets_func_imported = callable(getattr(sys.modules.get('aethercast.cpoa.main'), 'orchestrate_landing_page_snippets', None))
+cpoa_categories_func_imported = callable(getattr(sys.modules.get('aethercast.cpoa.main'), 'get_popular_categories', None))
+
+IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS = all([
+    cpoa_podcast_func_imported, cpoa_snippet_func_imported, cpoa_exploration_func_imported,
+    cpoa_search_func_imported, cpoa_landing_snippets_func_imported, cpoa_categories_func_imported
+])
+
+if not IMPORTS_SUCCESSFUL_ALL_CPOA_FUNCS:
+    missing_cpoa_funcs_messages = [
+        "CPOA 'orchestrate_podcast_generation' not available." if not cpoa_podcast_func_imported else "",
+        "CPOA 'orchestrate_snippet_generation' not available." if not cpoa_snippet_func_imported else "",
+        "CPOA 'orchestrate_topic_exploration' not available." if not cpoa_exploration_func_imported else "",
+        "CPOA 'orchestrate_search_results_generation' not available." if not cpoa_search_func_imported else "",
+        "CPOA 'orchestrate_landing_page_snippets' not available." if not cpoa_landing_snippets_func_imported else "",
+        "CPOA 'get_popular_categories' not available." if not cpoa_categories_func_imported else ""
+    ]
+    full_cpoa_import_error_msg = "API Gateway Warning: One or more CPOA functions failed to import correctly. Related API endpoints may be affected. Details: " + " ".join(filter(None, missing_cpoa_funcs_messages))
+    app.logger.error(full_cpoa_import_error_msg)
+else:
+    app.logger.info("All CPOA core functions imported successfully into API Gateway.")
+
 
 @app.route('/health', methods=['GET'])
 def health_check_endpoint():
@@ -419,13 +520,288 @@ def health_check_endpoint():
     return jsonify({"status": "healthy", "service": "API Gateway", "timestamp": datetime.utcnow().isoformat()}), 200
 
 # --- Session Management Endpoints ---
-# ... (session_init, get_session_preferences, update_session_preferences_endpoint as before) ...
+@app.route('/api/v1/session/init', methods=['POST'])
+def session_init():
+    data = request.get_json()
+    client_id_from_request = data.get('client_id') if data else None
+    session_id_to_use = None
+    conn = None
+    try:
+        conn = get_db_connection()
+        if client_id_from_request:
+            try:
+                uuid.UUID(client_id_from_request) # Validate format
+                existing_session = _get_session(conn, client_id_from_request)
+                if existing_session:
+                    session_id_to_use = client_id_from_request
+                    _touch_session_last_seen(conn, session_id_to_use)
+                    app.logger.info(f"Session init: Client provided valid session_id {session_id_to_use}, session exists and touched.")
+                else:
+                    session_id_to_use = client_id_from_request
+                    _create_session(conn, session_id_to_use, preferences=data.get('initial_preferences'))
+                    app.logger.info(f"Session init: Client provided session_id {session_id_to_use} which was not found. New session created with this ID.")
+            except ValueError:
+                app.logger.warning(f"Session init: Client provided invalid format client_id '{client_id_from_request}'. A new ID will be generated.")
+
+        if not session_id_to_use:
+            session_id_to_use = str(uuid.uuid4())
+            _create_session(conn, session_id_to_use, preferences=data.get('initial_preferences'))
+            app.logger.info(f"Session init: No valid client_id provided or found. New session created with ID {session_id_to_use}.")
+
+        final_session_state = _get_session(conn, session_id_to_use)
+        if not final_session_state:
+            app.logger.error(f"Session init: Critical error - session {session_id_to_use} not found after creation attempt.")
+            return jsonify({"error_code": "API_GW_SESSION_INIT_FAILURE", "message": "Failed to initialize or retrieve session."}), 500
+
+        token_payload = {
+            'session_id': session_id_to_use,
+            'user_id': None,
+            'exp': datetime.utcnow() + timedelta(days=app.config.get('JWT_EXPIRATION_DAYS', 7))
+        }
+        session_token = generate_jwt(token_payload, app.config['SECRET_KEY'])
+
+        return jsonify({
+            "message": "Session initialized successfully.",
+            "client_id": session_id_to_use,
+            "session_token": session_token,
+            "preferences": json.loads(final_session_state["preferences_json"]) if final_session_state["preferences_json"] else {}
+        }), 200
+
+    except ConnectionError as e_conn:
+        app.logger.error(f"Session init: Database connection error: {e_conn}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DATABASE_CONNECTION_ERROR", "message": "Database connection error."}), 503
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Session init: Database error: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_SESSION_DB_ERROR", "message": "Database error during session initialization."}), 500
+    except Exception as e:
+        app.logger.error(f"Session init: Unexpected error: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_SESSION_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route('/api/v1/session/preferences', methods=['GET'])
+@token_required
+def get_session_preferences():
+    session_id_from_token = g.current_user.get('session_id')
+    if not session_id_from_token:
+        app.logger.warning("get_session_preferences: No session_id found in token.")
+        return jsonify({"error_code": "API_GW_INVALID_TOKEN_CLAIMS", "message": "Token does not contain session information."}), 401
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        session_data = _get_session(conn, session_id_from_token)
+        if not session_data:
+            return jsonify({"error_code": "API_GW_SESSION_NOT_FOUND", "message": "Session not found."}), 404
+
+        _touch_session_last_seen(conn, session_id_from_token)
+
+        preferences = json.loads(session_data["preferences_json"]) if session_data["preferences_json"] else {}
+        return jsonify({"client_id": session_id_from_token, "preferences": preferences}), 200
+    except ConnectionError as e_conn:
+        app.logger.error(f"Get session preferences: Database connection error: {e_conn}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DATABASE_CONNECTION_ERROR", "message": "Database connection error."}), 503
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Get session preferences: Database error: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_SESSION_DB_ERROR", "message": "Database error retrieving session preferences."}), 500
+    except Exception as e:
+        app.logger.error(f"Get session preferences: Unexpected error: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_SESSION_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
+    finally:
+        if conn:
+            conn.close()
+
+@app.route('/api/v1/session/preferences', methods=['PUT'])
+@token_required # Activate token requirement
+def update_session_preferences_endpoint():
+    data = request.get_json()
+    if not data:
+        return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+
+    target_client_id = data.get('client_id') # client_id for which preferences are being updated
+    preferences = data.get('preferences')
+
+    if not target_client_id or not isinstance(target_client_id, str):
+        return jsonify({"error_code": "API_GW_CLIENT_ID_REQUIRED", "message": "'client_id' is required in payload."}), 400
+    if preferences is None or not isinstance(preferences, dict):
+        return jsonify({"error_code": "API_GW_PREFERENCES_REQUIRED", "message": "'preferences' (object) is required in payload."}), 400
+
+    session_id_from_token = g.current_user.get('session_id')
+
+    if not session_id_from_token:
+        app.logger.warning("Update session preferences: No session_id claim found in JWT token.")
+        return jsonify({"error_code": "API_GW_INVALID_TOKEN_CLAIMS", "message": "Token does not contain required session information."}), 401
+
+    if session_id_from_token != target_client_id:
+        app.logger.warning(f"Update session preferences: Authenticated session_id '{session_id_from_token}' "
+                           f"does not match target_client_id '{target_client_id}'. Forbidden.")
+        return jsonify({"error_code": "API_GW_FORBIDDEN_SESSION_UPDATE", "message": "Forbidden to update preferences for this client_id."}), 403
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        session_exists = _get_session(conn, target_client_id)
+
+        if not session_exists:
+            app.logger.warning(f"Update session preferences: target_client_id {target_client_id} (matching token) does not exist in DB. Update failed.")
+            return jsonify({"error_code": "API_GW_SESSION_NOT_FOUND", "message": "Session to update not found."}), 404
+        else:
+            _update_session_preferences(conn, target_client_id, preferences)
+            app.logger.info(f"Update session preferences: Successfully updated for target_client_id {target_client_id}.")
+            return jsonify({"message": "Preferences updated successfully.", "client_id": target_client_id, "preferences": preferences}), 200
+
+    except ConnectionError as e_conn:
+        app.logger.error(f"Update session preferences: Database connection error: {e_conn}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DATABASE_CONNECTION_ERROR", "message": "Database connection error."}), 503
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Update session preferences: Database error: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_SESSION_DB_ERROR", "message": "Database error updating session preferences."}), 500
+    except Exception as e:
+        app.logger.error(f"Update session preferences: Unexpected error: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_SESSION_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
+    finally:
+        if conn:
+            conn.close()
 
 # --- Auth Endpoints ---
-# ... (register_user, login_user as before) ...
+@app.route('/api/v1/auth/register', methods=['POST'])
+def register_user():
+    try:
+        data = request.get_json()
+        if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+
+    username = data.get('username')
+    email = data.get('email')
+    password = data.get('password')
+
+    if not username or not isinstance(username, str) or len(username) < 3:
+        return jsonify({"error_code": "API_GW_INVALID_USERNAME", "message": "Username must be at least 3 characters."}), 400
+    if not email or not isinstance(email, str) or not re.fullmatch(EMAIL_REGEX, email): # Using EMAIL_REGEX from subscribe
+        return jsonify({"error_code": "API_GW_INVALID_EMAIL", "message": "Invalid email format."}), 400
+    if not password or not isinstance(password, str) or len(password) < 8:
+        return jsonify({"error_code": "API_GW_INVALID_PASSWORD", "message": "Password must be at least 8 characters."}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Check if username or email already exists
+        check_sql = "SELECT user_id FROM users WHERE username = %s OR email = %s;" if DATABASE_TYPE == "postgres" else "SELECT user_id FROM users WHERE username = ? OR email = ?;"
+        cursor.execute(check_sql, (username, email))
+        if cursor.fetchone():
+            return jsonify({"error_code": "API_GW_USER_EXISTS", "message": "Username or email already exists."}), 409
+
+        user_id = str(uuid.uuid4())
+        hashed_pw = hash_password(password)
+        created_at_ts = datetime.utcnow()
+
+        insert_sql = "INSERT INTO users (user_id, username, email, hashed_password, created_at) VALUES (%s, %s, %s, %s, %s);" if DATABASE_TYPE == "postgres" else "INSERT INTO users (user_id, username, email, hashed_password, created_at) VALUES (?, ?, ?, ?, ?);"
+        params_insert = (user_id, username, email, hashed_pw, created_at_ts) if DATABASE_TYPE == "postgres" else (user_id, username, email, hashed_pw, created_at_ts.isoformat())
+
+        cursor.execute(insert_sql, params_insert)
+        conn.commit()
+        app.logger.info(f"User registered successfully: {username} (ID: {user_id})")
+        return jsonify({"message": "User registered successfully.", "user_id": user_id}), 201
+
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Register user: Database error for {username}: {e_db}", exc_info=True)
+        if conn and DATABASE_TYPE == "postgres": conn.rollback()
+        return jsonify({"error_code": "API_GW_REGISTER_DB_ERROR", "message": "Could not register user due to a database issue."}), 500
+    except Exception as e_unexp:
+        app.logger.error(f"Register user: Unexpected error for {username}: {e_unexp}", exc_info=True)
+        if conn and DATABASE_TYPE == "postgres": conn.rollback()
+        return jsonify({"error_code": "API_GW_REGISTER_UNEXPECTED_ERROR", "message": "An unexpected error occurred during registration."}), 500
+    finally:
+        if conn: conn.close()
+
+@app.route('/api/v1/auth/login', methods=['POST'])
+def login_user():
+    try:
+        data = request.get_json()
+        if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+
+    identifier = data.get('identifier') # Can be username or email
+    password = data.get('password')
+
+    if not identifier or not password:
+        return jsonify({"error_code": "API_GW_LOGIN_CREDS_REQUIRED", "message": "Username/email and password required."}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Allow login with username or email
+        sql = "SELECT * FROM users WHERE username = %s OR email = %s;" if DATABASE_TYPE == "postgres" else "SELECT * FROM users WHERE username = ? OR email = ?;"
+        cursor.execute(sql, (identifier, identifier))
+        user_row = cursor.fetchone()
+
+        if not user_row:
+            return jsonify({"error_code": "API_GW_LOGIN_INVALID_CREDS", "message": "Invalid username/email or password."}), 401
+
+        user = dict(user_row) # Convert row to dict
+        if not check_password(user['hashed_password'], password):
+            return jsonify({"error_code": "API_GW_LOGIN_INVALID_CREDS", "message": "Invalid username/email or password."}), 401
+
+        # Password is correct, generate JWT
+        # IMPORTANT: For session preference updates to be authorized by this token,
+        # the token MUST include the 'session_id' claim.
+        # This requires that upon login, a session is either created or retrieved for the user,
+        # and that session_id is then included in the JWT.
+        # The current logic for session_init creates a session and a token with 'session_id'.
+        # A robust login would:
+        # 1. Authenticate user.
+        # 2. Create/retrieve a session_id for this user (e.g. using _create_session or finding an existing one).
+        # 3. Put BOTH user_id AND session_id into the JWT.
+
+        # For now, let's assume a session_id needs to be generated or fetched here.
+        # This is a simplified example; a real system might have more complex session handling at login.
+        session_id_for_user = str(uuid.uuid4()) # Example: create a new session on login
+        _create_session(conn, session_id_for_user) # Create a new session for this login
+        app.logger.info(f"User {user['username']} logged in. New session created: {session_id_for_user}")
+
+
+        token_payload = {
+            'user_id': str(user['user_id']),
+            'username': user['username'],
+            'session_id': session_id_for_user, # CRUCIAL for session preference endpoint
+            'exp': datetime.utcnow() + timedelta(days=app.config.get('JWT_EXPIRATION_DAYS', 7))
+        }
+        auth_token = generate_jwt(token_payload, app.config['SECRET_KEY'])
+
+        app.logger.info(f"User {user['username']} logged in successfully.")
+        return jsonify({"message": "Login successful.", "token": auth_token, "user_id": str(user['user_id']), "username": user['username'], "client_id": session_id_for_user}), 200
+
+    except ConnectionError as e_conn:
+        app.logger.error(f"Login user: Database connection error: {e_conn}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DATABASE_CONNECTION_ERROR", "message": "Database connection error."}), 503
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Login user: Database error for {identifier}: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_LOGIN_DB_ERROR", "message": "Database error during login."}), 500
+    except Exception as e_unexp:
+        app.logger.error(f"Login user: Unexpected error for {identifier}: {e_unexp}", exc_info=True)
+        return jsonify({"error_code": "API_GW_LOGIN_UNEXPECTED_ERROR", "message": "An unexpected error occurred during login."}), 500
+    finally:
+        if conn: conn.close()
+
 
 # --- Helper to process snippets for signed URLs ---
-# ... (_process_snippets_for_signed_urls as before) ...
+def _process_snippets_for_signed_urls(snippets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    processed = []
+    for snippet in snippets:
+        if isinstance(snippet, dict) and snippet.get("image_url") and snippet["image_url"].startswith("gs://"):
+            signed_image_url = generate_gcs_signed_url(snippet["image_url"])
+            if signed_image_url:
+                snippet["image_url_signed"] = signed_image_url
+            else:
+                app.logger.warning(f"Failed to generate signed URL for image: {snippet['image_url']}")
+                snippet["image_url_signed"] = None # Or keep original, or error placeholder
+        processed.append(snippet)
+    return processed
 
 # --- Snippets Endpoint ---
 @app.route('/api/v1/snippets', methods=['GET'])
@@ -479,7 +855,20 @@ def get_dynamic_snippets():
         return jsonify({"error_code": "API_GW_SNIPPETS_UNEXPECTED_ERROR", "message": "An unexpected error occurred while fetching snippets.", "workflow_id": wf_id_for_error}), 500
 
 # --- Categories Endpoint ---
-# ... (get_categories_endpoint as before) ...
+@app.route('/api/v1/categories', methods=['GET'])
+def get_categories_endpoint():
+    app.logger.info("Request received for /api/v1/categories")
+    if not cpoa_categories_func_imported:
+        return jsonify({"error_code": "API_GW_CPOA_CATEGORIES_SERVICE_UNAVAILABLE", "message": "Categories service unavailable."}), 503
+    try:
+        categories_data = get_popular_categories() # This is a direct call to CPOA
+        return jsonify(categories_data), 200
+    except ImportError: # Should be caught by func_imported check, but as safeguard
+        app.logger.error("CPOA get_popular_categories import error.", exc_info=True)
+        return jsonify({"error_code": "API_GW_CPOA_CATEGORIES_MODULE_UNAVAILABLE", "message": "Categories service module unavailable."}), 503
+    except Exception as e:
+        app.logger.error(f"Unexpected error in /categories: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_CATEGORIES_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
 
 # --- Topic Exploration Endpoint ---
 @app.route('/api/v1/topics/explore', methods=['POST'])
@@ -494,23 +883,30 @@ def explore_topic():
     current_topic_id = data.get("current_topic_id")
     keywords = data.get("keywords")
     depth_mode = data.get("depth_mode", "deeper")
-    client_id = data.get("client_id")
+    client_id = data.get("client_id") # client_id for fetching preferences, not necessarily for auth here
     if not current_topic_id and not keywords: return jsonify({"error_code": "API_GW_EXPLORE_INPUT_REQUIRED", "message": "current_topic_id or keywords required."}), 400
+
     user_preferences = None
-    if client_id:
+    if client_id: # If client_id (session_id) is provided, try to fetch its preferences
         conn_prefs = None
         try:
             conn_prefs = get_db_connection()
             session_data = _get_session(conn_prefs, client_id)
-            if session_data and session_data["preferences_json"]: user_preferences = json.loads(session_data["preferences_json"]) if isinstance(session_data["preferences_json"], str) else session_data["preferences_json"]
-            elif not session_data: _create_session(conn_prefs, client_id); user_preferences = {}
-            else: user_preferences = {}
+            if session_data and session_data["preferences_json"]:
+                user_preferences = json.loads(session_data["preferences_json"]) if isinstance(session_data["preferences_json"], str) else session_data["preferences_json"]
+            elif not session_data: # If session doesn't exist, create it (idempotent)
+                _create_session(conn_prefs, client_id)
+                user_preferences = {}
+            else: # Session exists but no preferences
+                user_preferences = {}
             if session_data: _touch_session_last_seen(conn_prefs, client_id)
-        except Exception as e_prefs: app.logger.error(f"DB/JSON error for client {client_id} preferences (explore): {e_prefs}"); user_preferences = {}
+        except Exception as e_prefs:
+            app.logger.error(f"DB/JSON error for client {client_id} preferences (explore): {e_prefs}"); user_preferences = {}
         finally:
             if conn_prefs: conn_prefs.close()
+
     try:
-        current_user_id = g.current_user['user_id']
+        current_user_id = g.current_user['user_id'] # From @token_required
         cpoa_response_dict = orchestrate_topic_exploration(
             current_topic_id=current_topic_id, keywords=keywords, depth_mode=depth_mode,
             user_preferences=user_preferences, user_id=current_user_id
@@ -522,18 +918,19 @@ def explore_topic():
             app.logger.error(f"CPOA error in explore_topic: {error_code} - {error_details}. Workflow ID: {workflow_id_from_cpoa}")
             status_code = 503 if "TDA_" in error_code or "SCA_" in error_code or "WORKFLOW_CREATION_FAILED" in error_code else 500
             return jsonify({"error_code": f"API_GW_CPOA_EXPLORE_ERROR_{error_code}", "message": error_details, "workflow_id": workflow_id_from_cpoa}), status_code
+
         explored_topics_list = cpoa_response_dict.get("explored_topics", [])
         processed_explored_topics = _process_snippets_for_signed_urls(explored_topics_list)
         return jsonify({"workflow_id": workflow_id_from_cpoa, "explored_topics": processed_explored_topics}), 200
     except ImportError:
         app.logger.error("CPOA module import error in explore_topic.", exc_info=True)
         return jsonify({"error_code": "API_GW_CPOA_EXPLORE_MODULE_UNAVAILABLE_RUNTIME", "message": "Exploration module unavailable."}), 503
-    except ValueError as ve:
-        app.logger.warning(f"ValueError in explore_topic: {ve}")
+    except ValueError as ve: # Catch ValueErrors from CPOA's orchestrate_topic_exploration
+        app.logger.warning(f"ValueError in explore_topic (likely from CPOA validation): {ve}")
         return jsonify({"error_code": "API_GW_EXPLORE_INVALID_INPUT_OR_STATE", "message": str(ve)}), 400
     except Exception as e:
         app.logger.error(f"Unexpected error in /explore: {e}", exc_info=True)
-        wf_id_for_error = locals().get('cpoa_response_dict', {}).get('workflow_id')
+        wf_id_for_error = locals().get('cpoa_response_dict', {}).get('workflow_id') # Try to get wf_id if possible
         return jsonify({"error_code": "API_GW_EXPLORE_UNEXPECTED_ERROR", "message": "An unexpected error occurred.", "workflow_id": wf_id_for_error}), 500
 
 # --- Search Endpoint ---
@@ -546,30 +943,47 @@ def search_podcasts_endpoint():
     try: data = request.get_json()
     except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
     if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+
     query = data.get("query")
     if not query or not isinstance(query, str) or not query.strip():
         return jsonify({"error_code": "API_GW_SEARCH_QUERY_INVALID", "message": "Query required."}), 400
-    client_id = data.get("client_id")
+
+    client_id = data.get("client_id") # For fetching preferences
     user_preferences = None
     if client_id:
-        # ... (fetch user_preferences logic as in explore_topic) ...
-        pass
+        conn_prefs = None
+        try:
+            conn_prefs = get_db_connection()
+            session_data = _get_session(conn_prefs, client_id)
+            if session_data and session_data["preferences_json"]:
+                user_preferences = json.loads(session_data["preferences_json"]) if isinstance(session_data["preferences_json"], str) else session_data["preferences_json"]
+            elif not session_data: _create_session(conn_prefs, client_id); user_preferences = {}
+            else: user_preferences = {}
+            if session_data: _touch_session_last_seen(conn_prefs, client_id)
+        except Exception as e_prefs: app.logger.error(f"DB/JSON error for client {client_id} preferences (search): {e_prefs}"); user_preferences = {}
+        finally:
+            if conn_prefs: conn_prefs.close()
+
     try:
-        current_user_id = g.current_user['user_id']
+        current_user_id = g.current_user['user_id'] # From @token_required
         cpoa_response_dict = orchestrate_search_results_generation(
             query=query, user_preferences=user_preferences, user_id=current_user_id
         )
         workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
+
         if cpoa_response_dict.get("error"):
             error_code = str(cpoa_response_dict.get("error", "CPOA_SEARCH_ERROR")).upper()
             error_details = cpoa_response_dict.get("details", "Search failed via CPOA.")
             app.logger.error(f"CPOA error in search: {error_code} - {error_details}. Workflow ID: {workflow_id_from_cpoa}")
             status_code = 503 if "TDA_" in error_code or "SCA_" in error_code or "WORKFLOW_CREATION_FAILED" in error_code else 500
             return jsonify({"error_code": f"API_GW_CPOA_SEARCH_ERROR_{error_code}", "message": error_details, "workflow_id": workflow_id_from_cpoa}), status_code
+
         search_results_list = cpoa_response_dict.get("search_results", [])
         processed_search_results = _process_snippets_for_signed_urls(search_results_list)
+
         response_payload = {"workflow_id": workflow_id_from_cpoa, "search_results": processed_search_results}
         if "message" in cpoa_response_dict: response_payload["message"] = cpoa_response_dict["message"]
+
         return jsonify(response_payload), 200
     except ImportError:
         app.logger.error("CPOA module import error in search.", exc_info=True)
@@ -589,57 +1003,253 @@ def create_podcast_generation_task():
     try: data = request.get_json()
     except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
     if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+
     topic = data.get('topic')
     if not topic or not isinstance(topic, str) or not topic.strip(): return jsonify({"error_code": "API_GW_PODCAST_TOPIC_INVALID", "message": "Topic required."}), 400
+
     voice_params_from_request = data.get('voice_params')
-    client_id_from_request = data.get('client_id')
-    test_scenarios_from_request = data.get('test_scenarios')
+    client_id_from_request = data.get('client_id') # For fetching preferences and UI updates
+    test_scenarios_from_request = data.get('test_scenarios') # For testing specific error paths
+
     user_preferences = None
-    if client_id_from_request:
-        # ... (fetch user_preferences logic as in explore_topic) ...
-        pass
+    if client_id_from_request: # If client_id (session_id) is provided, try to fetch its preferences
+        conn_prefs = None
+        try:
+            conn_prefs = get_db_connection()
+            session_data = _get_session(conn_prefs, client_id_from_request)
+            if session_data and session_data["preferences_json"]:
+                user_preferences = json.loads(session_data["preferences_json"]) if isinstance(session_data["preferences_json"], str) else session_data["preferences_json"]
+            elif not session_data: _create_session(conn_prefs, client_id_from_request); user_preferences = {} # Create session if not found
+            else: user_preferences = {} # Session exists but no preferences
+            if session_data: _touch_session_last_seen(conn_prefs, client_id_from_request)
+        except Exception as e_prefs: app.logger.error(f"DB/JSON error for client {client_id_from_request} preferences (podcast create): {e_prefs}"); user_preferences = {}
+        finally:
+            if conn_prefs: conn_prefs.close()
+
     try:
-        podcast_id = str(uuid.uuid4()) # This is the original_task_id for CPOA
+        podcast_id = str(uuid.uuid4())
         task_created_timestamp = datetime.utcnow()
-        # ... (DB insertion into 'podcasts' table as before) ...
-        current_user_id = g.current_user['user_id']
+
+        # Initial DB entry for the podcast task (legacy table)
+        conn_main_db = None
+        try:
+            conn_main_db = get_db_connection()
+            cursor = conn_main_db.cursor()
+            sql_insert_podcast = """
+                INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, last_updated_timestamp)
+                VALUES (%s, %s, %s, %s, %s)
+            """
+            params_insert_podcast = (podcast_id, topic, "pending_cpoa_dispatch", task_created_timestamp, task_created_timestamp)
+            if DATABASE_TYPE == "sqlite":
+                sql_insert_podcast = sql_insert_podcast.replace("%s", "?")
+                params_insert_podcast = (podcast_id, topic, "pending_cpoa_dispatch", task_created_timestamp.isoformat(), task_created_timestamp.isoformat())
+
+            cursor.execute(sql_insert_podcast, params_insert_podcast)
+            conn_main_db.commit()
+            app.logger.info(f"Podcast task {podcast_id} for topic '{topic}' initially saved to DB.")
+        except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db_init:
+            app.logger.error(f"Failed to make initial DB entry for podcast task {podcast_id}: {e_db_init}", exc_info=True)
+            # Proceed with CPOA call but log this DB error. CPOA will also log its own DB interactions.
+        finally:
+            if conn_main_db: conn_main_db.close()
+
+        current_user_id = g.current_user['user_id'] # From @token_required
+
         cpoa_kwargs = {
             "topic": topic, "original_task_id": podcast_id, "user_id": current_user_id,
             "voice_params_input": voice_params_from_request, "user_preferences": user_preferences,
             "test_scenarios": test_scenarios_from_request
         }
         if client_id_from_request: cpoa_kwargs["client_id"] = client_id_from_request
+
         cpoa_result = orchestrate_podcast_generation(**cpoa_kwargs)
+
         final_cpoa_status = cpoa_result.get("status", "unknown_cpoa_status")
-        workflow_id_from_cpoa = cpoa_result.get("workflow_id")
+        workflow_id_from_cpoa = cpoa_result.get("workflow_id") # This is the new CPOA state workflow_id
+
         response_payload = {
-            "podcast_id": podcast_id, "workflow_id": workflow_id_from_cpoa, "topic": topic,
-            "generation_status": final_cpoa_status, "details": cpoa_result
+            "podcast_id": podcast_id, # original_task_id
+            "workflow_id": workflow_id_from_cpoa,
+            "topic": topic,
+            "generation_status": final_cpoa_status, # Legacy status for direct API response
+            "details": cpoa_result # Full CPOA result for debugging/logging
         }
-        # ... (rest of response_payload construction and status code logic as before) ...
-        if final_cpoa_status.startswith("failed") or cpoa_result.get("error"):
+
+        http_status_code = 201 # Default for accepted/processing
+        if final_cpoa_status.startswith("failed") or cpoa_result.get("error_message"):
             error_message = cpoa_result.get("error_message", cpoa_result.get("details", f"Podcast generation failed: {final_cpoa_status}"))
             response_payload["error_code"] = f"API_GW_CPOA_ORCHESTRATION_ERROR_{final_cpoa_status.upper()}"
             response_payload["message"] = error_message
-            http_status_code = 502 if "request_exception" in final_cpoa_status or "reported_error" in final_cpoa_status or "WORKFLOW_CREATION_FAILED" in final_cpoa_status.upper() else 500
-        # ... (other status handling)
-        return jsonify(response_payload), 201 # Default to 201, adjust based on error
-    except ImportError:
+            # Determine appropriate HTTP status code based on CPOA error
+            # Example: if CPOA indicates a sub-service request failed (e.g., timeout, service unavailable)
+            if "request_exception" in final_cpoa_status or "reported_error" in final_cpoa_status or "WORKFLOW_CREATION_FAILED" in final_cpoa_status.upper() or "timeout" in final_cpoa_status.lower():
+                http_status_code = 502 # Bad Gateway (upstream service failure)
+            else: # Other CPOA internal errors
+                http_status_code = 500 # Internal Server Error
+        elif final_cpoa_status == "completed_with_vfa_skipped": # A specific non-failure but not full success
+             http_status_code = 200 # OK, but with details indicating skipped part
+
+        return jsonify(response_payload), http_status_code
+
+    except ImportError: # Should be caught by func_imported check, but as safeguard
         app.logger.error("CPOA module import error in create_podcast_generation_task.", exc_info=True)
         return jsonify({"error_code": "API_GW_CPOA_PODCAST_MODULE_UNAVAILABLE", "message": "Podcast module unavailable."}), 503
     except Exception as e:
         app.logger.error(f"Unexpected error in create_podcast_generation_task: {e}", exc_info=True)
-        wf_id_for_error = locals().get('cpoa_result', {}).get('workflow_id')
+        wf_id_for_error = locals().get('cpoa_result', {}).get('workflow_id') # Try to get wf_id if possible
         return jsonify({"error_code": "API_GW_PODCAST_CREATE_UNEXPECTED_ERROR", "message": "Unexpected error.", "workflow_id": wf_id_for_error}), 500
 
 # --- List All Podcasts & Get Specific Podcast Details Endpoints ---
-# ... (list_podcasts, get_podcast_details as before, no changes for user_id/workflow_id here) ...
+@app.route('/api/v1/podcasts', methods=['GET'])
+def list_podcasts():
+    # ... (implementation as before) ...
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        # Fetch relevant fields, including GCS URI for audio
+        cursor.execute("SELECT podcast_id, topic, cpoa_status, final_audio_filepath, task_created_timestamp, last_updated_timestamp FROM podcasts ORDER BY task_created_timestamp DESC LIMIT 100;")
+        podcasts_raw = cursor.fetchall()
+
+        podcasts_list = []
+        for row in podcasts_raw:
+            podcast_dict = dict(row) # Convert row to dict if not already (RealDictCursor does this)
+            # Generate signed URL for final_audio_filepath if it's a GCS URI
+            if podcast_dict.get("final_audio_filepath") and podcast_dict["final_audio_filepath"].startswith("gs://"):
+                signed_url = generate_gcs_signed_url(podcast_dict["final_audio_filepath"])
+                podcast_dict["audio_url_signed"] = signed_url # Add signed URL to response
+            podcasts_list.append(podcast_dict)
+
+        return jsonify({"podcasts": podcasts_list})
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"List podcasts: Database error: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DB_ERROR_LIST_PODCASTS", "message": "Database error listing podcasts."}), 500
+    except Exception as e:
+        app.logger.error(f"List podcasts: Unexpected error: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_UNEXPECTED_ERROR_LIST_PODCASTS", "message": "Unexpected error listing podcasts."}), 500
+    finally:
+        if conn: conn.close()
+
+
+@app.route('/api/v1/podcasts/<uuid:podcast_id_from_path>', methods=['GET'])
+def get_podcast_details(podcast_id_from_path: uuid.UUID):
+    # ... (implementation as before) ...
+    podcast_id_str = str(podcast_id_from_path)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        sql = "SELECT * FROM podcasts WHERE podcast_id = %s;" if DATABASE_TYPE == "postgres" else "SELECT * FROM podcasts WHERE podcast_id = ?;"
+        cursor.execute(sql, (podcast_id_str,))
+        podcast_data_raw = cursor.fetchone()
+
+        if not podcast_data_raw:
+            return jsonify({"error_code": "API_GW_PODCAST_NOT_FOUND", "message": "Podcast not found."}), 404
+
+        podcast_data = dict(podcast_data_raw) # Convert row to dict
+
+        # Generate signed URL for final_audio_filepath if it's a GCS URI
+        if podcast_data.get("final_audio_filepath") and podcast_data["final_audio_filepath"].startswith("gs://"):
+            signed_url = generate_gcs_signed_url(podcast_data["final_audio_filepath"])
+            podcast_data["audio_url_signed"] = signed_url # Add signed URL
+
+        # Parse JSONB log if present (PostgreSQL)
+        if DATABASE_TYPE == "postgres" and 'cpoa_full_orchestration_log' in podcast_data and isinstance(podcast_data['cpoa_full_orchestration_log'], str):
+            try: podcast_data['cpoa_full_orchestration_log'] = json.loads(podcast_data['cpoa_full_orchestration_log'])
+            except json.JSONDecodeError: app.logger.warning(f"Failed to parse cpoa_full_orchestration_log JSON for podcast {podcast_id_str}")
+        # For SQLite, if it was stored as JSON string, it might already be string. If needs parsing, add here.
+
+        return jsonify(podcast_data)
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Get podcast details: Database error for {podcast_id_str}: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DB_ERROR_PODCAST_DETAILS", "message": "Database error fetching podcast details."}), 500
+    except Exception as e:
+        app.logger.error(f"Get podcast details: Unexpected error for {podcast_id_str}: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_UNEXPECTED_ERROR_PODCAST_DETAILS", "message": "Unexpected error fetching podcast details."}), 500
+    finally:
+        if conn: conn.close()
+
 
 # --- Serve Podcast Audio Endpoint ---
-# ... (serve_podcast_audio as before) ...
+@app.route('/api/v1/podcasts/<uuid:podcast_id_from_path>/audio', methods=['GET'])
+def serve_podcast_audio(podcast_id_from_path: uuid.UUID):
+    # ... (implementation as before, but use signed URL logic) ...
+    podcast_id_str = str(podcast_id_from_path)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        sql = "SELECT final_audio_filepath FROM podcasts WHERE podcast_id = %s;" if DATABASE_TYPE == "postgres" else "SELECT final_audio_filepath FROM podcasts WHERE podcast_id = ?;"
+        cursor.execute(sql, (podcast_id_str,))
+        row = cursor.fetchone()
+
+        if not row or not row.get("final_audio_filepath"):
+            return jsonify({"error_code": "API_GW_AUDIO_NOT_FOUND_OR_NO_PATH", "message": "Audio file path not found for this podcast."}), 404
+
+        audio_path = row["final_audio_filepath"]
+
+        if audio_path.startswith("gs://"):
+            signed_url = generate_gcs_signed_url(audio_path, expiration_minutes=5) # Short expiration for direct streaming
+            if signed_url:
+                app.logger.info(f"Redirecting to GCS signed URL for podcast {podcast_id_str} audio.")
+                return redirect(signed_url, code=302)
+            else:
+                app.logger.error(f"Failed to generate signed URL for GCS audio path: {audio_path}")
+                return jsonify({"error_code": "API_GW_GCS_SIGNED_URL_FAILURE", "message": "Could not generate secure audio link."}), 500
+        else: # Fallback for local file paths (legacy or testing)
+            app.logger.warning(f"Serving audio for podcast {podcast_id_str} from local path: {audio_path}. This is not recommended for production.")
+            if not os.path.isabs(audio_path): # Ensure path is absolute if local
+                # This might need adjustment based on where VFA/ASF actually store files relative to API GW's perspective
+                # For Docker, this usually means paths within a shared volume.
+                # Assuming audio_path is an absolute path in the container if local.
+                app.logger.error(f"Local audio path is not absolute: {audio_path}")
+                return jsonify({"error_code": "API_GW_LOCAL_AUDIO_PATH_INVALID", "message": "Invalid local audio path configured."}), 500
+            if not os.path.exists(audio_path):
+                app.logger.error(f"Local audio file not found at: {audio_path}")
+                return jsonify({"error_code": "API_GW_LOCAL_AUDIO_FILE_MISSING", "message": "Audio file not found locally."}), 404
+
+            # Determine mimetype (simple version)
+            mimetype = "audio/mpeg" # Default
+            if audio_path.lower().endswith(".wav"): mimetype = "audio/wav"
+            elif audio_path.lower().endswith(".ogg"): mimetype = "audio/ogg"
+
+            return send_file(audio_path, mimetype=mimetype, as_attachment=False)
+
+    except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e_db:
+        app.logger.error(f"Serve audio: Database error for {podcast_id_str}: {e_db}", exc_info=True)
+        return jsonify({"error_code": "API_GW_DB_ERROR_SERVE_AUDIO", "message": "Database error serving audio."}), 500
+    except Exception as e:
+        app.logger.error(f"Serve audio: Unexpected error for {podcast_id_str}: {e}", exc_info=True)
+        return jsonify({"error_code": "API_GW_UNEXPECTED_ERROR_SERVE_AUDIO", "message": "Unexpected error serving audio."}), 500
+    finally:
+        if conn: conn.close()
 
 # --- Internal Endpoints ---
-# ... (get_internal_media_access_url as before) ...
+@app.route('/api/v1/internal/media_access_url', methods=['GET'])
+@token_required # Protect this internal endpoint as well
+def get_internal_media_access_url():
+    # This endpoint is intended to be called by other internal services (like ASF)
+    # to get a publicly accessible URL (e.g., a GCS signed URL) for a media file.
+    # It requires authentication to ensure only trusted internal services can use it.
+    # The requesting service's JWT might need specific claims if we want to verify which service it is.
+
+    # For now, g.current_user will contain whatever claims the internal service's token has.
+    # We might add a specific 'service_role' or 'service_name' claim to internal tokens.
+    app.logger.info(f"Internal media access URL request received. Authenticated entity: {g.current_user}")
+
+    gcs_uri = request.args.get('gcs_uri')
+    if not gcs_uri or not gcs_uri.startswith("gs://"):
+        return jsonify({"error_code": "API_GW_INVALID_GCS_URI_PARAM", "message": "Valid 'gcs_uri' parameter starting with 'gs://' is required."}), 400
+
+    signed_url = generate_gcs_signed_url(gcs_uri, expiration_minutes=5) # Short-lived for immediate use
+    if signed_url:
+        app.logger.info(f"Generated signed URL for internal request: {gcs_uri}")
+        return jsonify({"gcs_uri": gcs_uri, "signed_url": signed_url}), 200
+    else:
+        app.logger.error(f"Failed to generate signed URL for internal request: {gcs_uri}")
+        return jsonify({"error_code": "API_GW_INTERNAL_SIGNED_URL_FAILURE", "message": "Could not generate secure URL for the GCS resource."}), 500
+
 
 # --- Subscribe Endpoint (New) ---
 EMAIL_REGEX = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
@@ -696,12 +1306,7 @@ def handle_subscribe():
         if conn: conn.close()
 
 # --- Main Block ---
-# ... (if __name__ == '__main__' as before) ...
-# Placeholder for Flask app run
 if __name__ == '__main__':
-    # init_db() is called by CPOA or individual services now, or on first request in some cases.
-    # For standalone API Gateway run, ensure it's called if needed or relies on auto-init.
-    # For this logging change, the key is that logging is set up before app.run.
     app.logger.info("Starting API Gateway service directly for development.")
-    init_db() # Ensure DB is ready if running standalone
+    init_db()
     app.run(debug=True, host=os.getenv("API_GATEWAY_HOST", "0.0.0.0"), port=int(os.getenv("API_GATEWAY_PORT", "5001")))

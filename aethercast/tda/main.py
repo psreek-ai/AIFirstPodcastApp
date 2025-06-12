@@ -10,7 +10,6 @@ import psycopg2 # Added
 from psycopg2.extras import RealDictCursor # Added
 from datetime import datetime
 import time # Added for metric logging
-from python_json_logger import jsonlogger # Added for JSON logging
 
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -41,15 +40,14 @@ def setup_json_logging(flask_app):
     service_filter = ServiceNameFilter("tda") # Service name for TDA
     logHandler.addFilter(service_filter)
 
-    formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s",
-        rename_fields={"levelname": "level", "name": "logger_name", "asctime": "timestamp"}
+    formatter = logging.Formatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
     )
     logHandler.setFormatter(formatter)
 
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("JSON logging configured for TDA service.")
+    flask_app.logger.info("Standard logging configured for TDA service.")
 
 setup_json_logging(app)
 

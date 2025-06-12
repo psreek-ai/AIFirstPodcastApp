@@ -58,7 +58,6 @@ services:
       # - cpoa (though cpoa is part of api_gateway image)
       # - aims_service # If API Gateway directly called AIMS
       # GCS_BUCKET_NAME is sourced from common.env
-      - GCS_BUCKET_NAME=${GCS_BUCKET_NAME}
     networks: # Example: assuming a custom network for all backend services
       - aethercast_network
     logging:
@@ -205,7 +204,8 @@ services:
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-aethercastpass}
       - POSTGRES_DB=${POSTGRES_DB:-aethercast_db}
     depends_on:
-      - aims_service
+      aims_service:
+        condition: service_started # Assuming service_started is sufficient
       postgres_db:
         condition: service_healthy
     networks:

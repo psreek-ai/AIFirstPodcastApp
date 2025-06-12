@@ -1,4 +1,5 @@
 Flask>=2.0
 python-dotenv>=0.20.0
 google-cloud-aiplatform>=1.0.0
-python-json-logger>=2.0.0
+celery>=5.2.0 # Using a recent stable version
+redis>=4.0.0  # For Celery broker and backend

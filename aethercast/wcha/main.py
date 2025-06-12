@@ -5,12 +5,31 @@ import json # Not directly used by new functions but often useful
 import os # Added
 from dotenv import load_dotenv # Added
 from typing import Optional # Added for type hinting
+from celery import Celery
+from celery.result import AsyncResult
 import socket # New import
 import ipaddress # New import
 from urllib.parse import urlparse # New import
 
 # --- Load Environment Variables ---
 load_dotenv() # Added
+
+# --- Celery Configuration ---
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+
+celery_app = Celery(
+    'wcha_tasks',
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND
+)
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+)
 
 # --- WCHA Configuration ---
 wcha_config = {}
@@ -183,27 +202,49 @@ def is_url_safe(url_string: str) -> tuple[bool, str]:
             return False, reason
 
         try:
-            resolved_ip_str = socket.gethostbyname(hostname)
-            ip_addr = ipaddress.ip_address(resolved_ip_str)
-            logger.debug(f"[WCHA_URL_VALIDATION] URL '{url_string}' (hostname: '{hostname}') resolved to IP: {resolved_ip_str}")
+            # Use getaddrinfo to get all addresses (IPv4 and IPv6)
+            addr_info_list = socket.getaddrinfo(hostname, None)
         except socket.gaierror:
             reason = f"Could not resolve hostname: '{hostname}'."
             logger.warning(f"[WCHA_URL_VALIDATION] {reason}")
             return False, reason
 
-        if not ip_addr.is_global:
-            check_details = []
-            if ip_addr.is_loopback: check_details.append("is loopback")
-            if ip_addr.is_private: check_details.append("is private")
-            if ip_addr.is_link_local: check_details.append("is link-local")
-            if ip_addr.is_multicast: check_details.append("is multicast")
-            if ip_addr.is_unspecified: check_details.append("is unspecified")
-
-            reason = f"Resolved IP address '{resolved_ip_str}' for hostname '{hostname}' is not a public IP ({', '.join(check_details)})."
+        if not addr_info_list:
+            reason = f"No address information found for hostname: '{hostname}'."
             logger.warning(f"[WCHA_URL_VALIDATION] {reason}")
             return False, reason
 
-        logger.info(f"[WCHA_URL_VALIDATION] URL '{url_string}' (IP: {resolved_ip_str}) is deemed safe.")
+        all_ips_safe = True
+        unsafe_ip_details = ""
+
+        for family, socktype, proto, canonname, sockaddr in addr_info_list:
+            ip_str = sockaddr[0] # The IP address is the first element of the sockaddr tuple
+            try:
+                ip_addr = ipaddress.ip_address(ip_str)
+                logger.debug(f"[WCHA_URL_VALIDATION] URL '{url_string}' (hostname: '{hostname}') resolved to IP: {ip_str} (Family: {family})")
+
+                if not ip_addr.is_global:
+                    check_details = []
+                    if ip_addr.is_loopback: check_details.append("is loopback")
+                    if ip_addr.is_private: check_details.append("is private")
+                    if ip_addr.is_link_local: check_details.append("is link-local")
+                    if ip_addr.is_multicast: check_details.append("is multicast")
+                    if ip_addr.is_unspecified: check_details.append("is unspecified")
+
+                    unsafe_ip_details = f"Resolved IP address '{ip_str}' for hostname '{hostname}' is not a public IP ({', '.join(check_details)})."
+                    all_ips_safe = False
+                    break # One unsafe IP is enough to mark the URL as unsafe
+            except ValueError:
+                # This can happen if the IP string format is somehow invalid, though rare from getaddrinfo
+                unsafe_ip_details = f"Invalid IP address format received from getaddrinfo: '{ip_str}'."
+                all_ips_safe = False
+                break
+
+        if not all_ips_safe:
+            logger.warning(f"[WCHA_URL_VALIDATION] {unsafe_ip_details}")
+            return False, unsafe_ip_details
+
+        logger.info(f"[WCHA_URL_VALIDATION] URL '{url_string}' (all resolved IPs are public) is deemed safe.")
         return True, "URL is safe."
 
     except ValueError as ve:
@@ -215,11 +256,133 @@ def is_url_safe(url_string: str) -> tuple[bool, str]:
         logger.error(f"[WCHA_URL_VALIDATION] {reason}", exc_info=True)
         return False, reason
 
+@celery_app.task(bind=True, name='fetch_news_articles_task')
+def fetch_news_articles_task(self, request_id: str, topic: str, language: Optional[str] = None, max_results: Optional[int] = None):
+    """
+    Celery task to fetch news articles from NewsAPI.org.
+    """
+    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Fetching news for topic '{topic}'.")
+    if not wcha_config.get("USE_REAL_NEWS_API"):
+        logger.info(f"Celery Task {self.request.id}: USE_REAL_NEWS_API is false. Returning empty list for mock behavior.")
+        # For consistency, the mock/placeholder logic for NewsAPI could be here if needed.
+        # For now, just returning empty as this task is about "real" API call.
+        return {"status": "success_mock", "articles": [], "message": "News API is not enabled; mock response."}
+
+    if not wcha_config.get("TDA_NEWS_API_KEY"): # Corrected key based on existing call_real_news_api
+        logger.error(f"Celery Task {self.request.id}: TDA_NEWS_API_KEY not configured.")
+        raise ValueError("NewsAPI key not configured.") # Makes task fail
+
+    base_url = wcha_config.get("TDA_NEWS_API_BASE_URL", "https://newsapi.org/v2/") # Get from wcha_config
+    endpoint = wcha_config.get("TDA_NEWS_API_ENDPOINT", "everything")
+    api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+
+    params = {}
+    query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else wcha_config.get("TDA_NEWS_DEFAULT_KEYWORDS", [])
+    if query_keywords_list:
+        params["q"] = " OR ".join(query_keywords_list)
+
+    current_language = language if language else wcha_config.get("TDA_NEWS_DEFAULT_LANGUAGE", "en")
+    if current_language:
+        params["language"] = current_language
+
+    params["pageSize"] = max_results if max_results else wcha_config.get("TDA_NEWS_PAGE_SIZE", 25)
+
+    headers = {
+        "X-Api-Key": wcha_config["TDA_NEWS_API_KEY"],
+        "User-Agent": wcha_config.get("WCHA_USER_AGENT", "AethercastContentHarvester/0.2")
+    }
+    request_timeout = wcha_config.get("WCHA_REQUEST_TIMEOUT", 15)
+
+    logger.info(f"Celery Task {self.request.id}: Calling NewsAPI: URL={api_url}, Params={params}")
+    try:
+        response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
+        response.raise_for_status()
+        response_json = response.json()
+
+        if response_json.get("status") != "ok": # NewsAPI specific status
+            error_msg = f"NewsAPI returned error status: {response_json.get('status')}. Message: {response_json.get('message')}"
+            logger.error(f"Celery Task {self.request.id}: {error_msg}")
+            # Raise an exception to mark the task as FAILED
+            raise requests.exceptions.HTTPError(error_msg, response=response)
+
+        articles = response_json.get("articles", [])
+        logger.info(f"Celery Task {self.request.id}: Fetched {len(articles)} articles from NewsAPI for topic '{topic}'.")
+        # We are not saving to DB here anymore, that's a separate step if needed.
+        return {"status": "success", "articles": articles, "message": f"Fetched {len(articles)} articles."}
+
+    except requests.exceptions.RequestException as e_req:
+        logger.error(f"Celery Task {self.request.id}: NewsAPI request error: {e_req}", exc_info=True)
+        raise self.retry(exc=e_req, countdown=5, max_retries=2)
+    except Exception as e_unexp:
+        logger.error(f"Celery Task {self.request.id}: Unexpected error fetching news: {e_unexp}", exc_info=True)
+        raise self.retry(exc=e_unexp, countdown=5, max_retries=2)
+
+
+@celery_app.task(bind=True, name='harvest_url_content_task')
+def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_length: int = 150):
+    """
+    Celery task to harvest content from a single URL.
+    Note: is_url_safe check should be done *before* dispatching this task.
+    """
+    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting content harvest for URL: {url_to_harvest}")
+
+    # Configuration for the task execution (could be passed or accessed if worker has access to wcha_config)
+    request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
+    headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
+
+    if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4:
+        error_msg = f"Required library missing: requests/bs4 ({_MISSING_IMPORT_ERROR_REQUESTS_BS4})"
+        logger.error(f"Celery Task {self.request.id}: {error_msg}")
+        # Raise an exception to mark the task as FAILED in Celery
+        raise ImportError(error_msg)
+
+    if not _IMPORTS_SUCCESSFUL_TRAFILATURA:
+        error_msg = f"Required library missing: trafilatura ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
+        logger.error(f"Celery Task {self.request.id}: {error_msg}")
+        raise ImportError(error_msg)
+
+    logger.info(f"Celery Task {self.request.id}: Attempting to harvest content from URL: {url_to_harvest} using Trafilatura")
+
+    try:
+        response = requests.get(url_to_harvest, headers=headers, timeout=request_timeout, allow_redirects=False)
+        response.raise_for_status()
+        content_type = response.headers.get('Content-Type', '').lower()
+        if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
+            logger.warning(f"Celery Task {self.request.id}: Content at URL '{url_to_harvest}' may not be HTML (Content-Type: {content_type}).")
+
+        extracted_text = trafilatura.extract(response.content, url=url_to_harvest, output_format='txt',
+                                             include_comments=False, include_tables=False, favor_precision=True)
+
+        if extracted_text:
+            if len(extracted_text) < min_length:
+                logger.warning(f"Celery Task {self.request.id}: Content from {url_to_harvest} is shorter ({len(extracted_text)}) than min_length ({min_length}).")
+            logger.info(f"Celery Task {self.request.id}: Trafilatura successfully extracted {len(extracted_text)} characters from {url_to_harvest}.")
+            return {"url": url_to_harvest, "content": extracted_text, "error_type": None, "error_message": None}
+        else:
+            logger.warning(f"Celery Task {self.request.id}: Trafilatura extracted no content from URL: {url_to_harvest}.")
+            # This is a valid outcome, not an exception, but indicates no content found.
+            return {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
+
+    except requests.exceptions.RequestException as e_req:
+        error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url_to_harvest}': {e_req}"
+        logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True)
+        raise self.retry(exc=e_req, countdown=5, max_retries=2) # Retry for network issues
+    except Exception as e_traf: # Includes Trafilatura errors or other unexpected issues
+        error_msg = f"Trafilatura processing or other unexpected error for '{url_to_harvest}': {type(e_traf).__name__} - {e_traf}"
+        logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True)
+        # Do not retry Trafilatura errors by default, as they might be content-specific.
+        # Could add specific retry logic if needed.
+        raise # Re-raise to mark task as FAILED
+
 def harvest_from_url(url: str, min_length: int = 150) -> dict:
+    # This function remains for synchronous use (e.g., by get_content_for_topic)
+    # or as a wrapper if needed. For Celery, the core logic is in harvest_url_content_task.
+    # For now, it simply calls the old logic.
+    # If get_content_for_topic is also to be made async, this would need more refactoring.
+
     # First, check if the URL is safe to fetch
-    safe, reason = is_url_safe(url) # is_url_safe uses the global 'logger'
+    safe, reason = is_url_safe(url)
     if not safe:
-        # is_url_safe already logs the specific reason
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
 
     request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
@@ -227,60 +390,82 @@ def harvest_from_url(url: str, min_length: int = 150) -> dict:
 
     if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4:
         error_msg = f"Required library missing: requests/bs4 ({_MISSING_IMPORT_ERROR_REQUESTS_BS4})"
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
+        logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg}")
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_LIB_MISSING, "error_message": error_msg}
 
     if not _IMPORTS_SUCCESSFUL_TRAFILATURA:
         error_msg = f"Required library missing: trafilatura ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}")
+        logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg}")
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_LIB_MISSING, "error_message": error_msg}
 
-    logger.info(f"[WCHA_LOGIC_WEB] Attempting to harvest content from URL: {url} using Trafilatura")
+    logger.info(f"[WCHA_LOGIC_WEB_SYNC] Attempting to harvest content from URL: {url} using Trafilatura")
 
     try:
-        response = requests.get(url, headers=headers, timeout=request_timeout, allow_redirects=False) # Added allow_redirects=False
+        response = requests.get(url, headers=headers, timeout=request_timeout, allow_redirects=False)
         response.raise_for_status()
-
         content_type = response.headers.get('Content-Type', '').lower()
         if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
-            logger.warning(f"[WCHA_LOGIC_WEB] Content at URL '{url}' may not be HTML (Content-Type: {content_type}). Trafilatura will attempt extraction.")
-
+            logger.warning(f"[WCHA_LOGIC_WEB_SYNC] Content at URL '{url}' may not be HTML (Content-Type: {content_type}). Trafilatura will attempt extraction.")
         extracted_text = trafilatura.extract(response.content, url=url, output_format='txt',
-                                             include_comments=False, include_tables=False,
-                                             favor_precision=True)
-
+                                             include_comments=False, include_tables=False, favor_precision=True)
         if extracted_text:
             if len(extracted_text) < min_length:
-                logger.warning(f"[WCHA_LOGIC_WEB] Content from {url} is shorter ({len(extracted_text)} chars) than min_length ({min_length} chars).")
-            logger.info(f"[WCHA_LOGIC_WEB] Trafilatura successfully extracted {len(extracted_text)} characters from {url}.")
+                logger.warning(f"[WCHA_LOGIC_WEB_SYNC] Content from {url} is shorter ({len(extracted_text)} chars) than min_length ({min_length} chars).")
+            logger.info(f"[WCHA_LOGIC_WEB_SYNC] Trafilatura successfully extracted {len(extracted_text)} characters from {url}.")
             return {"url": url, "content": extracted_text, "error_type": None, "error_message": None}
         else:
-            logger.warning(f"[WCHA_LOGIC_WEB] Trafilatura extracted no content from URL: {url}.")
+            logger.warning(f"[WCHA_LOGIC_WEB_SYNC] Trafilatura extracted no content from URL: {url}.")
             return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
-
     except requests.exceptions.Timeout as e_timeout:
         error_msg = f"Timeout after {request_timeout} seconds while fetching '{url}'."
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
+        logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
     except requests.exceptions.HTTPError as e_http:
         error_msg = f"HTTP Status {e_http.response.status_code} while fetching '{url}'."
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg} Response: {e_http.response.text[:200]}", exc_info=True)
+        logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg} Response: {e_http.response.text[:200]}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
     except requests.exceptions.RequestException as e_req:
         error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url}': {e_req}"
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
+        logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_FETCH, "error_message": error_msg}
     except Exception as e_traf:
         error_msg = f"Trafilatura processing or other unexpected error for '{url}': {type(e_traf).__name__} - {e_traf}"
-        logger.error(f"[WCHA_LOGIC_WEB] {error_msg}", exc_info=True)
+        logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg}", exc_info=True)
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_EXTRACTION, "error_message": error_msg}
 
 def get_content_for_topic(topic: str, max_results_override: Optional[int] = None) -> dict:
-    if not IMPORTS_SUCCESSFUL:
+    # This function is now primarily for orchestrating search (DDGS) and then individual URL harvesting.
+    # If USE_REAL_NEWS_API is true, it will dispatch a Celery task for news fetching.
+    # The harvesting of individual URLs (from DDGS or NewsAPI results) will remain synchronous within this function for now,
+    # or could be refactored to dispatch harvest_url_content_task for each URL.
+    # For this subtask, we focus on making the NewsAPI call async.
+
+    if not IMPORTS_SUCCESSFUL: # For DDGS and Trafilatura primarily now
         error_msg = f"{ERROR_WCHA_LIB_MISSING} {MISSING_IMPORT_ERROR}"
         logger.error(error_msg)
-        return {"status": "failure", "content": None, "source_urls": [], "message": error_msg}
+        return {"status": "failure_dependency", "content": None, "source_urls": [], "message": error_msg, "task_id": None}
 
+    request_id = f"wcha_topic_req_{uuid.uuid4().hex[:8]}" # For logging and potential task correlation
+
+    if wcha_config.get("USE_REAL_NEWS_API"):
+        logger.info(f"[WCHA_GET_CONTENT] Using REAL NewsAPI for topic: '{topic}'. Dispatching Celery task.")
+        task = fetch_news_articles_task.delay(
+            request_id=request_id,
+            topic=topic,
+            language=wcha_config.get("TDA_NEWS_DEFAULT_LANGUAGE", "en"), # Assuming lang from config
+            max_results=(max_results_override if max_results_override is not None
+                         else wcha_config.get('WCHA_SEARCH_MAX_RESULTS', 3))
+        )
+        logger.info(f"[WCHA_GET_CONTENT] Dispatched NewsAPI fetch task {task.id} for topic '{topic}'.")
+        # The caller of get_content_for_topic will now get a task_id for NewsAPI results.
+        # The actual content harvesting from these news URLs would be a subsequent step.
+        return {"status": "pending_news_api",
+                "task_id": task.id,
+                "message": "News article fetching initiated.",
+                "source_urls": [],
+                "content": None}
+
+    # Fallback to DDGS if NewsAPI is not used (existing synchronous logic)
     if max_results_override is not None:
         actual_max_search_results = max_results_override
     else:
@@ -383,52 +568,46 @@ try:
                         harvest_params_for_search["max_results_override"] = int(max_results_override)
                     except ValueError:
                         logger.warning(f"[WCHA_API] Invalid max_results value '{max_results_override}'. Using default.")
-                result_dict = get_content_for_topic(topic, **harvest_params_for_search)
+
+            # Call to get_content_for_topic which now might return a task_id for NewsAPI
+            result_dict_or_task = get_content_for_topic(topic, **harvest_params_for_search)
+
+            if result_dict_or_task.get("status") == "pending_news_api":
+                logger.info(f"[WCHA_API] NewsAPI task {result_dict_or_task['task_id']} dispatched for topic '{topic}'.")
+                return flask.jsonify({
+                    "task_id": result_dict_or_task['task_id'],
+                    "status_url": f"/v1/tasks/{result_dict_or_task['task_id']}", # Client polls this for NewsAPI results
+                    "message": "News article fetching initiated. Poll task ID for results. Then, optionally re-call /harvest with specific article URLs if needed."
+                }), 202
+            else: # Synchronous DDGS path result
                 status_code = 500
-                if result_dict["status"] == "success":
-                    status_code = 200
-                elif result_dict["message"].startswith(ERROR_WCHA_LIB_MISSING):
-                    status_code = 503
-                elif result_dict["message"].startswith(ERROR_WCHA_NO_SEARCH_RESULTS):
-                    status_code = 404
-                elif result_dict["message"].startswith(ERROR_WCHA_SEARCH_FAILED):
-                    status_code = 502
-                return flask.jsonify(result_dict), status_code
+                if result_dict_or_task["status"] == "success": status_code = 200
+                elif result_dict_or_task["message"].startswith(ERROR_WCHA_LIB_MISSING): status_code = 503
+                elif result_dict_or_task["message"].startswith(ERROR_WCHA_NO_SEARCH_RESULTS): status_code = 404
+                elif result_dict_or_task["message"].startswith(ERROR_WCHA_SEARCH_FAILED): status_code = 502
+                return flask.jsonify(result_dict_or_task), status_code
 
-            elif url_to_harvest:
-                logger.info(f"[WCHA_API] Received API request for direct URL harvest: '{url_to_harvest}'")
-                harvest_params = {}
-                if timeout_override is not None:
-                    try: harvest_params["timeout"] = int(timeout_override) # This was missing in original, but harvest_from_url does not take timeout
-                    except ValueError: logger.warning(f"Invalid timeout override: {timeout_override}")
+            elif url_to_harvest: # This part remains for direct URL async harvesting
+                logger.info(f"[WCHA_API] Received API request for async direct URL harvest: '{url_to_harvest}'")
+                safe, reason = is_url_safe(url_to_harvest)
+                if not safe:
+                    return flask.jsonify({"error_code": WCHA_ERROR_TYPE_SSRF_BLOCKED, "message": reason, "url": url_to_harvest}), 400
+
+                min_length_val = 150 # Default
                 if min_length_override is not None:
-                    try: harvest_params["min_length"] = int(min_length_override)
-                    except ValueError: logger.warning(f"Invalid min_length override: {min_length_override}")
+                    try: min_length_val = int(min_length_override)
+                    except ValueError: logger.warning(f"Invalid min_length override: {min_length_override}, using default {min_length_val}.")
 
-                direct_harvest_result = harvest_from_url(url_to_harvest, **harvest_params)
+                request_id = f"wcha_harvest_{uuid.uuid4().hex[:8]}" # Unique ID for this request/task
+                task = harvest_url_content_task.delay(
+                    request_id=request_id,
+                    url_to_harvest=url_to_harvest,
+                    min_length=min_length_val
+                )
+                logger.info(f"[WCHA_API] Dispatched harvest task {task.id} for URL: {url_to_harvest}")
+                return flask.jsonify({"task_id": task.id, "status_url": f"/v1/tasks/{task.id}", "message": "Harvest task accepted."}), 202
 
-                if direct_harvest_result.get("content"):
-                    api_response = {
-                        "status": "success",
-                        "content": direct_harvest_result["content"],
-                        "source_urls": [url_to_harvest],
-                        "message": f"Successfully harvested content from URL: {url_to_harvest}"
-                    }
-                    return flask.jsonify(api_response), 200
-                else:
-                    error_message_detail = direct_harvest_result.get("error_message", "Unknown error during direct URL harvest.")
-                    api_response = {
-                        "status": "failure", "content": None, "source_urls": [],
-                        "message": f"Failed to harvest content from URL: {url_to_harvest}. Reason: {error_message_detail}"
-                    }
-                    error_type = direct_harvest_result.get("error_type")
-                    status_code = 500
-                    if error_type == WCHA_ERROR_TYPE_LIB_MISSING: status_code = 503
-                    elif error_type == WCHA_ERROR_TYPE_FETCH: status_code = 502
-                    elif error_type == WCHA_ERROR_TYPE_NO_CONTENT: status_code = 404
-                    return flask.jsonify(api_response), status_code
-
-            elif topic:
+            elif topic: # Mock content, synchronous
                 logger.info(f"[WCHA_API] Received API request for mock topic (no use_search or url): '{topic}'")
                 content_result_mock_str = harvest_content(topic)
                 if content_result_mock_str.startswith("No pre-defined content found"):
@@ -442,12 +621,29 @@ try:
                     "source_urls": ["mock_data_source"],
                     "message": f"Mock content provided for topic: {topic}"
                     }), 200
-            else:
+            else: # No valid parameters for /harvest
                 logger.warning("[WCHA_API] Invalid API request. 'url' or 'topic' (with use_search=true for web search, or alone for mock) must be provided.")
                 return flask.jsonify({"error_code": "WCHA_MISSING_PARAMETERS", "message": "Invalid input", "details": "'topic' (with use_search=true) or 'url' must be provided."}), 400
-        except Exception as e:
-            logger.error(f"Unexpected error in /harvest: {e}", exc_info=True)
+        except Exception as e: # Catch-all for unexpected errors in the endpoint
+            logger.error(f"Unexpected error in /harvest endpoint: {e}", exc_info=True)
             return flask.jsonify({"error_code": "WCHA_INTERNAL_SERVER_ERROR", "message": "Internal server error", "details": str(e)}), 500
+
+    @app.route('/v1/tasks/<task_id>', methods=['GET'])
+    def get_task_status(task_id: str):
+        logger.info(f"Received request for WCHA task status: {task_id}")
+        task_result = AsyncResult(task_id, app=celery_app)
+        response_data = {"task_id": task_id, "status": task_result.status, "result": None}
+
+        if task_result.successful():
+            response_data["result"] = task_result.result
+            return flask.jsonify(response_data), 200
+        elif task_result.failed():
+            error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
+            response_data["result"] = error_info
+            return flask.jsonify(response_data), 500 # Or 200
+        else: # PENDING, STARTED, RETRY
+            return flask.jsonify(response_data), 202
+
 except ImportError:
     app = None 
     logger.info("Flask not installed. API endpoint /harvest will not be available.")
