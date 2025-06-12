@@ -5,3 +5,4 @@ PyJWT>=2.0.0
 Werkzeug>=2.0.0
 psycopg2-binary>=2.9.0
 google-cloud-storage>=1.30.0
+python-json-logger==2.0.7

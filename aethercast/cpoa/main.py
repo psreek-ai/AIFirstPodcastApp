@@ -147,10 +147,7 @@ CPOA_TDA_POLLING_TIMEOUT_SECONDS = int(os.getenv("CPOA_TDA_POLLING_TIMEOUT_SECON
 CPOA_WCHA_POLLING_INTERVAL_SECONDS = int(os.getenv("CPOA_WCHA_POLLING_INTERVAL_SECONDS", "10"))
 CPOA_WCHA_POLLING_TIMEOUT_SECONDS = int(os.getenv("CPOA_WCHA_POLLING_TIMEOUT_SECONDS", "300")) # 5 minutes for content harvesting
 
-# Database Configuration
-DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite") # Default to sqlite
-CPOA_DATABASE_PATH = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db") # SQLite path
-
+# Database Configuration (PostgreSQL only)
 POSTGRES_HOST = os.getenv("POSTGRES_HOST")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 POSTGRES_USER = os.getenv("POSTGRES_USER")
@@ -169,15 +166,12 @@ if not logger.hasHandlers():
 # Create a temporary adapter for these initial logs if needed, or log directly.
 initial_log_extra = {'workflow_id': 'N/A', 'task_id': 'N/A'}
 logger.info("--- CPOA Configuration ---", extra=initial_log_extra)
-logger.info(f"DATABASE_TYPE: {DATABASE_TYPE}", extra=initial_log_extra)
-if DATABASE_TYPE == "sqlite":
-    logger.info(f"SHARED_DATABASE_PATH (SQLite): {CPOA_DATABASE_PATH}", extra=initial_log_extra)
-elif DATABASE_TYPE == "postgres":
-    logger.info(f"POSTGRES_HOST: {POSTGRES_HOST}", extra=initial_log_extra)
-    logger.info(f"POSTGRES_PORT: {POSTGRES_PORT}", extra=initial_log_extra)
-    logger.info(f"POSTGRES_USER: {POSTGRES_USER}", extra=initial_log_extra)
-    # Do not log password
-    logger.info(f"POSTGRES_DB: {POSTGRES_DB}", extra=initial_log_extra)
+logger.info("DATABASE_TYPE: postgres (hardcoded)", extra=initial_log_extra) # Hardcoded to postgres
+logger.info(f"POSTGRES_HOST: {POSTGRES_HOST}", extra=initial_log_extra)
+logger.info(f"POSTGRES_PORT: {POSTGRES_PORT}", extra=initial_log_extra)
+logger.info(f"POSTGRES_USER: {POSTGRES_USER}", extra=initial_log_extra)
+# Do not log password
+logger.info(f"POSTGRES_DB: {POSTGRES_DB}", extra=initial_log_extra)
 
 logger.info(f"TDA_SERVICE_URL: {TDA_SERVICE_URL}", extra=initial_log_extra)
 logger.info(f"PSWA_SERVICE_URL: {PSWA_SERVICE_URL}", extra=initial_log_extra)
@@ -192,41 +186,30 @@ logger.info(f"CPOA_SERVICE_RETRY_BACKOFF_FACTOR: {CPOA_SERVICE_RETRY_BACKOFF_FAC
 logger.info("--- End CPOA Configuration ---", extra=initial_log_extra)
 
 
-# --- Database Connection Helper (New for PostgreSQL, adaptable) ---
+# --- Database Connection Helper (PostgreSQL only) ---
 def _get_cpoa_db_connection():
-    db_type = DATABASE_TYPE # Use the global config
-    if db_type == "postgres":
-        required_pg_vars = {"POSTGRES_HOST": POSTGRES_HOST,
-                            "POSTGRES_USER": POSTGRES_USER,
-                            "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
-                            "POSTGRES_DB": POSTGRES_DB}
-        missing_vars = [key for key, value in required_pg_vars.items() if not value]
-        if missing_vars:
-            logger.error(f"CPOA: PostgreSQL connection variables not fully set: Missing {', '.join(missing_vars)}")
-            raise ConnectionError(f"CPOA: PostgreSQL environment variables not fully configured: Missing {', '.join(missing_vars)}")
-        try:
-            conn = psycopg2.connect(
-                host=POSTGRES_HOST,
-                port=POSTGRES_PORT,
-                user=POSTGRES_USER,
-                password=POSTGRES_PASSWORD,
-                dbname=POSTGRES_DB,
-                cursor_factory=RealDictCursor
-            )
-            logger.info("CPOA successfully connected to PostgreSQL.")
-            return conn
-        except psycopg2.Error as e:
-            logger.error(f"CPOA: Unable to connect to PostgreSQL: {e}")
-            raise ConnectionError(f"CPOA: PostgreSQL connection failed: {e}") from e
-    elif db_type == "sqlite":
-        # This function is now primarily for PG. SQLite connections will be handled by existing logic
-        # that uses CPOA_DATABASE_PATH directly. Or, refactor that logic to call a similar helper.
-        # For now, returning None indicates to use the old SQLite path.
-        logger.debug("CPOA DB type is SQLite. Connection handled by individual functions using CPOA_DATABASE_PATH.")
-        return None
-    else:
-        logger.error(f"CPOA: Unsupported DATABASE_TYPE: {db_type}", extra=initial_log_extra)
-        raise ValueError(f"CPOA: Unsupported DATABASE_TYPE: {db_type}")
+    required_pg_vars = {"POSTGRES_HOST": POSTGRES_HOST,
+                        "POSTGRES_USER": POSTGRES_USER,
+                        "POSTGRES_PASSWORD": POSTGRES_PASSWORD,
+                        "POSTGRES_DB": POSTGRES_DB}
+    missing_vars = [key for key, value in required_pg_vars.items() if not value]
+    if missing_vars:
+        logger.error(f"CPOA: PostgreSQL connection variables not fully set: Missing {', '.join(missing_vars)}")
+        raise ConnectionError(f"CPOA: PostgreSQL environment variables not fully configured: Missing {', '.join(missing_vars)}")
+    try:
+        conn = psycopg2.connect(
+            host=POSTGRES_HOST,
+            port=POSTGRES_PORT,
+            user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+            dbname=POSTGRES_DB,
+            cursor_factory=RealDictCursor
+        )
+        logger.info("CPOA successfully connected to PostgreSQL.")
+        return conn
+    except psycopg2.Error as e:
+        logger.error(f"CPOA: Unable to connect to PostgreSQL: {e}")
+        raise ConnectionError(f"CPOA: PostgreSQL connection failed: {e}") from e
 
 # --- CPOA State Management DB Status Constants (New) ---
 WORKFLOW_STATUS_PENDING = "pending"
@@ -243,17 +226,17 @@ TASK_STATUS_FAILED = "failed"
 TASK_STATUS_SKIPPED = "skipped"
 
 # --- CPOA State Management DB Helpers (New) ---
-def _create_workflow_instance(trigger_event_type: str, trigger_event_details: Optional[dict] = None, user_id: Optional[str] = None) -> Optional[str]:
-    conn = None
+# Now expects db_conn to be passed
+def _create_workflow_instance(db_conn, trigger_event_type: str, trigger_event_details: Optional[dict] = None, user_id: Optional[str] = None) -> Optional[str]:
     workflow_id = None
     log_extra = {'workflow_id': None, 'task_id': None}
+    # Connection is managed by the caller
     try:
-        conn = _get_cpoa_db_connection()
-        if not conn or DATABASE_TYPE != "postgres":
-            logger.error(f"CPOA State: Failed to get PostgreSQL connection for creating workflow. DB Type: {DATABASE_TYPE}", extra=log_extra)
-            return None
+        if not db_conn:
+            logger.error(f"CPOA State: DB connection not provided for creating workflow.", extra=log_extra)
+            raise ConnectionError("DB connection not provided to _create_workflow_instance")
 
-        with conn.cursor() as cur:
+        with db_conn.cursor() as cur:
             sql = """
                 INSERT INTO workflow_instances
                     (user_id, trigger_event_type, trigger_event_details_json, overall_status, start_timestamp, last_updated_timestamp)
@@ -265,31 +248,30 @@ def _create_workflow_instance(trigger_event_type: str, trigger_event_details: Op
             result = cur.fetchone()
             if result and 'workflow_id' in result: # Check if 'workflow_id' key exists
                 workflow_id = str(result['workflow_id'])
-            conn.commit()
+            # conn.commit() # Commit handled by caller
             log_extra['workflow_id'] = workflow_id # Update log_extra with the new workflow_id
             logger.info(f"Workflow instance created. Type: {trigger_event_type}", extra=log_extra)
             return workflow_id
     except psycopg2.Error as e:
         logger.error(f"CPOA State: DB error creating workflow. Type: {trigger_event_type}. Error: {e}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return None
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise to be handled by caller's transaction management
     except Exception as e_unexp:
         logger.error(f"CPOA State: Unexpected error creating workflow. Type: {trigger_event_type}. Error: {e_unexp}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return None
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     finally:
-        if conn: conn.close()
+        pass # Connection managed by the caller, cursor closed by 'with'
 
-def _update_workflow_instance_status(workflow_id: str, overall_status: str, context_data: Optional[dict] = None, error_message: Optional[str] = None):
-    conn = None
+def _update_workflow_instance_status(db_conn, workflow_id: str, overall_status: str, context_data: Optional[dict] = None, error_message: Optional[str] = None):
     log_extra = {'workflow_id': workflow_id, 'task_id': None}
+    # Connection is managed by the caller
     try:
-        conn = _get_cpoa_db_connection()
-        if not conn or DATABASE_TYPE != "postgres":
-            logger.error(f"CPOA State: Failed to get PostgreSQL connection for updating workflow.", extra=log_extra)
-            return False
+        if not db_conn:
+            logger.error(f"CPOA State: DB connection not provided for updating workflow.", extra=log_extra)
+            raise ConnectionError("DB connection not provided to _update_workflow_instance_status")
 
-        with conn.cursor() as cur:
+        with db_conn.cursor() as cur:
             end_ts_sql_part = ", end_timestamp = current_timestamp" if overall_status in [WORKFLOW_STATUS_COMPLETED, WORKFLOW_STATUS_FAILED, WORKFLOW_STATUS_COMPLETED_WITH_ERRORS] else ""
 
             current_context_data = {}
@@ -313,31 +295,30 @@ def _update_workflow_instance_status(workflow_id: str, overall_status: str, cont
                 WHERE workflow_id = %s;
             """
             cur.execute(sql, (overall_status, json.dumps(context_data_to_save) if context_data_to_save else None, error_message, workflow_id))
-            conn.commit()
+            # conn.commit() # Commit handled by caller
             logger.info(f"Workflow instance status updated to {overall_status}.", extra=log_extra)
-            return True
+            return True # Indicates SQL execution was successful
     except psycopg2.Error as e:
         logger.error(f"CPOA State: DB error updating workflow to status {overall_status}. Error: {e}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return False
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     except Exception as e_unexp:
         logger.error(f"CPOA State: Unexpected error updating workflow. Error: {e_unexp}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return False
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     finally:
-        if conn: conn.close()
+        pass # Connection managed by the caller, cursor closed by 'with'
 
-def _create_task_instance(workflow_id: str, agent_name: str, task_order: int, input_params: Optional[dict] = None, initial_status: str = TASK_STATUS_PENDING) -> Optional[str]:
-    conn = None
+def _create_task_instance(db_conn, workflow_id: str, agent_name: str, task_order: int, input_params: Optional[dict] = None, initial_status: str = TASK_STATUS_PENDING) -> Optional[str]:
     task_id = None
     log_extra = {'workflow_id': workflow_id, 'task_id': None}
+    # Connection is managed by the caller
     try:
-        conn = _get_cpoa_db_connection()
-        if not conn or DATABASE_TYPE != "postgres":
-            logger.error(f"CPOA State: Failed to get PostgreSQL connection for creating task.", extra=log_extra)
-            return None
+        if not db_conn:
+            logger.error(f"CPOA State: DB connection not provided for creating task.", extra=log_extra)
+            raise ConnectionError("DB connection not provided to _create_task_instance")
 
-        with conn.cursor() as cur:
+        with db_conn.cursor() as cur:
             sql = """
                 INSERT INTO task_instances
                     (workflow_id, agent_name, task_order, status, input_params_json, start_timestamp, last_updated_timestamp)
@@ -348,33 +329,32 @@ def _create_task_instance(workflow_id: str, agent_name: str, task_order: int, in
 
             cur.execute(sql, (workflow_id, agent_name, task_order, initial_status, json.dumps(input_params) if input_params else None, start_ts))
             result = cur.fetchone()
-            if result and 'task_id' in result: # Check key existence
+            if result and 'task_id' in result: # Check if 'task_id' key exists, was workflow_id before
                 task_id = str(result['task_id'])
-            conn.commit()
+            # conn.commit() # Commit handled by caller
             log_extra['task_id'] = task_id # Update log_extra with new task_id
             logger.info(f"Task instance created. Agent: {agent_name}, Order: {task_order}, Status: {initial_status}", extra=log_extra)
             return task_id
     except psycopg2.Error as e:
         logger.error(f"CPOA State: DB error creating task for agent {agent_name}. Error: {e}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return None
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     except Exception as e_unexp:
         logger.error(f"CPOA State: Unexpected error creating task for agent {agent_name}. Error: {e_unexp}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return None
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     finally:
-        if conn: conn.close()
+        pass # Connection managed by the caller, cursor closed by 'with'
 
-def _update_task_instance_status(task_id: str, status: str, output_summary: Optional[dict] = None, error_details: Optional[dict] = None, retry_count: Optional[int] = None, workflow_id_for_log: Optional[str] = None):
-    conn = None
+def _update_task_instance_status(db_conn, task_id: str, status: str, output_summary: Optional[dict] = None, error_details: Optional[dict] = None, retry_count: Optional[int] = None, workflow_id_for_log: Optional[str] = None):
     log_extra = {'workflow_id': workflow_id_for_log, 'task_id': task_id}
+    # Connection is managed by the caller
     try:
-        conn = _get_cpoa_db_connection()
-        if not conn or DATABASE_TYPE != "postgres":
-            logger.error(f"CPOA State: Failed to get PostgreSQL connection for updating task.", extra=log_extra)
-            return False
+        if not db_conn:
+            logger.error(f"CPOA State: DB connection not provided for updating task.", extra=log_extra)
+            raise ConnectionError("DB connection not provided to _update_task_instance_status")
 
-        with conn.cursor() as cur:
+        with db_conn.cursor() as cur:
             set_clauses = ["status = %s", "last_updated_timestamp = current_timestamp"]
             params = [status]
 
@@ -399,19 +379,19 @@ def _update_task_instance_status(task_id: str, status: str, output_summary: Opti
             params.append(task_id)
 
             cur.execute(sql, tuple(params))
-            conn.commit()
+            # conn.commit() # Commit handled by caller
             logger.info(f"Task instance status updated to {status}.", extra=log_extra)
-            return True
+            return True # Indicates SQL execution was successful
     except psycopg2.Error as e:
         logger.error(f"CPOA State: DB error updating task to status {status}. Error: {e}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return False
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     except Exception as e_unexp:
         logger.error(f"CPOA State: Unexpected error updating task. Error: {e_unexp}", exc_info=True, extra=log_extra)
-        if conn: conn.rollback()
-        return False
+        # if conn: conn.rollback() # Rollback handled by caller
+        raise # Re-raise
     finally:
-        if conn: conn.close()
+        pass # Connection managed by the caller, cursor closed by 'with'
 
 # Try to import WCHA. PSWA and VFA are now services.
 try:
@@ -494,67 +474,43 @@ def requests_with_retry(method: str, url: str, max_retries: int, backoff_factor:
     raise Exception(f"Requests with retry failed for {url} after {max_retries} attempts without specific exception.")
 
 
-def _update_task_status_in_db(task_id: str, new_cpoa_status: str, error_msg: Optional[str] = None, db_path_sqlite: Optional[str] = None) -> None:
+def _update_task_status_in_db(db_conn, task_id: str, new_cpoa_status: str, error_msg: Optional[str] = None, workflow_id_for_log: Optional[str] = None) -> None: # Added workflow_id_for_log for consistency
     """
-    Updates the cpoa_status, cpoa_error_message, and last_updated_timestamp for a task in the database.
-    Uses PostgreSQL if configured, otherwise falls back to SQLite with db_path_sqlite.
+    Updates the cpoa_status, cpoa_error_message, and last_updated_timestamp for a task in the 'podcasts' table (PostgreSQL only).
+    Accepts an active db_conn.
     """
-    logger.info(f"Task {task_id}: Updating CPOA status to '{new_cpoa_status}'. Error: '{error_msg or 'None'}'")
-    timestamp = datetime.now() # Use datetime object for PG, format for SQLite
-
-    conn = None
+    log_extra = {'workflow_id': workflow_id_for_log, 'task_id': task_id}
+    logger.info(f"Updating legacy podcast status to '{new_cpoa_status}'. Error: '{error_msg or 'None'}'", extra=log_extra)
+    timestamp = datetime.now()
     cursor = None
-    db_type_used = DATABASE_TYPE
 
     try:
-        conn = _get_cpoa_db_connection() # This will return PG conn or None (for SQLite)
+        if not db_conn:
+             logger.error(f"DB connection not provided for legacy status update.", extra=log_extra)
+             raise ConnectionError("DB connection not provided for _update_task_status_in_db")
 
-        if conn: # PostgreSQL path
-            cursor = conn.cursor()
-            # Ensure task_id is a string for UUID compatibility if it isn't already
-            task_id_str = str(task_id) if not isinstance(task_id, str) else task_id
+        cursor = db_conn.cursor()
+        task_id_str = str(task_id) # Ensure UUID is string for query
 
-            sql = """
-                UPDATE podcasts
-                SET cpoa_status = %s, cpoa_error_message = %s, last_updated_timestamp = %s
-                WHERE podcast_id = %s;
-            """
-            cursor.execute(sql, (new_cpoa_status, error_msg, timestamp, task_id_str))
-            conn.commit()
-            logger.info(f"Task {task_id}: Successfully updated CPOA status in PostgreSQL DB to '{new_cpoa_status}'.")
+        sql = """
+            UPDATE podcasts
+            SET cpoa_status = %s, cpoa_error_message = %s, last_updated_timestamp = %s
+            WHERE podcast_id = %s;
+        """
+        cursor.execute(sql, (new_cpoa_status, error_msg, timestamp, task_id_str))
+        # Commit is handled by the calling task
+        logger.info(f"Task {task_id}: Successfully prepared update for CPOA status in PostgreSQL DB to '{new_cpoa_status}'.")
 
-        else: # SQLite path (using db_path_sqlite which defaults to CPOA_DATABASE_PATH)
-            db_type_used = "sqlite" # For logging
-            sqlite_path = db_path_sqlite or CPOA_DATABASE_PATH
-            if not sqlite_path:
-                logger.error(f"Task {task_id}: SQLite DB path not available for status update.")
-                return
-
-            conn_sqlite = sqlite3.connect(sqlite_path)
-            cursor_sqlite = conn_sqlite.cursor()
-            cursor_sqlite.execute(
-                """
-                UPDATE podcasts
-                SET cpoa_status = ?, cpoa_error_message = ?, last_updated_timestamp = ?
-                WHERE podcast_id = ?
-                """,
-                (new_cpoa_status, error_msg, timestamp.isoformat(), task_id)
-            )
-            conn_sqlite.commit()
-            conn_sqlite.close() # Close SQLite connection
-            logger.info(f"Task {task_id}: Successfully updated CPOA status in SQLite DB to '{new_cpoa_status}'.")
-
-    except (psycopg2.Error, sqlite3.Error) as e:
-        logger.error(f"CPOA: DB error for task {task_id} (DB: {db_type_used}, Status: {new_cpoa_status}): {e}", exc_info=True)
-        if conn and db_type_used == "postgres": conn.rollback() # Rollback PG transaction
+    except psycopg2.Error as e:
+        logger.error(f"CPOA: DB error for task {task_id} (PostgreSQL, Status: {new_cpoa_status}): {e}", exc_info=True)
+        raise # Re-raise to be caught by task's transaction handler
     except Exception as e_unexp:
-        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id} (DB: {db_type_used}, Status: {new_cpoa_status}): {e_unexp}", exc_info=True)
-        if conn and db_type_used == "postgres": conn.rollback()
+        logger.error(f"CPOA: Unexpected error in _update_task_status_in_db for task {task_id} (PostgreSQL, Status: {new_cpoa_status}): {e_unexp}", exc_info=True)
+        raise # Re-raise
     finally:
-        if cursor and db_type_used == "postgres": # Only close PG cursor if it was used
+        if cursor:
             cursor.close()
-        if conn and db_type_used == "postgres": # Only close PG conn if it was used
-            conn.close()
+        # Connection closing and commit/rollback are handled by the calling task for transactions
 
 # --- Helper function to send UI updates to ASF ---
 def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, Any], workflow_id_for_log: Optional[str] = None):
@@ -1273,43 +1229,40 @@ def trigger_podcast_orchestration(
 
 
 # --- Snippet DB Interaction ---
-def _save_snippet_to_db(snippet_object: dict, db_path_sqlite: Optional[str] = None): # db_path_sqlite for SQLite fallback
-    """Saves a single snippet object to the topics_snippets table."""
-    conn = None
+def _save_snippet_to_db(db_conn, snippet_object: dict):
+    """Saves a single snippet object to the topics_snippets table.
+    Accepts an active db_conn.
+    """
     cursor = None
-    db_type_used = DATABASE_TYPE
-    # Ensure snippet_id is a UUID string for PG, generate if missing
     snippet_id = str(snippet_object.get("snippet_id") or uuid.uuid4())
-
+    log_extra = {'workflow_id': None, 'task_id': snippet_id} # Assuming snippet_id can serve as task_id for logging context
 
     try:
-        conn = _get_cpoa_db_connection()
+        if not db_conn:
+            logger.error(f"DB connection not provided for saving snippet {snippet_id}.", extra=log_extra)
+            raise ConnectionError(f"DB connection not provided to _save_snippet_to_db for snippet {snippet_id}")
 
+        cursor = db_conn.cursor()
         keywords_data = snippet_object.get("keywords", [])
         original_topic_details_data = snippet_object.get("original_topic_details_from_tda")
-
-        current_ts = datetime.now() # Use datetime obj for PG
+        current_ts = datetime.now()
         generation_timestamp_input = snippet_object.get("generation_timestamp", current_ts.isoformat())
 
-        # Ensure generation_timestamp is a datetime object for PG
         if isinstance(generation_timestamp_input, str):
             try:
                 generation_timestamp_to_save = datetime.fromisoformat(generation_timestamp_input.replace("Z", "+00:00"))
             except ValueError:
-                logger.warning(f"Could not parse generation_timestamp string '{generation_timestamp_input}', using current time.")
+                logger.warning(f"Could not parse generation_timestamp string '{generation_timestamp_input}' for snippet {snippet_id}, using current time.")
                 generation_timestamp_to_save = current_ts
         elif isinstance(generation_timestamp_input, datetime):
             generation_timestamp_to_save = generation_timestamp_input
-        else: # Fallback for unexpected types
-            logger.warning(f"Unexpected type for generation_timestamp '{type(generation_timestamp_input)}', using current time.")
+        else:
+            logger.warning(f"Unexpected type for generation_timestamp '{type(generation_timestamp_input)}' for snippet {snippet_id}, using current time.")
             generation_timestamp_to_save = current_ts
 
-
-        if conn: # PostgreSQL Path
-            cursor = conn.cursor()
-
-            sql = """
-            INSERT INTO topics_snippets (
+        cursor = conn.cursor()
+        sql = """
+        INSERT INTO topics_snippets (
                 id, type, title, summary, keywords,
                 source_url, source_name, original_topic_details,
                 llm_model_used_for_snippet, cover_art_prompt, image_url,
@@ -1328,128 +1281,68 @@ def _save_snippet_to_db(snippet_object: dict, db_path_sqlite: Optional[str] = No
                 image_url = EXCLUDED.image_url,
                 generation_timestamp = EXCLUDED.generation_timestamp,
                 last_accessed_timestamp = EXCLUDED.last_accessed_timestamp,
-                relevance_score = EXCLUDED.relevance_score;
-            """
-            params = (
-                snippet_id, DB_TYPE_SNIPPET, snippet_object.get("title"),
-                snippet_object.get("summary"), keywords_data, # Pass list/dict directly for JSONB
-                snippet_object.get("source_url"), snippet_object.get("source_name"),
-                original_topic_details_data, # Pass dict/list directly for JSONB
-                snippet_object.get("llm_model_used"), snippet_object.get("cover_art_prompt"),
-                snippet_object.get("image_url"), generation_timestamp_to_save, # datetime object
-                current_ts, # datetime object for last_accessed
-                snippet_object.get("relevance_score", 0.5)
-            )
-            cursor.execute(sql, params)
-            conn.commit()
-            logger.info(f"Saved/Replaced snippet {snippet_id} to PostgreSQL DB: {snippet_object.get('title')}")
+            relevance_score = EXCLUDED.relevance_score;
+        """
+        params = (
+            snippet_id, DB_TYPE_SNIPPET, snippet_object.get("title"),
+            snippet_object.get("summary"), json.dumps(keywords_data) if keywords_data else None, # Ensure JSON string for PG JSONB
+            snippet_object.get("source_url"), snippet_object.get("source_name"),
+            json.dumps(original_topic_details_data) if original_topic_details_data else None, # Ensure JSON string for PG JSONB
+            snippet_object.get("llm_model_used"), snippet_object.get("cover_art_prompt"),
+            snippet_object.get("image_url"), generation_timestamp_to_save,
+            current_ts,
+            snippet_object.get("relevance_score", 0.5)
+        )
+        cursor.execute(sql, params)
+        # Commit is handled by the calling task
+        logger.info(f"Prepared save/replace for snippet {snippet_id} to PostgreSQL DB: {snippet_object.get('title')}")
 
-        else: # SQLite Path
-            db_type_used = "sqlite"
-            sqlite_path = db_path_sqlite or CPOA_DATABASE_PATH
-            if not sqlite_path:
-                logger.error(f"SQLite DB path not available for saving snippet {snippet_id}.")
-                return
-
-            keywords_json = json.dumps(keywords_data)
-            original_topic_details_json = json.dumps(original_topic_details_data) if original_topic_details_data else None
-            gen_ts_iso = generation_timestamp_to_save.isoformat()
-            last_acc_ts_iso = current_ts.isoformat()
-
-            conn_sqlite = sqlite3.connect(sqlite_path)
-            cursor_sqlite = conn_sqlite.cursor()
-            cursor_sqlite.execute(
-                """
-                INSERT OR REPLACE INTO topics_snippets (
-                    id, type, title, summary, keywords,
-                    source_url, source_name, original_topic_details,
-                    llm_model_used_for_snippet, cover_art_prompt, image_url,
-                    generation_timestamp, last_accessed_timestamp, relevance_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    snippet_id, DB_TYPE_SNIPPET, snippet_object.get("title"),
-                    snippet_object.get("summary"), keywords_json,
-                    snippet_object.get("source_url"), snippet_object.get("source_name"),
-                    original_topic_details_json, snippet_object.get("llm_model_used"),
-                    snippet_object.get("cover_art_prompt"), snippet_object.get("image_url"),
-                    gen_ts_iso, last_acc_ts_iso, snippet_object.get("relevance_score", 0.5)
-                )
-            )
-            conn_sqlite.commit()
-            conn_sqlite.close()
-            logger.info(f"Saved/Replaced snippet {snippet_id} to SQLite DB: {snippet_object.get('title')}")
-
-    except (psycopg2.Error, sqlite3.Error) as e:
-        logger.error(f"Database error saving snippet {snippet_id} (DB: {db_type_used}): {e}", exc_info=True)
-        if conn and db_type_used == "postgres": conn.rollback()
+    except psycopg2.Error as e:
+        logger.error(f"Database error saving snippet {snippet_id} (PostgreSQL): {e}", exc_info=True)
+        raise # Re-raise
     except Exception as e_unexp:
-        logger.error(f"Unexpected error saving snippet {snippet_id} (DB: {db_type_used}): {e_unexp}", exc_info=True)
-        if conn and db_type_used == "postgres": conn.rollback()
+        logger.error(f"Unexpected error saving snippet {snippet_id} (PostgreSQL): {e_unexp}", exc_info=True)
+        raise # Re-raise
     finally:
-        if cursor and db_type_used == "postgres": cursor.close()
-        if conn and db_type_used == "postgres": conn.close()
+        if cursor: cursor.close()
+        # Connection closing and commit/rollback are handled by the calling task
 
 # --- Topic Exploration DB Helper ---
-def _get_topic_details_from_db(topic_id: str, db_path_sqlite: Optional[str] = None) -> Optional[Dict[str, Any]]:
-    """Fetches details for a specific topic_id from the topics_snippets table."""
-    conn = None
+def _get_topic_details_from_db(db_conn, topic_id: str) -> Optional[Dict[str, Any]]: # Added db_conn
+    """Fetches details for a specific topic_id from the topics_snippets table (PostgreSQL only).
+    Expects db_conn to be passed.
+    """
     cursor = None
-    db_type_used = DATABASE_TYPE
-    # Ensure topic_id is a string for UUID compatibility if it isn't already
-    topic_id_str = str(topic_id) if not isinstance(topic_id, str) else topic_id
+    topic_id_str = str(topic_id)
+    log_extra = {'workflow_id': None, 'task_id': topic_id_str} # Assuming topic_id can serve as task_id for logging
 
     try:
-        conn = _get_cpoa_db_connection()
+        if not db_conn:
+            logger.error(f"DB connection not provided for fetching topic {topic_id_str}.", extra=log_extra)
+            raise ConnectionError(f"DB connection not provided to _get_topic_details_from_db for topic {topic_id_str}")
 
-        if conn: # PostgreSQL Path
-            cursor = conn.cursor()
-            sql = "SELECT * FROM topics_snippets WHERE id = %s AND type = %s;"
-            cursor.execute(sql, (topic_id_str, DB_TYPE_TOPIC))
-            row = cursor.fetchone()
-            if row:
-                # RealDictCursor already returns a dict-like object
-                # Keywords are already JSONB, psycopg2 handles them as dict/list
-                return dict(row)
-            return None
+        cursor = db_conn.cursor()
+        sql = "SELECT * FROM topics_snippets WHERE id = %s AND type = %s;"
+        cursor.execute(sql, (topic_id_str, DB_TYPE_TOPIC))
+        row = cursor.fetchone()
+        if row:
+            # RealDictCursor returns a dict. Keywords and original_topic_details are JSONB,
+            # psycopg2 should handle their conversion to Python dict/list automatically.
+            return dict(row)
+        return None
 
-        else: # SQLite Path
-            db_type_used = "sqlite"
-            sqlite_path = db_path_sqlite or CPOA_DATABASE_PATH
-            if not sqlite_path:
-                logger.error(f"SQLite DB path not available for fetching topic {topic_id_str}.")
-                return None
-
-            conn_sqlite = sqlite3.connect(sqlite_path)
-            conn_sqlite.row_factory = sqlite3.Row
-            cursor_sqlite = conn_sqlite.cursor()
-            cursor_sqlite.execute("SELECT * FROM topics_snippets WHERE id = ? AND type = ?", (topic_id_str, DB_TYPE_TOPIC))
-            row_sqlite = cursor_sqlite.fetchone()
-            conn_sqlite.close()
-
-            if row_sqlite:
-                topic_details = dict(row_sqlite)
-                if isinstance(topic_details.get('keywords'), str): # SQLite stores JSON as TEXT
-                    try:
-                        topic_details['keywords'] = json.loads(topic_details['keywords'])
-                    except json.JSONDecodeError:
-                        logger.warning(f"Failed to decode keywords JSON (SQLite) for topic {topic_id_str}")
-                        topic_details['keywords'] = []
-                return topic_details
-            return None
-
-    except (psycopg2.Error, sqlite3.Error) as e:
-        logger.error(f"Database error fetching topic {topic_id_str} (DB: {db_type_used}): {e}", exc_info=True)
+    except psycopg2.Error as e:
+        logger.error(f"Database error fetching topic {topic_id_str} (PostgreSQL): {e}", exc_info=True)
         return None
     except Exception as e_unexp:
-        logger.error(f"Unexpected error fetching topic {topic_id_str} (DB: {db_type_used}): {e_unexp}", exc_info=True)
+        logger.error(f"Unexpected error fetching topic {topic_id_str} (PostgreSQL): {e_unexp}", exc_info=True)
         return None
     finally:
-        if cursor and db_type_used == "postgres": cursor.close()
-        if conn and db_type_used == "postgres": conn.close()
+        if cursor: cursor.close()
+        # Connection managed by the caller
 
 
-def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
+def orchestrate_snippet_generation(topic_info: dict, db_conn_param = None) -> Dict[str, Any]:
     """
     Orchestrates snippet generation by calling the SnippetCraftAgent (SCA) service.
     """
@@ -1694,24 +1587,26 @@ if __name__ == "__main__":
     # It uses the globally configured DATABASE_TYPE and associated paths/credentials.
     # So, ensure your .env for CPOA points to a test DB (SQLite or PG) for this block.
 
-    # Example for testing (assuming DATABASE_TYPE and related vars are set in .env for CPOA):
-    if DATABASE_TYPE == "sqlite" and CPOA_DATABASE_PATH:
-        logger.info(f"__main__ testing with SQLite DB: {CPOA_DATABASE_PATH}")
-        try:
-            conn = sqlite3.connect(CPOA_DATABASE_PATH)
-            cursor = conn.cursor()
-            # Minimal schema for testing orchestrate_podcast_generation's _update_task_status_in_db
-            cursor.execute("CREATE TABLE IF NOT EXISTS podcasts (podcast_id TEXT PRIMARY KEY, topic TEXT, cpoa_status TEXT, cpoa_error_message TEXT, last_updated_timestamp TEXT)")
-            # Minimal schema for _save_snippet_to_db and _get_topic_details_from_db
-            cursor.execute("CREATE TABLE IF NOT EXISTS topics_snippets (id TEXT PRIMARY KEY, type TEXT, title TEXT, summary TEXT, keywords TEXT, original_topic_details TEXT, llm_model_used_for_snippet TEXT, cover_art_prompt TEXT, image_url TEXT, generation_timestamp TEXT, last_accessed_timestamp TEXT, relevance_score REAL, source_url TEXT, source_name TEXT)")
-
-            conn.commit()
-        except sqlite3.Error as e: logger.error(f"Error creating test DB tables: {e}")
-        finally:
-            if conn: conn.close()
+    # Example for testing (assuming PostgreSQL related env vars are set):
+    # Ensure your .env for CPOA points to a test PG DB for this block.
+    # Local schema creation for testing is removed as it should target a running PG instance.
+    logger.info(f"__main__ testing assumes PostgreSQL DB is available and configured via environment variables.")
 
     sample_topic_1 = "AI in Healthcare"
-    sample_task_id_1 = str(uuid.uuid4()) # Ensure UUID for PG path
+    # The 'task_id' for orchestrate_podcast_generation is now expected to be the Celery task_id.
+    # For direct testing of the core logic, we can simulate one.
+    sample_celery_task_id_1 = str(uuid.uuid4())
+    print(f"\nTest 1: Orchestrating for topic '{sample_topic_1}' (Simulated Celery Task ID: {sample_celery_task_id_1})")
+
+    # If testing the trigger function:
+    # result1_trigger = trigger_podcast_orchestration(topic=sample_topic_1)
+    # print(f"\n--- Result for '{sample_topic_1}' (Trigger) ---")
+    # pretty_print_orchestration_result(result1_trigger)
+    # print(f"To check status, poll: CPOA_HOST{result1_trigger['status_url']}")
+
+    # Direct call to core logic for testing (simulating what Celery worker would do)
+    # Note: original_task_id is now the Celery task's ID.
+    result1 = orchestrate_podcast_generation(topic=sample_topic_1, original_task_id=sample_celery_task_id_1)
     print(f"\nTest 1: Orchestrating for topic '{sample_topic_1}' (Task ID: {sample_task_id_1})")
     # Simulate initial record creation if needed for testing _update_task_status_in_db
     # This would now also depend on DATABASE_TYPE

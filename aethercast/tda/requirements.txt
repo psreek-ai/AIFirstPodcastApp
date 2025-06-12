@@ -4,3 +4,4 @@ python-dotenv>=0.20.0
 psycopg2-binary>=2.9.0
 celery>=5.2.0
 redis>=4.0.0
+python-json-logger==2.0.7

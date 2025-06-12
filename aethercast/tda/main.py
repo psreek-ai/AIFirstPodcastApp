@@ -84,8 +84,8 @@ tda_config = {
     "TDA_NEWS_USER_AGENT": os.getenv("TDA_NEWS_USER_AGENT", "AethercastTopicDiscovery/0.1"),
 
     # Database Configuration
-    "DATABASE_TYPE": os.getenv("DATABASE_TYPE", "sqlite"), # Default to sqlite if not set
-    "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db"), # SQLite path
+    # "DATABASE_TYPE": os.getenv("DATABASE_TYPE", "sqlite"), # Removed, TDA now uses PostgreSQL only
+    # "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db"), # Removed
     "POSTGRES_HOST": os.getenv("POSTGRES_HOST"),
     "POSTGRES_PORT": os.getenv("POSTGRES_PORT", "5432"),
     "POSTGRES_USER": os.getenv("POSTGRES_USER"),
@@ -118,24 +118,13 @@ if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
     app.logger.critical(error_message) # Use critical for startup failures
     raise ValueError(error_message)
 
-# Startup check for DB config
-if tda_config["DATABASE_TYPE"] == "postgres":
-    required_pg_vars = ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]
-    missing_pg_vars = [var for var in required_pg_vars if not tda_config.get(var)]
-    if missing_pg_vars:
-        error_msg = f"CRITICAL: DATABASE_TYPE is 'postgres' but required PostgreSQL config is missing: {', '.join(missing_pg_vars)}"
-        app.logger.critical(error_msg)
-        raise ValueError(error_msg)
-elif tda_config["DATABASE_TYPE"] == "sqlite":
-    if not tda_config.get("SHARED_DATABASE_PATH"):
-        error_msg = "CRITICAL: DATABASE_TYPE is 'sqlite' but SHARED_DATABASE_PATH is not set."
-        app.logger.critical(error_msg)
-        raise ValueError(error_msg)
-else:
-    error_msg = f"CRITICAL: Invalid DATABASE_TYPE: {tda_config['DATABASE_TYPE']}. Must be 'sqlite' or 'postgres'."
+# Startup check for DB config (PostgreSQL only)
+required_pg_vars = ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]
+missing_pg_vars = [var for var in required_pg_vars if not tda_config.get(var)]
+if missing_pg_vars:
+    error_msg = f"CRITICAL: Required PostgreSQL config is missing: {', '.join(missing_pg_vars)}"
     app.logger.critical(error_msg)
     raise ValueError(error_msg)
-
 
 # --- Constants ---
 DB_SCHEMA_TDA_TABLES = """
@@ -165,76 +154,50 @@ NEWS_API_STATUS_OK = "ok"
 
 # --- Database Helper Functions ---
 def _get_db_connection():
-    """Establishes a database connection based on DATABASE_TYPE."""
-    db_type = tda_config.get("DATABASE_TYPE")
-    if db_type == "postgres":
-        try:
-            conn = psycopg2.connect(
-                host=tda_config["POSTGRES_HOST"],
-                port=tda_config["POSTGRES_PORT"],
-                user=tda_config["POSTGRES_USER"],
-                password=tda_config["POSTGRES_PASSWORD"],
-                dbname=tda_config["POSTGRES_DB"],
-                cursor_factory=RealDictCursor
-            )
-            return conn
-        except psycopg2.Error as e:
-            app.logger.error(f"Error connecting to PostgreSQL database: {e}")
-            raise
-    elif db_type == "sqlite":
-        # This part will become obsolete once fully migrated and SQLite code is removed
-        # For now, keeping it for potential phased rollout or testing.
-        db_path = tda_config.get("SHARED_DATABASE_PATH")
-        if not db_path:
-            app.logger.error("SHARED_DATABASE_PATH not configured for SQLite.")
-            raise ValueError("SHARED_DATABASE_PATH not configured for SQLite.")
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row # For dict-like access if needed by other SQLite parts
+    """Establishes a PostgreSQL database connection."""
+    try:
+        conn = psycopg2.connect(
+            host=tda_config["POSTGRES_HOST"],
+            port=tda_config["POSTGRES_PORT"],
+            user=tda_config["POSTGRES_USER"],
+            password=tda_config["POSTGRES_PASSWORD"],
+            dbname=tda_config["POSTGRES_DB"],
+            cursor_factory=RealDictCursor
+        )
         return conn
-    else:
-        app.logger.error(f"Unsupported DATABASE_TYPE: {db_type}")
-        raise ValueError(f"Unsupported DATABASE_TYPE: {db_type}")
+    except psycopg2.Error as e:
+        app.logger.error(f"Error connecting to PostgreSQL database: {e}")
+        raise
 
 def init_tda_db():
-    """Initializes the TDA database table if it doesn't exist."""
-    app.logger.info(f"[TDA_DB_INIT] Ensuring TDA database schema exists (DB Type: {tda_config.get('DATABASE_TYPE')})...")
+    """Initializes the TDA database table if it doesn't exist (PostgreSQL only)."""
+    app.logger.info("[TDA_DB_INIT] Ensuring TDA database schema exists (PostgreSQL)...")
     conn = None
     cursor = None
     try:
         conn = _get_db_connection()
         cursor = conn.cursor()
-        if tda_config.get("DATABASE_TYPE") == "postgres":
-            # Check if table exists for PostgreSQL
-            cursor.execute("""
-                SELECT EXISTS (
+        # Check if table exists for PostgreSQL
+        cursor.execute("""
+            SELECT EXISTS (
                     SELECT FROM information_schema.tables
                     WHERE table_schema = 'public'
-                    AND table_name = 'topics_snippets'
-                );
-            """)
-            table_exists = cursor.fetchone()['exists']
-            if not table_exists:
-                app.logger.info("Table 'topics_snippets' not found in PostgreSQL. Creating now...")
-                cursor.execute(DB_SCHEMA_TDA_TABLES)
-                conn.commit()
-                app.logger.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' created.")
-            else:
-                app.logger.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' already exists.")
-        elif tda_config.get("DATABASE_TYPE") == "sqlite":
-            # SQLite table check (less critical now but kept for completeness if needed)
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='topics_snippets';")
-            if not cursor.fetchone():
-                 app.logger.info("Table 'topics_snippets' not found in SQLite. Creating now...")
-                 cursor.executescript(DB_SCHEMA_TDA_TABLES) # executescript for SQLite
-                 conn.commit()
-                 app.logger.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' ensured.")
-            else:
-                app.logger.info("[TDA_DB_INIT] SQLite: Table 'topics_snippets' already exists.")
+                AND table_name = 'topics_snippets'
+            );
+        """)
+        table_exists = cursor.fetchone()['exists']
+        if not table_exists:
+            app.logger.info("Table 'topics_snippets' not found in PostgreSQL. Creating now...")
+            cursor.execute(DB_SCHEMA_TDA_TABLES)
+            conn.commit()
+            app.logger.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' created.")
+        else:
+            app.logger.info("[TDA_DB_INIT] PostgreSQL: Table 'topics_snippets' already exists.")
 
-    except (psycopg2.Error, sqlite3.Error) as e: # Catch both error types
-        app.logger.error(f"[TDA_DB_INIT] Database error during schema initialization: {e}", exc_info=True)
+    except psycopg2.Error as e:
+        app.logger.error(f"[TDA_DB_INIT] PostgreSQL error during schema initialization: {e}", exc_info=True)
     except Exception as e_unexp:
-        app.logger.error(f"[TDA_DB_INIT] Unexpected error during schema initialization: {e_unexp}", exc_info=True)
+        app.logger.error(f"[TDA_DB_INIT] Unexpected PostgreSQL error during schema initialization: {e_unexp}", exc_info=True)
     finally:
         if cursor:
             cursor.close()
@@ -252,9 +215,7 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
         cursor = conn.cursor()
 
         keywords_data = topic_object.get("keywords", [])
-        # For PostgreSQL JSONB, psycopg2 handles dict/list to JSON conversion
-        # For SQLite, we need to json.dumps it if the column is TEXT
-        keywords_to_save = json.dumps(keywords_data) if tda_config.get("DATABASE_TYPE") == "sqlite" else keywords_data
+        keywords_to_save = json.dumps(keywords_data) if keywords_data else None # Ensure JSON string for PG JSONB
 
         potential_sources = topic_object.get("potential_sources", [])
         source_url = potential_sources[0].get("url") if potential_sources and len(potential_sources) > 0 else None
@@ -297,47 +258,32 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
                 relevance_score = EXCLUDED.relevance_score;
         """
         # Using %s for psycopg2, original_topic_details is expected to be JSONB compatible (dict/list)
-        # For SQLite, this would need ? and json.dumps for JSON fields.
-        # Assuming for now this function is primarily for PostgreSQL path.
-        # If SQLite path is still needed, conditional SQL and param formatting would be required.
-        # Using app.logger for consistency
         params = (
             topic_id_str,
             DB_TYPE_TOPIC,
             topic_object.get("title_suggestion"),
             topic_object.get("summary"),
-            keywords_to_save, # Already formatted for PG or SQLite
+            keywords_to_save,
             source_url,
             source_name,
-            topic_object.get("original_topic_details"), # Directly pass dict for JSONB
+            json.dumps(topic_object.get("original_topic_details")) if topic_object.get("original_topic_details") else None, # Ensure JSON string for PG JSONB
             None, # llm_model_used_for_snippet
             None, # cover_art_prompt
-            topic_object.get("image_url"), # image_url
+            topic_object.get("image_url"),
             publication_date_to_save,
             last_accessed_ts_to_save,
             topic_object.get("relevance_score")
         )
-
-        if tda_config.get("DATABASE_TYPE") == "sqlite":
-            # Convert SQL for SQLite
-            sql_insert_sqlite = sql_insert.replace("%s", "?")
-            # Ensure JSON fields are dumped to strings for SQLite
-            params_sqlite = list(params)
-            params_sqlite[4] = json.dumps(params[4]) if not isinstance(params[4], str) else params[4] # keywords
-            params_sqlite[7] = json.dumps(params[7]) if not isinstance(params[7], str) else params[7] # original_topic_details
-            cursor.execute(sql_insert_sqlite, tuple(params_sqlite))
-        else: # PostgreSQL
-            cursor.execute(sql_insert, params)
-
+        cursor.execute(sql_insert, params)
         conn.commit()
-        app.logger.info(f"Saved/Replaced topic {topic_id_str} to DB: {topic_object.get('title_suggestion')}")
+        app.logger.info(f"Saved/Replaced topic {topic_id_str} to PostgreSQL DB: {topic_object.get('title_suggestion')}")
 
-    except (psycopg2.Error, sqlite3.Error) as e:
-        app.logger.error(f"Database error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
-        if conn: conn.rollback() # Rollback on error for PG
+    except psycopg2.Error as e:
+        app.logger.error(f"PostgreSQL error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
+        if conn: conn.rollback()
     except Exception as e_unexp:
-        app.logger.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to DB: {e_unexp}", exc_info=True)
-        if conn and tda_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
+        app.logger.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to PostgreSQL DB: {e_unexp}", exc_info=True)
+        if conn: conn.rollback()
     finally:
         if cursor:
             cursor.close()
@@ -610,7 +556,7 @@ def discover_topics_async_endpoint(): # Renamed endpoint function
     if error_trigger == "tda_endpoint_error": # Test endpoint error before dispatch
         logger.info(f"Request {request_id_main}: Simulated TDA endpoint error triggered.")
         return flask.jsonify({"error_code": "TDA_SIMULATED_ENDPOINT_ERROR", "message": "Simulated TDA endpoint error."}), 500
-        
+
     use_real_news_api_flag = tda_config["USE_REAL_NEWS_API"]
 
     logger.info(f"Request {request_id_main}: Dispatching topic discovery to Celery task. Query: '{query}', Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}")
@@ -665,5 +611,5 @@ if __name__ == "__main__":
     port = tda_config.get("TDA_PORT")
     debug_mode = tda_config.get("TDA_DEBUG_MODE")
     # The initial "JSON logging configured..." message is now part of setup_json_logging
-    app.logger.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: {tda_config.get('DATABASE_TYPE')}) ---")
+    app.logger.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: PostgreSQL) ---")
     app.run(host=host, port=port, debug=debug_mode)
