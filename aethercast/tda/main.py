@@ -6,6 +6,8 @@ import json
 import os
 from dotenv import load_dotenv
 import requests
+from celery import Celery
+from celery.result import AsyncResult
 import psycopg2 # Added
 from psycopg2.extras import RealDictCursor # Added
 from datetime import datetime
@@ -14,6 +16,23 @@ import time # Added for metric logging
 # Load environment variables from .env file
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=dotenv_path)
+
+# --- Celery Configuration ---
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+
+celery_app = Celery(
+    'tda_tasks',
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND
+)
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    enable_utc=True,
+)
 
 # --- Logging Setup ---
 # Custom filter to add service_name to log records
@@ -405,7 +424,39 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
         return topic_objects
     except requests.exceptions.RequestException as req_err:
         app.logger.error(f"NewsAPI request error: {req_err}", exc_info=True)
-        return [] # Return empty list on request failure, CPOA/caller handles "no topics"
+        # For Celery task, we should raise the error so it can be retried or marked as failed
+        raise # Re-raise the exception
+    except Exception as e_unexp: # Catch any other unexpected error
+        app.logger.error(f"Unexpected error in call_real_news_api: {e_unexp}", exc_info=True)
+        raise # Re-raise
+
+
+@celery_app.task(bind=True, name='fetch_news_from_newsapi_task')
+def fetch_news_from_newsapi_task(self, request_id_celery: str, keywords: list[str] = None, categories: list[str] = None, language: str = None, country: str = None):
+    """
+    Celery task to fetch articles from NewsAPI.org.
+    request_id_celery is for logging correlation with the dispatching request.
+    """
+    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id_celery}): Fetching news. Keywords: {keywords}, Categories: {categories}")
+
+    # The actual NewsAPI call logic is now within call_real_news_api
+    # We pass the parameters to it.
+    # Note: _save_topic_to_db is called inside call_real_news_api.
+    # If saving to DB should also be part of the async task's success criteria, this is fine.
+    # If DB save fails, call_real_news_api currently logs it and continues, returning successfully fetched articles.
+    # For a Celery task, you might want more explicit error propagation if DB save is critical.
+    try:
+        # Pass page_size or other specific params if needed, or rely on defaults in call_real_news_api
+        articles = call_real_news_api(keywords=keywords, categories=categories, language=language, country=country)
+        # The 'articles' returned by call_real_news_api are already transformed TopicObjects and saved.
+        return {"status": "success", "discovered_topics": articles, "message": f"Fetched {len(articles)} topics."}
+    except requests.exceptions.RequestException as e_req:
+        logger.error(f"Celery Task {self.request.id}: NewsAPI request error in task: {e_req}", exc_info=True)
+        raise self.retry(exc=e_req, countdown=10, max_retries=2) # Celery retry for network issues
+    except Exception as e_task: # Catch other exceptions from call_real_news_api or within the task
+        logger.error(f"Celery Task {self.request.id}: Unexpected error: {e_task}", exc_info=True)
+        raise self.retry(exc=e_task, countdown=10, max_retries=2) # Generic retry
+
 
 SIMULATED_DATA_SOURCES = [
     {
@@ -460,94 +511,147 @@ def calculate_relevance_score(article: dict, query: str = None) -> float:
             if qk in article.get("title", "").lower(): score = min(1.0, score + 0.1)
     return round(score, 2)
 
+@celery_app.task(bind=True, name='discover_topics_task')
+def discover_topics_task(self, request_id_main: str, query: Optional[str], limit: int, use_real_news_api: bool, error_trigger: Optional[str] = None):
+    """
+    Celery task to discover topics, potentially calling another Celery task for NewsAPI.
+    """
+    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id_main}): Starting topic discovery. Query: '{query}', Limit: {limit}, UseNewsAPI: {use_real_news_api}")
+
+    if error_trigger == "tda_error": # For testing celery task failure
+        logger.info(f"Celery Task {self.request.id}: Simulated TDA error triggered in task.")
+        raise Exception("Simulated TDA error in Celery task.")
+
+    discovered_topics = []
+    if use_real_news_api:
+        request_keywords = [k.strip() for k in query.split(',')] if query else None
+        logger.info(f"Celery Task {self.request.id}: Dispatching NewsAPI sub-task. Keywords: {request_keywords}")
+
+        news_task = fetch_news_from_newsapi_task.delay(
+            request_id_celery=self.request.id, # Correlate sub-task with this parent task
+            keywords=request_keywords,
+            language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE"),
+            max_results=limit
+        )
+        logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} dispatched. Polling for results...")
+
+        # Polling logic for the NewsAPI sub-task
+        # This worker will block here until the sub-task completes or polling times out.
+        # A more advanced pattern would use Celery chains/callbacks to avoid worker blocking.
+        polling_start_time = time.time()
+        # Use specific polling config or reuse general ones if suitable
+        news_polling_interval = int(os.getenv("TDA_NEWSAPI_POLLING_INTERVAL_SECONDS", "5"))
+        news_polling_timeout = int(os.getenv("TDA_NEWSAPI_POLLING_TIMEOUT_SECONDS", "120")) # E.g., 2 minutes for news API call
+
+        while True:
+            if time.time() - polling_start_time > news_polling_timeout:
+                logger.error(f"Celery Task {self.request.id}: Polling NewsAPI sub-task {news_task.id} timed out.")
+                raise Exception(f"Polling NewsAPI sub-task {news_task.id} timed out.")
+
+            news_task_result = AsyncResult(news_task.id, app=celery_app)
+            logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} status: {news_task_result.status}")
+
+            if news_task_result.successful():
+                sub_task_output = news_task_result.result
+                if sub_task_output.get("status") == "success":
+                    discovered_topics = sub_task_output.get("discovered_topics", [])
+                    logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} successful. Found {len(discovered_topics)} topics.")
+                else: # NewsAPI task itself reported an issue in its result
+                    logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} reported failure: {sub_task_output.get('message')}")
+                    raise Exception(f"NewsAPI sub-task failed: {sub_task_output.get('message', 'Unknown error from NewsAPI task')}")
+                break
+            elif news_task_result.failed():
+                logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} failed with Celery status FAILED. Info: {news_task_result.info}")
+                raise Exception(f"NewsAPI sub-task failed: {str(news_task_result.info)}")
+
+            time.sleep(news_polling_interval)
+    else:
+        # Simulated data path
+        logger.info(f"Celery Task {self.request.id}: Using simulated data sources. Query: '{query}', Limit: {limit}")
+        discovered_topics = identify_topics_from_sources(query=query, limit=limit)
+        logger.info(f"Celery Task {self.request.id}: Simulated data discovery found {len(discovered_topics)} topics.")
+
+    # Return the final list of topics (or an error structure if preferred)
+    if not discovered_topics:
+        return {"status": "success_no_topics", "message": "No topics discovered.", "topics": []}
+
+    return {"status": "success", "discovered_topics": discovered_topics, "message": f"Successfully discovered {len(discovered_topics)} topics."}
+
+
 # --- API Endpoint ---
 @app.route("/discover_topics", methods=["POST"])
-def discover_topics_endpoint():
-    request_start_time = time.time()
-    final_status_str = "unknown_error"
-    discovered_topics_count = 0
+def discover_topics_async_endpoint(): # Renamed endpoint function
+    request_start_time = time.time() # For overall endpoint response time, not full task time
+    request_id_main = f"tda_req_{uuid.uuid4().hex[:8]}"
+    logger.info(f"Request {request_id_main}: Received async /discover_topics request.")
 
     try:
+        request_data = flask.request.get_json() if flask.request.content_length else {}
+    except Exception as e_json_decode:
+        logger.warning(f"Request {request_id_main}: Failed to decode JSON: {e_json_decode}", exc_info=True)
+        return flask.jsonify({"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+
+    query = request_data.get("query")
+    limit_raw = request_data.get("limit")
+    error_trigger = request_data.get("error_trigger") # For testing endpoint itself
+
+    if query is not None and (not isinstance(query, str) or not query.strip()):
+        return flask.jsonify({"error_code": "TDA_INVALID_QUERY", "message": "query must be non-empty string."}), 400
+
+    limit = 5
+    if limit_raw is not None:
         try:
-            request_data = flask.request.get_json() if flask.request.content_length else {}
-        except Exception as e_json_decode:
-            app.logger.warning(f"/discover_topics: Failed to decode JSON: {e_json_decode}", exc_info=True)
-            final_status_str = "validation_error_bad_json"
-            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-            return flask.jsonify({"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+            limit = int(limit_raw)
+            if not (1 <= limit <= 50):
+                return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "limit must be 1-50."}), 400
+        except ValueError:
+            return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "limit must be integer."}), 400
 
-        query = request_data.get("query")
-        limit_raw = request_data.get("limit")
-        error_trigger = request_data.get("error_trigger")
-
-        if query is not None and (not isinstance(query, str) or not query.strip()):
-            final_status_str = "validation_error_query"
-            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-            return flask.jsonify({"error_code": "TDA_INVALID_QUERY", "message": "query must be non-empty string."}), 400
-
-        limit = 5
-        if limit_raw is not None:
-            try:
-                limit = int(limit_raw)
-                if not (1 <= limit <= 50):
-                    final_status_str = "validation_error_limit_range"
-                    app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-                    return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "limit must be 1-50."}), 400
-            except ValueError:
-                final_status_str = "validation_error_limit_type"
-                app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-                return flask.jsonify({"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "limit must be integer."}), 400
-
-        app.logger.info(f"POST /discover_topics. Query: '{query}', Limit: {limit}, Trigger: '{error_trigger}'")
-
-        if error_trigger == "tda_error":
-            final_status_str = "simulated_error"
-            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-            return flask.jsonify({"error_code": "TDA_SIMULATED_ERROR", "message": "Simulated TDA error."}), 500
+    if error_trigger == "tda_endpoint_error": # Test endpoint error before dispatch
+        logger.info(f"Request {request_id_main}: Simulated TDA endpoint error triggered.")
+        return flask.jsonify({"error_code": "TDA_SIMULATED_ENDPOINT_ERROR", "message": "Simulated TDA endpoint error."}), 500
         
-        discovered_topics = []
-        if tda_config["USE_REAL_NEWS_API"]:
-            request_keywords = [k.strip() for k in query.split(',')] if query else None
-            newsapi_call_start_time = time.time()
-            raw_topics_from_api = call_real_news_api(keywords=request_keywords, language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE"))
-            newsapi_duration_ms = (time.time() - newsapi_call_start_time) * 1000
-            app.logger.info("TDA NewsAPI call processed", extra=dict(metric_name="tda_newsapi_call_latency_ms", value=round(newsapi_duration_ms, 2)))
+    use_real_news_api_flag = tda_config["USE_REAL_NEWS_API"]
 
-            if raw_topics_from_api == []: # call_real_news_api returns [] on error or no results
-                 # Check logs from call_real_news_api to confirm if it was an actual error
-                app.logger.warning("NewsAPI call returned empty list, potentially an error or no results.")
-                # To definitively log tda_newsapi_error_count, call_real_news_api would need to return an error status
-                # For now, we can't distinguish easily here if [] means error or just no articles.
-                # Assuming if it's empty, it's a "no results" rather than API error for status_str here.
-                # If an error was logged inside call_real_news_api, it would be a separate log.
-                # To log tda_newsapi_error_count, we'd need a clearer error signal from call_real_news_api
-            discovered_topics = raw_topics_from_api[:limit] if limit > 0 else raw_topics_from_api
-        else:
-            discovered_topics = identify_topics_from_sources(query=query, limit=limit)
+    logger.info(f"Request {request_id_main}: Dispatching topic discovery to Celery task. Query: '{query}', Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}")
 
-        discovered_topics_count = len(discovered_topics)
-        app.logger.info("TDA topics discovered", extra=dict(metric_name="tda_topics_discovered_count", value=discovered_topics_count))
+    task = discover_topics_task.delay(
+        request_id_main=request_id_main,
+        query=query,
+        limit=limit,
+        use_real_news_api_flag=use_real_news_api_flag,
+        error_trigger=error_trigger # Pass error_trigger for testing task failure if needed
+    )
 
-        overall_latency_ms = (time.time() - request_start_time) * 1000
-        app.logger.info("TDA discover topics latency", extra=dict(metric_name="tda_discover_topics_latency_ms", value=round(overall_latency_ms, 2)))
+    logger.info(f"Request {request_id_main}: Topic discovery task {task.id} dispatched.")
+    return flask.jsonify({
+        "task_id": task.id,
+        "status_url": f"/v1/tasks/{task.id}",
+        "message": "Topic discovery task initiated. Poll task ID for results."
+    }), 202
 
-        if not discovered_topics:
-            final_status_str = "success_no_topics"
-            app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-            return flask.jsonify({"message": "No topics discovered.", "topics": []}), 200
 
-        final_status_str = "success"
-        app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-        return flask.jsonify({"discovered_topics": discovered_topics}), 200
+@app.route('/v1/tasks/<task_id>', methods=['GET'])
+def get_tda_task_status(task_id: str):
+    logger.info(f"Received request for TDA task status: {task_id}")
+    task_result = AsyncResult(task_id, app=celery_app)
+    response_data = {"task_id": task_id, "status": task_result.status, "result": None}
 
-    except Exception as e:
-        app.logger.error(f"Error in /discover_topics: {e}", exc_info=True)
-        final_status_str = "internal_server_error"
-        # Log overall latency even on error, if possible
-        overall_latency_ms_err = (time.time() - request_start_time) * 1000
-        app.logger.info("TDA discover topics latency", extra=dict(metric_name="tda_discover_topics_latency_ms", value=round(overall_latency_ms_err, 2)))
-        app.logger.info("TDA request completed", extra=dict(metric_name="tda_discover_topics_request_count", value=1, tags={"status": final_status_str}))
-        return flask.jsonify({"error_code": ENDPOINT_ERROR_INTERNAL_SERVER_TDA, "message": "Unexpected error."}), 500
+    if task_result.successful():
+        task_output = task_result.result # This is the dict from fetch_news_from_newsapi_task
+        response_data["result"] = task_output
+        http_status = 200
+        # Example: check if the task's internal logic indicated an issue
+        if isinstance(task_output, dict) and task_output.get("status") != "success":
+             # Could map specific task error messages to HTTP status codes if desired
+             http_status = 500 # Default for task-level errors reported in a successful Celery execution
+        return flask.jsonify(response_data), http_status
+    elif task_result.failed():
+        error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
+        response_data["result"] = error_info
+        return flask.jsonify(response_data), 500
+    else: # PENDING, STARTED, RETRY
+        return flask.jsonify(response_data), 202
 
 if __name__ == "__main__":
     if tda_config.get("DATABASE_TYPE") == "sqlite" and not tda_config.get("SHARED_DATABASE_PATH"):

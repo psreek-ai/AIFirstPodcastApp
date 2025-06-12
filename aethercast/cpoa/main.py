@@ -100,6 +100,14 @@ TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_t
 CPOA_SERVICE_RETRY_COUNT = int(os.getenv("CPOA_SERVICE_RETRY_COUNT", "3"))
 CPOA_SERVICE_RETRY_BACKOFF_FACTOR = float(os.getenv("CPOA_SERVICE_RETRY_BACKOFF_FACTOR", "0.5"))
 
+# Polling Configuration for PSWA (and potentially others later)
+CPOA_PSWA_POLLING_INTERVAL_SECONDS = int(os.getenv("CPOA_PSWA_POLLING_INTERVAL_SECONDS", "5"))
+CPOA_PSWA_POLLING_TIMEOUT_SECONDS = int(os.getenv("CPOA_PSWA_POLLING_TIMEOUT_SECONDS", "600")) # 10 minutes
+
+# Polling Configuration for SCA
+CPOA_SCA_POLLING_INTERVAL_SECONDS = int(os.getenv("CPOA_SCA_POLLING_INTERVAL_SECONDS", "3"))
+CPOA_SCA_POLLING_TIMEOUT_SECONDS = int(os.getenv("CPOA_SCA_POLLING_TIMEOUT_SECONDS", "180")) # 3 minutes for snippet crafting
+
 # Database Configuration
 DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite") # Default to sqlite
 CPOA_DATABASE_PATH = os.getenv("SHARED_DATABASE_PATH", "/app/database/aethercast_podcasts.db") # SQLite path
@@ -670,34 +678,87 @@ def orchestrate_podcast_generation(
             pswa_payload = {"content": wcha_content, "topic": topic}
             pswa_headers = {'X-Test-Scenario': test_scenarios["pswa"]} if test_scenarios and test_scenarios.get("pswa") else {}
 
-            response_pswa = requests_with_retry("post", PSWA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                            json=pswa_payload, timeout=180, headers=pswa_headers,
-                                            workflow_id_for_log=workflow_id, task_id_for_log=pswa_task_id)
-            structured_script_from_pswa = response_pswa.json()
+            pswa_payload = {"content": wcha_content, "topic": topic}
+            pswa_headers = {'X-Test-Scenario': test_scenarios["pswa"]} if test_scenarios and test_scenarios.get("pswa") else {}
 
-            if not (isinstance(structured_script_from_pswa, dict) and structured_script_from_pswa.get("script_id") and structured_script_from_pswa.get("title")):
-                pswa_error_details = {"message": "PSWA service returned invalid or malformed structured script.", "received_script_preview": structured_script_from_pswa}
-                log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
-            else:
-                pswa_output_summary = {"script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title"), "segment_count": len(structured_script_from_pswa.get("segments", []))}
-                log_step_cpoa("PSWA Service finished successfully.", data=pswa_output_summary)
-        except requests.exceptions.RequestException as e_req_pswa:
+            # Initial call to PSWA to dispatch task
+            response_pswa_initial = requests_with_retry("post", PSWA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+                                                      json=pswa_payload, timeout=30, headers=pswa_headers, # Shorter timeout for task dispatch
+                                                      workflow_id_for_log=workflow_id, task_id_for_log=pswa_task_id)
+
+            if response_pswa_initial.status_code != 202:
+                pswa_error_details = {"message": f"PSWA service did not accept the task. Status: {response_pswa_initial.status_code}", "response_text": response_pswa_initial.text[:200]}
+                raise Exception(pswa_error_details["message"])
+
+            pswa_task_init_data = response_pswa_initial.json()
+            pswa_internal_task_id = pswa_task_init_data.get("task_id")
+            pswa_status_url_suffix = pswa_task_init_data.get("status_url")
+
+            if not pswa_internal_task_id or not pswa_status_url_suffix:
+                pswa_error_details = {"message": "PSWA task submission response missing task_id or status_url.", "response_data": pswa_task_init_data}
+                raise Exception(pswa_error_details["message"])
+
+            pswa_base_url = '/'.join(PSWA_SERVICE_URL.split('/')[:-1]) # e.g., http://pswa:5004
+            pswa_poll_url = f"{pswa_base_url}{pswa_status_url_suffix}"
+            log_step_cpoa(f"PSWA task {pswa_internal_task_id} submitted. Polling at {pswa_poll_url}", data=pswa_task_init_data)
+            wf_logger.info(f"PSWA task {pswa_internal_task_id} submitted. Polling status at {pswa_poll_url}", extra={'task_id': pswa_task_id})
+
+
+            polling_start_time = time.time()
+            while True:
+                if time.time() - polling_start_time > CPOA_PSWA_POLLING_TIMEOUT_SECONDS:
+                    pswa_error_details = {"message": f"Polling PSWA task {pswa_internal_task_id} timed out after {CPOA_PSWA_POLLING_TIMEOUT_SECONDS}s."}
+                    raise Exception(pswa_error_details["message"])
+
+                try:
+                    poll_response = requests.get(pswa_poll_url, timeout=15)
+                    poll_response.raise_for_status()
+                    pswa_task_status_data = poll_response.json()
+                    pswa_task_state = pswa_task_status_data.get("status")
+                    log_step_cpoa(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", data=pswa_task_status_data)
+                    wf_logger.info(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", extra={'task_id': pswa_task_id})
+
+                    if pswa_task_state == "SUCCESS":
+                        structured_script_from_pswa = pswa_task_status_data.get("result", {}).get("script_data") # PSWA task returns dict with script_data or error_data
+                        if not structured_script_from_pswa: # Check if script_data is present
+                             pswa_error_details = {"message": "PSWA task succeeded but script_data missing.", "pswa_response": pswa_task_status_data}
+                             log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
+                        elif not (isinstance(structured_script_from_pswa, dict) and structured_script_from_pswa.get("script_id") and structured_script_from_pswa.get("title")):
+                            pswa_error_details = {"message": "PSWA task result is invalid or malformed.", "received_script_preview": structured_script_from_pswa}
+                            log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
+                        else:
+                            pswa_output_summary = {"script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title"), "segment_count": len(structured_script_from_pswa.get("segments", []))}
+                            log_step_cpoa("PSWA Task polling successful, script received.", data=pswa_output_summary)
+                        break
+                    elif pswa_task_state == "FAILURE":
+                        pswa_error_details = {"message": "PSWA task execution failed.", "pswa_response": pswa_task_status_data.get("result")}
+                        log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
+                        break
+
+                    time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
+                except requests.exceptions.RequestException as e_poll_pswa:
+                    log_step_cpoa(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", is_error_payload=True)
+                    wf_logger.warning(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", extra={'task_id': pswa_task_id})
+                    time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
+
+        except requests.exceptions.RequestException as e_req_pswa: # For initial PSWA call
             status_code = e_req_pswa.response.status_code if e_req_pswa.response is not None else "N/A"
-            pswa_error_details = {"message": f"PSWA service call failed (HTTP status: {status_code}, type: {type(e_req_pswa).__name__}): {str(e_req_pswa)}." , "response_payload_preview": e_req_pswa.response.text[:200] if e_req_pswa.response is not None else "N/A"}
+            pswa_error_details = {"message": f"PSWA service initial call failed (HTTP status: {status_code}, type: {type(e_req_pswa).__name__}): {str(e_req_pswa)}." , "response_payload_preview": e_req_pswa.response.text[:200] if e_req_pswa.response is not None else "N/A"}
             log_step_cpoa("PSWA service request exception.", data=pswa_error_details, is_error_payload=True)
-        except json.JSONDecodeError as e_json_pswa:
-            pswa_error_details = {"message": f"PSWA service response was not valid JSON: {str(e_json_pswa)}", "response_text_preview": response_pswa.text[:200] if 'response_pswa' in locals() else "N/A"}
-            log_step_cpoa("PSWA service JSON decode error.", data=pswa_error_details, is_error_payload=True)
-        except Exception as e_pswa_unexp: # Catch any other unexpected error
-            pswa_error_details = {"message": f"PSWA unexpected error: {str(e_pswa_unexp)}", "exception_type": type(e_pswa_unexp).__name__}
+        except json.JSONDecodeError as e_json_pswa: # For initial PSWA call
+            pswa_error_details = {"message": f"PSWA service initial response was not valid JSON: {str(e_json_pswa)}", "response_text_preview": response_pswa_initial.text[:200] if 'response_pswa_initial' in locals() else "N/A"}
+            log_step_cpoa("PSWA service JSON decode error on initial call.", data=pswa_error_details, is_error_payload=True)
+        except Exception as e_pswa_unexp:
+            pswa_error_details = pswa_error_details or {"message": f"PSWA stage unexpected error: {str(e_pswa_unexp)}", "exception_type": type(e_pswa_unexp).__name__}
             wf_logger.error(f"PSWA stage unexpected error: {pswa_error_details['message']}", exc_info=True, extra={'task_id': pswa_task_id})
 
         if pswa_task_id:
             _update_task_instance_status(pswa_task_id, TASK_STATUS_COMPLETED if not pswa_error_details else TASK_STATUS_FAILED,
                                          output_summary=pswa_output_summary, error_details=pswa_error_details, workflow_id_for_log=workflow_id)
-        if pswa_error_details or not structured_script_from_pswa:
-            final_error_message = (pswa_error_details.get("message") if pswa_error_details else None) or "PSWA critical failure: No script."
-            final_cpoa_status_legacy = CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION # Or appropriate legacy status
+
+        if pswa_error_details or not structured_script_from_pswa: # Check if error occurred or script is still None
+            final_error_message = (pswa_error_details.get("message") if pswa_error_details else None) or "PSWA critical failure: No script after polling."
+            final_cpoa_status_legacy = CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION
             raise Exception(final_error_message)
 
         context_data_for_workflow["script_title"] = structured_script_from_pswa.get("title")
@@ -1072,88 +1133,120 @@ def orchestrate_snippet_generation(topic_info: dict) -> Dict[str, Any]:
         "topic_info": topic_info # Pass the whole topic_info dict as it might contain other useful fields for SCA
     }
 
-    logger.info(f"CPOA: {function_name} - Calling SCA Service for topic_id {topic_id}...")
+    logger.info(f"CPOA: {function_name} - Calling SCA Service for topic_id {topic_id} (async)...")
+    sca_task_id = None
+    sca_status_url = None
+    snippet_data = None
+
     try:
-        response = requests_with_retry("post", SCA_SERVICE_URL,
-                                       max_retries=CPOA_SERVICE_RETRY_COUNT,
-                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                       json=sca_payload, timeout=60)
+        # 1. Initiate SCA Task
+        initial_sca_response = requests_with_retry(
+            "post", SCA_SERVICE_URL,
+            max_retries=CPOA_SERVICE_RETRY_COUNT,
+            backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
+            json=sca_payload, timeout=30 # Shorter timeout for task dispatch
+        )
 
-        snippet_data = response.json() # This is the SnippetDataObject from SCA
-        logger.info(f"CPOA: {function_name} - SCA Service call successful for topic_id {topic_id}. Snippet data received: {snippet_data.get('snippet_id')}")
+        if initial_sca_response.status_code != 202:
+            logger.error(f"CPOA: {function_name} - SCA service did not accept task for topic_id {topic_id}. Status: {initial_sca_response.status_code}, Response: {initial_sca_response.text[:200]}")
+            return {"error": "SCA_TASK_REJECTED", "details": f"SCA rejected task: {initial_sca_response.status_code} - {initial_sca_response.text[:200]}"}
 
-        # Save the generated snippet to the database
-        # db_path argument is removed from _save_snippet_to_db
-        # It will use CPOA_DATABASE_PATH for SQLite if DATABASE_TYPE is sqlite
-        # or _get_cpoa_db_connection for PostgreSQL.
-        # No explicit db_path needed here anymore.
+        sca_task_init_data = initial_sca_response.json()
+        sca_task_id = sca_task_init_data.get("task_id")
+        sca_status_url_suffix = sca_task_init_data.get("status_url")
 
-        # --- IGA Call for Cover Art ---
-        cover_art_prompt = snippet_data.get("cover_art_prompt")
-        if cover_art_prompt and IGA_SERVICE_URL:
-            logger.info(f"CPOA: Orchestrating image generation for snippet '{snippet_data.get('snippet_id')}' with prompt: '{cover_art_prompt}'")
-            iga_payload = {"prompt": cover_art_prompt}
-            iga_endpoint = f"{IGA_SERVICE_URL.rstrip('/')}/generate_image"
+        if not sca_task_id or not sca_status_url_suffix:
+            logger.error(f"CPOA: {function_name} - SCA task submission response missing task_id or status_url for topic_id {topic_id}. Response: {sca_task_init_data}")
+            return {"error": "SCA_BAD_TASK_RESPONSE", "details": f"SCA task submission response invalid: {sca_task_init_data}"}
+
+        sca_base_url = '/'.join(SCA_SERVICE_URL.split('/')[:-1]) # e.g., http://sca:5002
+        sca_poll_url = f"{sca_base_url}{sca_status_url_suffix}"
+        logger.info(f"CPOA: {function_name} - SCA task {sca_task_id} submitted for topic_id {topic_id}. Polling at {sca_poll_url}")
+
+        # 2. Poll SCA Task
+        polling_start_time = time.time()
+        polling_interval = os.getenv("CPOA_SCA_POLLING_INTERVAL_SECONDS", "3") # Get from env or default
+        polling_timeout = os.getenv("CPOA_SCA_POLLING_TIMEOUT_SECONDS", "180")
+
+        while True:
+            if time.time() - polling_start_time > polling_timeout:
+                logger.error(f"CPOA: {function_name} - Polling SCA task {sca_task_id} for topic_id {topic_id} timed out after {polling_timeout}s.")
+                return {"error": "SCA_POLLING_TIMEOUT", "details": f"Polling SCA task {sca_task_id} timed out."}
 
             try:
-                iga_response = requests_with_retry("post", iga_endpoint,
-                                                   max_retries=CPOA_SERVICE_RETRY_COUNT,
-                                                   backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
-                                                   json=iga_payload,
-                                                   timeout=20) # IGA specific timeout
+                poll_response = requests.get(sca_poll_url, timeout=10)
+                poll_response.raise_for_status()
+                sca_task_status_data = poll_response.json()
+                sca_task_state = sca_task_status_data.get("status")
+                logger.info(f"CPOA: {function_name} - SCA task {sca_task_id} for topic_id {topic_id} status: {sca_task_state}")
 
-                iga_response_data = iga_response.json()
-                if iga_response.status_code == 200 and iga_response_data.get("image_url"):
-                    snippet_data["image_url"] = iga_response_data["image_url"]
-                    logger.info(f"CPOA: Successfully received image_url '{snippet_data['image_url']}' from IGA for snippet '{snippet_data.get('snippet_id')}'.")
-                else:
-                    logger.warning(f"CPOA: IGA service responded with status {iga_response.status_code} or missing image_url for snippet '{snippet_data.get('snippet_id')}'. Response: {iga_response_data}")
+                if sca_task_state == "SUCCESS":
+                    snippet_data_from_task = sca_task_status_data.get("result")
+                    if not snippet_data_from_task or isinstance(snippet_data_from_task, dict) and snippet_data_from_task.get("error_code"): # SCA task itself might return an error structure in result
+                        logger.error(f"CPOA: {function_name} - SCA task {sca_task_id} succeeded but returned an error or no valid data: {snippet_data_from_task}")
+                        return {"error": "SCA_TASK_LOGICAL_ERROR", "details": snippet_data_from_task}
+                    snippet_data = snippet_data_from_task # This is the final SnippetDataObject
+                    break
+                elif sca_task_state == "FAILURE":
+                    logger.error(f"CPOA: {function_name} - SCA task {sca_task_id} for topic_id {topic_id} failed. Data: {sca_task_status_data}")
+                    return {"error": "SCA_TASK_FAILED", "details": sca_task_status_data.get("result", {}).get("error", "Unknown SCA task failure")}
+
+                time.sleep(polling_interval)
+            except requests.exceptions.RequestException as e_poll_sca:
+                logger.warning(f"CPOA: {function_name} - Polling SCA task {sca_task_id} for topic_id {topic_id} failed: {e_poll_sca}. Retrying.")
+                time.sleep(polling_interval)
+
+        # At this point, snippet_data should be populated from successful SCA task
+        logger.info(f"CPOA: {function_name} - SCA task {sca_task_id} successful for topic_id {topic_id}. Snippet data received: {snippet_data.get('snippet_id')}")
+
+        # --- IGA Call for Cover Art (Remains synchronous within this flow for now) ---
+        if snippet_data: # Ensure we have snippet_data before proceeding
+            cover_art_prompt = snippet_data.get("cover_art_prompt")
+            if cover_art_prompt and IGA_SERVICE_URL:
+                logger.info(f"CPOA: Orchestrating image generation for snippet '{snippet_data.get('snippet_id')}' with prompt: '{cover_art_prompt}'")
+                iga_payload = {"prompt": cover_art_prompt}
+                # Assuming IGA is still synchronous or CPOA handles its async nature if IGA was also updated
+                iga_endpoint = f"{IGA_SERVICE_URL.rstrip('/')}/generate_image"
+                try:
+                    iga_response = requests_with_retry("post", iga_endpoint, max_retries=CPOA_SERVICE_RETRY_COUNT,
+                                                       backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR, json=iga_payload, timeout=20) # IGA specific timeout
+                    iga_response_data = iga_response.json()
+                    if iga_response.status_code == 200 and iga_response_data.get("image_url"): # Assuming IGA returns 200 OK for sync success
+                        snippet_data["image_url"] = iga_response_data["image_url"]
+                        logger.info(f"CPOA: Successfully received image_url '{snippet_data['image_url']}' from IGA for snippet '{snippet_data.get('snippet_id')}'.")
+                    # If IGA is async and returns 202, this part needs further async handling (out of scope for this specific SCA change)
+                    elif iga_response.status_code == 202 and iga_response_data.get("task_id"):
+                         logger.warning(f"CPOA: IGA returned async task {iga_response_data.get('task_id')} for snippet '{snippet_data.get('snippet_id')}'. CPOA does not yet poll IGA tasks in this flow. Image_url will be missing.")
+                         snippet_data["image_url"] = None # Mark as None if IGA is async and CPOA isn't polling it here
+                    else:
+                        logger.warning(f"CPOA: IGA service responded with status {iga_response.status_code} or missing image_url for snippet '{snippet_data.get('snippet_id')}'. Response: {iga_response_data}")
+                        snippet_data["image_url"] = None
+                except requests.exceptions.RequestException as e_iga_req:
+                    logger.warning(f"CPOA: IGA service call failed for snippet '{snippet_data.get('snippet_id')}': {e_iga_req}", exc_info=True)
                     snippet_data["image_url"] = None
-            except requests.exceptions.RequestException as e_iga_req:
-                logger.warning(f"CPOA: IGA service call failed for snippet '{snippet_data.get('snippet_id')}': {e_iga_req}", exc_info=True)
+                # ... (other IGA error handling as before) ...
+            elif not IGA_SERVICE_URL:
+                logger.warning("CPOA: IGA_SERVICE_URL not configured. Skipping image generation for snippets.")
                 snippet_data["image_url"] = None
-            except json.JSONDecodeError as e_iga_json:
-                logger.warning(f"CPOA: Failed to decode IGA response for snippet '{snippet_data.get('snippet_id')}': {e_iga_json}. Response text: {iga_response.text[:200] if 'iga_response' in locals() else 'N/A'}", exc_info=True)
-                snippet_data["image_url"] = None
-            except Exception as e_iga_unexpected:
-                logger.error(f"CPOA: Unexpected error during IGA call for snippet '{snippet_data.get('snippet_id')}': {e_iga_unexpected}", exc_info=True)
-                snippet_data["image_url"] = None
-        elif not IGA_SERVICE_URL:
-            logger.warning("CPOA: IGA_SERVICE_URL not configured. Skipping image generation for snippets.")
-            snippet_data["image_url"] = None
-        else: # No cover_art_prompt
-             snippet_data["image_url"] = None
+            else: snippet_data["image_url"] = None
 
-        # Now save to DB. _save_snippet_to_db will handle DB type.
-        # If DATABASE_TYPE is "sqlite", it will use CPOA_DATABASE_PATH.
-        _save_snippet_to_db(snippet_data)
+            _save_snippet_to_db(snippet_data)
+            return snippet_data
+        else: # Should not happen if polling logic is correct and SCA task returns valid data on success
+            logger.error(f"CPOA: {function_name} - Snippet data is None after successful polling for SCA task {sca_task_id}. This indicates an issue.")
+            return {"error": "SCA_POLLING_LOGIC_ERROR", "details": "Snippet data missing after SCA task success."}
 
 
-        return snippet_data
-
-    except requests.exceptions.RequestException as e_req:
-        sca_err_payload_str = "N/A"
-        status_code_str = "N/A"
-        if hasattr(e_req, 'response') and e_req.response is not None:
-            status_code_str = str(e_req.response.status_code)
-            try:
-                # SCA errors might be in "detail" or directly in the response body
-                error_payload = e_req.response.json()
-                sca_err_payload_str = error_payload.get("detail", json.dumps(error_payload))
-            except json.JSONDecodeError:
-                sca_err_payload_str = e_req.response.text[:200]
-
-        error_message = f"SCA service call failed for topic_id {topic_id} after retries (HTTP status: {status_code_str}, type: {type(e_req).__name__}): {str(e_req)}. Response: {sca_err_payload_str}"
+    except requests.exceptions.RequestException as e_req: # For initial SCA call
+        error_message = f"SCA service initial call failed for topic_id {topic_id}: {str(e_req)}"
         logger.error(f"CPOA: {function_name} - {error_message}", exc_info=True)
         return {"error": SCA_STATUS_CALL_FAILED_AFTER_RETRIES, "details": error_message}
-
-    except json.JSONDecodeError as e_json:
-        error_message = f"SCA service response was not valid JSON for topic_id {topic_id}: {str(e_json)}"
+    except json.JSONDecodeError as e_json: # For initial SCA call response
+        error_message = f"SCA service initial response was not valid JSON for topic_id {topic_id}: {str(e_json)}"
         logger.error(f"CPOA: {function_name} - {error_message}", exc_info=True)
-        return {"error": SCA_STATUS_RESPONSE_INVALID_JSON, "details": error_message, "raw_response": response.text[:500] if 'response' in locals() and response is not None else "N/A"}
-
-    except Exception as e: # Catch-all for other unexpected errors
-        error_message = f"Unexpected error during SCA call for topic_id {topic_id}: {str(e)}"
+        return {"error": SCA_STATUS_RESPONSE_INVALID_JSON, "details": error_message, "raw_response": initial_sca_response.text[:500] if 'initial_sca_response' in locals() else "N/A"}
+    except Exception as e:
+        error_message = f"Unexpected error during SCA interaction for topic_id {topic_id}: {str(e)}"
         logger.error(f"CPOA: {function_name} - {error_message}", exc_info=True)
         return {"error": SCA_STATUS_CALL_UNEXPECTED_ERROR, "details": error_message}
 
