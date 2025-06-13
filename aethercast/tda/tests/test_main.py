@@ -1,6 +1,6 @@
 # aethercast/tda/tests/test_main.py
 import unittest
-from unittest.mock import patch, MagicMock, mock_open
+from unittest.mock import patch, MagicMock
 import os
 import json # For creating mock API responses
 
@@ -491,18 +491,28 @@ class TestTDAIntegration(unittest.TestCase):
 class TestTDAHelpers(unittest.TestCase):
 
     def setUp(self):
-        # Mock tda_config for these helper tests if they rely on it,
-        # e.g., for SHARED_DATABASE_PATH if testing _save_topic_to_db interaction.
+        # Mock tda_config for these helper tests
         self.mock_tda_config = {
-            "SHARED_DATABASE_PATH": ":memory:", # Or None if we want to test path not configured
-            "TDA_NEWS_DEFAULT_KEYWORDS": ["default", "keyword"], # if identify_topics uses it
-            # Add any other configs that might be accessed by these helpers, with defaults if necessary
+            # "SHARED_DATABASE_PATH": ":memory:", # Removed
+            "TDA_NEWS_DEFAULT_KEYWORDS": ["default", "keyword"],
         }
-        self.config_patcher = patch.dict(tda_main.tda_config, self.mock_tda_config, clear=True) # clear=True ensures only these values
+        self.config_patcher = patch.dict(tda_main.tda_config, self.mock_tda_config, clear=True)
         self.mock_config = self.config_patcher.start()
+
+        # Add PG env vars for _get_db_connection if it were not mocked in each test
+        self.pg_env_vars = {
+            "POSTGRES_HOST": "mock_pg_host_helper",
+            "POSTGRES_USER": "mock_pg_user_helper",
+            "POSTGRES_PASSWORD": "mock_pg_password_helper",
+            "POSTGRES_DB": "mock_pg_db_helper"
+        }
+        self.env_patcher = patch.dict(os.environ, self.pg_env_vars)
+        self.env_patcher.start()
+
 
     def tearDown(self):
         self.config_patcher.stop()
+        self.env_patcher.stop()
 
     def test_generate_summary_from_title(self):
         title = "Test Title for Summary"
@@ -577,24 +587,40 @@ class TestTDAHelpers(unittest.TestCase):
 
     @patch('aethercast.tda.main._save_topic_to_db')
     def test_identify_topics_from_sources_db_path_not_configured(self, mock_save_db):
-        # Test that _save_topic_to_db is not called if SHARED_DATABASE_PATH is None or empty
-        with patch.dict(tda_main.tda_config, {"SHARED_DATABASE_PATH": None, "TDA_NEWS_DEFAULT_KEYWORDS": self.mock_tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]}):
-            with patch.object(tda_main.logging, 'warning') as mock_log_warning:
-                tda_main.identify_topics_from_sources(query="test")
-                mock_save_db.assert_not_called()
-                # Check if any of the log calls contain the expected warning
-                found_warning = False
-                for call_args in mock_log_warning.call_args_list:
-                    if "SHARED_DATABASE_PATH not configured" in call_args[0][0]:
-                        found_warning = True
-                        break
-                self.assertTrue(found_warning, "Expected warning about SHARED_DATABASE_PATH not configured was not logged.")
+        # This test's premise changes as SHARED_DATABASE_PATH is removed from tda_config
+        # _save_topic_to_db now relies on _get_db_connection, which itself checks PG env vars.
+        # If PG env vars are not set, _get_db_connection would raise an error.
+        # If _save_topic_to_db is called, it implies a connection was intended.
+        # For this test, we'll assume _save_topic_to_db is called, and its internal PG connection logic is tested elsewhere or mocked.
+        # The original intent was about SHARED_DATABASE_PATH, which is no longer relevant for this function's direct logic.
+        # We can verify that if _save_topic_to_db is called (meaning a DB interaction was intended),
+        # it's called correctly, regardless of the old SHARED_DATABASE_PATH config.
+        # If the goal is to test that identify_topics_from_sources *doesn't* try to save if DB is unavailable,
+        # that would require mocking _get_db_connection to raise an error, and then checking identify_topics_from_sources behavior.
+        # For now, let's assume this test is less relevant or needs rethinking due to PG-only shift.
+        # We will keep the mock_save_db.assert_not_called() if that's the desired outcome under some condition,
+        # but the condition "SHARED_DATABASE_PATH not configured" is gone.
 
-    @patch('sqlite3.connect')
-    def test_save_topic_to_db_success(self, mock_sqlite_connect):
+        # If PG vars are missing, _get_db_connection (if not mocked) would fail.
+        # Let's test that identify_topics_from_sources still proceeds and calls _save_topic_to_db
+        # (which is mocked here, so its internal DB connection logic doesn't run).
+        # This means the responsibility of DB availability is now on _get_db_connection and _save_topic_to_db.
+
+        tda_main.identify_topics_from_sources(query="test")
+        # _save_topic_to_db should still be called if articles are found.
+        # The number of calls depends on how many articles in SIMULATED_DATA_SOURCES match "test".
+        # For simplicity, let's just assert it was called if any articles are processed.
+        if any("test" in article["title"].lower() for source in tda_main.SIMULATED_DATA_SOURCES for article in source["articles"]):
+            mock_save_db.assert_called()
+        else:
+            mock_save_db.assert_not_called()
+
+
+    @patch('aethercast.tda.main._get_db_connection')
+    def test_save_topic_to_db_success(self, mock_get_db_conn):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_sqlite_connect.return_value = mock_conn
+        mock_get_db_conn.return_value = mock_conn
         mock_conn.cursor.return_value = mock_cursor
 
         topic_obj = {
@@ -605,30 +631,19 @@ class TestTDAHelpers(unittest.TestCase):
             "potential_sources": [{"url": "http://db.test/source", "source_name": "TestSource"}],
             "relevance_score": 0.88,
             "publication_date": "2024-01-15T10:00:00Z"
-            # category_suggestion is not directly saved by _save_topic_to_db
         }
-        db_path = "dummy_tda_save.db"
 
-        # Patch datetime.now within the scope of the function call if possible, or assert type
-        # For simplicity, we'll assert the type of last_accessed_timestamp later.
-        tda_main._save_topic_to_db(topic_obj, db_path)
+        # Call the function, db_path is no longer an argument
+        tda_main._save_topic_to_db(mock_conn, topic_obj) # Pass the mocked connection
 
-        mock_sqlite_connect.assert_called_once_with(db_path)
+        mock_get_db_conn.assert_not_called() # Connection is passed directly
         mock_conn.cursor.assert_called_once()
-
         self.assertEqual(mock_cursor.execute.call_count, 1)
         args, _ = mock_cursor.execute.call_args
 
-        # Basic check for query structure
-        self.assertIn("INSERT OR REPLACE INTO topics_snippets", args[0])
-        # Check for key columns presence (order might vary slightly based on SQL formatting)
-        expected_cols_in_sql = [
-            "id", "type", "title", "summary", "keywords", "source_url", "source_name",
-            "original_topic_details", "llm_model_used_for_snippet", "cover_art_prompt",
-            "generation_timestamp", "last_accessed_timestamp", "relevance_score"
-        ]
-        for col in expected_cols_in_sql:
-            self.assertIn(col, args[0].replace("\n", " ")) # Normalize newlines for check
+        self.assertIn("INSERT INTO topics_snippets", args[0])
+        # PostgreSQL uses %s placeholders
+        self.assertIn("VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", args[0])
 
         params = args[1]
         self.assertEqual(params[0], "topic_db_test_001")
@@ -638,69 +653,70 @@ class TestTDAHelpers(unittest.TestCase):
         self.assertEqual(params[4], json.dumps(["db", "test"]))
         self.assertEqual(params[5], "http://db.test/source")
         self.assertEqual(params[6], "TestSource")
-        self.assertIsNone(params[7])
-        self.assertIsNone(params[8])
-        self.assertIsNone(params[9])
-        self.assertEqual(params[10], "2024-01-15T10:00:00Z")
-        self.assertIsInstance(params[11], str)
-        self.assertTrue(datetime.fromisoformat(params[11].replace("Z", ""))) # Check if it's a valid ISO string
+        self.assertIsNone(params[7]) # original_topic_details
+        self.assertIsNone(params[8]) # llm_model_used_for_snippet
+        self.assertIsNone(params[9]) # cover_art_prompt
+        # publication_date is now correctly mapped to generation_timestamp
+        from datetime import datetime # Ensure datetime is available for type check
+        self.assertIsInstance(params[10], datetime) # generation_timestamp (from publication_date)
+        self.assertEqual(params[10].isoformat(), "2024-01-15T10:00:00") # Check value
+        self.assertIsInstance(params[11], datetime) # last_accessed_timestamp
         self.assertEqual(params[12], 0.88)
 
         mock_conn.commit.assert_called_once()
-        mock_conn.close.assert_called_once()
+        # mock_conn.close() is not called by _save_topic_to_db; connection is managed by caller
 
-    @patch('sqlite3.connect')
-    def test_save_topic_to_db_sqlite_error(self, mock_sqlite_connect):
+    @patch('aethercast.tda.main._get_db_connection')
+    def test_save_topic_to_db_psycopg2_error(self, mock_get_db_conn):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_sqlite_connect.return_value = mock_conn
+        mock_get_db_conn.return_value = mock_conn
         mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.execute.side_effect = sqlite3.Error("Simulated DB execute error")
+        # Import psycopg2 if not already imported at the top of the test file
+        import psycopg2 # Add this import if not present
+        mock_cursor.execute.side_effect = psycopg2.Error("Simulated DB execute error")
 
         topic_obj = {"topic_id": "topic_db_fail", "title_suggestion": "DB Fail Topic"}
-        db_path = "dummy_tda_fail.db"
 
         with patch.object(tda_main.logging, 'error') as mock_logger_error:
-            tda_main._save_topic_to_db(topic_obj, db_path)
+            # The function now expects the connection to be passed
+            with self.assertRaises(psycopg2.Error): # The function should re-raise the error
+                 tda_main._save_topic_to_db(mock_conn, topic_obj)
 
             found_log = False
             for call_arg_tuple in mock_logger_error.call_args_list:
-                log_message = call_arg_tuple[0][0] # First positional argument of the call
+                log_message = call_arg_tuple[0][0]
                 if "Database error saving topic topic_db_fail" in log_message and \
-                   "Simulated DB execute error" in log_message:
+                   "Simulated DB execute error" in str(call_arg_tuple[0][1]): # Error object is second arg
                     found_log = True
                     break
             self.assertTrue(found_log, "Expected database error log message not found.")
 
         mock_conn.commit.assert_not_called()
-        mock_conn.close.assert_called_once()
+        # mock_conn.close() is not called by _save_topic_to_db
 
-    @patch('sqlite3.connect')
-    def test_save_topic_to_db_unexpected_error(self, mock_sqlite_connect):
+    @patch('aethercast.tda.main._get_db_connection')
+    def test_save_topic_to_db_unexpected_error(self, mock_get_db_conn):
         mock_conn = MagicMock()
         mock_cursor = MagicMock()
-        mock_sqlite_connect.return_value = mock_conn
+        mock_get_db_conn.return_value = mock_conn
         mock_conn.cursor.return_value = mock_cursor
         mock_cursor.execute.side_effect = TypeError("Simulated unexpected type error")
 
         topic_obj = {"topic_id": "topic_db_unexpected_fail", "title_suggestion": "DB Unexpected Fail Topic"}
-        db_path = "dummy_tda_unexpected_fail.db"
 
         with patch.object(tda_main.logging, 'error') as mock_logger_error:
-            tda_main._save_topic_to_db(topic_obj, db_path)
+            with self.assertRaises(TypeError): # Expect the original TypeError to be re-raised
+                tda_main._save_topic_to_db(mock_conn, topic_obj)
 
             found_log = False
             for call_arg_tuple in mock_logger_error.call_args_list:
                 log_message = call_arg_tuple[0][0]
-                exc_info_obj = call_arg_tuple.kwargs.get('exc_info', None) # Error object is usually in exc_info
 
                 is_message_match = "Unexpected error saving topic topic_db_unexpected_fail" in log_message
-                # For exc_info, the actual exception object is passed. str(exc_info_obj) might be too simple.
-                # isinstance(exc_info_obj, TypeError) and "Simulated unexpected type error" in str(exc_info_obj)
-                # However, logger usually gets True for exc_info, and then sys.exc_info() is used.
-                # For this test, checking that exc_info=True was passed to logger.error is a good sign.
-                # The log message itself should contain the string representation of the error if formatted that way.
-                is_details_match = "Simulated unexpected type error" in log_message or exc_info_obj is True
+                # Check if the logged error details contain the simulated error string
+                is_details_match = "Simulated unexpected type error" in str(call_arg_tuple[0][1])
+
 
                 if is_message_match and is_details_match:
                     found_log = True
@@ -708,6 +724,100 @@ class TestTDAHelpers(unittest.TestCase):
             self.assertTrue(found_log, f"Expected unexpected error log message not found. Logs: {mock_logger_error.call_args_list}")
 
         mock_conn.commit.assert_not_called()
+        # mock_conn.close() is not called
+
+
+# Import psycopg2 for error simulation if not already at the top
+import psycopg2
+
+class TestInitTdaDb(unittest.TestCase):
+    @patch('aethercast.tda.main._get_db_connection')
+    @patch.object(tda_main.app.logger, 'info') # To check for info logs
+    def test_init_db_creates_table_if_not_exists(self, mock_logger_info, mock_get_db_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_db_conn.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        # Simulate table does not exist
+        mock_cursor.fetchone.return_value = (False,) # Or {'exists': False} depending on query
+
+        tda_main.init_tda_db()
+
+        # Check that execute was called for table existence check AND for creation
+        self.assertGreaterEqual(mock_cursor.execute.call_count, 2)
+
+        # Check for the schema creation call
+        schema_creation_call_found = False
+        for call_args_tuple in mock_cursor.execute.call_args_list:
+            sql_command = call_args_tuple[0][0] # First argument of the first call
+            if "CREATE TABLE IF NOT EXISTS topics_snippets" in sql_command:
+                 # Check for some key columns to be reasonably sure it's the right schema
+                self.assertIn("id UUID PRIMARY KEY", sql_command)
+                self.assertIn("title TEXT", sql_command)
+                self.assertIn("keywords JSONB", sql_command)
+                self.assertIn("relevance_score FLOAT", sql_command)
+                schema_creation_call_found = True
+                break
+        self.assertTrue(schema_creation_call_found, "Schema creation SQL command not found or incorrect.")
+
+        mock_conn.commit.assert_called_once()
+        mock_conn.close.assert_called_once()
+        mock_logger_info.assert_any_call("Database initialized successfully and table 'topics_snippets' is present.")
+
+    @patch('aethercast.tda.main._get_db_connection')
+    @patch.object(tda_main.app.logger, 'info')
+    def test_init_db_does_not_create_table_if_exists(self, mock_logger_info, mock_get_db_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_db_conn.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+
+        # Simulate table exists
+        # The actual query in init_tda_db is:
+        # "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'topics_snippets');"
+        # So fetchone() will return a tuple like (True,) or (False,)
+        mock_cursor.fetchone.return_value = (True,)
+
+        tda_main.init_tda_db()
+
+        # Check execute calls: Once for existence check, not for creation.
+        # Let's be specific about which calls we expect.
+        calls = mock_cursor.execute.call_args_list
+        self.assertEqual(len(calls), 1) # Only the existence check
+        self.assertIn("SELECT EXISTS", calls[0][0][0])
+        self.assertNotIn("CREATE TABLE", calls[0][0][0])
+
+        mock_conn.commit.assert_not_called() # No changes, so no commit
+        mock_conn.close.assert_called_once()
+        mock_logger_info.assert_any_call("Table 'topics_snippets' already exists. No action taken.")
+
+    @patch('aethercast.tda.main._get_db_connection')
+    @patch.object(tda_main.app.logger, 'error')
+    def test_init_db_handles_psycopg2_error_on_connection(self, mock_logger_error, mock_get_db_conn):
+        mock_get_db_conn.side_effect = psycopg2.Error("Simulated DB connection error")
+
+        tda_main.init_tda_db()
+
+        mock_logger_error.assert_called_once()
+        self.assertIn("Error during TDA DB initialization (connection)", mock_logger_error.call_args[0][0])
+        self.assertIsInstance(mock_logger_error.call_args[0][1], psycopg2.Error)
+
+    @patch('aethercast.tda.main._get_db_connection')
+    @patch.object(tda_main.app.logger, 'error')
+    def test_init_db_handles_psycopg2_error_on_execute(self, mock_logger_error, mock_get_db_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_db_conn.return_value = mock_conn
+        mock_conn.cursor.return_value = mock_cursor
+        mock_cursor.execute.side_effect = psycopg2.Error("Simulated DB execute error")
+
+        tda_main.init_tda_db()
+
+        mock_logger_error.assert_called_once()
+        self.assertIn("Error during TDA DB initialization (execution)", mock_logger_error.call_args[0][0])
+        self.assertIsInstance(mock_logger_error.call_args[0][1], psycopg2.Error)
+        mock_conn.rollback.assert_called_once() # Ensure rollback on error
         mock_conn.close.assert_called_once()
 
 
