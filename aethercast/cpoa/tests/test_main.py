@@ -20,13 +20,301 @@ if project_root_dir not in sys.path:
 
 
 from aethercast.cpoa import main as cpoa_main
+from psycopg2 import pool, OperationalError # Import for mocking
+import time # For time.sleep mock
 # Import requests specifically for requests.exceptions.RequestException etc.
 import requests
+
+
+class TestConnectionPoolInitialization(unittest.TestCase):
+    @patch.dict(os.environ, {
+        "POSTGRES_HOST": "test_host", "POSTGRES_PORT": "5432",
+        "POSTGRES_USER": "test_user", "POSTGRES_PASSWORD": "test_password",
+        "POSTGRES_DB": "test_db", "DB_POOL_MIN_CONN": "1", "DB_POOL_MAX_CONN": "3"
+    })
+    @patch('psycopg2.pool.SimpleConnectionPool')
+    def test_init_cpoa_db_pool_success(self, mock_simple_connection_pool):
+        # Ensure cpoa_main.cpoa_db_pool is None before init (or re-init for test)
+        cpoa_main.cpoa_db_pool = None
+        # Patch module level PG vars for the duration of this call
+        with patch.object(cpoa_main, 'POSTGRES_HOST', "test_host"), \
+             patch.object(cpoa_main, 'POSTGRES_PORT', "5432"), \
+             patch.object(cpoa_main, 'POSTGRES_USER', "test_user"), \
+             patch.object(cpoa_main, 'POSTGRES_PASSWORD', "test_password"), \
+             patch.object(cpoa_main, 'POSTGRES_DB', "test_db"), \
+             patch.object(cpoa_main, 'DB_POOL_MIN_CONN', 1), \
+             patch.object(cpoa_main, 'DB_POOL_MAX_CONN', 3):
+            cpoa_main.init_cpoa_db_pool()
+
+        mock_simple_connection_pool.assert_called_once_with(
+            minconn=1, maxconn=3,
+            host="test_host", port="5432", user="test_user",
+            password="test_password", dbname="test_db",
+            cursor_factory=cpoa_main.RealDictCursor
+        )
+        self.assertIsNotNone(cpoa_main.cpoa_db_pool)
+
+    @patch.dict(os.environ, {"DB_POOL_MIN_CONN": "1", "DB_POOL_MAX_CONN": "3"}) # Missing core PG vars
+    @patch('psycopg2.pool.SimpleConnectionPool')
+    @patch.object(cpoa_main.logger, 'error')
+    def test_init_cpoa_db_pool_missing_env_vars(self, mock_logger_error, mock_simple_connection_pool):
+        cpoa_main.cpoa_db_pool = None
+        with patch.object(cpoa_main, 'POSTGRES_HOST', ""), \
+             patch.object(cpoa_main, 'POSTGRES_USER', ""), \
+             patch.object(cpoa_main, 'POSTGRES_PASSWORD', ""), \
+             patch.object(cpoa_main, 'POSTGRES_DB', ""):
+            cpoa_main.init_cpoa_db_pool()
+
+        mock_simple_connection_pool.assert_not_called()
+        mock_logger_error.assert_any_call("Database connection parameters not fully configured. Pool not initialized.", extra={'workflow_id': 'N/A', 'task_id': 'N/A'})
+        self.assertIsNone(cpoa_main.cpoa_db_pool)
+
+    @patch.dict(os.environ, {
+        "POSTGRES_HOST": "test_host_fail", "POSTGRES_USER": "test_user_fail",
+        "POSTGRES_PASSWORD": "test_password_fail", "POSTGRES_DB": "test_db_fail",
+        "DB_POOL_MIN_CONN": "1", "DB_POOL_MAX_CONN": "2"
+    })
+    @patch('psycopg2.pool.SimpleConnectionPool', side_effect=Exception("Pool creation failed"))
+    @patch.object(cpoa_main.logger, 'error')
+    def test_init_cpoa_db_pool_exception_on_creation(self, mock_logger_error, mock_simple_connection_pool):
+        cpoa_main.cpoa_db_pool = None
+        with patch.object(cpoa_main, 'POSTGRES_HOST', "test_host_fail"), \
+             patch.object(cpoa_main, 'POSTGRES_USER', "test_user_fail"), \
+             patch.object(cpoa_main, 'POSTGRES_PASSWORD', "test_password_fail"), \
+             patch.object(cpoa_main, 'POSTGRES_DB', "test_db_fail"):
+            cpoa_main.init_cpoa_db_pool()
+
+        mock_simple_connection_pool.assert_called_once()
+        mock_logger_error.assert_any_call("Failed to initialize CPOA database connection pool: Pool creation failed", exc_info=True, extra={'workflow_id': 'N/A', 'task_id': 'N/A'})
+        self.assertIsNone(cpoa_main.cpoa_db_pool)
+
+
+class TestGetConnectionFromPool(unittest.TestCase):
+    def setUp(self):
+        # Mock cpoa_db_pool for these tests
+        self.mock_pool_instance = MagicMock(spec=SimpleConnectionPool)
+        self.pool_patcher = patch.object(cpoa_main, 'cpoa_db_pool', self.mock_pool_instance)
+        self.pool_patcher.start()
+
+    def tearDown(self):
+        self.pool_patcher.stop()
+
+    def test_get_connection_success(self):
+        mock_conn = MagicMock()
+        self.mock_pool_instance.getconn.return_value = mock_conn
+        conn = cpoa_main._get_cpoa_db_connection()
+        self.mock_pool_instance.getconn.assert_called_once()
+        self.assertEqual(conn, mock_conn)
+
+    @patch('time.sleep')
+    def test_get_connection_retry_once_then_success(self, mock_sleep):
+        mock_conn = MagicMock()
+        self.mock_pool_instance.getconn.side_effect = [OperationalError("Connection failed first time"), mock_conn]
+        # Patch DB_MAX_RETRIES to 2 for this specific test case for predictability
+        with patch.object(cpoa_main, 'DB_MAX_RETRIES', 2):
+            conn = cpoa_main._get_cpoa_db_connection()
+        self.assertEqual(self.mock_pool_instance.getconn.call_count, 2)
+        mock_sleep.assert_called_once_with(cpoa_main.DB_RETRY_BACKOFF_FACTOR * (2**0))
+        self.assertEqual(conn, mock_conn)
+
+    @patch('time.sleep')
+    def test_get_connection_exhaust_retries(self, mock_sleep):
+        self.mock_pool_instance.getconn.side_effect = OperationalError("Persistent connection failure")
+        # Ensure DB_MAX_RETRIES is at least 1 for the loop to run
+        with patch.object(cpoa_main, 'DB_MAX_RETRIES', 3) as mock_max_retries: # Example: 3 retries
+            if mock_max_retries == 0: # Should not happen with default, but defensive
+                 with self.assertRaises(ConnectionError): # Or whatever error it raises if retries is 0
+                     cpoa_main._get_cpoa_db_connection()
+                 self.assertEqual(self.mock_pool_instance.getconn.call_count, 0)
+                 mock_sleep.assert_not_called()
+                 return
+
+            with self.assertRaises(OperationalError):
+                cpoa_main._get_cpoa_db_connection()
+
+            self.assertEqual(self.mock_pool_instance.getconn.call_count, mock_max_retries)
+            if mock_max_retries > 1:
+                expected_sleep_calls = [call(cpoa_main.DB_RETRY_BACKOFF_FACTOR * (2**i)) for i in range(mock_max_retries -1)]
+                mock_sleep.assert_has_calls(expected_sleep_calls)
+            else: # if DB_MAX_RETRIES is 1, sleep should not be called.
+                mock_sleep.assert_not_called()
+
+
+    def test_get_connection_pool_not_initialized(self):
+        # Temporarily make the pool None for this test
+        with patch.object(cpoa_main, 'cpoa_db_pool', None):
+            with self.assertRaisesRegex(ConnectionError, "CPOA DB connection pool is not initialized."):
+                cpoa_main._get_cpoa_db_connection()
+
+
+class TestPutConnectionToPool(unittest.TestCase):
+    def setUp(self):
+        self.mock_pool_instance = MagicMock(spec=SimpleConnectionPool)
+        self.pool_patcher = patch.object(cpoa_main, 'cpoa_db_pool', self.mock_pool_instance)
+        self.pool_patcher.start()
+
+    def tearDown(self):
+        self.pool_patcher.stop()
+
+    def test_put_connection_success(self):
+        mock_conn = MagicMock()
+        cpoa_main._put_cpoa_db_connection(mock_conn)
+        self.mock_pool_instance.putconn.assert_called_once_with(mock_conn)
+
+    def test_put_connection_pool_not_initialized(self):
+        mock_conn = MagicMock()
+        with patch.object(cpoa_main, 'cpoa_db_pool', None):
+            cpoa_main._put_cpoa_db_connection(mock_conn)
+        # Check that conn.close() was called if pool is None
+        mock_conn.close.assert_called_once()
+
+    def test_put_connection_operational_error_on_putconn(self):
+        mock_conn = MagicMock()
+        self.mock_pool_instance.putconn.side_effect = OperationalError("Error putting connection back")
+        with patch.object(cpoa_main.logger, 'error') as mock_log_error:
+            cpoa_main._put_cpoa_db_connection(mock_conn)
+            self.mock_pool_instance.putconn.assert_called_once_with(mock_conn)
+            # Check that the error was logged
+            self.assertTrue(any("Error returning DB connection to pool" in str(call_args) for call_args in mock_log_error.call_args_list))
+            # Check that conn.close() was called as a fallback
+            mock_conn.close.assert_called_once()
+
+
+class TestOrchestrationWithConnectionPooling(unittest.TestCase):
+    # This class will test one of the orchestrator functions to ensure it
+    # correctly uses _get_cpoa_db_connection and _put_cpoa_db_connection.
+    # We'll use orchestrate_podcast_generation as an example.
+
+    def setUp(self):
+        self.original_env = os.environ.copy()
+        self.mock_env_vars = {
+            "PSWA_SERVICE_URL": "http://mockpswa.test/weave_script",
+            "VFA_SERVICE_URL": "http://mockvfa.test/forge_voice",
+            "ASF_NOTIFICATION_URL": "http://mockasf.test/notify",
+            "ASF_WEBSOCKET_BASE_URL": "ws://mockasf.test/stream",
+            "SCA_SERVICE_URL": "http://mocksca.test/craft_snippet",
+            "CPOA_ASF_SEND_UI_UPDATE_URL": "http://mockasf.test/internal/send_ui_update",
+            "CPOA_SERVICE_RETRY_COUNT": "1",
+            "CPOA_SERVICE_RETRY_BACKOFF_FACTOR": "0.01",
+            "POSTGRES_HOST": "mock_pg_host_orch",
+            "POSTGRES_USER": "mock_pg_user_orch",
+            "POSTGRES_PASSWORD": "mock_pg_password_orch",
+            "POSTGRES_DB": "mock_pg_db_orch",
+            "DB_POOL_MIN_CONN": "1",
+            "DB_POOL_MAX_CONN": "2"
+        }
+        os.environ.clear()
+        os.environ.update(self.original_env)
+        os.environ.update(self.mock_env_vars)
+
+        # Patch service URLs and other configs directly on cpoa_main module
+        patch.object(cpoa_main, 'PSWA_SERVICE_URL', self.mock_env_vars['PSWA_SERVICE_URL']).start()
+        patch.object(cpoa_main, 'VFA_SERVICE_URL', self.mock_env_vars['VFA_SERVICE_URL']).start()
+        # ... (add other necessary config patches here if orchestrate_podcast_generation uses them directly)
+
+        # Ensure WCHA is considered imported
+        patch.object(cpoa_main, 'WCHA_IMPORT_SUCCESSFUL', True).start()
+
+    def tearDown(self):
+        patch.stopall()
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    @patch.object(cpoa_main, '_put_cpoa_db_connection')
+    @patch.object(cpoa_main, '_get_cpoa_db_connection')
+    @patch.object(cpoa_main, 'requests_with_retry') # Mock external service calls
+    @patch.object(cpoa_main, 'get_content_for_topic') # Mock WCHA call
+    @patch.object(cpoa_main, '_send_ui_update') # Mock UI updates
+    # Mock the DB helper functions that orchestrate_podcast_generation calls.
+    # We are not testing their internal logic here, but that the orchestrator
+    # passes the connection to them and manages the connection lifecycle.
+    @patch.object(cpoa_main, '_create_workflow_instance', return_value="wf_test_id_123")
+    @patch.object(cpoa_main, '_update_workflow_instance_status')
+    @patch.object(cpoa_main, '_create_task_instance', return_value="task_test_id_456")
+    @patch.object(cpoa_main, '_update_task_instance_status')
+    @patch.object(cpoa_main, '_update_task_status_in_db') # Legacy DB update
+    def test_orchestrate_podcast_generation_manages_db_connection(
+        self, mock_legacy_update_db, mock_update_task_status, mock_create_task,
+        mock_update_workflow_status, mock_create_workflow,
+        mock_send_ui, mock_get_content, mock_requests_retry,
+        mock_get_db_conn, mock_put_db_conn
+    ):
+        mock_db_conn_instance = MagicMock(name="MockDBConnection")
+        mock_get_db_conn.return_value = mock_db_conn_instance
+
+        # Simulate successful WCHA, PSWA, VFA, ASF calls
+        mock_get_content.return_value = {"status": "success", "content": "Mock content", "source_urls": [], "message": "WCHA mock success"}
+
+        mock_pswa_script = {"script_id": "s1", "title": "T1", "segments": [{"c": "c1"}]}
+        mock_vfa_result = {"status": "success", "audio_filepath": "fp1", "stream_id": "st1", "tts_settings_used": {}}
+
+        def requests_side_effect(method, url, **kwargs):
+            if cpoa_main.PSWA_SERVICE_URL in url:
+                # Simulate PSWA task submission (202) then success poll (200)
+                if kwargs.get('json', {}).get('content') == "Mock content": # Initial call
+                    resp_submit = MagicMock(status_code=202)
+                    resp_submit.json.return_value = {"task_id": "pswa_task_abc", "status_url": "/pswa_status/abc"}
+                    return resp_submit
+                elif "/pswa_status/abc" in url: # Poll call
+                    resp_poll = MagicMock(status_code=200)
+                    resp_poll.json.return_value = {"status": "SUCCESS", "result": {"script_data": mock_pswa_script}}
+                    return resp_poll
+            elif cpoa_main.VFA_SERVICE_URL in url:
+                 # Simulate VFA task submission (202) then success poll (200)
+                if kwargs.get('json', {}).get('script', {}).get('script_id') == "s1": # Initial call
+                    resp_submit = MagicMock(status_code=202)
+                    resp_submit.json.return_value = {"task_id": "vfa_task_xyz", "status_url": "/vfa_status/xyz"}
+                    return resp_submit
+                elif "/vfa_status/xyz" in url: # Poll call
+                    resp_poll = MagicMock(status_code=200)
+                    resp_poll.json.return_value = {"status": "SUCCESS", "result": mock_vfa_result}
+                    return resp_poll
+            elif cpoa_main.ASF_NOTIFICATION_URL in url:
+                resp_asf = MagicMock(status_code=200)
+                resp_asf.json.return_value = {"message": "ASF Notified"}
+                return resp_asf
+            # WCHA is mocked by get_content_for_topic directly
+            return MagicMock(status_code=404, text="Unhandled mock URL")
+        mock_requests_retry.side_effect = requests_side_effect
+
+
+        # Call the orchestrator
+        cpoa_main.orchestrate_podcast_generation(
+            topic="Test Topic Orchestration DB Pool",
+            original_task_id="orig_task_pool_test"
+        )
+
+        # Assert that _get_cpoa_db_connection was called
+        mock_get_db_conn.assert_called_once()
+
+        # Assert that helper functions were called with the mock_db_conn_instance
+        mock_create_workflow.assert_called_with(mock_db_conn_instance, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+        mock_update_workflow_status.assert_any_call(mock_db_conn_instance, "wf_test_id_123", cpoa_main.WORKFLOW_STATUS_IN_PROGRESS)
+        # Check at least one call for other helpers (exact number depends on success/failure paths not fully mocked here)
+        self.assertTrue(any(
+            call[0][0] == mock_db_conn_instance for call in mock_create_task.call_args_list
+        ))
+        self.assertTrue(any(
+            call[0][0] == mock_db_conn_instance for call in mock_update_task_status.call_args_list
+        ))
+        self.assertTrue(any(
+            call[0][0] == mock_db_conn_instance for call in mock_legacy_update_db.call_args_list
+        ))
+
+
+        # Assert that _put_cpoa_db_connection was called with the same connection instance
+        # This is critical for ensuring connections are returned to the pool.
+        # The finally block should ensure this, even if there are exceptions (which we are not fully simulating here).
+        mock_put_db_conn.assert_called_once_with(mock_db_conn_instance)
+
+        # Also check for commit on the main connection if successful
+        mock_db_conn_instance.commit.assert_called_once()
 
 
 class TestOrchestratePodcastGeneration(unittest.TestCase):
 
     def setUp(self):
+        self.original_env = os.environ.copy()
         self.mock_env_vars = {
             "PSWA_SERVICE_URL": "http://mockpswa.test/weave_script",
             "VFA_SERVICE_URL": "http://mockvfa.test/forge_voice",
