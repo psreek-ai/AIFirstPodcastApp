@@ -4,7 +4,7 @@
 
 The Central Podcast Orchestrator Agent (CPOA) manages complex, multi-step workflows to generate podcasts and other content. To provide robust tracking, observability, debugging capabilities, and to lay the groundwork for future enhancements like workflow resumption, a dedicated state management schema is required.
 
-These tables are designed for PostgreSQL and will track the overall state of each workflow initiated within CPOA and the state of individual tasks (agent calls) within those workflows.
+These tables are designed for **PostgreSQL** and will track the overall state of each workflow initiated within CPOA and the state of individual tasks (agent calls) within those workflows. The same PostgreSQL database instance also hosts the shared `idempotency_keys` table, which is used by downstream services (TDA, SCA, PSWA, IGA, VFA) to ensure their operations are idempotent. CPOA plays a key role in propagating the necessary idempotency headers to these services.
 
 ## 2. Table Definitions
 
@@ -33,10 +33,10 @@ CREATE TABLE workflow_instances (
 
 | Column                       | Type          | Constraints                                       | Purpose                                                                                                |
 |------------------------------|---------------|---------------------------------------------------|--------------------------------------------------------------------------------------------------------|
-| `workflow_id`                | UUID          | Primary Key, DEFAULT `gen_random_uuid()`          | Unique identifier for the workflow instance.                                                           |
+| `workflow_id`                | UUID          | Primary Key, DEFAULT `gen_random_uuid()`          | Unique identifier for the workflow instance. This ID is passed by CPOA as the `X-Workflow-ID` header to downstream idempotent services, linking their idempotency records to this CPOA workflow. |
 | `user_id`                    | UUID          | Foreign Key to `users.user_id`, ON DELETE SET NULL, Nullable | Identifier of the user who initiated the workflow, if applicable. Set to NULL if the user is deleted. |
 | `trigger_event_type`         | VARCHAR(255)  | NOT NULL                                          | Type of event that triggered the workflow (e.g., "api_podcast_generation", "api_landing_page_snippets", "api_search"). |
-| `trigger_event_details_json` | JSONB         | Nullable                                          | Stores the initial parameters or payload that triggered the workflow (e.g., API request body).        |
+| `trigger_event_details_json` | JSONB         | Nullable                                          | Stores the initial parameters or payload that triggered the workflow (e.g., API request body, including client-provided `X-Idempotency-Key` if applicable for the top-level CPOA operation, though CPOA itself isn't idempotent in the same way as backend task agents).        |
 | `overall_status`             | VARCHAR(50)   | NOT NULL                                          | Current overall status of the workflow.                                                                |
 | `start_timestamp`            | TIMESTAMPTZ   | NOT NULL, DEFAULT `current_timestamp`             | Timestamp when the workflow instance was created/started.                                              |
 | `end_timestamp`              | TIMESTAMPTZ   | Nullable                                          | Timestamp when the workflow instance concluded (completed or failed).                                  |
@@ -54,6 +54,7 @@ This table stores information about each individual task executed as part of a w
 CREATE TABLE task_instances (
     task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     workflow_id UUID NOT NULL REFERENCES workflow_instances(workflow_id) ON DELETE CASCADE,
+    external_celery_task_id VARCHAR(255) NULL, -- Store Celery task ID from downstream async services
     agent_name VARCHAR(255) NOT NULL,
     task_order INTEGER NOT NULL,
     status VARCHAR(50) NOT NULL,
@@ -71,11 +72,12 @@ CREATE TABLE task_instances (
 
 | Column                         | Type         | Constraints                                                          | Purpose                                                                                                    |
 |--------------------------------|--------------|----------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
-| `task_id`                      | UUID         | Primary Key, DEFAULT `gen_random_uuid()`                             | Unique identifier for the task instance.                                                                   |
-| `workflow_id`                  | UUID         | NOT NULL, Foreign Key to `workflow_instances.workflow_id`, ON DELETE CASCADE | Identifier of the parent workflow this task belongs to. If workflow is deleted, tasks are also deleted.   |
+| `task_id`                      | UUID         | Primary Key, DEFAULT `gen_random_uuid()`                             | Unique identifier for this CPOA task instance record (CPOA's internal ID for this step).                                                                   |
+| `workflow_id`                  | UUID         | NOT NULL, Foreign Key to `workflow_instances.workflow_id`, ON DELETE CASCADE | Identifier of the parent workflow this task belongs to.                                                    |
+| `external_celery_task_id`      | VARCHAR(255) | Nullable                                                             | Stores the Celery task ID returned by downstream asynchronous services (TDA, SCA, PSWA, IGA, VFA). Used by CPOA for polling the actual agent task. |
 | `agent_name`                   | VARCHAR(255) | NOT NULL                                                             | Name of the agent or component responsible for this task (e.g., "TDA", "SCA", "PSWA", "IGA", "ASF_NOTIFY"). |
-| `task_order`                   | INTEGER      | NOT NULL                                                             | Sequence number of this task within the workflow, especially for tasks of the same `agent_name` (e.g., multiple SCA calls for snippets). |
-| `status`                       | VARCHAR(50)  | NOT NULL                                                             | Current status of this specific task.                                                                      |
+| `task_order`                   | INTEGER      | NOT NULL                                                             | Sequence number of this task within the workflow.                                                          |
+| `status`                       | VARCHAR(50)  | NOT NULL                                                             | Current status of this specific CPOA-tracked task (e.g., "dispatched", "polling", "agent_completed", "agent_failed"). |
 | `input_params_json`            | JSONB        | Nullable                                                             | Parameters or payload sent to the agent for this task.                                                     |
 | `output_result_summary_json`   | JSONB        | Nullable                                                             | A summary of the agent's output or a reference to it (e.g., generated snippet ID, GCS URI of audio).       |
 | `error_details_json`           | JSONB        | Nullable                                                             | If the task failed, stores detailed error information from the agent or CPOA.                              |
@@ -165,8 +167,12 @@ The CPOA module utilizes these tables to manage and track its operations. Key CP
 To interact with these tables, CPOA uses a set of internal helper functions:
 -   `_create_workflow_instance(...)`: Creates a new workflow entry.
 -   `_update_workflow_instance_status(...)`: Updates an existing workflow's status and other relevant fields.
--   `_create_task_instance(...)`: Creates a new task entry linked to a workflow.
--   `_update_task_instance_status(...)`: Updates an existing task's status and outcome details.
+    -   `_create_task_instance(...)`: Creates a new task entry, capturing input parameters and the `external_celery_task_id` if an async task is dispatched.
+    -   `_update_task_instance_status(...)`: Updates an existing task's status (based on polling results from the agent's status endpoint) and outcome details.
 
-These helpers encapsulate the SQL logic for database interactions, ensuring consistency and proper error handling (including transaction management) when CPOA updates its state in the PostgreSQL database. They are designed to primarily use PostgreSQL connections obtained via `_get_cpoa_db_connection()`.
+These helpers encapsulate the SQL logic for database interactions, ensuring consistency and proper error handling (including transaction management) when CPOA updates its state in the PostgreSQL database. They are designed to primarily use PostgreSQL connections obtained via CPOA's internal DB connection management.
 ```
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

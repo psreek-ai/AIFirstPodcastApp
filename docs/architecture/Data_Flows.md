@@ -13,21 +13,15 @@ Understanding these data flows is crucial for system design, development, debugg
 ## 2. General Data Handling Principles
 
 * **Data Formats:**
-    * **Inter-Service Communication (Backend):** JSON is the primary format for synchronous API calls (RESTful) and message payloads in asynchronous messaging (e.g., RabbitMQ, Kafka). Protocol Buffers (Protobuf) may be used for gRPC-based communication where performance and schema enforcement are critical between internal microservices.
-    * **Frontend-Backend Communication:** JSON is used for API requests and responses. Audio data is streamed in standard audio formats (e.g., MP3 segments, Opus).
-    * **AI Model Interactions:** Input prompts to LLMs are typically text or structured JSON. Outputs from LLMs are text or JSON. TTS inputs are text/SSML, outputs are raw audio data.
-* **Security in Transit:**
-    * All external communication (User to Frontend, Frontend to API Gateway) will use HTTPS.
-    * All internal backend communication between services (API Gateway to CPOA, CPOA to Agents, Agents to AIMS) should use TLS/mTLS encryption, even within a trusted network.
-    * Message queues should be configured with transport layer security.
-* **Large Data Objects:**
-    * For very large data payloads (e.g., extensive harvested web content from `WebContentHarvesterAgent`, full podcast scripts before TTS if exceptionally long, or full audio files if not streamed chunk-by-chunk), a "claim check" pattern might be used:
-        1.  The producing agent stores the large object in a dedicated object store (e.g., AWS S3, Google Cloud Storage).
-        2.  A reference (e.g., URI to the object) is passed in messages or API calls.
-        3.  The consuming agent retrieves the object directly from the object store using the reference.
-    * Audio streaming will inherently handle large audio data by breaking it into manageable chunks.
-* **Data Validation:**
-    * All components (API Gateway, CPOA, each specialized agent) must validate incoming data for schema, type, and business rules before processing.
+    * **Inter-Service Communication (Backend):**
+        *   **Asynchronous Operations (CPOA <-> TDA, SCA, PSWA, IGA, VFA):** CPOA dispatches Celery tasks. Arguments and results are JSON. CPOA polls HTTP GET endpoints (`/v1/tasks/<task_id>`) on these services to retrieve JSON results.
+        *   **Synchronous Operations (e.g., PSWA/SCA/VFA -> AIMS/AIMS_TTS, CPOA -> ASF notify):** JSON over HTTP/HTTPS.
+        *   **Idempotency Headers:** `X-Idempotency-Key` and `X-Workflow-ID` are passed as HTTP headers by the client to the API Gateway, then relayed by CPOA as parameters to the Celery tasks of idempotent backend services (TDA, SCA, PSWA, IGA, VFA). These services use the `X-Idempotency-Key` in conjunction with a shared `idempotency_keys` table in the PostgreSQL database to manage the state of operations and ensure exactly-once processing.
+    * **Frontend-Backend Communication:** JSON over HTTPS.
+    * **AI Model Interactions:** (As before).
+* **Security in Transit:** (As before - HTTPS for external, TLS for internal HTTP, secure Celery broker).
+* **Large Data Objects:** (As before - claim check pattern with GCS URIs is used, e.g., by VFA for audio).
+* **Data Validation:** (As before).
 
 ## 3. Detailed Data Flow Scenarios
 
@@ -45,78 +39,87 @@ Understanding these data flows is crucial for system design, development, debugg
         participant FEND as Frontend UI
         participant APIGW as API Gateway
         participant CPOA as Central Orchestrator
-        participant TDA as TopicDiscoveryAgent
-        participant SCA as SnippetCraftAgent
+        participant TDA_Celery as TDA Celery Task
+        participant SCA_Celery as SCA Celery Task
+        participant IGA_Celery as IGA Celery Task
         participant AIMS_LLM as AI Models (LLM)
-        participant DS as Data Stores
-        %% Optional: participant IGA as ImageGenerationAgent
-        %% Optional: participant AIMS_IMG as AI Models (Image)
+        participant VertexAI_IMG as Vertex AI Imagen
+        participant PG_DB as PostgreSQL DB (Topics, Idempotency)
+        participant DUIA as DynamicUIAgent
 
         User->>FEND: Requests Landing Page
-        FEND->>APIGW: GET /api/v1/snippets (or similar)
-        note right of FEND: Request may include pagination, personalization tokens (future)
-        APIGW->>CPOA: Forward GET /api/v1/snippets request
-        CPOA->>CPOA: Determine topic needs (fresh vs. cached)
+        FEND->>APIGW: GET /api/v1/snippets (Headers: X-Idempotency-Key, X-Workflow-ID - optional for GET)
+        note right of FEND: Request may include pagination, personalization tokens
+        APIGW->>CPOA: Forward request (incl. headers, user_id if auth)
+        CPOA-->>PG_DB: Create CPOA WorkflowInstance
+        CPOA->>CPOA: Determine topic needs
 
-        %% Topic Discovery Sub-Flow (may happen periodically or on-demand)
-        CPOA->>TDA: Request Topics (e.g., {count: 10, categories: ["tech", "science"]})
-        note right of CPOA: Communication via Message Queue (Async) or API (Sync)
-        TDA->>ExternalWeb: Query news APIs, trend services
-        ExternalWeb-->>TDA: Raw trend/news data (JSON/XML/HTML)
-        TDA->>TDA: Process & Rank Topics
-        TDA-->>CPOA: TopicObjects (JSON Array, e.g., [{topic_id, title_suggestion, summary, keywords}])
-        CPOA->>DS: Store/Cache TopicObjects (if new)
+        %% Topic Discovery Sub-Flow
+        CPOA->>TDA_Celery: dispatch_task(Discover Topics, IdempotencyKey_TDA, CPOA_WorkflowID)
+        TDA_Celery-->>CPOA: tda_task_id (Celery AsyncResult)
+        note right of CPOA: TDA Task internally handles Idempotency DB check/store for IdempotencyKey_TDA
+        note right of CPOA: Poll TDA Task: GET /v1/tasks/{tda_task_id}
+        TDA_Celery-->>PG_DB: Store Topics in topics_snippets
+        TDA_Celery-->>CPOA: Result: TopicObjects (JSON Array)
+        note right of CPOA: TDA Task internally updates Idempotency DB (Completed)
 
         %% Snippet Generation Sub-Flow (parallel for multiple snippets)
-        CPOA->>SCA: Generate Snippet (Task with TopicObject)
-        note right of CPOA: For each topic, via Message Queue (Async) or API (Sync)
-        SCA->>AIMS_LLM: Prompt for snippet text & title (JSON/Text)
-        AIMS_LLM-->>SCA: Generated text (JSON containing title, snippet_text)
-        %% Optional Image Prompt Generation
-        %% SCA->>AIMS_LLM: Prompt for image description
-        %% AIMS_LLM-->>SCA: Image description text
-        SCA-->>CPOA: SnippetDataObject (JSON, e.g., {snippet_id, topic_id, title, text_content, cover_art_prompt})
+        loop For Each Topic
+            CPOA->>SCA_Celery: dispatch_task(Craft Snippet, TopicObject, IdemKey_SCA, CPOA_WorkflowID)
+            SCA_Celery-->>CPOA: sca_task_id
+            note right of CPOA: SCA Task internally handles Idempotency DB check/store
+            note right of CPOA: Poll SCA Task: GET /v1/tasks/{sca_task_id}
+            SCA_Celery->>AIMS_LLM: Call AIMS for text generation
+            AIMS_LLM-->>SCA_Celery: Generated text (title, snippet, image_prompt)
+            SCA_Celery-->>CPOA: Result: SnippetDataObject (with image_prompt)
+            note right of CPOA: SCA Task internally updates Idempotency DB (Completed)
 
-        %% Optional Image Generation Sub-Flow
-        %% loop For each SnippetDataObject with cover_art_prompt
-        %%    CPOA->>IGA: Generate Image (Task with cover_art_prompt)
-        %%    IGA->>AIMS_IMG: Prompt for image generation
-        %%    AIMS_IMG-->>IGA: Image data/URL
-        %%    IGA-->>CPOA: Image URL
-        %%    CPOA->>CPOA: Associate Image URL with SnippetDataObject
-        %% end
+            %% Image Generation Sub-Flow
+            CPOA->>IGA_Celery: dispatch_task(Generate Image, image_prompt, IdemKey_IGA, CPOA_WorkflowID)
+            IGA_Celery-->>CPOA: iga_task_id
+            note right of CPOA: IGA Task internally handles Idempotency DB check/store
+            note right of CPOA: Poll IGA Task: GET /v1/tasks/{iga_task_id}
+            IGA_Celery->>VertexAI_IMG: Call Vertex AI Imagen
+            VertexAI_IMG-->>IGA_Celery: Image GCS URI
+            IGA_Celery-->>CPOA: Result: Image GCS URI
+            note right of CPOA: IGA Task internally updates Idempotency DB (Completed)
+            CPOA->>CPOA: Augment SnippetDataObject with image_url (GCS URI)
+        end
 
-        CPOA->>CPOA: Aggregate SnippetDataObjects
-        CPOA-->>APIGW: List of SnippetDataObjects (JSON Array)
-        APIGW-->>FEND: Response with SnippetDataObjects (JSON)
-        FEND->>FEND: Process data, render snippets
+        CPOA->>CPOA: Aggregate augmented SnippetDataObjects
+        CPOA->>DUIA: Generate UI Definition (with SnippetDataObjects)
+        DUIA-->>CPOA: UI Definition JSON
+        CPOA-->>APIGW: UI Definition JSON (including CPOA workflow_id)
+        APIGW-->>FEND: Response with UI Definition JSON (APIGW converts GCS URIs to Signed URLs)
         FEND->>User: Displays Landing Page
     ```
 
 * **Data Exchanged & Formats:**
-    1.  **FEND -> APIGW:** HTTP GET request. Path: `/api/v1/snippets`. Headers: Auth token (if applicable).
-    2.  **APIGW -> CPOA:** Internal request (e.g., HTTP/gRPC call or message queue event) mirroring the frontend request. If the user is authenticated or an `Authorization` token is provided opportunistically, the `user_id` is extracted by the API Gateway and passed to CPOA.
-    3.  **CPOA -> TDA (Task):**
-        * Channel: Message Queue (e.g., `topic_discovery_tasks`) or direct API call.
-        * Payload (JSON): `{ "task_id": "uuid", "requested_count": 10, "filter_criteria": {"categories": ["tech"], "min_recency_hours": 24}, "reply_to_queue": "cpoa_topic_results" }`
-    4.  **TDA -> External Web:** HTTP GET requests to news APIs, web pages.
-    5.  **External Web -> TDA:** Raw data (HTML, JSON, XML).
-    6.  **TDA -> CPOA (Result):**
-        * Channel: Message Queue (e.g., `cpoa_topic_results`) or API response.
-        * Payload (JSON Array of `TopicObjects`): `[ { "topic_id": "uuid", "title_suggestion": "...", "summary": "...", "keywords": ["...", "..."], "potential_sources": [{"url": "...", "title": "..."}], "relevance_score": 0.85 } ]`
-    7.  **CPOA -> DS (Topic Storage):** `TopicObjects` stored (e.g., in a NoSQL document store or relational DB).
-    8.  **CPOA -> SCA (Task):**
-        * Channel: Message Queue (e.g., `snippet_craft_tasks`) or direct API call.
-        * Payload (JSON): `{ "task_id": "uuid", "topic_object": { ...from_TDA... }, "output_parameters": {"max_length_chars": 300, "style_persona_id": "engaging_teaser"}, "reply_to_queue": "cpoa_snippet_results" }`
-    9.  **SCA -> AIMS (LLM):**
-        * Channel: Secure API call (HTTPS/gRPC).
-        * Payload (JSON/Text): Prompt engineered from `topic_object` and `output_parameters`. Example: `{"prompt": "Create a compelling 2-sentence teaser and a catchy title for the topic: 'AI in Renewable Energy Management'. Focus on recent breakthroughs. Style: Enthusiastic but informative.", "max_tokens": 100}`
-    10. **AIMS (LLM) -> SCA:**
-        * Payload (JSON): `{"title": "AI Supercharges Green Energy!", "snippet_text": "Discover how artificial intelligence is revolutionizing renewable energy, optimizing grids and accelerating the transition to a sustainable future. Recent innovations are game-changers!", "finish_reason": "stop"}`
-    11. **SCA -> CPOA (Result):**
-        * Channel: Message Queue (e.g., `cpoa_snippet_results`) or API response.
-        * Payload (JSON `SnippetDataObject`): `{"snippet_id": "uuid", "topic_id": "uuid", "title": "AI Supercharges Green Energy!", "text_content": "...", "cover_art_prompt": "Futuristic wind turbines and solar panels with glowing AI data streams", "generation_timestamp": "iso_datetime"}`
-    12. **CPOA -> APIGW:** HTTP Response. Payload: JSON dictionary containing `workflow_id` and a list of `SnippetDataObjects`.
+    1.  **FEND -> APIGW:** HTTP GET `/api/v1/snippets`. Headers: Optional `X-Idempotency-Key`, `X-Workflow-ID`, Auth token.
+    2.  **APIGW -> CPOA:** Internal call. Passes headers, `user_id`. CPOA generates its own `workflow_id`.
+    3.  **CPOA -> TDA_Celery (Task Dispatch):**
+        * Celery task message via broker.
+        * `kwargs` (JSON): `{ "query": "...", "limit": N, "idempotency_key": "key_from_client_or_cpoa_generated", "workflow_id": "cpoa_workflow_id" }`
+    4.  **TDA_Celery -> CPOA (Result via Polling):**
+        * CPOA polls `GET /v1/tasks/<tda_task_id>` on TDA service.
+        * Response (JSON): `{ "status": "SUCCESS", "result": {"discovered_topics": [...] } }`
+    5.  **CPOA -> SCA_Celery (Task Dispatch):**
+        * Celery task message.
+        * `kwargs` (JSON): `{ "topic_id": "...", ..., "idempotency_key": "unique_key_for_this_sca_task", "workflow_id": "cpoa_workflow_id" }`
+    6.  **SCA_Celery -> AIMS_LLM:** Synchronous HTTP POST to AIMS. Payload: prompt, model params.
+    7.  **AIMS_LLM -> SCA_Celery:** HTTP Response. JSON with generated text.
+    8.  **SCA_Celery -> CPOA (Result via Polling):**
+        * CPOA polls `GET /v1/tasks/<sca_task_id>` on SCA service.
+        * Response (JSON): `{ "status": "SUCCESS", "result": {"snippet_id": ..., "title": ..., "text_content": ..., "cover_art_prompt": ...} }`
+    9.  **CPOA -> IGA_Celery (Task Dispatch):**
+        * Celery task message.
+        * `kwargs` (JSON): `{ "prompt": "cover_art_prompt_from_sca", "idempotency_key": "unique_key_for_this_iga_task", "workflow_id": "cpoa_workflow_id" }`
+    10. **IGA_Celery -> VertexAI_IMG:** API call to Google Vertex AI.
+    11. **VertexAI_IMG -> IGA_Celery:** Image data/reference. IGA uploads to GCS.
+    12. **IGA_Celery -> CPOA (Result via Polling):**
+        * CPOA polls `GET /v1/tasks/<iga_task_id>` on IGA service.
+        * Response (JSON): `{ "status": "SUCCESS", "result": {"image_url": "gs://bucket/image.png"} }`
+    13. **CPOA -> APIGW:** Internal data (list of fully populated SnippetDataObjects, CPOA workflow_id).
         ```json
         {
             "workflow_id": "uuid-for-this-snippet-generation-workflow",
@@ -126,155 +129,130 @@ Understanding these data flows is crucial for system design, development, debugg
             "source": "generation"
         }
         ```
-    13. **APIGW -> FEND:** HTTP Response. Payload: Same as CPOA to APIGW.
+    14. **APIGW -> FEND:** HTTP Response. Payload: Same as CPOA to APIGW.
 
 ---
 
 ### 3.2. Data Flow 2: On-Demand Full Podcast Generation and Streaming
 
-* **Trigger:** User clicks "Listen" on a podcast snippet or directly requests a podcast for a given topic.
-* **Goal:** To dynamically generate a full podcast episode based on the topic, sourcing live web content, and stream the audio to the user in real-time.
-* **Actors/Components Involved:** User, Frontend (FEND), API Gateway (APIGW), CPOA, `WebContentHarvesterAgent` (WCHA), `PodcastScriptWeaverAgent` (PSWA), `VoiceForgeAgent` (VFA), AI Model Serving Infrastructure (AIMS - LLM, AIMS_TTS), Data Stores (DS), External Web, Audio Streaming Service (conceptual, could be part of VFA or CPOA's responsibility to deliver to FEND).
+* **Trigger:** User clicks "Listen" on a podcast snippet or initiates a request for a podcast on a specific topic via API Gateway.
+* **Goal:** Generate and make available a full podcast episode. The generation involves multiple asynchronous, idempotent Celery tasks.
+* **Actors/Components Involved:** User, Frontend (FEND), API Gateway (APIGW), CPOA, `WebContentHarvesterAgent` (WCHA - as library), `PodcastScriptWeaverAgent` (PSWA - Celery Task), `VoiceForgeAgent` (VFA - Celery Task), `ImageGenerationAgent` (IGA - Celery Task, optional), AI Model Serving Infrastructure (AIMS - LLM, AIMS_TTS), Vertex AI Imagen, PostgreSQL DB (for CPOA state & Idempotency), Google Cloud Storage (GCS), Audio Stream Feeder (ASF).
 
 * **Sequence Diagram:**
-
     ```mermaid
     sequenceDiagram
         participant User
         participant FEND as Frontend UI
         participant APIGW as API Gateway
-        participant CPOA as Central Orchestrator
-        participant WCHA as WebContentHarvester
-        participant PSWA as PodcastScriptWeaver
-        participant VFA as VoiceForgeAgent
-        participant AIMS_LLM as AI Models (LLM)
-        participant AIMS_TTS as AI Models (TTS)
-        participant ExtWeb as External Web
-        participant DS as Data Stores
-        participant StreamFeeder as Audio Stream Feeder (Conceptual)
+        participant CPOA as Central Podcast Orchestrator
+        participant WCHA as WebContentHarvester (Library)
+        participant PSWA_Celery as PSWA Celery Task
+        participant VFA_Celery as VFA Celery Task
+        participant IGA_Celery as IGA Celery Task (Optional)
+        participant AIMS_LLM as AI Model Serving (LLM)
+        participant AIMS_TTS as AI Model Serving (TTS)
+        participant VertexAI_IMG as Vertex AI Imagen
+        participant PG_DB as PostgreSQL DB (CPOA State, Idempotency)
+        participant ASF as AudioStreamFeeder
 
-        User->>FEND: Clicks "Listen" (Topic ID: "xyz")
-        FEND->>APIGW: POST /api/v1/podcasts/generate (Body: {topicId: "xyz"})
-        note right of FEND: Request may include preferred persona, length hints
-        APIGW->>CPOA: Forward POST request with topicId
+        User->>FEND: Request Podcast (Topic X)
+        FEND->>APIGW: POST /api/v1/podcasts (Topic X, X-Idempotency-Key, X-Workflow-ID)
+        APIGW->>CPOA: Generate podcast (Topic X, IdemKey, WorkflowID, UserContext)
+        CPOA-->>PG_DB: Create WorkflowInstance (master CPOA workflow_id created here)
 
-        %% Web Content Harvesting
-        CPOA->>WCHA: Task: Harvest Content (Topic ID: "xyz", params: {depth: 3, recency_days: 7})
-        note right of CPOA: Async via Message Queue
-        WCHA->>ExtWeb: HTTP GET requests (search engines, specific sites)
-        ExtWeb-->>WCHA: HTML/JSON/XML content
-        WCHA->>WCHA: Process & Extract Text
-        WCHA-->>CPOA: Result: HarvestedContentBundle (JSON, potentially with S3 links for large content)
-        CPOA->>DS: (Optional) Cache HarvestedContentBundle
+        CPOA->>WCHA: Harvest Content (sync library call)
+        WCHA-->>CPOA: Harvested Content
 
-        %% Script Weaving
-        CPOA->>PSWA: Task: Weave Script (HarvestedContentBundle, params: {persona_id: "expert", target_minutes: 10})
-        note right of CPOA: Async via Message Queue
-        PSWA->>AIMS_LLM: Prompt for script generation (Text/JSON, including harvested content)
-        AIMS_LLM-->>PSWA: Generated Script (Text/JSON)
-        PSWA-->>CPOA: Result: PodcastScript (JSON)
-        CPOA->>DS: (Optional) Store PodcastScript metadata
+        CPOA->>PSWA_Celery: dispatch_task(Weave Script, Content, Topic, Persona, IdemKey_PSWA, CPOA_WorkflowID)
+        PSWA_Celery-->>CPOA: pswa_celery_task_id
+        note right of CPOA: PSWA Task internally handles Idempotency DB check/store
+        note right of CPOA: Poll PSWA Task: GET /tasks/{pswa_celery_task_id}
+        PSWA_Celery->>AIMS_LLM: Generate Script
+        AIMS_LLM-->>PSWA_Celery: Script
+        note right of PSWA_Celery: PSWA Task internally updates Idempotency DB (Completed)
+        PSWA_Celery-->>CPOA: Final Script (result)
 
-        %% Voice Forging & Streaming
-        CPOA->>VFA: Task: Forge Voice (PodcastScript, params: {voice_id: "aura", format: "opus_segments"})
-        note right of CPOA: Async via Message Queue, or direct call to initiate streaming
-        FEND->>StreamFeeder: GET /api/v1/podcasts/stream/{stream_id} (WebSocket or HTTP Streaming)
-        note left of FEND: Frontend establishes connection for audio stream
-        CPOA->>StreamFeeder: Provide Stream ID to FEND (via APIGW initial response or separate message)
+        CPOA->>VFA_Celery: dispatch_task(Forge Voice, Script, VoiceParams, IdemKey_VFA, CPOA_WorkflowID)
+        VFA_Celery-->>CPOA: vfa_celery_task_id
+        note right of CPOA: VFA Task internally handles Idempotency DB check/store
+        note right of CPOA: Poll VFA Task: GET /tasks/{vfa_celery_task_id}
+        VFA_Celery->>AIMS_TTS: Synthesize Audio (now an async call itself, VFA polls AIMS_TTS)
+        AIMS_TTS-->>VFA_Celery: Audio GCS URI
+        note right of VFA_Celery: VFA Task internally updates Idempotency DB (Completed)
+        VFA_Celery-->>CPOA: Audio GCS URI (result)
 
-        VFA->>AIMS_TTS: Text Segments for TTS
-        AIMS_TTS-->>VFA: Audio Chunks (raw audio data)
-        VFA->>StreamFeeder: Push Audio Chunks to {stream_id}
-        StreamFeeder-->>FEND: Stream Audio Chunks
-        FEND->>User: Plays Podcast Audio
+        %% Optional Image Generation
+        CPOA->>IGA_Celery: dispatch_task(Generate Image, Prompt, IdemKey_IGA, CPOA_WorkflowID)
+        IGA_Celery-->>CPOA: iga_celery_task_id
+        note right of CPOA: IGA Task internally handles Idempotency DB check/store
+        Note right of CPOA: Poll IGA Task
+        IGA_Celery->>VertexAI_IMG: Generate Image
+        VertexAI_IMG-->>IGA_Celery: Image GCS URI
+        note right of IGA_Celery: IGA Task internally updates Idempotency DB (Completed)
+        IGA_Celery-->>CPOA: Image GCS URI (result)
 
-        %% Status updates (simplified)
-        CPOA-->>APIGW: Initial Response (e.g., {status: "generating", stream_id: "abc"})
-        APIGW-->>FEND: Initial Response
+        CPOA->>ASF: HTTP POST /asf/internal/notify_new_audio (GCS URI, StreamID)
+        CPOA-->>PG_DB: Update WorkflowInstance (Completed, GCS URIs)
+
+        APIGW-->>FEND: task_id (CPOA workflow_id or initial podcast_id for client to track)
+        note left of FEND: Client polls API GW task status endpoint for CPOA workflow.
+        note left of FEND: When audio ready, FEND connects to ASF WebSocket using StreamID.
     ```
 
 * **Data Exchanged & Formats:**
-    1.  **FEND -> APIGW:** HTTP POST `/api/v1/podcasts/generate`. Body (JSON): `{"topic_id": "xyz", "user_preferences": {"persona_id": "friendly_explainer"}}`
-    2.  **APIGW -> CPOA:** Internal request forwarding the above, including the authenticated `user_id`. The `podcast_id` generated by API Gateway is passed as `original_task_id` to CPOA.
-    3.  **CPOA (Initial Response Path) -> APIGW -> FEND:** HTTP Response (JSON):
-        ```json
-        {
-            "podcast_id": "original_task_id_from_apigw",
-            "workflow_id": "uuid-for-this-podcast-generation-workflow",
-            "status": "GENERATING",
-            "stream_id": "unique_stream_id_for_client_to_connect_to",
-            "estimated_wait_time_seconds": 15
-        }
-        ```
-        (The `stream_id` is crucial for the client to connect for audio. `workflow_id` allows tracking).
-    4.  **CPOA -> WCHA (Task):**
-        * Channel: Message Queue (e.g., `content_harvest_tasks`).
-        * Payload (JSON): `{"task_id": "uuid", "topic_id": "xyz", "constraints": {"max_sources": 5, "recency_days": 7, "depth_level": 2}, "reply_to_queue": "cpoa_harvest_results"}`
-    5.  **WCHA -> External Web:** HTTP GET requests.
-    6.  **External Web -> WCHA:** HTML, JSON, XML.
-    7.  **WCHA -> CPOA (Result):**
-        * Channel: Message Queue (e.g., `cpoa_harvest_results`).
-        * Payload (JSON `HarvestedContentBundle`): `{"task_id": "uuid", "status": "COMPLETED", "content": { "topic_id": "xyz", "sources": [{"url": "...", "cleaned_text": "...", "title": "..."}] }}`. (If very large, `cleaned_text` might be an S3 URI).
-    8.  **CPOA -> PSWA (Task):**
-        * Channel: Message Queue (e.g., `script_weave_tasks`).
-        * Payload (JSON): `{"task_id": "uuid", "harvested_content_ref": "uri_or_inline_content", "topic_details": {...}, "script_parameters": {"persona_id": "friendly_explainer", "target_duration_minutes": 8, "style": "conversational"}, "reply_to_queue": "cpoa_script_results"}`
-    9.  **PSWA -> AIMS (LLM):**
-        * Channel: Secure API call.
-        * Payload (JSON/Text): Extensive prompt containing processed web content, instructions for structure, persona, style.
-    10. **AIMS (LLM) -> PSWA:**
-        * Payload (JSON/Text): The generated podcast script.
-    11. **PSWA -> CPOA (Result):**
-        * Channel: Message Queue (e.g., `cpoa_script_results`).
-        * Payload (JSON `PodcastScript`): `{"task_id": "uuid", "status": "COMPLETED", "script": {"title": "...", "full_text": "...", "segments": [...]}}`
-    12. **CPOA -> VFA (Task):**
-        * Channel: Message Queue or direct API call to initiate streaming.
-        * Payload (JSON): `{"task_id": "uuid", "script_object": { ...from_PSWA... }, "voice_parameters": {"voice_id": "persona_voice_xyz", "audio_format": "opus", "chunk_duration_ms": 5000}, "stream_id": "unique_stream_id_for_client"}`
-    13. **FEND -> Audio Stream Feeder (Conceptual - could be VFA, CPOA, or dedicated service):**
-        * Channel: WebSocket connection or HTTP long-polling/streaming request to ` /api/v1/podcasts/stream/{stream_id}`.
-    14. **VFA -> AIMS (TTS):**
-        * Channel: Secure API call.
-        * Payload (Text/SSML): Segments of the script.
-    15. **AIMS (TTS) -> VFA:**
-        * Payload: Raw audio data chunks (e.g., PCM, Opus frames).
-    16. **VFA -> Audio Stream Feeder:** Pushes audio chunks.
-    17. **Audio Stream Feeder -> FEND:**
-        * Channel: WebSocket messages or HTTP stream.
-        * Payload: Audio data chunks (e.g., Opus packets, MP3 segments).
+    1.  **FEND -> APIGW:** HTTP POST `/api/v1/podcasts`. Headers: `X-Idempotency-Key`, `X-Workflow-ID` (optional), Auth Token. Body (JSON): `{"topic_id": "xyz", "user_preferences": {...}}`
+    2.  **APIGW -> CPOA:** Internal call. Passes headers, `user_id`, topic data. CPOA generates its own master `workflow_id`.
+    3.  **CPOA (Initial Response Path) -> APIGW -> FEND:** HTTP 202 Accepted. Body (JSON): `{"podcast_id": "cpoa_workflow_id", "workflow_id": "cpoa_workflow_id", "status": "GENERATING", ...}`. (Client uses `podcast_id` or `workflow_id` to poll main task status via API GW).
+    4.  **CPOA -> WCHA (Library Call):** Direct function call with topic string. Returns harvested text.
+    5.  **CPOA -> PSWA_Celery (Task Dispatch):** Celery task. `kwargs` (JSON): `{..., "idempotency_key": "client_idem_key_for_pswa", "workflow_id": "cpoa_workflow_id"}`.
+    6.  **PSWA_Celery -> CPOA (Result via Polling):** CPOA polls `GET /tasks/<pswa_celery_task_id>` on PSWA. Response (JSON): `{ "status": "SUCCESS", "result": {PodcastScript object} }`.
+    7.  **CPOA -> VFA_Celery (Task Dispatch):** Celery task. `kwargs` (JSON): `{..., "script_object": {...}, "idempotency_key": "client_idem_key_for_vfa", "workflow_id": "cpoa_workflow_id"}`.
+    8.  **VFA_Celery -> AIMS_TTS:** VFA's Celery task makes async HTTP calls to AIMS_TTS and polls it.
+    9.  **AIMS_TTS -> VFA_Celery:** AIMS_TTS task result (JSON with GCS URI).
+    10. **VFA_Celery -> CPOA (Result via Polling):** CPOA polls `GET /tasks/<vfa_celery_task_id>` on VFA. Response (JSON): `{ "status": "SUCCESS", "result": {"audio_filepath": "gs://...", ...} }`.
+    11. **CPOA -> IGA_Celery (Task Dispatch, Optional):** Similar async pattern with idempotency keys.
+    12. **IGA_Celery -> CPOA (Result via Polling, Optional):** Similar async pattern.
+    13. **CPOA -> ASF (HTTP Call):** `POST /asf/internal/notify_new_audio`. Body (JSON): `{"stream_id": "...", "filepath": "gcs_uri_from_vfa"}`.
+    14. **Client (FEND) -> API_GW -> CPOA (Polling for overall status):** Client polls `GET /api/v1/podcasts/<cpoa_workflow_id>` (or similar endpoint that tracks CPOA workflow). API GW gets updates from CPOA's PostgreSQL `workflow_instances` table.
+    15. **Client (FEND) -> ASF (WebSocket):** Connects to ASF for audio streaming once GCS URI and stream ID are available and ASF is notified.
 
 ---
 
 ## 4. Data Storage Overview (Data At Rest)
 
-Referencing `Data Stores (DS)` from `System_Architecture.md`:
+The primary database for structured data like CPOA state, idempotency records, and topic/snippet metadata is **PostgreSQL**. Google Cloud Storage (GCS) is used for media files.
 
 * **User Session State:**
-    * **Data:** Active user context (e.g., current topic interest, partial interactions for resumability).
-    * **Storage:** Key-value store (e.g., Redis) for fast access, keyed by session ID.
-    * **Format:** JSON.
-* **Generated Content Metadata:**
-    * **Data:** Information about `TopicObjects`, `SnippetDataObjects`, `PodcastScripts` (e.g., IDs, titles, text, source references, generation parameters, timestamps, (optional) S3 URIs to full content if not stored directly).
-    * **Storage:** NoSQL Document Store (e.g., MongoDB, Firestore) or Relational Database (e.g., PostgreSQL). Chosen for querying and relational needs if any.
-    * **Format:** JSON documents or structured relational tables.
-* **Agent Task & Workflow State (Managed by CPOA):**
-    * **Data:** Status of ongoing and completed orchestration workflows (`workflow_instances` table: `workflow_id`, `user_id`, `trigger_event_type`, `overall_status`, etc.) and individual agent tasks (`task_instances` table: `task_id`, `workflow_id`, `agent_name`, `status`, `input_params_json`, `output_result_summary_json`, etc.).
-    * **Storage:** PostgreSQL database, as defined in `docs/architecture/CPOA_State_Management.md`.
-    * **Format:** Structured data in relational tables with JSONB fields for flexible details.
-* **Topic Cache:**
-    * **Data:** Recently discovered or frequently accessed `TopicObjects`.
-    * **Storage:** Cache (e.g., Redis, Memcached) or a table in the main `Data Stores` with TTL.
-    * **Format:** JSON.
-* **Script Cache (Optional):**
-    * **Data:** Full `PodcastScripts` if caching is implemented to serve identical requests quickly.
-    * **Storage:** Cache or object store, linked from metadata.
-    * **Format:** Text/JSON.
-* **Large Binary Objects (e.g., full harvested web content, intermediate audio files if not purely streamed):**
-    * **Storage:** Object Storage (e.g., AWS S3, Google Cloud Storage). Referenced by URI in metadata stores.
+    * **Storage:** Key-value store (e.g., Redis, or potentially PostgreSQL `user_sessions` table managed by API Gateway).
+* **CPOA Workflow & Task State:**
+    * **Data:** `workflow_instances` and `task_instances` as defined in `docs/architecture/CPOA_State_Management.md`.
+    * **Storage:** PostgreSQL database.
+* **Idempotency Keys Table (`idempotency_keys`):**
+    * **Data:** `idempotency_key`, `task_name`, `workflow_id`, `status`, `result_payload`, `error_payload`, timestamps.
+    * **Storage:** Shared PostgreSQL database. Used by TDA, SCA, PSWA, IGA, VFA.
+* **Discovered Topics & Snippets Metadata (`topics_snippets` table):**
+    * **Data:** `TopicObjects` from TDA, `SnippetDataObjects` (text by SCA, image GCS URI by IGA).
+    * **Storage:** PostgreSQL database (managed by TDA for initial topic creation, CPOA updates with snippet/image details).
+* **Podcast Scripts Cache (`generated_scripts` table - PSWA):**
+    * **Data:** Full `PodcastScripts` generated by PSWA.
+    * **Storage:** Configurable by PSWA (SQLite file, or preferably the shared PostgreSQL database).
+* **Media Files (Audio, Images):**
+    * **Data:** MP3/Opus audio files, PNG/JPEG images.
+    * **Storage:** Google Cloud Storage (GCS). Referenced by GCS URIs (e.g., `gs://bucket-name/...`) in PostgreSQL metadata tables.
 
 ## 5. Error State Data Flows (Brief Overview)
 
-* When an agent fails a task, it reports an error object/message back to the CPOA (via its reply queue or API response).
-* Error Object (JSON): `{"task_id": "uuid", "status": "FAILED", "error_code": "AGENT_TIMEOUT_ERROR", "error_message": "Agent X timed out", "error_details": {...}}`
-* CPOA logs this error and initiates error handling logic (retry, fallback, inform user).
-* Error messages to the user (via FEND) are user-friendly, not raw technical errors, e.g., `{"user_message": "Sorry, we couldn't generate this podcast right now. Please try another."}`.
+* When an agent's Celery task (TDA, SCA, PSWA, IGA, VFA) fails:
+    * The agent's `on_failure` handler (if defined, like in `ScaCeleryTask`, `TdaCeleryTask`, etc.) updates the corresponding record in the `idempotency_keys` table to "failed", storing error details in `error_payload`.
+* CPOA, while polling the agent's `/v1/tasks/<celery_task_id>` endpoint, will receive a `FAILURE` status from Celery (or a success status with an error payload if the task handles its own errors gracefully before Celery marks it as failed).
+* CPOA updates its own `task_instances` record for that agent call to reflect the failure, storing detailed error information.
+* CPOA's workflow logic then decides on retries. If retrying, CPOA will re-dispatch the Celery task using the **same `X-Idempotency-Key`** as the original attempt.
+* If an operation cannot be completed after retries or due to non-recoverable errors, the overall CPOA `workflow_instance` is marked as "failed" or "completed_with_errors".
+* User-friendly error messages are relayed to the client via the API Gateway.
 
 This document provides a detailed view of the data flows. It should be updated as the system evolves and specific implementation choices for communication channels and data formats are finalized.
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

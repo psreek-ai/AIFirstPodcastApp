@@ -7,6 +7,9 @@ This endpoint allows the frontend to fetch a list of podcast snippets, typically
 - Method: GET
 - Query Parameters:
   - `limit` (optional, integer, default: 6, max: 20): Maximum number of snippets to return.
+- Optional Headers:
+  - `X-Idempotency-Key` (string): While this is a GET request, providing an idempotency key can be useful if the client wants to ensure that any backend CPOA workflow triggered to refresh/generate snippets (e.g., if none are cached or available) is processed idempotently by the downstream services (TDA, SCA, IGA). CPOA may use this key if it initiates a new generation workflow.
+  - `X-Workflow-ID` (string): An optional identifier to correlate this request with a larger client-side or end-to-end workflow. CPOA may log this ID or pass it to downstream services.
 
 ## Expected Response
 - Status Code: 200 OK
@@ -57,3 +60,7 @@ This endpoint allows the frontend to fetch a list of podcast snippets, typically
     "details": "Specific error information."
   }
   ```
+
+---
+
+*For information on the overarching Aethercast project architecture, CPOA orchestration details, how idempotency keys are utilized by backend services, and shared database schemas (including `idempotency_keys` table), please refer to the main [README.md](../../../README.md) at the root of the Aethercast project and relevant documents in the `docs/architecture/` directory.*

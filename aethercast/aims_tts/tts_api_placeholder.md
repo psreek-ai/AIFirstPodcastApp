@@ -4,7 +4,9 @@
 
 This document defines the API contract for the placeholder Text-to-Speech (TTS) service.
 
-## Endpoint: `/v1/synthesize`
+## Endpoint: `/v1/synthesize` (Asynchronous)
+
+This endpoint initiates an asynchronous Text-to-Speech (TTS) task.
 
 ### Method
 POST
@@ -12,62 +14,86 @@ POST
 ### Request Body
 ```json
 {
-  "text": "string", // The text to synthesize into speech
-  "voice_id": "string", // Identifier for the desired voice (e.g., "AetherVoice-Nova", "en-US-Wavenet-D")
-  "language_code": "string", // Optional: Language code (e.g., "en-US")
-  "output_format": "string", // Desired audio format (e.g., "mp3", "aac", "pcm", "LINEAR16", "OGG_OPUS")
-  "speech_rate": "float", // Optional: Speed of speech (e.g., 1.0 for normal, 0.25 for slowest, 4.0 for fastest)
-  "pitch": "float", // Optional: Pitch adjustment (e.g., 0.0 for normal, -20.0 for lowest, 20.0 for highest)
-  "response_type": "string" // "url" or "stream".
-                           // Note: The current `aims_tts_service` implementation primarily supports a file generation workflow.
-                           // When 'url' is implied or requested, it returns a file path within a shared volume, not a direct HTTP URL.
-                           // True 'stream' response is not implemented by the `aims_tts_service`.
+  "text": "string", // The text to synthesize
+  "voice_id": "string", // Optional: e.g., "en-US-Wavenet-D"
+  "language_code": "string", // Optional: e.g., "en-US"
+  "audio_format": "string", // Optional: e.g., "MP3", "OGG_OPUS" (determines GCS object extension)
+  "speech_rate": "float", // Optional: e.g., 1.0
+  "pitch": "float" // Optional: e.g., 0.0
+}
+```
+**Note:** The actual `aims_tts_service` implementation will pass these parameters to a Celery task. An `X-Idempotency-Key` header would be expected by the concrete service for this endpoint.
+
+### Success Response (Status Code: 202 Accepted)
+```json
+{
+  "task_id": "string", // Unique ID for the asynchronous TTS task
+  "status_url": "/v1/tasks/string", // URL to poll for task status and result
+  "message": "TTS synthesis task accepted."
+  // "idempotency_key_processed": "string" // Would be included if X-Idempotency-Key was processed
 }
 ```
 
-### Success Response (Status Code: 200 OK)
+## Endpoint: `/v1/tasks/<task_id>` (For Polling)
 
-#### For `response_type: "url"`
+### Method
+GET
+
+### Description
+Poll this endpoint to get the status and result of a TTS synthesis task.
+
+### Success Response (Status Code: 200 OK - Task Completed)
 ```json
 {
-  "request_id": "string", // Unique ID for this synthesis request
-  "voice_id": "string", // Voice used
-  "audio_url": "string", // URL or path to the generated audio file. (Note: The actual `aims_tts_service` returns a file path here, e.g., "/shared_audio/aims_tts/audio.mp3").
-  "audio_duration_seconds": "float", // Duration of the audio in seconds
-  "audio_format": "string" // Format of the audio (e.g., "mp3")
-}
-```
-**Illustrative Placeholder Response (for `response_type: "url"`):**
-```json
-{
-  "request_id": "aims-tts-placeholder-req-example",
-  "voice_id": "PlaceholderVoice-Standard",
-  "audio_url": "/path/to/audio/on/shared/volume/sample-audio.mp3", // Example file path
-  "audio_duration_seconds": 3.0,
-  "audio_format": "mp3"
-}
-```
-
-#### For `response_type: "stream"`
-The response would ideally be a direct audio stream (e.g., `audio/mpeg`). The current `aims_tts_service` does not implement this.
-A placeholder might simulate this by returning a JSON response indicating the intent.
-
-**Illustrative Placeholder Response (simulating `response_type: "stream"`):**
-```json
-{
-  "request_id": "aims-tts-placeholder-req-stream-example",
-  "voice_id": "PlaceholderVoice-Standard",
-  "message": "This is a placeholder response. If 'stream' type were fully supported, audio data would be streamed here.",
-  "audio_format": "mp3" // Intended stream format
-}
-```
-
-### Error Response (Status Code: 4xx/5xx)
-```json
-{
-  "error": {
-    "type": "string", // e.g., "invalid_request_error", "tts_failure"
-    "message": "string"
+  "task_id": "string",
+  "status": "SUCCESS", // Other statuses: PENDING, STARTED, FAILURE, RETRY
+  "result": { // Present if status is SUCCESS
+    "request_id": "string", // ID of the original synthesis request this task fulfilled
+    "voice_id": "string", // Voice used for synthesis
+    "audio_url": "gs://bucket-name/path/to/audio.mp3", // GCS URI of the generated audio
+    "audio_duration_seconds": "float",
+    "audio_format": "string" // e.g., "mp3"
   }
 }
 ```
+
+### Error Response (Status Code: 200 OK - Task Failed but Celery task completed)
+If the Celery task itself completes but reports a failure in processing (e.g., TTS provider error).
+```json
+{
+  "task_id": "string",
+  "status": "SUCCESS", // Celery task itself completed by returning an error structure
+  "result": {
+    "error_code": "AIMS_TTS_SYNTHESIS_FAILED",
+    "message": "Detailed error from TTS provider or internal processing."
+  }
+}
+```
+
+### Error Response (Status Code: 500 Internal Server Error - Celery Task Failed)
+If the Celery task execution itself raised an unhandled exception.
+```json
+{
+  "task_id": "string",
+  "status": "FAILURE",
+  "result": { // Contains error information from Celery
+    "error": {"type": "task_failed", "message": "Details of the exception..."}
+  }
+}
+```
+
+### Other Responses
+-   **202 Accepted:** If task is `PENDING` or `STARTED`. `result` field may be null or contain progress metadata.
+-   **409 Conflict (Conceptual for Idempotency):** If the concrete `aims_tts_service` were to implement idempotency checks at the endpoint level before dispatching or if a task with the same key is already processing (though the placeholder doesn't detail this, the concrete service does).
+    ```json
+    {
+        "task_id": "string", // ID of the conflicting/existing task
+        "status": "PROCESSING_CONFLICT", // Custom status indicating conflict
+        "message": "A task with the provided idempotency key is already processing.",
+        "idempotency_key": "client_provided_idempotency_key"
+    }
+    ```
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

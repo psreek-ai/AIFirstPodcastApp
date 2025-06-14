@@ -438,8 +438,12 @@ def get_vfa_task_status(task_id: str):
         task_output = task_result.result
         response_data["result"] = task_output
         http_status = 200
-        if isinstance(task_output, dict) and task_output.get("error_code"): http_status = 500 # Internal error from task logic
-        elif isinstance(task_output, dict) and task_output.get("status") == VFA_STATUS_SKIPPED: http_status = 200 # Skipped is a valid outcome
+        if isinstance(task_output, dict) and task_output.get("error_code"):
+            http_status = 500 # Internal error from task logic
+        elif isinstance(task_output, dict) and task_output.get("status") == VFA_STATUS_SKIPPED:
+            http_status = 200 # Skipped is a valid outcome
+        elif isinstance(task_output, dict) and task_output.get("status") == "PROCESSING_CONFLICT": # Idempotency conflict
+            http_status = 409 # Conflict
         return jsonify(response_data), http_status
     elif task_result.failed():
         error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}

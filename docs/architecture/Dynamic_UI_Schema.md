@@ -746,3 +746,7 @@ The rendering engine will have specific logic for each component type defined in
 *   **Debugging:** Debugging issues in a dynamically generated UI can be harder. Tools for inspecting the current `componentSchema` and `dataContext` alongside the rendered DOM would be helpful.
 *   **Expression Evaluation:** Safely evaluating expressions in `visibility_condition` or for complex data updates in `onClick` handlers requires a controlled parser/evaluator to prevent security risks if these expressions become too powerful or user-influenced.
 *   **Two-Way Data Binding for Inputs:** Implementing robust two-way data binding for `input_field` components (updating context on input, and updating input value on context change) requires careful state management and event handling.
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

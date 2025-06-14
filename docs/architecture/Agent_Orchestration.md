@@ -30,17 +30,19 @@ The CPOA acts as the central nervous system and primary decision-maker for the A
     * Validates requests for necessary parameters and permissions (if applicable).
     * Interprets user intent to initiate the appropriate workflow.
 * **Workflow Management & Execution:**
-    * Defines and manages multi-step workflows for various generation tasks (e.g., snippet generation, full podcast generation).
-    * Sequences agent invocations according to predefined or dynamically determined plans.
-    * Ensures that agents are triggered in the correct order and that dependencies between agent tasks are met.
+    * Defines and manages multi-step workflows for various generation tasks.
+    * Sequences asynchronous agent invocations (Celery tasks for TDA, SCA, PSWA, IGA, VFA) and handles their responses (typically by polling task status).
+    * Ensures correct order and dependency management for agent tasks.
 * **Task Delegation & Assignment:**
-    * Identifies the appropriate specialized AI agent (e.g., `SnippetCraftAgent`, `WebContentHarvesterAgent`) for each step in a workflow.
-    * Formats and dispatches task instructions (including necessary input data, parameters, and context) to the selected agents.
-* **Agent Communication Facilitation:**
-    * Acts as a central hub or uses a message bus for communication between specialized agents where direct peer-to-peer communication is not optimal.
-    * Ensures reliable delivery of messages and data payloads.
+    * Identifies the appropriate specialized AI agent for each step.
+    * Formats and dispatches task instructions to agents, including input data, parameters, context, and idempotency headers.
+* **Agent Communication Facilitation & Idempotency Propagation:**
+    * Primarily communicates with backend agents (TDA, SCA, PSWA, IGA, VFA) by dispatching Celery tasks.
+    * Receives `X-Idempotency-Key` and `X-Workflow-ID` (optional) from its caller (e.g., API Gateway).
+    * Passes these headers to the Celery tasks of the backend agents. CPOA's own generated `workflow_id` (from `workflow_instances` table) is typically used as the `X-Workflow-ID` value for downstream calls, ensuring end-to-end traceability and linking idempotency records to the overarching CPOA workflow.
 * **State Management:**
-    * Maintains and updates the state of user sessions (e.g., current interaction context, listening history for future personalization).
+    * Manages its own workflow and task instance states in a PostgreSQL database (see section 6).
+    * Maintains user session state (via API Gateway context).
     * Tracks the state of ongoing agent tasks and workflows (e.g., pending, in-progress, completed, failed).
     * Manages global context relevant to orchestration (e.g., availability of AI models, trending topics).
 * **Data Aggregation & Transformation:**
@@ -70,22 +72,25 @@ The CPOA executes several key workflows. These workflows are dynamic and may evo
 * **Steps:**
     1.  **CPOA: Receive Request:** CPOA receives the landing page request.
     2.  **CPOA: Initiate Topic Discovery (Optional/Periodic):**
-        * CPOA tasks `TopicDiscoveryAgent` to identify N fresh/trending/relevant topics.
-        * `TopicDiscoveryAgent`: Scans pre-configured news sources, social media trends, web search queries, or internal popularity metrics.
-        * `TopicDiscoveryAgent`: Returns a list of potential topics with brief justifications or source links to CPOA.
-        * CPOA: Stores/updates these topics in a short-term cache or `Data Stores (DS)`.
-    3.  **CPOA: Select Topics for Snippets:**
-        * CPOA selects a subset of topics from the available pool (either freshly discovered or from cache). Selection logic might involve diversity, recency, or (future) user personalization signals.
+        * CPOA dispatches an asynchronous Celery task to `TopicDiscoveryAgent` (passing `X-Idempotency-Key` and `X-Workflow-ID` if available from the initial request) to identify N fresh/trending/relevant topics.
+        * `TopicDiscoveryAgent` (Celery task): Scans sources and returns a task ID. CPOA polls this task.
+        * Upon successful completion of TDA task: TDA returns a list of potential topics.
+        * CPOA: Stores/updates these topics in its PostgreSQL database (`topics_snippets` table).
+    3.  **CPOA: Select Topics for Snippets:** (As before)
     4.  **CPOA: Delegate Snippet Crafting (Parallel for multiple snippets):**
-        * For each selected topic, CPOA tasks `SnippetCraftAgent`.
-        * Input to `SnippetCraftAgent`: Topic, desired length/style for snippet, (optional) links from `TopicDiscoveryAgent`.
-        * `SnippetCraftAgent`:
-            * (Optional) Briefly consults `WebContentHarvesterAgent` for a small piece of contextual data if the topic alone is insufficient.
-            * Utilizes LLMs (via `AIMS`) to generate a compelling text snippet, a catchy title, and potentially prompts for cover art.
-            * `SnippetCraftAgent`: Returns the generated snippet (title, text, metadata like art prompt, topic ID) to CPOA.
-    5.  **CPOA: Aggregate Snippets:** CPOA collects all generated `SnippetDataObjects`.
-    6.  **CPOA: Generate UI Definition:**
-        *   CPOA takes the aggregated list of `SnippetDataObjects` and any other relevant context (e.g., user preferences, application state).
+        * For each selected topic, CPOA dispatches an asynchronous Celery task to `SnippetCraftAgent` (passing topic, `X-Idempotency-Key`, and its own `workflow_id` as `X-Workflow-ID`).
+        * `SnippetCraftAgent` (Celery task):
+            * (Optional) Briefly consults `WebContentHarvesterAgent` (as a library function call from within its task) for minimal context if needed.
+            * Utilizes LLMs (via AIMS service) to generate snippet text and a `cover_art_prompt`.
+            * Returns a task ID. CPOA polls this task.
+        * Upon successful completion of SCA task: SCA returns the `SnippetDataObject` (with `cover_art_prompt`) to CPOA.
+    5.  **CPOA: Delegate Image Generation (In parallel with or after Snippet Crafting):**
+        * For each `SnippetDataObject` containing a `cover_art_prompt`, CPOA dispatches an asynchronous Celery task to `ImageGenerationAgent` (IGA) (passing the prompt, `X-Idempotency-Key`, and `X-Workflow-ID`).
+        * `ImageGenerationAgent` (Celery task): Generates image via Vertex AI, uploads to GCS. Returns a task ID. CPOA polls this task.
+        * Upon successful completion of IGA task: IGA returns the GCS URI of the image. CPOA updates the `SnippetDataObject` with this `image_url`.
+    6.  **CPOA: Aggregate Snippets:** CPOA collects all generated and augmented `SnippetDataObjects`.
+    7.  **CPOA: Generate UI Definition:**
+        *   CPOA takes the aggregated list of `SnippetDataObjects` (now including GCS image URIs) and any other relevant context.
         *   CPOA calls the `DynamicUIAgent (DUIA)` logic/module with this content and context, requesting a UI definition for the "landingPage" view (or equivalent).
         *   `DynamicUIAgent`: Constructs the UI Definition JSON based on the provided data and defined strategies (e.g., programmatic construction using the schema from `docs/architecture/Dynamic_UI_Schema.md`).
         *   `DynamicUIAgent`: Returns the UI Definition JSON to CPOA.
@@ -102,112 +107,126 @@ The CPOA executes several key workflows. These workflows are dynamic and may evo
         participant FEND as Frontend UI
         participant APIGW as API Gateway
         participant CPOA as Central Podcast Orchestrator
-        participant TDA as TopicDiscoveryAgent
-        participant SCA as SnippetCraftAgent
-        participant IGA as ImageGenerationAgent %% Added IGA
-        participant DUIA as DynamicUIAgent %% Added DUIA
+        participant TDA_Celery as TDA Celery Task
+        participant SCA_Celery as SCA Celery Task
+        participant IGA_Celery as IGA Celery Task
+        participant DUIA as DynamicUIAgent
         participant AIMS as AI Model Serving (LLM)
-        participant AIMS_IMG as AI Models (Image) %% Added AIMS_IMG for IGA
-        participant DS as Data Stores
+        participant VertexAI_IMG as Vertex AI Imagen
+        participant DS_PG as PostgreSQL DB (Topics, Idempotency)
 
         User->>FEND: Load Landing Page
-        FEND->>APIGW: GET /api/v1/snippets
-        APIGW->>CPOA: Request for landing page content (passing user_id if available)
+        FEND->>APIGW: GET /api/v1/snippets (X-Idempotency-Key, X-Workflow-ID optional)
+        APIGW->>CPOA: Request for landing page content (user_id, idempotency_key, workflow_id)
 
-        CPOA->>TDA: Discover Topics
-        TDA-->>CPOA: List of TopicObjects
-        CPOA->>DS: Store/Update TopicObjects
+        CPOA->>TDA_Celery: dispatch_task(Discover Topics, idempotency_key, workflow_id)
+        TDA_Celery-->>CPOA: task_id (TDA)
+        CPOA-->>DS_PG: Store/Check TDA idempotency record
+        Note right of CPOA: CPOA Polls TDA Task Status
+        TDA_Celery-->>DS_PG: Store Topics
+        TDA_Celery-->>CPOA: List of TopicObjects (result)
+        CPOA-->>DS_PG: Update TDA idempotency record (completed)
 
         loop For Each Snippet Needed
-            CPOA->>SCA: Generate Snippet for Topic X
-            SCA->>AIMS: Generate Text (Title, Snippet, Image Prompt)
-            AIMS-->>SCA: Generated Text & Image Prompt
-            SCA-->>CPOA: SnippetDataObject (with image_prompt)
+            CPOA->>SCA_Celery: dispatch_task(Generate Snippet for Topic X, idempotency_key_sca, workflow_id)
+            SCA_Celery-->>CPOA: task_id (SCA)
+            CPOA-->>DS_PG: Store/Check SCA idempotency record
+            Note right of CPOA: CPOA Polls SCA Task Status
+            SCA_Celery->>AIMS: Generate Text (Title, Snippet, Image Prompt)
+            AIMS-->>SCA_Celery: Generated Text & Image Prompt
+            SCA_Celery-->>CPOA: SnippetDataObject (with image_prompt) (result)
+            CPOA-->>DS_PG: Update SCA idempotency record (completed)
 
-            CPOA->>IGA: Generate Image (using image_prompt)
-            IGA->>AIMS_IMG: Call image generation model
-            AIMS_IMG-->>IGA: Image GCS URI
-            IGA-->>CPOA: SnippetDataObject updated with image GCS URI
+            CPOA->>IGA_Celery: dispatch_task(Generate Image, image_prompt, idempotency_key_iga, workflow_id)
+            IGA_Celery-->>CPOA: task_id (IGA)
+            CPOA-->>DS_PG: Store/Check IGA idempotency record
+            Note right of CPOA: CPOA Polls IGA Task Status
+            IGA_Celery->>VertexAI_IMG: Call image generation model
+            VertexAI_IMG-->>IGA_Celery: Image GCS URI
+            IGA_Celery-->>CPOA: SnippetDataObject updated with image GCS URI (result)
+            CPOA-->>DS_PG: Update IGA idempotency record (completed)
         end
 
         CPOA->>DUIA: Aggregated SnippetDataObjects + Context
         DUIA-->>CPOA: UI Definition JSON
-        CPOA-->>APIGW: UI Definition JSON (including workflow_id)
+        CPOA-->>APIGW: UI Definition JSON (including CPOA's workflow_id)
         APIGW-->>FEND: UI Definition JSON
         FEND->>User: Display Landing Page with Snippets
     ```
 
 ### 3.2. Workflow: On-Demand Full Podcast Generation
 
-* **Trigger:** User clicks "Listen" on a podcast snippet or initiates a request for a podcast on a specific topic.
-* **Goal:** Generate and stream a full podcast episode related to the selected topic/snippet in real-time.
+* **Trigger:** User clicks "Listen" on a podcast snippet or initiates a request for a podcast on a specific topic via API Gateway.
+* **Goal:** Generate and make available a full podcast episode. The generation involves multiple asynchronous, idempotent Celery tasks.
 
 * **Steps:**
-    1.  **FEND: User Interaction:** User clicks a snippet (containing a topic ID or context).
-    2.  **FEND: Request Podcast:** `Frontend UI` sends a request to `API Gateway` (e.g., POST /podcast/generate) with the topic ID/context.
-    3.  **APIGW: Route Request:** `API Gateway` forwards the request to `CPOA`.
-    4.  **CPOA: Receive & Validate Request:** `CPOA` receives the request, validates the topic ID/context.
-    5.  **CPOA: Initiate Web Content Harvesting:**
-        * `CPOA` tasks `WebContentHarvesterAgent` with the identified topic.
-        * Input to `WebContentHarvesterAgent`: Topic, constraints (e.g., desired depth, source preferences if any).
-        * `WebContentHarvesterAgent`:
-            * Performs web searches, accesses news APIs, or crawls specified domains.
-            * Retrieves relevant articles, documents, or data.
-            * Pre-processes content (e.g., text extraction, basic cleaning, summarization of individual sources).
-        * `WebContentHarvesterAgent`: Returns a structured collection of processed information (e.g., key points, source snippets, URLs) to `CPOA`.
-    6.  **CPOA: Initiate Podcast Script Weaving:**
-        * `CPOA` tasks `PodcastScriptWeaverAgent`.
-        * Input to `PodcastScriptWeaverAgent`: Processed web content from WCHA, target podcast length/style, persona for the AI host, topic.
-        * `PodcastScriptWeaverAgent`:
-            * Utilizes advanced LLMs (via `AIMS`) to synthesize the information into a coherent, engaging podcast script.
-            * Structures the script (e.g., intro, segments, outro), incorporates transitions, and adheres to the specified persona.
-        * `PodcastScriptWeaverAgent`: Returns the complete podcast script to `CPOA`.
-    7.  **CPOA: Initiate Voice Forging (Audio Generation & Streaming):**
-        * `CPOA` tasks `VoiceForgeAgent` with the script.
-        * Input to `VoiceForgeAgent`: Podcast script, desired voice characteristics (from persona).
-        * `VoiceForgeAgent`:
-            * Utilizes TTS models (via `AIMS_TTS`) to convert the script into audio.
-            * Generates audio in segments/chunks suitable for real-time streaming.
-            * Streams audio data back to `CPOA` or directly to a streaming endpoint accessible by the `Frontend UI`.
-    8.  **CPOA: Facilitate Streaming:**
-        * `CPOA` (or a dedicated streaming service it coordinates with) ensures the audio stream is delivered to the `Frontend UI`.
-        * `Frontend UI`: Receives and plays the audio stream.
-    9.  **CPOA: Post-Generation (Optional):**
-        * Log metadata about the generated podcast (topic, script hash, sources used) in `Data Stores`.
-        * (Future) Solicit user feedback.
+    1.  **FEND/Client: Request Podcast:** Client sends request to API Gateway (`POST /api/v1/podcasts`) with topic details and `X-Idempotency-Key` / `X-Workflow-ID` headers.
+    2.  **APIGW: Route Request:** API Gateway forwards to CPOA, including headers and user context.
+    3.  **CPOA: Receive & Validate Request:** CPOA validates, creates a master `workflow_instance` in PostgreSQL.
+    4.  **CPOA: Initiate Web Content Harvesting (Library Call):**
+        * `CPOA` calls `WebContentHarvesterAgent` (WCHA) library functions directly to fetch and process content for the topic. This step is synchronous within the CPOA's initial processing before dispatching long-running tasks.
+        * `WCHA`: Returns harvested content to CPOA.
+    5.  **CPOA: Initiate Podcast Script Weaving (Async Celery Task):**
+        * `CPOA` dispatches `weave_script_task` to `PodcastScriptWeaverAgent` (PSWA) with harvested content, topic, persona, and relevant idempotency headers (`X-Idempotency-Key` for PSWA task, CPOA's `workflow_id` as `X-Workflow-ID`).
+        * PSWA (Celery task) returns a task ID. CPOA polls for completion.
+        * `PSWA`: Checks cache, else calls AIMS (LLM) for script generation. Stores result in idempotency table. Returns `PodcastScript`.
+    6.  **CPOA: Initiate Voice Forging (Async Celery Task):**
+        * Upon PSWA success, `CPOA` dispatches `forge_voice_task` to `VoiceForgeAgent` (VFA) with the script and voice parameters, plus idempotency headers.
+        * VFA (Celery task) returns a task ID. CPOA polls.
+        * `VFA`: Calls AIMS_TTS (which itself might be async and involve polling by VFA). Stores audio to GCS. Stores result in idempotency table. Returns audio metadata (GCS URI).
+    7.  **CPOA: (Optional) Initiate Cover Image Generation (Async Celery Task):**
+        * `CPOA` may generate a prompt from script/topic and dispatch `generate_image_vertex_ai_task` to `ImageGenerationAgent` (IGA), with idempotency headers.
+        * IGA (Celery task) returns task ID. CPOA polls.
+        * `IGA`: Calls Vertex AI, stores image to GCS. Stores result in idempotency table. Returns image GCS URI.
+    8.  **CPOA: Finalize Workflow:** Once all tasks complete, CPOA updates its master `workflow_instance` in PostgreSQL with final status and links to artifacts (audio GCS URI, image GCS URI). The API Gateway can then provide these URIs (potentially as signed URLs) to the client via the task status endpoint.
+    9.  **CPOA: Notify ASF (HTTP Call):** CPOA notifies the Audio Stream Feeder (ASF) about the new audio GCS URI and stream ID.
 
-* **Diagrammatic Representation (Conceptual Sequence):**
+* **Diagrammatic Representation (Conceptual Sequence - Simplified for core flow):**
     ```mermaid
     sequenceDiagram
         participant User
         participant FEND as Frontend UI
         participant APIGW as API Gateway
         participant CPOA as Central Podcast Orchestrator
-        participant WCHA as WebContentHarvesterAgent
-        participant PSWA as PodcastScriptWeaverAgent
-        participant VFA as VoiceForgeAgent
+        participant WCHA as WebContentHarvester (Library)
+        participant PSWA_Celery as PSWA Celery Task
+        participant VFA_Celery as VFA Celery Task
+        participant IGA_Celery as IGA Celery Task (Optional)
         participant AIMS_LLM as AI Model Serving (LLM)
         participant AIMS_TTS as AI Model Serving (TTS)
-        participant StreamingService as Audio Streaming Service (Conceptual)
+        participant VertexAI_IMG as Vertex AI Imagen
+        participant PG_DB as PostgreSQL DB (CPOA State, Idempotency)
+        participant ASF as AudioStreamFeeder
 
-        User->>FEND: Clicks "Listen" on Snippet (Topic X)
-        FEND->>APIGW: POST /podcast/generate (Topic X)
-        APIGW->>CPOA: Request to generate podcast for Topic X
+        User->>FEND: Request Podcast (Topic X)
+        FEND->>APIGW: POST /api/v1/podcasts (Topic X, X-Idempotency-Key)
+        APIGW->>CPOA: Generate podcast (Topic X, IdempotencyKey, UserContext)
+        CPOA-->>PG_DB: Create WorkflowInstance
+        CPOA->>WCHA: Harvest Content (sync library call)
+        WCHA-->>CPOA: Harvested Content
 
-        CPOA->>WCHA: Harvest Web Content for Topic X
-        WCHA-->>CPOA: Processed Web Content
+        CPOA->>PSWA_Celery: dispatch_task(Weave Script, IdempotencyKey_PSWA, CPOA_WorkflowID)
+        PSWA_Celery-->>CPOA: pswa_task_id
+        CPOA-->>PG_DB: Store/Check PSWA Idempotency
+        Note right of CPOA: Poll PSWA Task
+        PSWA_Celery->>AIMS_LLM: Generate Script
+        AIMS_LLM-->>PSWA_Celery: Script
+        PSWA_Celery-->>PG_DB: Update PSWA Idempotency (Completed)
+        PSWA_Celery-->>CPOA: Final Script (result)
 
-        CPOA->>PSWA: Weave Podcast Script from Content
-        PSWA->>AIMS_LLM: Generate Script
-        AIMS_LLM-->>PSWA: Podcast Script
-        PSWA-->>CPOA: Final Script
+        CPOA->>VFA_Celery: dispatch_task(Forge Voice, Script, IdempotencyKey_VFA, CPOA_WorkflowID)
+        VFA_Celery-->>CPOA: vfa_task_id
+        CPOA-->>PG_DB: Store/Check VFA Idempotency
+        Note right of CPOA: Poll VFA Task
+        VFA_Celery->>AIMS_TTS: Synthesize Audio
+        AIMS_TTS-->>VFA_Celery: Audio GCS URI
+        VFA_Celery-->>PG_DB: Update VFA Idempotency (Completed)
+        VFA_Celery-->>CPOA: Audio GCS URI (result)
 
-        CPOA->>VFA: Forge Voice for Script
-        VFA->>AIMS_TTS: Synthesize Audio Chunks
-        AIMS_TTS-->>VFA: Audio Chunks
-        VFA->>StreamingService: Stream Audio Chunks
-        StreamingService-->>FEND: Audio Stream
-        FEND->>User: Plays Podcast Audio
+        CPOA->>ASF: Notify New Audio (GCS URI, StreamID)
+        CPOA-->>PG_DB: Update WorkflowInstance (Completed, GCS URI)
+        APIGW-->>FEND: task_id (initial response)
+        Note left of FEND: Client polls task status endpoint, eventually gets GCS URI (via signed URL from APIGW)
     ```
 
 ### 3.3. Workflow: (Future) Adaptive/Interactive Podcast
@@ -226,100 +245,75 @@ The CPOA executes several key workflows. These workflows are dynamic and may evo
 The CPOA and specialized agents will communicate using a combination of protocols, chosen for efficiency, reliability, and ease of integration.
 
 * **Primary Communication (CPOA to/from Specialized Agents):**
-    * **Synchronous Request-Response (HTTP/gRPC APIs):**
-        * **Usage:** For tasks where the CPOA needs an immediate result to proceed with the workflow, or for short-lived tasks. Example: `SnippetCraftAgent` generating a snippet might be synchronous if the CPOA waits for it.
-        * **Pros:** Simpler to implement and reason about for direct request-reply patterns.
-        * **Cons:** Can lead to blocking if tasks are long-running, potentially impacting CPOA responsiveness. Requires careful timeout management.
-    * **Asynchronous Messaging (Message Queues - e.g., RabbitMQ, Kafka, Redis Streams):**
-        * **Usage:** For long-running tasks, decoupling agents, and improving fault tolerance. Example: Full podcast generation steps (`WebContentHarvesterAgent`, `PodcastScriptWeaverAgent`, `VoiceForgeAgent`) are prime candidates.
-        * **CPOA Perspective:** Publishes a "task request" message to a specific queue for an agent type.
-        * **Agent Perspective:** Subscribes to its designated queue, consumes tasks, processes them, and publishes a "task completion" or "task failure" message to a reply queue or a status topic monitored by CPOA.
-        * **Pros:** Decoupling (CPOA doesn't need to know agent instance locations), resilience (messages persist if an agent is temporarily down), load balancing (multiple agent instances can consume from a queue), better handling of long-running tasks without blocking CPOA.
-        * **Cons:** More complex setup and management, eventual consistency model for results.
-* **Internal CPOA Communication (if CPOA is itself distributed or has sub-modules):**
-    * May use internal event buses or direct method calls depending on its own architecture.
+    * **Asynchronous Task Dispatch (Celery):**
+        * **Usage:** This is the primary method for CPOA to interact with TDA, SCA, PSWA, IGA, and VFA. CPOA dispatches a Celery task to the respective agent's service.
+        * **CPOA Perspective:** Calls the agent's Celery task (e.g., `discover_topics_task.delay(...)`) with necessary parameters, including the `X-Idempotency-Key` and an `X-Workflow-ID` (typically CPOA's own `workflow_id`). It receives a Celery `AsyncResult` object containing the `task_id`.
+        * **Agent Perspective:** The Celery worker in the target service picks up the task. The agent performs its processing, manages its own idempotency using the provided keys and a shared PostgreSQL `idempotency_keys` table, and eventually returns a result or an error.
+        * **Result Retrieval:** CPOA polls the task status using the `task_id` via the agent's `/v1/tasks/<task_id>` HTTP endpoint.
+        * **Pros:** Decoupling, resilience, load balancing, non-blocking for CPOA, standardized way to handle long-running AI operations.
+        * **Cons:** Requires polling or a callback mechanism (currently polling is used) to get results.
+    * **Synchronous Request-Response (HTTP APIs):**
+        * **Usage:** For calls to services that provide immediate responses and are not long-running by nature, such as AIMS, AIMS_TTS (though these services themselves might have internal async operations, their interface to CPOA's direct callers like PSWA/VFA is effectively synchronous for the initial request), or ASF for notifications. WCHA is used as a direct Python library call.
+        * **Pros:** Simpler for direct request-reply.
+        * **Cons:** Can block CPOA if the synchronous call is unexpectedly long.
 * **Data Payloads:**
-    * Standardized data formats like **JSON** or **Protocol Buffers (Protobuf)** will be used for message payloads to ensure interoperability. Protobuf is preferred for performance and schema enforcement if services are gRPC-based.
+    * **JSON** is the standard format for request and response bodies for HTTP APIs and Celery task arguments/results.
+    * Headers like `X-Idempotency-Key` and `X-Workflow-ID` are used for relevant Celery task dispatches.
 * **Service Discovery:**
-    * If agents are deployed as microservices, a service discovery mechanism (e.g., Consul, Kubernetes DNS) will be used by the CPOA (or its HTTP/gRPC clients) to locate agent instances. For message queues, agents simply connect to the queue.
+    * Docker Compose service names are used for inter-service HTTP communication (e.g., `http://pswa_service:5004`). Celery tasks are routed via the configured message broker (e.g., Redis).
 
-**Decision: A hybrid approach is recommended.**
-* Use **asynchronous messaging via Message Queues** for the main steps of the full podcast generation workflow (Harvest, Script, Forge) due to their potentially long-running nature and the benefits of decoupling.
-* Synchronous APIs (HTTP/gRPC) can be used for quicker, direct interactions like initial request validation by CPOA, or perhaps for the `SnippetCraftAgent` if snippets are expected rapidly and the LLM calls are fast enough.
+**Decision: Asynchronous Celery tasks are the standard for interactions with TDA, SCA, PSWA, IGA, and VFA from CPOA.** Synchronous calls are used for AIMS/AIMS_TTS by these agents, and by CPOA for ASF notifications or WCHA library usage.
 
 ## 5. Task Management & Delegation by CPOA
 
-* **Task Definition:**
-    * Each task dispatched by CPOA will have a clear definition, including:
-        * `task_id`: A unique identifier for tracking.
-        * `agent_type_target`: Specifies which type of specialized agent should handle the task (e.g., `WebContentHarvester`).
-        * `input_payload`: Data required by the agent (e.g., topic, source URLs, script text).
-        * `parameters`: Configuration for the task (e.g., desired length, style, persona).
-        * `reply_to_queue_or_topic` (for async): Where the agent should send its response/status.
-        * `correlation_id`: To link requests and responses across a workflow.
-        * `timestamp`, `priority` (optional).
-* **Task Assignment:**
-    * CPOA maintains a registry or configuration of available specialized agent types and how to reach them (e.g., queue names, API endpoints).
-    * For a given step in a workflow, CPOA selects the appropriate agent type and dispatches the task.
-* **Task Progress Monitoring (primarily for asynchronous tasks):**
-    * CPOA will listen on reply queues/topics for task completion/failure messages.
-    * Intermediate status updates ("in-progress," "X% complete") can be implemented if needed for long tasks, allowing CPOA to provide feedback to the user or manage timeouts more effectively.
-    * A timeout mechanism will be in place for each task. If an agent doesn't respond within the timeout, CPOA will trigger an error handling routine.
-* **Task Lifecycle:** `PENDING` -> `DISPATCHED` -> `IN_PROGRESS` (optional) -> `COMPLETED` / `FAILED`. CPOA updates task state in its internal state management or `Data Stores`.
-* **Agent Selection (Future):**
-    * Initially, agent types are fixed for specific tasks.
-    * In future, CPOA might incorporate logic to select among multiple available instances of an agent type based on load, capability (e.g., an LLM agent specialized in summarization vs. creative writing), or cost.
+* **Task Definition (for Celery tasks dispatched by CPOA):**
+    * Each task dispatch includes:
+        * Target agent's Celery task name (e.g., `discover_topics_task`).
+        * `args` and `kwargs` containing input data, parameters, and context.
+        * Crucially, `idempotency_key` and `workflow_id` (as `X-Workflow-ID`) are passed within `kwargs` to the Celery tasks of TDA, SCA, PSWA, IGA, VFA.
+* **Task Assignment:** (As before) CPOA selects the agent and constructs parameters.
+* **Task Progress Monitoring (for Celery tasks):**
+    * CPOA receives a Celery `task_id` upon dispatch.
+    * CPOA polls the respective service's `/v1/tasks/<task_id>` endpoint to get status (`PENDING`, `STARTED`, `SUCCESS`, `FAILURE`, `RETRY`) and the final result or error.
+    * The `task_instances` table within CPOA's PostgreSQL database is updated based on these polled statuses.
+    * Timeout for polling is managed by CPOA for each downstream task.
+* **Task Lifecycle (within CPOA's perspective for a downstream Celery task):** `DISPATCHED` -> `POLLING_ACTIVE` -> `AGENT_COMPLETED` / `AGENT_FAILED`. This maps to updating the `task_instances` table.
+* **Agent Selection (Future):** (As before)
 
 ## 6. State Management within CPOA
 
-Effective state management is crucial for orchestration.
+Effective state management is crucial for orchestration. CPOA uses a **PostgreSQL database** for robust state persistence.
 
-* **User Session State:**
-    * **Content:** Current page/view, last interaction, topic of interest, (future) listening history, explicit preferences, implicit feedback.
-    * **Storage:** A fast key-value store (e.g., Redis) or a document database, associated with a session ID.
-    * **Purpose:** To provide context for generation, personalize experience (future), and resume interrupted interactions (future).
-* **Workflow/Task Instance State:**
-    * **Content:** For each active workflow (e.g., a user's request to generate a full podcast):
-        * Overall workflow ID, user session ID.
-        * Current step in the workflow.
-        * Status of each dispatched task (`task_id`, agent assigned, status, start/end time, input/output references).
-        * Intermediate data/results from agents that are needed by subsequent agents in the same workflow.
-    * **Storage:** This is implemented using two primary PostgreSQL tables:
-        *   **`workflow_instances`**: Stores high-level information about each workflow initiated by CPOA (e.g., `workflow_id`, `user_id`, `trigger_event_type`, `overall_status`, timestamps, `context_data_json` for shared workflow data, `error_message`).
-        *   **`task_instances`**: Stores details for each individual agent call or significant step within a workflow (e.g., `task_id`, `workflow_id` (FK), `agent_name`, `task_order`, `status`, `input_params_json`, `output_result_summary_json`, `error_details_json`, timestamps, `retry_count`).
-    * **Purpose:** To track progress, enable recovery from failures (future), resume long workflows (future), and for detailed debugging, auditing, and observability of CPOA operations. (See `docs/architecture/CPOA_State_Management.md` for detailed schema).
+* **User Session State:** (As before - managed by API Gateway, context passed to CPOA)
+* **Workflow/Task Instance State (PostgreSQL):**
+    * **Storage:** This is implemented using two primary PostgreSQL tables: `workflow_instances` and `task_instances`. This same PostgreSQL database also hosts the shared `idempotency_keys` table, although CPOA does not directly write to `idempotency_keys` (the agents TDA, SCA, PSWA, IGA, VFA do).
+    * **`workflow_instances`**: (As before) Stores high-level workflow information. The `workflow_id` from this table is used as the `X-Workflow-ID` when CPOA calls downstream services.
+    * **`task_instances`**: (As before) Stores details for each agent call (now primarily Celery task dispatches). It records the Celery `task_id` received from the agent, the polled status, and eventually the summary of the result or error.
+    * **Purpose:** (As before) Tracking, recovery, debugging, observability. (See `docs/architecture/CPOA_State_Management.md`).
 * **Global Orchestration State:**
-    * **Content:** Availability/status of specialized agents or underlying models (e.g., AIMS health), rate limits for external APIs, cached popular topics, blacklisted sources.
-    * **Storage:** Could be in-memory for CPOA (if single instance and state is ephemeral) or a shared configuration store/cache.
-    * **Purpose:** To make informed decisions during orchestration (e.g., not dispatching tasks to a known faulty agent).
+    * **Content:** Availability/status of specialized agents or underlying models (e.g., AIMS health), rate limits for external APIs, cached popular topics, blacklisted sources. This now also includes awareness of the PostgreSQL database health for CPOA state and shared idempotency.
 
 **Key Principles for State Management:**
-* **Minimal Sharing:** Pass only necessary state to specialized agents. Agents should be as stateless as possible, receiving all context via task inputs.
-* **Persistence for Critical Workflow State:** Workflow instance state should be persisted to allow recovery.
-* **Standardized Formats:** Use formats like JSON for state data passed between CPOA and agents.
+* **Minimal Sharing:** (As before)
+* **Persistence for Critical Workflow State:** (As before, in PostgreSQL).
+* **Standardized Formats:** (As before, JSON).
 
 ## 7. Data Flow Management
 
-CPOA orchestrates the flow of data between the user, itself, and specialized agents.
+CPOA orchestrates the flow of data between the user (via API Gateway), itself, and specialized agents.
 
-* **User Request -> CPOA:** Via API Gateway, typically small JSON payloads.
-* **CPOA -> Specialized Agent:** Task definitions with input data (JSON/Protobuf).
-    * Example: Topic string to `WebContentHarvesterAgent`.
-    * Example: Processed web content (can be substantial, might involve passing references to data in an object store like S3 if too large for a message queue payload) to `PodcastScriptWeaverAgent`.
-    * Example: Script text to `VoiceForgeAgent`.
-* **Specialized Agent -> CPOA:** Task results (JSON/Protobuf).
-    * Example: Snippet object from `SnippetCraftAgent`.
-    * Example: Collection of source texts/URLs from `WebContentHarvesterAgent`.
-    * Example: Podcast script from `PodcastScriptWeaverAgent`.
-* **Specialized Agent -> Specialized Agent (Indirect via CPOA):** CPOA typically receives output from one agent, processes/validates it, and then uses it as input for the next agent. Direct agent-to-agent communication for a single workflow is generally avoided to keep CPOA in control.
-* **CPOA -> User Response:** Aggregated data (e.g., list of snippets) or stream initiation for audio.
-* **Large Data Objects:** For potentially large data like harvested web content collections or full podcast scripts before TTS, consider:
-    * Passing references (e.g., S3 URI) in messages rather than the full data if using message queues with size limits. Agents would then fetch the data from the shared object store.
-    * Using streaming APIs if agents support them for processing large inputs/outputs incrementally.
+* **User Request -> CPOA:** Via API Gateway, typically small JSON payloads, potentially including `X-Idempotency-Key` and `X-Workflow-ID` headers which are extracted by the API Gateway and passed to CPOA.
+* **CPOA -> Specialized Agent (Celery Task Dispatch):**
+    * Celery task messages include arguments (`args`, `kwargs`) containing input data (JSON).
+    * `kwargs` will include `idempotency_key` and `workflow_id` (CPOA's own `workflow_id` used as `X-Workflow-ID`) for agents that support this pattern (TDA, SCA, PSWA, IGA, VFA).
+* **Specialized Agent (Celery Task) -> CPOA (via Polling):**
+    * Agent's Celery task returns results (JSON) or exceptions.
+    * CPOA polls the agent's `/v1/tasks/<celery_task_id>` HTTP endpoint to get these results.
+* **Large Data Objects:** (As before) References are preferred over large direct payloads in task messages. WCHA, being a library, returns data directly to CPOA.
 
 ## 8. Error Handling, Retries, and Fallbacks by CPOA
 
-Robust error handling is vital for a system relying on multiple AI models and external data. (Ref: `Resilient by Design: Mastering Error Handling in Microservices Architecture`).
+Robust error handling is vital.
 
 * **Types of Errors CPOA Must Handle:**
     * **Agent Unavailability:** Specialized agent instance not responding or not found.
@@ -336,38 +330,27 @@ Robust error handling is vital for a system relying on multiple AI models and ex
     * **Configurable Retries:** For specific agents or task types, define max retry attempts.
     * **Exponential Backoff:** Increase delay between retries to avoid overwhelming a struggling service (e.g., 1s, 2s, 4s, 8s).
     * **Jitter:** Add randomness to backoff delays to prevent thundering herd problems.
-    * **Idempotency:** Critical for retries. Tasks should be designed so that executing them multiple times has the same effect as executing them once (e.g., `WebContentHarvesterAgent` re-fetching content for a topic should yield similar results, not duplicate entries if possible).
-* **Circuit Breaker Pattern:**
-    * CPOA (or its client libraries) should implement circuit breakers for calls to specialized agents. If an agent repeatedly fails, the circuit "opens," and CPOA stops sending requests for a period, failing fast and potentially routing to a fallback. After a timeout, it enters a "half-open" state to test if the agent has recovered.
-* **Fallback Mechanisms:**
-    * **Degraded Service:** If a primary agent/model fails, switch to a simpler/cheaper/more reliable one. Example: If the advanced TTS voice fails, fall back to a standard, more robust voice.
-    * **Cached Data:** If live web harvesting fails for a topic, CPOA might attempt to use a recently cached version of content for that topic (if available and acceptable).
-    * **Informative Error to User:** If a podcast cannot be generated after retries and fallbacks, provide a clear, user-friendly message rather than a cryptic error (e.g., "We're having trouble generating this podcast right now. Please try another topic or check back later.").
-    * **Reduced Snippet Set:** If some snippet generations fail, display fewer snippets rather than none.
-* **Dead Letter Queues (DLQs):**
-    * For asynchronous tasks, messages that consistently fail processing (after retries) should be moved to a DLQ for manual inspection and analysis. CPOA should be alerted to items in DLQs.
+    * **Idempotency for Retries:** When CPOA retries dispatching a Celery task to TDA, SCA, PSWA, IGA, or VFA due to a transient error (e.g., temporary agent unavailability before task acceptance, or a network issue during dispatch polling), it **must** use the same `X-Idempotency-Key` (and `X-Workflow-ID`) as the original attempt. This allows the downstream agent to correctly identify it as a retry and avoid reprocessing if the original task eventually succeeded or is already in progress. The agent's `on_failure` handler for Celery tasks also updates the idempotency record to "failed", allowing CPOA to know a retry is for a previously failed operation.
+* **Circuit Breaker Pattern:** (As before)
+* **Fallback Mechanisms:** (As before)
+* **Dead Letter Queues (DLQs):** (As before, for Celery tasks dispatched by CPOA).
 
 ## 9. Scalability and Concurrency of CPOA
 
-* **CPOA Architecture:**
-    * The CPOA itself should be designed to be **stateless or to manage its critical workflow state in an external persistent store.** This allows multiple instances of CPOA to run behind a load balancer, handling concurrent user requests.
-    * If CPOA uses a workflow engine, that engine must support distributed execution.
-* **Asynchronous Operations:** Heavily relying on asynchronous communication with specialized agents allows CPOA to handle many concurrent workflows without being blocked by individual long-running tasks.
-* **Scalable Specialized Agents:** The architecture assumes that individual specialized agents (SCA, TDA, WCHA, PSWA, VFA) and the AI Model Serving Infrastructure (AIMS, AIMS_TTS) are independently scalable (e.g., by running multiple instances of each microservice/function).
-* **Database Scalability:** The `Data Stores` used for session and workflow state must be scalable to handle the load from multiple CPOA instances and high user traffic.
-* **Concurrency Control:**
-    * Optimistic or pessimistic locking might be needed if multiple CPOA instances could potentially modify the same workflow state record simultaneously (less likely if a workflow instance is pinned to a CPOA instance or if using a proper workflow engine).
-    * Careful management of shared resources (e.g., rate limits for external APIs accessed by WCHA).
+* **CPOA Architecture:** (As before - CPOA logic is part of API Gateway, which can be scaled; PostgreSQL for state).
+* **Asynchronous Operations:** (As before - Celery tasks for backend agents are key).
+* **Scalable Specialized Agents:** (As before - individual services with their Flask apps and Celery workers scale independently).
+* **Database Scalability:** The PostgreSQL database used for CPOA state and shared idempotency records must be scalable.
+* **Concurrency Control:** (As before - CPOA workflow instances manage their own state; idempotency helps manage concurrent requests at agent level).
 
 ## 10. Extensibility
 
 The orchestration framework should be designed for future growth.
 
-* **Agent Registration/Discovery:** A mechanism for CPOA to discover or be configured with new specialized agent types and their communication details (queues/endpoints).
-* **Modular Workflow Definitions:** Workflows should be defined in a way that allows new steps or agents to be inserted, or existing ones to be replaced/updated, with minimal changes to the core CPOA logic.
-    * This could involve configuration-driven workflows or a domain-specific language (DSL) for defining orchestration flows.
-* **Standardized Agent Interface:** While agents are specialized, adhering to a common contract for task requests and responses (e.g., standard message headers, error reporting formats) simplifies integration.
-* **Versioning:** Support for versioning of agent APIs and workflow definitions to allow for phased rollouts and backward compatibility.
+* **Agent Registration/Discovery:** (As before)
+* **Modular Workflow Definitions:** (As before)
+* **Standardized Agent Interface:** (As before - Celery task signatures, HTTP polling endpoints, use of `X-Idempotency-Key` for async idempotent agents).
+* **Versioning:** (As before)
 
 ## 11. Decision-Making Logic within CPOA
 
@@ -388,30 +371,23 @@ This logic can be implemented using:
 Comprehensive observability is crucial.
 
 * **Centralized Logging:**
-    * All agents, including CPOA, should log to a centralized logging system (e.g., ELK Stack, Splunk, Grafana Loki).
-    * Logs should include `correlation_id`, `task_id`, `user_session_id`, agent name, timestamp, log level, and detailed messages.
-* **Distributed Tracing:**
-    * Implement distributed tracing (e.g., Jaeger, Zipkin, OpenTelemetry) across API Gateway, CPOA, and specialized agents. This allows tracking a single user request as it flows through the entire system.
-* **Metrics Monitoring:**
-    * CPOA and specialized agents should expose key metrics (e.g., number of active workflows, task processing times, error rates, queue lengths, API latencies for AIMS) to a monitoring system (e.g., Prometheus, Grafana).
-* **Workflow Visualization (Advanced):**
-    * Tools that can visualize the state and progress of active workflow instances, based on CPOA's state data, would be invaluable for debugging and operational insight.
-* **Alerting:**
-    * Set up alerts for critical errors, high latencies, queue build-ups, or high failure rates in orchestration.
+    * All agents, including CPOA (via API Gateway logging), should log to a centralized logging system.
+    * Logs should include `workflow_id` (from CPOA), agent-specific `task_id` (Celery task ID for downstream services), `idempotency_key` where applicable, `user_session_id`, agent name, timestamp, log level, and detailed messages.
+* **Distributed Tracing:** (As before - trace context should include these IDs).
+* **Metrics Monitoring:** (As before - include metrics related to idempotent operations, e.g., tasks created vs. completed, idempotency conflicts).
+* **Workflow Visualization (Advanced):** (As before - CPOA's PostgreSQL state is key).
+* **Alerting:** (As before)
 
 ## 13. Security Considerations
 
-* **Inter-Agent Communication Security:**
-    * Use TLS for all HTTP/gRPC communication.
-    * Secure message queues (e.g., authentication, authorization, encryption of messages at rest/transit).
-* **Authentication & Authorization for CPOA:**
-    * CPOA itself should be a secured service, with its API endpoints protected.
-    * Specialized agents should authenticate themselves to CPOA or the message bus if required.
-* **Credential Management:**
-    * Securely manage API keys or credentials needed by agents (e.g., WCHA accessing external APIs, agents accessing AIMS) using a secrets management system (e.g., HashiCorp Vault, AWS Secrets Manager).
-* **Input Validation:**
-    * CPOA and all agents must rigorously validate inputs to prevent injection attacks or unexpected behavior.
-* **Principle of Least Privilege:**
-    * Each specialized agent should only have the permissions necessary to perform its specific task. For example, `VoiceForgeAgent` doesn't need web access.
+* **Inter-Agent Communication Security:** (As before - TLS for HTTP, secure Celery broker).
+* **Authentication & Authorization for CPOA:** (As before - CPOA logic runs within authenticated API Gateway context).
+* **Credential Management:** (As before - PostgreSQL credentials, AIMS keys, etc., via secrets management).
+* **Input Validation:** (As before - including validation of `X-Idempotency-Key` format if strict rules apply, though currently it's client-defined).
+* **Principle of Least Privilege:** (As before).
 
 This document provides a detailed blueprint for the `Agent_Orchestration.md`. It will need to be a living document, updated as Aethercast evolves.
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

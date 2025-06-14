@@ -1,11 +1,11 @@
-**Note:** This document describes a **conceptual NoSQL collection (e.g., for MongoDB/DynamoDB)** designed for granular tracking of individual AI agent task states. While the Aethercast system orchestrates multiple agents, the current implementation primarily tracks the overall podcast generation task lifecycle and status within the **`podcasts` table in SQLite**. Detailed orchestration steps are logged in the `cpoa_full_orchestration_log` column of the `podcasts` table.
+**Note:** This document describes a **conceptual NoSQL collection (e.g., for MongoDB/DynamoDB)** for tracking detailed AI agent task states. The Aethercast system currently implements comprehensive workflow and task state management using **PostgreSQL** through its Central Podcast Orchestrator Agent (CPOA). Specifically, the `workflow_instances` and `task_instances` tables in PostgreSQL track the lifecycle, status, inputs, and outputs of orchestrated agent calls.
 
-This document outlines a more detailed, potential future approach for distributed task state management. Refer to the main `aethercast/data_stores/README.md` and the schema definition in `aethercast/api_gateway/main.py` for details on the current SQLite-based implementation.
+This document outlines a potential alternative or more granular NoSQL-based approach considered previously. For details on the current PostgreSQL-based state management, refer to the main `aethercast/data_stores/README.md` and `docs/architecture/CPOA_State_Management.md`.
 ---
-# NoSQL Data Store: AgentTaskState Collection
+# NoSQL Data Store: AgentTaskState Collection (Conceptual)
 
 ## Purpose
-Stores the state of tasks being processed by the various AI agents in the system. This allows for tracking, resuming, and debugging agent workflows.
+Conceptually stores the state of tasks being processed by various AI agents, allowing for tracking, resuming, and debugging. (Currently implemented via PostgreSQL in CPOA).
 
 ## Schema
 ```json

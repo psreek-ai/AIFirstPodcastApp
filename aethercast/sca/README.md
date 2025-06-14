@@ -2,54 +2,50 @@
 
 ## Purpose
 
-The Snippet Craft Agent (SCA) is a specialized microservice within the Aethercast system. Its primary function is to generate short, engaging podcast snippets based on topic information provided by the Central Podcast Orchestrator Agent (CPOA). These snippets typically include a title and a brief text content. SCA achieves this by calling the **AIMS (AI Model Service)** for LLM-based text generation.
+The Snippet Craft Agent (SCA) is a specialized microservice within the Aethercast system. Its primary function is to generate short, engaging podcast snippets (title, text content, and a cover art prompt) based on topic information provided by the Central Podcast Orchestrator Agent (CPOA). SCA achieves this by calling the **AIMS (AI Model Service)** for LLM-based text generation.
+
+SCA now operates **asynchronously using a Celery task queue** for the core snippet crafting process. When a request to craft a snippet is received, a task is dispatched, and clients can poll for the result. The service also features **idempotency** for its snippet crafting task; if the same request (identified by an `X-Idempotency-Key`) is submitted multiple times, it will be processed only once, with state managed in a shared PostgreSQL database.
 
 Key Responsibilities:
 
-1.  **Input Processing:** Receives topic information (e.g., a `topic_id`, a title suggestion as `content_brief`, and the full `topic_info` object) from the CPOA.
-2.  **Prompt Engineering:** Formulates a detailed prompt for the AIMS service based on the input `content_brief` and other details from `topic_info` (like summary, keywords, source inspiration).
-3.  **AIMS Service Interaction:**
-    *   Constructs a request payload for the AIMS `/v1/generate` endpoint, including the engineered prompt, desired model (e.g., `SCA_LLM_MODEL_ID`), temperature, and max tokens.
-    *   Calls the configured `AIMS_SERVICE_URL`.
-    *   Handles HTTP errors and error responses from the AIMS service.
-4.  **Snippet Structuring:**
-    *   Receives a JSON response from AIMS which contains the LLM's generated text (within `choices[0].text`), the model used, and usage statistics.
-    *   Parses the `text` from AIMS (which is expected to have the title on the first line, followed by content) to extract the snippet title and content.
-    *   Assembles the generated title, text, and other relevant metadata (like `topic_id`, a new `snippet_id`, timestamps, `llm_model_used` as reported by AIMS) into a structured `SnippetDataObject`.
-    *   Generates a basic `cover_art_prompt` based on the snippet title.
-5.  **Output:** Returns the `SnippetDataObject` to the CPOA.
+1.  **Input Processing:** Receives topic information (e.g., `topic_id`, `content_brief`, `topic_info`) from CPOA.
+2.  **Prompt Engineering:** Formulates a detailed prompt for AIMS.
+3.  **AIMS Service Interaction:** Calls AIMS with the engineered prompt, handling asynchronous polling if AIMS operates that way.
+4.  **Snippet Structuring:** Parses the AIMS response and assembles a `SnippetDataObject`.
+5.  **Output:** The Celery task returns the `SnippetDataObject`.
+6.  **Idempotent Task Processing:** Ensures that identical snippet crafting requests (with the same `X-Idempotency-Key`) are processed only once, returning the original result for subsequent identical requests. State is managed in a shared PostgreSQL `idempotency_keys` table.
 
 ## Configuration
 
-SCA is configured via environment variables, typically managed in a `.env` file within the `aethercast/sca/` directory. To create one, copy the example:
+SCA is configured via environment variables, typically managed in a `.env` file within the `aethercast/sca/` directory. Copy `.env.example` to `.env` and customize.
 
 ```bash
 cp .env.example .env
 ```
 
-Then, edit the `.env` file. The following variables are used:
+Key environment variables:
 
--   `AIMS_SERVICE_URL`: **Required if `USE_REAL_LLM_SERVICE=true`.** The URL for the AIMS (AI Model Service) endpoint for text generation.
-    -   *Example:* `http://aims_service:8000/v1/generate`
--   `AIMS_REQUEST_TIMEOUT_SECONDS`: Timeout in seconds for requests to the AIMS service.
-    -   *Default:* `60`
--   `SCA_LLM_MODEL_ID`: The LLM model ID to *request* from AIMS for snippet generation.
-    -   *Default:* `gpt-3.5-turbo`
--   `SCA_LLM_MAX_TOKENS_SNIPPET`: Maximum tokens for the generated snippet (passed as a request to AIMS).
-    -   *Default:* `150`
--   `SCA_LLM_TEMPERATURE_SNIPPET`: LLM sampling temperature (passed as a request to AIMS).
-    -   *Default:* `0.7`
--   `USE_REAL_LLM_SERVICE`: Set to `true` to use a real LLM (via AIMS); `false` for simulated placeholder responses (bypasses AIMS).
-    -   *Default:* `false`
-    -   *Note on placeholder mode (when `false`):* The placeholder generates snippet titles and content directly based on the `content_brief` and `keywords` from the `topic_info` in the request. This provides a more consistent and cleaner simulated response compared to older parsing-based placeholder behavior.
-
-**Flask Application Parameters:**
--   `SCA_HOST` / `FLASK_RUN_HOST`: Host for the Flask development server.
-    -   *Default in `main.py` if run directly:* `0.0.0.0`
--   `SCA_PORT` / `FLASK_RUN_PORT`: Port for the Flask development server.
-    -   *Default in `main.py` if run directly:* `5002`
--   `FLASK_DEBUG`: To run Flask in debug mode (standard Flask variable).
-    -   *Default in `main.py` if run directly:* `True`
+-   `AIMS_SERVICE_URL`: **Required if `USE_REAL_LLM_SERVICE=true`.** URL for AIMS.
+-   `AIMS_REQUEST_TIMEOUT_SECONDS`: Timeout for AIMS requests. *Default: `60`*.
+-   `AIMS_POLLING_INTERVAL_SECONDS`: Interval for polling AIMS if it operates asynchronously. *Default: `5`*.
+-   `AIMS_POLLING_TIMEOUT_SECONDS`: Overall timeout for polling AIMS task results. *Default: `120`*.
+-   `SCA_LLM_MODEL_ID`: LLM model ID to request from AIMS. *Default: `gpt-3.5-turbo`*.
+-   `SCA_LLM_MAX_TOKENS_SNIPPET`: Max tokens for snippet (passed to AIMS). *Default: `150`*.
+-   `SCA_LLM_TEMPERATURE_SNIPPET`: LLM temperature (passed to AIMS). *Default: `0.7`*.
+-   `USE_REAL_LLM_SERVICE`: `true` for real LLM (via AIMS), `false` for simulated responses. *Default: `false`*.
+-   **Flask Application Parameters:**
+    -   `SCA_HOST` / `FLASK_RUN_HOST`: Host for Flask. *Default: `0.0.0.0`*.
+    -   `SCA_PORT` / `FLASK_RUN_PORT`: Port for Flask. *Default: `5002`*.
+    -   `FLASK_DEBUG`: Standard Flask debug mode. *Default: `True`*.
+-   **Celery Configuration:**
+    -   `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`: URLs for Celery broker and backend.
+-   **PostgreSQL Database for Idempotency:** SCA uses a shared PostgreSQL database. Variables (e.g., `POSTGRES_HOST`) are typically from `common.env`.
+-   **Idempotency Behavior Configuration (SCA-specific):**
+    -   These are typically managed by constants within `main.py` but can be overridden by environment variables if `main.py` is adapted to load them into `sca_config` (e.g., `SCA_IDEMPOTENCY_STATUS_PROCESSING`, `SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`). The `.env.example` file shows the default string values used by the application code. Refer to `sca_config` initialization in `main.py` for specifics.
+        -   `SCA_IDEMPOTENCY_STATUS_PROCESSING`: Default "processing"
+        -   `SCA_IDEMPOTENCY_STATUS_COMPLETED`: Default "completed"
+        -   `SCA_IDEMPOTENCY_STATUS_FAILED`: Default "failed"
+        -   `SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Default 1800 seconds (30 minutes)
 
 ## Dependencies
 
@@ -58,94 +54,102 @@ Project dependencies are listed in `requirements.txt`. Install them using pip:
 ```bash
 pip install -r requirements.txt
 ```
-This includes `Flask`, `requests` (for AIMS calls), and `python-dotenv`.
+This includes `Flask`, `requests`, `python-dotenv`, `celery`, `redis`, and `psycopg2-binary`.
 
 ## Running the Service (Standalone)
 
-While SCA is typically called by CPOA, its Flask application can be run as a standalone service:
+1.  Set Environment Variables.
+2.  Start PostgreSQL & Redis.
+3.  Apply `idempotency_keys` table migration.
+4.  Run Flask App: `python aethercast/sca/main.py`
+5.  Run Celery Worker: `celery -A aethercast.sca.main.celery_app worker -l info` (from project root)
 
-1.  Ensure environment variables are set. If `USE_REAL_LLM_SERVICE=true`, ensure `AIMS_SERVICE_URL` and `SCA_LLM_MODEL_ID` are correctly configured.
-2.  Run the Flask development server:
-    ```bash
-    python aethercast/sca/main.py
-    ```
-    This will start the service, typically on `http://0.0.0.0:5002`.
+## Docker
+
+SCA is included in `docker-compose.yml`. Ensure environment variables in `.env` files are set, especially for PostgreSQL and AIMS communication. The `idempotency_keys` table migration must be applied to the `postgres_db` service.
 
 ## API Endpoints
 
-### Craft Snippet
+SCA operates asynchronously using Celery.
+
+### 1. Initiate Snippet Crafting
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/craft_snippet`
--   **Description:** Receives topic information and generates a podcast snippet by calling the AIMS service.
+-   **Description:** Dispatches a Celery task to generate a podcast snippet.
+-   **Headers:**
+    -   `X-Idempotency-Key` (string, **Required**): Unique key for idempotent processing.
+    -   `X-Workflow-ID` (string, Optional): Identifier for correlation.
 -   **Request Payload Example (JSON):**
     ```json
     {
         "topic_id": "topic_12345",
-        "content_brief": "The Future of Renewable Energy", // Used as the main subject for the prompt
-        "topic_info": { // Additional context for richer prompts
+        "content_brief": "The Future of Renewable Energy",
+        "topic_info": {
             "title_suggestion": "The Future of Renewable Energy",
             "summary": "Exploring advancements in solar, wind, and geothermal power.",
-            "keywords": ["solar", "wind", "geothermal", "sustainability"],
-            "potential_sources": [{"title": "Recent study on solar panel efficiency"}]
+            "keywords": ["solar", "wind", "geothermal", "sustainability"]
         }
-        // Optional: "error_trigger": "sca_error" // For testing SCA's internal error handling
     }
     ```
--   **Success Response (200 OK) Example (JSON - SnippetDataObject):**
+-   **Success Response (202 Accepted - JSON):**
     ```json
     {
-        "snippet_id": "snippet_abcdef123456",
-        "topic_id": "topic_12345",
-        "title": "Renewable Revolution: Powering Tomorrow", // Generated by LLM via AIMS
-        "summary": "Recent breakthroughs in solar panel efficiency...", // Generated by LLM via AIMS
-        "text_content": "Recent breakthroughs in solar panel efficiency...", // Same as summary for now
-        "audio_url": "https://aethercast.com/placeholder_audio/snippet_abcdef123456.mp3",
-        "cover_art_prompt": "Podcast snippet cover art for: Renewable Revolution: Powering Tomorrow",
-        "generation_timestamp": "2024-03-15T12:30:00Z",
-        "llm_prompt_used": "Generate a short, engaging podcast snippet title and content...", // The prompt SCA sent to AIMS
-        "llm_model_used": "aims-model-gpt-3.5-turbo", // Model reported by AIMS
-        "original_topic_details_from_tda": { /* ... topic_info from request ... */ }
+        "message": "Snippet crafting task accepted.",
+        "task_id": "celery_task_uuid_string",
+        "status_url": "/v1/tasks/celery_task_uuid_string",
+        "idempotency_key_processed": "client_provided_idempotency_key"
     }
     ```
--   **Error Response Examples (JSON):**
-    -   **400 Bad Request (Invalid Payload or Missing Fields):**
-        ```json
-        {
-            "error_code": "SCA_INVALID_PAYLOAD", // or SCA_MISSING_FIELDS
-            "message": "Invalid or missing JSON payload." // or specific missing fields message
+-   **Error Responses (JSON):**
+    -   **400 Bad Request**: If `X-Idempotency-Key` is missing, or payload is invalid.
+
+### 2. Get Task Status / Result
+
+-   **Endpoint:** `GET /v1/tasks/<task_id>`
+-   **Description:** Poll for task status and result.
+-   **Success Response (200 OK - JSON, if task completed successfully):**
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "SUCCESS",
+        "result": { /* SnippetDataObject */ }
+    }
+    ```
+-   **Conflict Response (409 Conflict - JSON, if idempotency conflict):**
+    If the task execution determined a conflict (e.g., another task with the same idempotency key is currently processing and not timed out).
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "SUCCESS", // Celery task itself finished by returning the conflict info
+        "result": {
+            "status": "PROCESSING_CONFLICT",
+            "message": "Task with this idempotency key is already processing.",
+            "idempotency_key": "client_provided_idempotency_key"
         }
-        ```
-    -   **50X Errors (AIMS Service Error):**
-        If the AIMS service call fails (e.g., timeout, AIMS returns an HTTP error, AIMS response is unparsable):
-        ```json
-        {
-            "error_code": "SCA_AIMS_HTTP_ERROR", // or SCA_AIMS_TIMEOUT, SCA_AIMS_BAD_RESPONSE_STRUCTURE etc.
-            "message": "AIMS request failed with HTTP error.", // or specific error from AIMS interaction
-            "details": "AIMS HTTP Error 500: Internal Server Error. AIMS Service Msg: {...}" // Details from AIMS if available
-        }
-        ```
-    -   **500 Internal Server Error (SCA Internal Simulated Error):**
-        If `error_trigger: "sca_error"` is passed in the request for testing.
-        ```json
-        {
-            "error_code": "SCA_SIMULATED_ERROR",
-            "message": "A simulated error occurred in SCA."
-        }
-        ```
-    -   **500 Internal Server Error (SCA Configuration Error):**
-        If `USE_REAL_LLM_SERVICE` is true but `AIMS_SERVICE_URL` or `SCA_LLM_MODEL_ID` is not set (this would typically prevent startup, but as an error response example).
-        ```json
-        {
-            "error_code": "SCA_AIMS_CONFIG_MISSING",
-            "message": "AIMS_SERVICE_URL not configured."
-        }
-        ```
+    }
+    ```
+-   **Error Response (500 Internal Server Error - JSON, if task failed):**
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "FAILURE",
+        "result": { "error": {"type": "task_failed", "message": "..."} }
+    }
+    ```
+-   **Response (202 Accepted - JSON, if task is still pending/processing without conflict):**
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "PENDING", // Or STARTED, RETRY
+        "result": null
+    }
+    ```
 
 ## Monitoring and Logging
 
-This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, and AIMS (LLM) call performance, are also logged as part of these structured logs.
+Structured JSON logs are output by this service. Refer to main project documentation for details.
 
-For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs sca`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+---
 
-[end of aethercast/sca/README.md]
+*For overarching project details, see the main [README.md](../../../README.md).*

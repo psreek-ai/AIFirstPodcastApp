@@ -20,6 +20,10 @@ POST
 }
 ```
 
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*
+
 ### Success Response (Status Code: 200 OK)
 
 #### For `response_format: {"type": "text"}` (or when `response_format` is omitted)

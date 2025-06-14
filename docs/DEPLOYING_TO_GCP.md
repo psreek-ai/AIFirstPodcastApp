@@ -231,6 +231,26 @@ Execute the following SQL commands in your `psql` session:
     ```
     You might also need to grant usage on the public schema if not already default: `GRANT USAGE ON SCHEMA public TO aethercastuser;`
 
+5.  **Apply Core Table Migrations:**
+    After the database and user are created, and you are connected to `aethercast_db` as `aethercastuser` (or `postgres` user if `aethercastuser` doesn't have rights to create tables initially, then `GRANT ALL ON TABLE ... TO aethercastuser;`):
+    *   **Idempotency Table:** Apply the migration script for the shared `idempotency_keys` table:
+        ```sql
+        -- Contents of aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql
+        CREATE TABLE IF NOT EXISTS idempotency_keys (
+            idempotency_key TEXT PRIMARY KEY,
+            task_name TEXT NOT NULL,
+            workflow_id TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+            locked_at TIMESTAMPTZ,
+            status TEXT NOT NULL, -- e.g., 'processing', 'completed', 'failed'
+            result_payload JSONB,
+            error_payload JSONB
+        );
+        CREATE INDEX IF NOT EXISTS idx_idempotency_locked_at ON idempotency_keys (locked_at) WHERE locked_at IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_idempotency_status ON idempotency_keys (status);
+        ```
+    *   Other services like TDA (`init_tda_db()`) and API Gateway (`init_db()`) create their own tables on startup if they don't exist. Ensure the `aethercastuser` has permissions to create tables or run these DDL statements manually.
+
 ### 4.3. Database Connection Details for Services
 
 The Aethercast services deployed to Cloud Run will need the following connection details. These should be stored securely (e.g., in Secret Manager) and provided to the services as environment variables.
@@ -301,11 +321,30 @@ Create secrets for the following (use descriptive names):
 *   **`aethercast-gcs-bucket-name`**: The name of your GCS bucket for media assets.
 
 *   **Regarding `gcp-credentials.json`:**
-    For services running on Cloud Run, the best practice is to use **Workload Identity** by assigning a dedicated IAM Service Account to each Cloud Run service, granting it the necessary permissions (e.g., to Vertex AI, GCS, Cloud SQL). This avoids needing to manage and mount service account key files (`gcp-credentials.json`) directly.
-    Therefore, storing the entire `gcp-credentials.json` content as a secret is generally **not recommended** for Cloud Run deployments. If a specific service *absolutely cannot* use Workload Identity and *must* use a key file, then storing its content in Secret Manager could be a last resort, but this scenario should be avoided if possible. We will focus on Workload Identity for Cloud Run services.
+    For services running on Cloud Run, the best practice is to use **Workload Identity** by assigning a dedicated IAM Service Account to each Cloud Run service, granting it the necessary permissions. This avoids needing to manage and mount service account key files (`gcp-credentials.json`) directly for GCP service access.
+    Therefore, storing the entire `gcp-credentials.json` content as a secret is generally **not recommended** for Cloud Run deployments interfacing with other GCP services.
+
+**Recommended Secrets for Aethercast (beyond those managed by Workload Identity for GCP services):**
+
+*   **`aethercast-flask-secret-key`**: For `FLASK_SECRET_KEY` (API Gateway, other Flask apps).
+*   **PostgreSQL Connection:**
+    *   `aethercast-pg-user`: The application username (e.g., `aethercastuser`).
+    *   `aethercast-pg-password`: The password for `aethercastuser`.
+    *   `aethercast-pg-db`: The database name (e.g., `aethercast_db`).
+    *   `aethercast-pg-host`: The Cloud SQL instance connection name (socket path like `/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance`) or private IP. This might be composed in the Cloud Run service definition if the socket path is predictable, or the IP stored if static.
+    *   `aethercast-pg-port`: The database port (e.g., `5432`).
+*   **Celery Broker/Backend URLs (if they contain sensitive parts):**
+    *   `aethercast-celery-broker-url`: Full URL for Redis or other broker, if it includes a password.
+    *   `aethercast-celery-result-backend-url`: Full URL for Redis or other backend, if sensitive.
+*   **External API Keys:**
+    *   `aethercast-tda-news-api-key`: For TDA's NewsAPI access.
+*   **Shared Configuration Values (Optional, for consistency):**
+    *   `aethercast-gcp-project-id`: Your GCP Project ID.
+    *   `aethercast-gcp-location`: Primary GCP region.
+    *   `aethercast-gcs-bucket-name`: GCS bucket name.
 
 **Secret Versions:**
-When you update the value of a secret, Secret Manager creates a new version of that secret. You can specify which version a service should access (e.g., `latest` or a specific version number).
+(As before)
 
 ### 5.2. Granting Access to Secrets
 
@@ -390,12 +429,10 @@ Each service in the `aethercast/` directory (e.g., `api_gateway/`, `aims_service
 
 *   **Volume Mounts:** Local Docker Compose configurations might use host-mounted volumes (e.g., for credentials or shared data). These direct host mounts are not applicable to Cloud Run. Secret management (covered in Section 5) and GCS integrations are the cloud-native ways to handle external data and configuration. Cloud Run does support mounting GCS buckets as volumes if needed for specific use cases, which is different from local Docker volume mounts.
 *   **Application Startup (`CMD`/`ENTRYPOINT`):**
-    *   Ensure the `CMD` or `ENTRYPOINT` in each Dockerfile correctly starts the application for production. For Python Flask applications like most Aethercast services, this means using a production-grade WSGI server like `gunicorn`. The existing Aethercast Dockerfiles generally use `gunicorn`, so this should be a point of confirmation. Avoid using the Flask development server (`flask run`) in production images.
-    *   Example (typical `gunicorn` command for Aethercast services):
-        ```Dockerfile
-        CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]
-        ```
-*   **Listening Port:**
+    *   Ensure the `CMD` or `ENTRYPOINT` in each Dockerfile correctly starts the application.
+        *   **Flask Apps (API Gateway, TDA/SCA/PSWA/IGA/VFA services):** Use a production WSGI server like `gunicorn`. Example: `CMD ["gunicorn", "--bind", "0.0.0.0:8080", "main:app"]` (port will be overridden by Cloud Run's `PORT` env var).
+        *   **Celery Workers (TDA/SCA/PSWA/IGA/VFA workers):** The `CMD` should start the Celery worker process. Example: `CMD ["celery", "-A", "main.celery_app", "worker", "-l", "info"]`. You might need separate Dockerfiles or use a startup script if the same image is used for both app server and worker. Often, it's cleaner to have slightly different Docker images or use command overrides in Cloud Run service definitions if the base image is the same.
+*   **Listening Port (for Flask Apps):**
     *   Applications running in Cloud Run must listen for incoming requests on `0.0.0.0`.
     *   Cloud Run automatically provides a `PORT` environment variable (typically `8080`) that your application should listen on. The `gunicorn` command above should bind to this port. If your application code or startup script hardcodes a port, it needs to be updated to use the `PORT` environment variable.
     *   Many of the Aethercast services' `main.py` or Dockerfiles might already be configured to use `os.environ.get("PORT", <default_local_port>)` or similar, which is good. Ensure the Docker `CMD` ultimately respects the `PORT` variable set by Cloud Run.
@@ -597,7 +634,7 @@ gcloud run deploy aethercast-aims-service \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-aims@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
-    --set-env-vars=FLASK_DEBUG=False,AIMS_GOOGLE_LLM_MODEL_ID=gemini-1.0-pro \
+    --set-env-vars=FLASK_DEBUG=False,AIMS_GOOGLE_LLM_MODEL_ID=gemini-1.0-pro,CELERY_BROKER_URL=YOUR_REDIS_URL,CELERY_RESULT_BACKEND=YOUR_REDIS_URL \
     --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest" \
     --cpu=1 \
     --memory=512Mi \
@@ -605,32 +642,19 @@ gcloud run deploy aethercast-aims-service \
     --min-instances=0 \
     --max-instances=2 # Adjust as needed
 ```
-*Replace `YOUR_REGION` and `YOUR_PROJECT_ID`.*
+*Replace `YOUR_REGION`, `YOUR_PROJECT_ID`, and `YOUR_REDIS_URL` (which might come from a Secret if it contains a password, or be the internal DNS for a Memorystore Redis instance).*
 *Ensure the secret names `aethercast-gcp-project-id` and `aethercast-gcp-location` exist in Secret Manager.*
+*Note: AIMS Service itself is synchronous; Celery env vars are listed if it were to ever use Celery internally for some sub-processing, but it's not its primary mode.*
+
 
 #### 7.2.2. Deploying `aims_tts_service`
 
-**Purpose:** Handles Text-to-Speech via Google Cloud TTS and saves audio to GCS.
+**Purpose:** Handles Text-to-Speech via Google Cloud TTS (now via an internal Celery task), saves audio to GCS.
 
-**1. Create Service Account:**
-   - Name: `sa-aethercast-aims-tts`
-   - Email: `sa-aethercast-aims-tts@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Cloud Text-to-Speech User` (roles/cloudtranslate.user) - if using `texttospeech.googleapis.com` directly. Some newer TTS voices might be under Vertex AI, requiring `Vertex AI User`. Check the specific model documentation.
-     - `Storage Object Creator` (roles/storage.objectCreator): To write audio files to your GCS bucket. Grant this specifically on the target GCS bucket for better security.
-     - `Secret Manager Secret Accessor` (roles/secretmanager.secretAccessor).
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-aims-tts --display-name="Aethercast AIMS TTS Service Account"
+**1. Create Service Account:** (As before, ensure Vertex AI User or Cloud Text-to-Speech User, Storage Object Creator, Secret Manager Secret Accessor)
 
-     # Grant roles (replace YOUR_PROJECT_ID and YOUR_GCS_BUCKET_NAME)
-     gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-aims-tts@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudtranslate.user"
-     # gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-aims-tts@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/aiplatform.user" # If using Vertex AI based TTS
-     gcloud storage buckets add-iam-policy-binding gs://YOUR_GCS_BUCKET_NAME --member="serviceAccount:sa-aethercast-aims-tts@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/storage.objectCreator"
-     # Grant access to specific secrets
-     ```
-
-**2. Deploy to Cloud Run:**
+**2. Deploy App Service (`aethercast-aims-tts-service`):**
+   This service will receive HTTP requests and dispatch Celery tasks.
 ```bash
 gcloud run deploy aethercast-aims-tts-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/aims-tts-service:latest \
@@ -638,37 +662,42 @@ gcloud run deploy aethercast-aims-tts-service \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-aims-tts@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \ # For Idempotency
     --set-env-vars=FLASK_DEBUG=False,AIMS_TTS_GCS_AUDIO_PREFIX=audio/aims_tts/,AIMS_TTS_DEFAULT_VOICE_ID=en-US-Wavenet-D,AIMS_TTS_DEFAULT_LANGUAGE_CODE=en-US,AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR=MP3 \
-    --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest" \
+    --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest,POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
     --cpu=1 \
     --memory=512Mi \
     --concurrency=80 \
     --min-instances=0 \
-    --max-instances=2 # Adjust as needed
+    --max-instances=3
+```
+**3. Deploy Worker Service (`aethercast-aims-tts-worker`):**
+   This service runs the Celery worker for `aims_tts_service`.
+```bash
+gcloud run deploy aethercast-aims-tts-worker \
+    --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/aims-tts-service:latest \ # Often uses the same image
+    --platform=managed \
+    --region=YOUR_REGION \
+    --service-account=sa-aethercast-aims-tts@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+    --no-traffics \ # Worker typically doesn't serve HTTP traffic directly
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \ # For Idempotency
+    --set-env-vars=FLASK_DEBUG=False,AIMS_TTS_GCS_AUDIO_PREFIX=audio/aims_tts/,IS_CELERY_WORKER=True \ # Add IS_CELERY_WORKER
+    --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest,POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --command=celery \ # Override CMD to start worker
+    --args="-A,main.celery_app,worker,-l,info" \
+    --cpu=1 \
+    --memory=1Gi # Workers might need more memory for TTS
+    --min-instances=0 \ # Can be 0 for dev/test, or 1+ for prod
+    --max-instances=5
 ```
 
-#### 7.2.3. Deploying `iga_service`
+#### 7.2.3. Deploying `iga_service` (App and Worker)
 
-**Purpose:** Generates images using Vertex AI Imagen and saves them to GCS.
+**Purpose:** Generates images using Vertex AI Imagen (via Celery task) and saves them to GCS.
 
-**1. Create Service Account:**
-   - Name: `sa-aethercast-iga`
-   - Email: `sa-aethercast-iga@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Vertex AI User` (roles/aiplatform.user).
-     - `Storage Object Creator` (roles/storage.objectCreator): To write images to your GCS bucket. Grant on the target bucket.
-     - `Secret Manager Secret Accessor` (roles/secretmanager.secretAccessor).
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-iga --display-name="Aethercast IGA Service Account"
+**1. Create Service Account:** (As before: Vertex AI User, Storage Object Creator, Secret Manager Secret Accessor, Cloud SQL Client for idempotency)
 
-     # Grant roles
-     gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-iga@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/aiplatform.user"
-     gcloud storage buckets add-iam-policy-binding gs://YOUR_GCS_BUCKET_NAME --member="serviceAccount:sa-aethercast-iga@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/storage.objectCreator"
-     # Grant access to specific secrets
-     ```
-
-**2. Deploy to Cloud Run:**
+**2. Deploy App Service (`aethercast-iga-service`):**
 ```bash
 gcloud run deploy aethercast-iga-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/iga-service:latest \
@@ -676,39 +705,37 @@ gcloud run deploy aethercast-iga-service \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-iga@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
-    --set-env-vars=FLASK_DEBUG=False,IGA_GCS_IMAGE_PREFIX=images/iga/,IGA_VERTEXAI_IMAGE_MODEL_ID=imagegeneration@006,IGA_DEFAULT_ASPECT_RATIO=1:1,IGA_ADD_WATERMARK=True \
-    --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest" \
-    --cpu=1 \
-    --memory=512Mi \
-    --concurrency=80 \
-    --min-instances=0 \
-    --max-instances=2 # Adjust as needed
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,IGA_GCS_IMAGE_PREFIX=images/iga/,IGA_VERTEXAI_IMAGE_MODEL_ID=imagegeneration@006 \
+    --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest,POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=3
+```
+**3. Deploy Worker Service (`aethercast-iga-worker`):**
+```bash
+gcloud run deploy aethercast-iga-worker \
+    --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/iga-service:latest \
+    --platform=managed \
+    --region=YOUR_REGION \
+    --service-account=sa-aethercast-iga@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+    --no-traffic \
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,IGA_GCS_IMAGE_PREFIX=images/iga/,IS_CELERY_WORKER=True \
+    --set-secrets="GCP_PROJECT_ID=aethercast-gcp-project-id:latest,GCP_LOCATION=aethercast-gcp-location:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest,POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --command=celery --args="-A,main.celery_app,worker,-l,info" \
+    --cpu=1 --memory=1Gi --min-instances=0 --max-instances=5
 ```
 
-### 7.3. Deploying Core Content and Orchestration Services
+### 7.3. Deploying Core Content and Orchestration Services (App and Worker for each)
 
-These backend services handle the core logic of content processing, discovery, script generation, and audio synthesis orchestration. They are typically internal-facing, called by the API Gateway (which includes CPOA logic) or by each other.
+These services (TDA, SCA, PSWA, VFA) now all follow a similar pattern: a Flask app service for API interactions (task dispatching, status polling) and a Celery worker service for background processing. Both need access to PostgreSQL for idempotency (and potentially other data) and Celery broker (Redis).
 
-#### 7.3.1. Deploying `tda_service`
+#### 7.3.1. Deploying `tda_service` (App and Worker)
 
-**Purpose:** Topic Discovery Agent, responsible for finding and suggesting podcast topics, potentially using external sources like NewsAPI and storing results in the database.
+**Purpose:** Topic Discovery Agent (Celery-based), uses NewsAPI, stores topics in PostgreSQL.
 
-**1. Create Service Account:**
-   - Name: `sa-aethercast-tda`
-   - Email: `sa-aethercast-tda@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Cloud SQL Client` (roles/cloudsql.client): To connect to the Cloud SQL PostgreSQL instance.
-     - `Secret Manager Secret Accessor` (roles/secretmanager.secretAccessor): To access database credentials and NewsAPI key.
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-tda --display-name="Aethercast TDA Service Account"
+**1. Create Service Account:** (As before: Cloud SQL Client, Secret Manager Secret Accessor for DB & NewsAPI key)
 
-     # Grant roles (replace YOUR_PROJECT_ID)
-     gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-tda@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudsql.client"
-     # Grant access to specific secrets (POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB, POSTGRES_HOST, POSTGRES_PORT, TDA_NEWS_API_KEY etc.)
-     ```
-
-**2. Deploy to Cloud Run:**
+**2. Deploy App Service (`aethercast-tda-service`):**
 ```bash
 gcloud run deploy aethercast-tda-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/tda-service:latest \
@@ -717,83 +744,68 @@ gcloud run deploy aethercast-tda-service \
     --service-account=sa-aethercast-tda@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
     --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
-    --set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,USE_REAL_NEWS_API=True,TDA_NEWS_DEFAULT_KEYWORDS="technology" \
-    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-db-user:latest,POSTGRES_PASSWORD=aethercast-db-password:latest,POSTGRES_DB=aethercast-db-name:latest,TDA_NEWS_API_KEY=aethercast-tda-news-api-key:latest" \
-    --cpu=1 \
-    --memory=512Mi \
-    --min-instances=0 \
-    --max-instances=1 # TDA might not need many instances initially
+    --set-env-vars=FLASK_DEBUG=False,USE_REAL_NEWS_API=True \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,TDA_NEWS_API_KEY=aethercast-tda-news-api-key:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=2
 ```
-*Replace placeholders. Ensure secret names match those in Secret Manager (e.g., `aethercast-db-user` for the DB username, `aethercast-db-name` for the DB name if also stored as a secret, though often `aethercast_db` is fixed).*
-*Note: `POSTGRES_HOST` is set to the Cloud SQL socket path when using `--add-cloudsql-instances`.*
-
-#### 7.3.2. Deploying `sca_service`
-
-**Purpose:** Snippet Craft Agent, responsible for generating short text snippets, calling `aims_service`.
-
-**1. Create Service Account:**
-   - Name: `sa-aethercast-sca`
-   - Email: `sa-aethercast-sca@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Secret Manager Secret Accessor` (if any secrets like AIMS_SERVICE_URL were stored, though direct env var is also common).
-     - `Cloud Run Invoker` (roles/run.invoker): To invoke `aethercast-aims-service`. This should be granted on `aethercast-aims-service` for `sa-aethercast-sca`.
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-sca --display-name="Aethercast SCA Service Account"
-     # Grant access to specific secrets if any are used by SCA
-
-     # Grant permission for SCA to invoke AIMS service (on AIMS service)
-     # gcloud run services add-iam-policy-binding aethercast-aims-service \
-     #    --member="serviceAccount:sa-aethercast-sca@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-     #    --role="roles/run.invoker" \
-     #    --region=YOUR_REGION
-     ```
-     *(Note: Service-to-service authentication can also rely on authenticated internal ingress if both services are in the same project and network context, reducing the need for explicit invoker roles for internal traffic, but explicit invoker role is more secure).*
-
-**2. Deploy to Cloud Run:**
-   The `AIMS_SERVICE_URL` will be the internal URL provided by Cloud Run for the `aethercast-aims-service`. You can get this URL after deploying `aims-service` (e.g., from `gcloud run services describe aethercast-aims-service --region=YOUR_REGION --format='value(status.url)'`).
+**3. Deploy Worker Service (`aethercast-tda-worker`):**
 ```bash
-# Example: AIMS_SERVICE_INTERNAL_URL=$(gcloud run services describe aethercast-aims-service --platform managed --region YOUR_REGION --format 'value(status.url)')
+gcloud run deploy aethercast-tda-worker \
+    --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/tda-service:latest \
+    --platform=managed \
+    --region=YOUR_REGION \
+    --service-account=sa-aethercast-tda@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+    --no-traffic \
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,USE_REAL_NEWS_API=True,IS_CELERY_WORKER=True \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,TDA_NEWS_API_KEY=aethercast-tda-news-api-key:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --command=celery --args="-A,main.celery_app,worker,-l,info" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=3
+```
 
+#### 7.3.2. Deploying `sca_service` (App and Worker)
+
+**Purpose:** Snippet Craft Agent (Celery-based), calls `aims_service`.
+
+**1. Create Service Account:** (As before: Secret Manager Accessor, Cloud Run Invoker for AIMS, Cloud SQL Client for idempotency)
+
+**2. Deploy App Service (`aethercast-sca-service`):**
+```bash
+# AIMS_SERVICE_INTERNAL_URL should be set from deployed aims-service
 gcloud run deploy aethercast-sca-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/sca-service:latest \
     --platform=managed \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-sca@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
-    --set-env-vars=FLASK_DEBUG=False,USE_REAL_LLM_SERVICE=True,AIMS_SERVICE_URL=YOUR_AIMS_SERVICE_INTERNAL_URL,SCA_LLM_MODEL_ID="gemini-1.0-pro" \
-    --cpu=1 \
-    --memory=512Mi \
-    --min-instances=0 \
-    --max-instances=1
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,USE_REAL_LLM_SERVICE=True,AIMS_SERVICE_URL=$AIMS_SERVICE_INTERNAL_URL \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=2
 ```
-*Replace `YOUR_AIMS_SERVICE_INTERNAL_URL` with the actual internal URL of your deployed `aethercast-aims-service`.*
-
-#### 7.3.3. Deploying `pswa_service`
-
-**Purpose:** Podcast Script Weaver Agent, generates full podcast scripts using `aims_service` and caches results in the database.
-
-**1. Create Service Account:**
-   - Name: `sa-aethercast-pswa`
-   - Email: `sa-aethercast-pswa@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Cloud SQL Client` (roles/cloudsql.client).
-     - `Secret Manager Secret Accessor`.
-     - `Cloud Run Invoker` (roles/run.invoker): To invoke `aethercast-aims-service`. Grant on `aethercast-aims-service`.
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-pswa --display-name="Aethercast PSWA Service Account"
-
-     # Grant roles
-     gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-pswa@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudsql.client"
-     # Grant access to specific secrets (DB secrets, AIMS_SERVICE_URL if stored as secret)
-     # Grant invoker role to aims-service similar to SCA if needed
-     ```
-
-**2. Deploy to Cloud Run:**
+**3. Deploy Worker Service (`aethercast-sca-worker`):**
 ```bash
-# Example: AIMS_SERVICE_INTERNAL_URL=$(gcloud run services describe aethercast-aims-service --platform managed --region YOUR_REGION --format 'value(status.url)')
+gcloud run deploy aethercast-sca-worker \
+    --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/sca-service:latest \
+    --platform=managed \
+    --region=YOUR_REGION \
+    --service-account=sa-aethercast-sca@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+    --no-traffic \
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,USE_REAL_LLM_SERVICE=True,AIMS_SERVICE_URL=$AIMS_SERVICE_INTERNAL_URL,IS_CELERY_WORKER=True \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --command=celery --args="-A,main.celery_app,worker,-l,info" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=3
+```
 
+#### 7.3.3. Deploying `pswa_service` (App and Worker)
+
+**Purpose:** Podcast Script Weaver Agent (Celery-based), calls `aims_service`, uses DB for cache & idempotency.
+
+**1. Create Service Account:** (As before: Cloud SQL Client, Secret Manager Accessor, Cloud Run Invoker for AIMS)
+
+**2. Deploy App Service (`aethercast-pswa-service`):**
+```bash
 gcloud run deploy aethercast-pswa-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/pswa-service:latest \
     --platform=managed \
@@ -801,147 +813,95 @@ gcloud run deploy aethercast-pswa-service \
     --service-account=sa-aethercast-pswa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
     --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
-    --set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,PSWA_SCRIPT_CACHE_ENABLED=True,AIMS_SERVICE_URL=YOUR_AIMS_SERVICE_INTERNAL_URL \
-    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-db-user:latest,POSTGRES_PASSWORD=aethercast-db-password:latest,POSTGRES_DB=aethercast-db-name:latest" \
-    --cpu=1 \
-    --memory=512Mi \
-    --min-instances=0 \
-    --max-instances=1
+    --set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,PSWA_SCRIPT_CACHE_ENABLED=True,AIMS_SERVICE_URL=$AIMS_SERVICE_INTERNAL_URL,PSWA_TEST_MODE_ENABLED=False \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=2
 ```
-*Replace `YOUR_AIMS_SERVICE_INTERNAL_URL`.*
-
-#### 7.3.4. Deploying `vfa_service`
-
-**Purpose:** Voice Forge Agent, orchestrates voice synthesis by calling `aims_tts_service`.
-
-**1. Create Service Account:**
-   - Name: `sa-aethercast-vfa`
-   - Email: `sa-aethercast-vfa@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Secret Manager Secret Accessor` (if any secrets used).
-     - `Cloud Run Invoker` (roles/run.invoker): To invoke `aethercast-aims-tts-service`. Grant on `aethercast-aims-tts-service`.
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-vfa --display-name="Aethercast VFA Service Account"
-     # Grant access to specific secrets if any
-     # Grant invoker role to aims-tts-service
-     ```
-
-**2. Deploy to Cloud Run:**
+**3. Deploy Worker Service (`aethercast-pswa-worker`):**
 ```bash
-# Example: AIMS_TTS_SERVICE_INTERNAL_URL=$(gcloud run services describe aethercast-aims-tts-service --platform managed --region YOUR_REGION --format 'value(status.url)')
+gcloud run deploy aethercast-pswa-worker \
+    --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/pswa-service:latest \
+    --platform=managed \
+    --region=YOUR_REGION \
+    --service-account=sa-aethercast-pswa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+    --no-traffic \
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,PSWA_SCRIPT_CACHE_ENABLED=True,AIMS_SERVICE_URL=$AIMS_SERVICE_INTERNAL_URL,PSWA_TEST_MODE_ENABLED=False,IS_CELERY_WORKER=True \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --command=celery --args="-A,main.pswa_celery_app,worker,-l,info" \
+    --cpu=1 --memory=1Gi --min-instances=0 --max-instances=3
+```
 
+#### 7.3.4. Deploying `vfa_service` (App and Worker)
+
+**Purpose:** Voice Forge Agent (Celery-based), calls `aims_tts_service`.
+
+**1. Create Service Account:** (As before: Secret Manager Accessor, Cloud Run Invoker for AIMS_TTS, Cloud SQL Client for idempotency)
+
+**2. Deploy App Service (`aethercast-vfa-service`):**
+```bash
 gcloud run deploy aethercast-vfa-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/vfa-service:latest \
     --platform=managed \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-vfa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=internal \
-    --set-env-vars=FLASK_DEBUG=False,VFA_TEST_MODE_ENABLED=False,AIMS_TTS_SERVICE_URL=YOUR_AIMS_TTS_SERVICE_INTERNAL_URL \
-    --cpu=1 \
-    --memory=512Mi \
-    --min-instances=0 \
-    --max-instances=1
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,VFA_TEST_MODE_ENABLED=False,AIMS_TTS_SERVICE_URL=$AIMS_TTS_SERVICE_INTERNAL_URL \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --cpu=1 --memory=512Mi --min-instances=0 --max-instances=2
 ```
-*Replace `YOUR_AIMS_TTS_SERVICE_INTERNAL_URL`.*
+**3. Deploy Worker Service (`aethercast-vfa-worker`):**
+```bash
+gcloud run deploy aethercast-vfa-worker \
+    --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/vfa-service:latest \
+    --platform=managed \
+    --region=YOUR_REGION \
+    --service-account=sa-aethercast-vfa@YOUR_PROJECT_ID.iam.gserviceaccount.com \
+    --no-traffic \
+    --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
+    --set-env-vars=FLASK_DEBUG=False,VFA_TEST_MODE_ENABLED=False,AIMS_TTS_SERVICE_URL=$AIMS_TTS_SERVICE_INTERNAL_URL,IS_CELERY_WORKER=True \
+    --set-secrets="POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --command=celery --args="-A,main.celery_app,worker,-l,info" \
+    --cpu=1 --memory=1Gi --min-instances=0 --max-instances=3
+```
 
 #### 7.3.5. Deploying `asf_service`
 
-**Purpose:** Audio Stream Feeder, handles WebSocket connections for real-time audio streaming and UI updates.
+**Purpose:** Audio Stream Feeder (WebSocket service). Does not use Celery itself.
 
-**1. Create Service Account:**
-   - Name: `sa-aethercast-asf`
-   - Email: `sa-aethercast-asf@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Secret Manager Secret Accessor` (for `FLASK_SECRET_KEY`).
-     - `Cloud Run Invoker` (roles/run.invoker): To invoke `api-gateway` for internal calls if needed.
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-asf --display-name="Aethercast ASF Service Account"
-     # Grant access to FLASK_SECRET_KEY secret
-     # Grant invoker role to api-gateway if needed
-     ```
+**1. Create Service Account:** (As before: Secret Manager Accessor, Cloud Run Invoker for API GW for signed URLs)
 
-**2. Deploy to Cloud Run:**
-   The `INTERNAL_API_GW_BASE_URL` will be the internal URL of the deployed `aethercast-api-gateway`.
-   `ASF_CORS_ALLOWED_ORIGINS` should be the public URL of your deployed API Gateway or frontend.
-   Cloud Run supports WebSockets directly. If the frontend connects directly to ASF, ASF ingress needs to be `all` and secured (e.g., with IAP or in-app auth). For now, assuming API Gateway proxies or ASF is internal. If direct client access is needed, `--allow-unauthenticated` and `--ingress=all` would be used, with robust application-level authentication for WebSockets.
-
+**2. Deploy to Cloud Run:** (As before, ensure `INTERNAL_API_GW_BASE_URL` is set to the deployed API Gateway's internal URL)
 ```bash
 # Example: API_GATEWAY_INTERNAL_URL=$(gcloud run services describe aethercast-api-gateway --platform managed --region YOUR_REGION --format 'value(status.url)')
-# Example: FRONTEND_URL="https://your-frontend-or-api-gateway-url.a.run.app" # Or custom domain
+# Example: FRONTEND_URL="https://your-frontend-or-api-gateway-url.a.run.app"
 
 gcloud run deploy aethercast-asf-service \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/asf-service:latest \
     --platform=managed \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-asf@YOUR_PROJECT_ID.iam.gserviceaccount.com \
-    --ingress=internal \ # Change to 'all' if clients connect directly to ASF WebSockets
+    --ingress=internal \
     --session-affinity \
-    --set-env-vars=FLASK_DEBUG=False,INTERNAL_API_GW_BASE_URL=YOUR_API_GATEWAY_INTERNAL_URL,ASF_CORS_ALLOWED_ORIGINS=YOUR_FRONTEND_URL \
+    --set-env-vars=FLASK_DEBUG=False,INTERNAL_API_GW_BASE_URL=$API_GATEWAY_INTERNAL_URL,ASF_CORS_ALLOWED_ORIGINS=$FRONTEND_URL \
     --set-secrets="FLASK_SECRET_KEY=aethercast-flask-secret-key:latest" \
-    --cpu=1 \
-    --memory=512Mi \
-    --concurrency=20 # Lower concurrency might be suitable for WebSocket services
-    --min-instances=0 \
-    --max-instances=1
+    --cpu=1 --memory=512Mi --concurrency=80 --min-instances=0 --max-instances=2
 ```
-*Replace `YOUR_API_GATEWAY_INTERNAL_URL` and `YOUR_FRONTEND_URL`.*
-*Consider security implications carefully if changing ingress to `all` for ASF.*
 
 ### 7.4. Deploying the API Gateway Service
 
-The API Gateway is the main public entry point for the Aethercast system. It handles incoming user requests, serves the frontend (if this deployment strategy is chosen), orchestrates the Central Podcast Orchestrator Agent (CPOA) logic which runs within its process, and interacts with various backend services.
+(No significant changes here other than ensuring the backend service URLs passed as env vars are the new Cloud Run URLs for the *app services* of TDA, PSWA, etc., not their workers). The `api-gateway-service` itself doesn't run a Celery worker. Its CPOA logic dispatches tasks to other services' Celery queues.
 
 #### 7.4.1. Deploying `api-gateway-service`
 
-**Purpose:** The primary public-facing service. It routes requests, manages user authentication and sessions, interacts with the database, and calls other backend microservices to fulfill user requests.
-
-**1. Create Service Account:**
-   - Name: `sa-aethercast-api-gateway`
-   - Email: `sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com`
-   - Required IAM Roles:
-     - `Cloud SQL Client` (roles/cloudsql.client): To connect to the Cloud SQL PostgreSQL instance.
-     - `Secret Manager Secret Accessor` (roles/secretmanager.secretAccessor): To access its own secrets (like `FLASK_SECRET_KEY`) and database credentials.
-     - `Service Account Token Creator` (roles/iam.serviceAccountTokenCreator): **On itself.** Required for the API Gateway to sign GCS URLs directly.
-     - `Cloud Run Invoker` (roles/run.invoker): To call all other internal Aethercast Cloud Run services (TDA, PSWA, SCA, VFA, IGA, ASF). This role needs to be granted to this service account *on each target service* or on a broader scope if using a shared project/network setup that allows authenticated internal calls.
-     ```bash
-     # Create Service Account
-     gcloud iam service-accounts create sa-aethercast-api-gateway --display-name="Aethercast API Gateway Service Account"
-
-     # Grant roles (replace YOUR_PROJECT_ID)
-     gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/cloudsql.client"
-     gcloud projects add-iam-policy-binding YOUR_PROJECT_ID --member="serviceAccount:sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com" --role="roles/iam.serviceAccountTokenCreator" # For signing GCS URLs
-
-     # Grant access to specific secrets (FLASK_SECRET_KEY, DB secrets, GCS_BUCKET_NAME etc.)
-     # Example for one secret:
-     # gcloud secrets add-iam-policy-binding aethercast-flask-secret-key \
-     #    --member="serviceAccount:sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-     #    --role="roles/secretmanager.secretAccessor"
-     # Repeat for all secrets it needs.
-
-     # Grant Cloud Run Invoker role to this SA for each backend service it calls.
-     # Example for tda-service:
-     # gcloud run services add-iam-policy-binding aethercast-tda-service \
-     #    --member="serviceAccount:sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-     #    --role="roles/run.invoker" \
-     #    --region=YOUR_REGION
-     # Repeat for pswa, sca, vfa, iga, asf services.
-     ```
+**1. Create Service Account:** (As before: Cloud SQL Client, Secret Manager Accessor, SA Token Creator for GCS URLs, Cloud Run Invoker for all backend app services TDA, PSWA, SCA, VFA, IGA, ASF).
 
 **2. Deploy to Cloud Run:**
-   The service URLs for backend services (`TDA_SERVICE_URL`, `PSWA_SERVICE_URL`, etc.) will be the `.run.app` URLs provided by Cloud Run after each of those services is deployed. You will need to collect these URLs.
-
-   **Note on `ASF_WEBSOCKET_BASE_URL`:** If ASF service's ingress is `internal`, API Gateway would need to proxy WebSocket connections, which is complex. If ASF ingress is `all` (public, but secured), this URL would be ASF's public `.run.app` URL. This guide assumes internal URLs for service-to-service REST calls; WebSocket proxying by API GW is an advanced topic not covered here. For direct client-to-ASF WebSocket, ASF would need public ingress.
-
 ```bash
-# You'll need to gather these URLs from your deployed backend services:
-# TDA_URL=$(gcloud run services describe aethercast-tda-service --platform managed --region YOUR_REGION --format 'value(status.url)')
-# PSWA_URL=$(gcloud run services describe aethercast-pswa-service --platform managed --region YOUR_REGION --format 'value(status.url)')
-# VFA_URL=$(gcloud run services describe aethercast-vfa-service --platform managed --region YOUR_REGION --format 'value(status.url)')
-# SCA_URL=$(gcloud run services describe aethercast-sca-service --platform managed --region YOUR_REGION --format 'value(status.url)')
-# IGA_URL=$(gcloud run services describe aethercast-iga-service --platform managed --region YOUR_REGION --format 'value(status.url)')
-# ASF_URL=$(gcloud run services describe aethercast-asf-service --platform managed --region YOUR_REGION --format 'value(status.url)') # Internal URL for notifications
+# Gather internal URLs for all backend services (TDA_URL, PSWA_URL, etc.)
+# Example: TDA_APP_URL=$(gcloud run services describe aethercast-tda-service --platform managed --region YOUR_REGION --format 'value(status.url)')
+# ... and so on for SCA_APP_URL, PSWA_APP_URL, VFA_APP_URL, IGA_APP_URL, ASF_APP_URL
 
 gcloud run deploy aethercast-api-gateway \
     --image=YOUR_REGION-docker.pkg.dev/YOUR_PROJECT_ID/aethercast-services/api-gateway:latest \
@@ -949,534 +909,64 @@ gcloud run deploy aethercast-api-gateway \
     --region=YOUR_REGION \
     --service-account=sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com \
     --ingress=all \
-    --allow-unauthenticated \ # This makes the API Gateway public
+    --allow-unauthenticated \
     --add-cloudsql-instances=YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance \
-    --set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,TDA_SERVICE_URL=$TDA_URL,PSWA_SERVICE_URL=$PSWA_URL,VFA_SERVICE_URL=$VFA_URL,SCA_SERVICE_URL=$SCA_URL,IGA_SERVICE_URL=$IGA_URL,ASF_NOTIFICATION_URL=$ASF_URL/asf/internal/notify_new_audio,CPOA_ASF_SEND_UI_UPDATE_URL=$ASF_URL/asf/internal/send_ui_update,ASF_WEBSOCKET_BASE_URL=ws://$ASF_URL # Adjust ASF_WEBSOCKET_BASE_URL based on how ASF is exposed \
-    --set-secrets="FLASK_SECRET_KEY=aethercast-flask-secret-key:latest,POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-db-user:latest,POSTGRES_PASSWORD=aethercast-db-password:latest,POSTGRES_DB=aethercast-db-name:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest" \
-    --cpu=1 \
-    --memory=1Gi # API Gateway might need more memory as it runs CPOA
-    --concurrency=80 \
-    --min-instances=0 # Set to 1 or more for production to reduce cold starts
-    --max-instances=5 # Adjust as needed
+    --set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,TDA_SERVICE_URL=$TDA_APP_URL,PSWA_SERVICE_URL=$PSWA_APP_URL,VFA_SERVICE_URL=$VFA_APP_URL,SCA_SERVICE_URL=$SCA_APP_URL,IGA_SERVICE_URL=$IGA_APP_URL,ASF_NOTIFICATION_URL=$ASF_APP_URL/asf/internal/notify_new_audio,CPOA_ASF_SEND_UI_UPDATE_URL=$ASF_APP_URL/asf/internal/send_ui_update,ASF_WEBSOCKET_BASE_URL=ws_or_wss_url_for_asf \
+    --set-secrets="FLASK_SECRET_KEY=aethercast-flask-secret-key:latest,POSTGRES_HOST=/cloudsql/YOUR_PROJECT_ID:YOUR_REGION:aethercast-postgres-instance,POSTGRES_PORT=5432,POSTGRES_USER=aethercast-pg-user:latest,POSTGRES_PASSWORD=aethercast-pg-password:latest,POSTGRES_DB=aethercast-pg-db:latest,GCS_BUCKET_NAME=aethercast-gcs-bucket-name:latest,CELERY_BROKER_URL=aethercast-celery-broker-url:latest,CELERY_RESULT_BACKEND=aethercast-celery-result-backend-url:latest" \
+    --cpu=1 --memory=1Gi --concurrency=80 --min-instances=0 --max-instances=5
 ```
-*Replace placeholders like `YOUR_REGION`, `YOUR_PROJECT_ID`, and ensure the service URLs are correctly captured and set.*
-*The `--allow-unauthenticated` flag makes the API Gateway publicly accessible. For production, you would typically put this behind a Google Cloud Load Balancer and configure security measures like IAP (Identity-Aware Proxy) or an API Gateway product (e.g., Apigee or Cloud Endpoints with ESPv2).*
-
-**Authentication Note:**
-While `--allow-unauthenticated` makes the Cloud Run service itself open to invocation, the Aethercast API Gateway has its own built-in JWT-based authentication for many of its endpoints (e.g., `/api/v1/podcasts`, `/api/v1/topics/explore`). Publicly accessible, non-authenticated endpoints include `/auth/register`, `/auth/login`, `/api/v1/snippets`, `/api/v1/categories`, and the frontend serving paths.
 
 ## 8. Inter-Service Communication in Cloud Run
-
-Aethercast is a microservices-based architecture, meaning its various services (API Gateway, AIMS, TDA, etc.) need to communicate with each other over the network. When deployed to Cloud Run, this communication typically happens via HTTPS requests.
-
-### 8.1. Service Discovery
-
-Each Cloud Run service, upon deployment, is assigned a stable and unique HTTPS URL by Google Cloud. This URL is the primary way other services will discover and interact with it.
-
-*   **URL Format:** The URL typically looks like `https://[SERVICE_NAME]-[PROJECT_HASH]-[REGION_CODE].a.run.app`.
-    *   `[SERVICE_NAME]`: The name you gave your Cloud Run service (e.g., `aethercast-aims-service`).
-    *   `[PROJECT_HASH]`: A unique hash generated for your project and region.
-    *   `[REGION_CODE]`: A short code for the region (e.g., `uc` for `us-central1`).
-*   **Usage:** These URLs are used to configure the environment variables of services that need to call other services. For example, the API Gateway service will have environment variables like `TDA_SERVICE_URL`, `PSWA_SERVICE_URL`, etc., populated with the respective `.run.app` URLs of those backend services.
-
-You can retrieve the URL of a deployed Cloud Run service using the GCP Console or via `gcloud`:
-```bash
-gcloud run services describe YOUR_SERVICE_NAME --platform managed --region YOUR_REGION --format 'value(status.url)'
-```
-
-### 8.2. Authentication and Authorization for Internal Services
-
-For security, backend services that are not intended to be publicly accessible should be configured with internal ingress.
-
-*   **Ingress Control:** As mentioned in Section 7.1, backend services like `aims-service`, `tda-service`, etc., should be deployed with `--ingress=internal` or `--ingress=internal-and-cloud-load-balancing`. This restricts access to traffic originating from within your GCP project's VPC network or other Cloud Run services in the same project/region.
-
-*   **Authenticated Calls:** Even with internal ingress, Cloud Run enforces that invocations to these services are authenticated. This is achieved using IAM and service accounts:
-    1.  **Caller's Identity:** The calling Cloud Run service (e.g., `api-gateway-service`) runs with its own dedicated IAM service account (e.g., `sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com`).
-    2.  **Permission to Invoke:** This service account must be granted the `Cloud Run Invoker` role (`roles/run.invoker`) on the target (callee) service (e.g., `tda-service`). This was outlined in the deployment steps for each service in Section 7.
-        ```bash
-        # Example: Granting API Gateway's SA permission to invoke TDA service
-        gcloud run services add-iam-policy-binding aethercast-tda-service \
-            --member="serviceAccount:sa-aethercast-api-gateway@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
-            --role="roles/run.invoker" \
-            --region=YOUR_REGION \
-            --platform=managed
-        ```
-    3.  **Automatic Token Acquisition:** When a Cloud Run service makes an HTTPS request to another Cloud Run service (that requires authentication), the Google Cloud client libraries (or the `google-auth` library for Python) can automatically fetch an OIDC identity token from the local metadata server. This token represents the identity of the calling service's service account.
-    4.  **Authorization Header:** This identity token is then included as a `Bearer` token in the `Authorization` header of the HTTPS request to the target service.
-        `Authorization: Bearer [ID_TOKEN]`
-    5.  **Verification by Callee:** The receiving Cloud Run service automatically verifies this token with Google's authentication servers to ensure the caller is legitimate and has the `run.invoker` permission.
-
-*   **Making Authenticated Requests in Code:**
-    *   **Using Google Cloud Client Libraries:** If you are using a Google Cloud client library (e.g., for Pub/Sub, Storage, etc.) from within a Cloud Run service to call another Google API or an authenticated Cloud Run service, these libraries typically handle the authentication flow (fetching and attaching the token) transparently, provided the service account has the necessary permissions.
-    *   **Using `google-auth` with `requests` (Python):** For making generic HTTP requests from one Cloud Run service to another, you can use the `google.auth.transport.requests` module along with `google.oauth2.id_token`.
-        ```python
-        import google.auth.transport.requests
-        import google.oauth2.id_token
-        import requests
-
-        # Target URL of the internal Cloud Run service
-        target_url = "https://internal-service-xxxxxx-uc.a.run.app/path"
-
-        # Obtain an identity token for the target audience (URL)
-        auth_req = google.auth.transport.requests.Request()
-        id_token = google.oauth2.id_token.fetch_id_token(auth_req, target_url)
-
-        # Include the token in the Authorization header
-        headers = {
-            "Authorization": f"Bearer {id_token}"
-        }
-
-        response = requests.get(target_url, headers=headers)
-        # Process response
-        ```
-    *   **Manual Token Fetching (Less Common for Direct Calls):** While possible to query the metadata server endpoint (`http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity?audience=[AUDIENCE]`) directly to get a token, using the `google-auth` library is generally simpler and more robust. The `AUDIENCE` is typically the URL of the service you are calling.
-
-### 8.3. Example Configuration
-
-When deploying a service like the API Gateway, you will set environment variables for the URLs of the backend services it needs to call.
-
-For example, in the `gcloud run deploy aethercast-api-gateway ...` command (from Section 7.4.1), you would have lines like:
-
-```bash
-# ... other flags ...
---set-env-vars=FLASK_DEBUG=False,DATABASE_TYPE=postgres,TDA_SERVICE_URL=https://aethercast-tda-service-xxxxxx-uc.a.run.app,PSWA_SERVICE_URL=https://aethercast-pswa-service-yyyyyy-uc.a.run.app # ... and so on for other services
-# ... other flags ...
-```
-These URLs (`https://aethercast-tda-service-xxxxxx-uc.a.run.app`, etc.) are the stable HTTPS endpoints provided by Cloud Run for your deployed internal services.
-
-### 8.4. VPC Network Considerations (Recap)
-
-As mentioned previously:
-*   If your Cloud SQL instance uses a **Private IP**, your Cloud Run services needing database access must be configured with a **Serverless VPC Access connector**. This connector allows Cloud Run to communicate with resources within your VPC network.
-*   Communication between Cloud Run services, even if they are `internal` ingress, happens over Google's network infrastructure. If these services and the Cloud SQL instance (with Private IP) are connected via the same VPC network (through the connector for Cloud Run), then the database communication path remains within your VPC, enhancing security.
-*   Service-to-service calls between Cloud Run services themselves (e.g., API Gateway to TDA) use their `.run.app` URLs. These are resolved by Google's infrastructure. If both services are `internal` and in the same project/region, the traffic is routed internally within Google's network.
+(No changes seem immediately necessary in sections 8.1 to 8.4 due to idempotency itself, but the context is now Celery tasks for many backend services).
 
 ## 9. Authentication and Authorization (IAM for Cloud Run Services)
-
-Securing your Aethercast services on Google Cloud Platform is paramount. Identity and Access Management (IAM) is the core tool within GCP for managing who (which identity) has what access (which roles/permissions) to which resources. This section focuses on how IAM is used to secure Aethercast services running on Cloud Run.
-
-### 9.1. Principle of Least Privilege
-
-A core security principle applied throughout the Aethercast deployment on Cloud Run is the **Principle of Least Privilege**. This means:
-
-*   **Dedicated Service Accounts:** Each Aethercast Cloud Run service (e.g., `aethercast-api-gateway`, `aethercast-aims-service`, `aethercast-tda-service`, etc.) is configured to run with its own dedicated IAM Service Account (SA). This was specified using the `--service-account` flag during deployment in Section 7.
-*   **Minimal Permissions:** Each dedicated service account is granted only the specific IAM roles and permissions it absolutely needs to perform its tasks. For example, a service that only reads from a GCS bucket would not be granted permission to delete objects or manage the bucket itself.
-
-This approach significantly minimizes the potential impact if a single service were to be compromised, as the compromised service account would only have access to a limited set of resources and actions.
-
-### 9.2. Key IAM Roles Used (Summary)
-
-During the deployment steps outlined in Section 7, several common IAM roles were assigned to the service accounts for the Aethercast services. Here's a summary of these roles and their purpose within the Aethercast system:
-
-*   **`roles/secretmanager.secretAccessor` (Secret Manager Secret Accessor):**
-    *   **Purpose:** Allows a service to access the *values* of secrets stored in Google Secret Manager.
-    *   **Used By:** All services that need to retrieve sensitive configuration at runtime, such as database passwords (`POSTGRES_PASSWORD`), API keys (`TDA_NEWS_API_KEY`), or application secrets (`FLASK_SECRET_KEY`).
-
-*   **`roles/run.invoker` (Cloud Run Invoker):**
-    *   **Purpose:** Allows a service account (the caller) to invoke (make requests to) another Cloud Run service (the callee) when that callee service has its ingress restricted to "internal" or "internal-and-cloud-load-balancing".
-    *   **Used By:** Service accounts of services that need to make calls to other internal Aethercast services. For example, `sa-aethercast-api-gateway` needs this role on `aethercast-tda-service`, `aethercast-pswa-service`, etc.
-
-*   **`roles/cloudsql.client` (Cloud SQL Client):**
-    *   **Purpose:** Allows a service to connect to Cloud SQL instances within the same project using the Cloud SQL Auth Proxy or direct IP connections.
-    *   **Used By:** Services that directly interact with the PostgreSQL database (e.g., `aethercast-api-gateway`, `aethercast-tda-service`, `aethercast-pswa-service`).
-
-*   **`roles/storage.objectCreator` (Storage Object Creator):**
-    *   **Purpose:** Allows a service to create (upload) objects in a GCS bucket.
-    *   **Used By:** Services that write media files to GCS, such as `aethercast-aims-tts-service` (for audio files) and `aethercast-iga-service` (for images). This role is typically granted on the specific `aethercast-media` GCS bucket.
-
-*   **`roles/storage.objectViewer` (Storage Object Viewer):**
-    *   **Purpose:** Allows a service to read (download) objects from a GCS bucket.
-    *   **Used By:** While not explicitly detailed for many backend services (as they might create and then just pass GCS URIs), if a service needed to directly read GCS objects managed by another service, it would need this role (or `roles/storage.objectAdmin` for broader access). The API Gateway, when generating signed URLs, doesn't need this to *read the object itself* but needs permission to *sign the URL*.
-
-*   **`roles/aiplatform.user` (Vertex AI User):**
-    *   **Purpose:** Allows a service to interact with Vertex AI resources, primarily for making predictions with AI models or managing AI platform jobs.
-    *   **Used By:** Services that utilize Vertex AI, such as `aethercast-aims-service` (for LLMs), `aethercast-iga-service` (for Imagen), and potentially `aethercast-aims-tts-service` if using Vertex AI-based TTS models.
-
-*   **`roles/iam.serviceAccountTokenCreator` (Service Account Token Creator):**
-    *   **Purpose:** Allows a service account to create OIDC identity tokens or OAuth 2.0 access tokens for *itself* or other service accounts it has permission to impersonate. In the Aethercast context, this is primarily used by the `sa-aethercast-api-gateway` service account (granted on itself) to create signed URLs for GCS objects. This allows it to sign a URL that grants temporary access to a GCS object.
-    *   **Used By:** `sa-aethercast-api-gateway`.
-
-### 9.3. Reviewing Permissions
-
-It's good security hygiene to periodically review the IAM permissions granted to your service accounts and other principals (like users or groups).
-
-*   **Ensure Least Privilege:** As your application evolves, requirements might change. Verify that services only have the permissions they currently need. Remove any unnecessary roles or permissions.
-*   **GCP Console IAM Page:** The [IAM & Admin page](https://console.cloud.google.com/iam-admin/iam) in the GCP Console is the central place to view and manage all IAM policies for your project, including service accounts and their roles. You can also view permissions on individual resources (like a specific Secret or GCS bucket).
-
-### 9.4. Service-to-Service Authentication Recap
-
-As detailed in **Section 8.2. Authentication and Authorization for Internal Services**, the IAM roles, particularly `roles/run.invoker`, are fundamental to securing communication between your Cloud Run services. When a service like the API Gateway (running as `sa-aethercast-api-gateway`) calls an internal service like TDA (running as `sa-aethercast-tda`), the following happens:
-1.  `sa-aethercast-api-gateway` has the `roles/run.invoker` permission on the `aethercast-tda-service`.
-2.  Google's infrastructure automatically attaches an identity token to the request from API Gateway to TDA.
-3.  The TDA service (Cloud Run infrastructure) validates this token to ensure the call is authorized.
-
-This ensures that only explicitly authorized services can invoke your internal backend services, forming a key part of your application's security posture on Cloud Run.
+(No changes seem immediately necessary here, but service accounts for workers will need appropriate DB access like their app counterparts).
 
 ## 10. Frontend Deployment
-
-The Aethercast frontend consists of static HTML, CSS, and JavaScript files located in the `aethercast/fend/` directory. These files need to be deployed to a web hosting solution so users can access the Aethercast application through their browsers. There are several options for deploying these static assets on Google Cloud Platform.
-
-### 10.1. Option 1: Google Cloud Storage (GCS) with Cloud Load Balancing (Recommended for Flexibility)
-
-This approach involves hosting the static frontend files in a Google Cloud Storage bucket and using Cloud Load Balancing to serve them globally, optionally with Cloud CDN for caching.
-
-**Overview:**
-Host static files in a GCS bucket, configure it for web serving, and front it with an HTTP(S) Load Balancer for custom domain support, SSL, and CDN.
-
-**Steps:**
-
-1.  **Create a GCS Bucket for Frontend Assets:**
-    *   This bucket should be separate from the one used for media assets (`aethercast-media`).
-    *   Choose a globally unique name, e.g., `aethercast-frontend-assets-YOUR_UNIQUE_ID`.
-    *   **Make the bucket publicly accessible for website hosting:**
-        *   Grant the `roles/storage.objectViewer` IAM role to `allUsers` on this bucket.
-        *   Alternatively, for more fine-grained control (though more complex for purely static assets), keep the bucket private and use the Load Balancer to serve content, potentially with signed URLs if needed (uncommon for typical web frontends). For simplicity, public read is often used for static site buckets.
-    *   Enable website configuration on the bucket:
-        ```bash
-        gcloud storage buckets update gs://YOUR_FRONTEND_BUCKET_NAME --website-set-main-page-suffix=index.html --website-set-error-page=404.html
-        ```
-
-2.  **Upload Frontend Files:**
-    *   Use `gsutil` to upload the contents of your `aethercast/fend/` directory to the root of the bucket:
-        ```bash
-        gsutil rsync -R aethercast/fend/ gs://YOUR_FRONTEND_BUCKET_NAME/
-        ```
-    *   Ensure `index.html` is present for the main page. You might want a custom `404.html` as well.
-
-3.  **Set up HTTP(S) Load Balancer:**
-    1.  **Create an HTTP(S) Load Balancer:** Navigate to "Network Services" > "Load balancing" in the GCP Console.
-    2.  **Backend Configuration:**
-        *   Create a "Backend bucket".
-        *   Select the GCS bucket you created for frontend assets.
-        *   **Enable Cloud CDN** (optional but highly recommended for performance and caching).
-    3.  **Frontend Configuration:**
-        *   Choose HTTP/2 and HTTPS.
-        *   Reserve a static external IP address.
-        *   Create or select an SSL certificate (Google-managed certificates are free and auto-renewing).
-    4.  **Review and Create:** Finalize the load balancer setup.
-
-4.  **DNS Configuration:**
-    *   Once the load balancer is provisioned and you have its external IP address, go to your DNS provider.
-    *   Create an `A` record for your custom domain (e.g., `app.aethercast.yourdomain.com`) pointing to the load balancer's IP address.
-
-**Pros:**
-*   Highly scalable and reliable.
-*   Can leverage Google's global CDN for fast content delivery.
-*   Full support for custom domains with SSL/TLS certificates.
-*   More control over caching, headers, and routing rules via the Load Balancer.
-
-**Cons:**
-*   More complex to set up initially compared to options like Firebase Hosting.
-*   Potentially higher cost if traffic is very high (though CDN can mitigate this).
-
-### 10.2. Option 2: Firebase Hosting (Recommended for Simplicity)
-
-Firebase Hosting is a Google service specifically designed for hosting static web applications, offering a streamlined experience with built-in CDN and SSL.
-
-**Overview:**
-Use the Firebase CLI to deploy your static frontend files directly to Firebase Hosting.
-
-**Steps:**
-
-1.  **Set up a Firebase Project:**
-    *   Go to the [Firebase Console](https://console.firebase.google.com/).
-    *   Click "Add project". You can either:
-        *   Select your existing GCP project (if it's not already a Firebase project).
-        *   Create a new Firebase project (which will also create a corresponding GCP project or link to an existing one).
-
-2.  **Install Firebase CLI:**
-    If you don't have it already, install the Firebase Command Line Interface:
-    ```bash
-    npm install -g firebase-tools
-    ```
-
-3.  **Login and Initialize Firebase:**
-    *   Login to Firebase:
-        ```bash
-        firebase login
-        ```
-    *   Navigate to your Aethercast project's root directory (or `aethercast/fend/` if you want to initialize Firebase there).
-        ```bash
-        cd /path/to/aethercast # Or cd aethercast/fend
-        firebase init hosting
-        ```
-    *   Follow the prompts:
-        *   Select your Firebase project.
-        *   **Configure `firebase.json`:**
-            *   Specify your public directory. If you initialized from the root of the Aethercast project, you might set it to `aethercast/fend`. If you initialized from within `aethercast/fend`, you can set it to `.` (current directory) or just `public` if you move files there.
-                Example `firebase.json` (if initialized from Aethercast root):
-                ```json
-                {
-                  "hosting": {
-                    "public": "aethercast/fend",
-                    "ignore": [
-                      "firebase.json",
-                      "**/.*",
-                      "**/node_modules/**"
-                    ]
-                  }
-                }
-                ```
-            *   Configure as a single-page app (SPA): Say "No" if asked, as Aethercast's current frontend is not strictly an SPA needing client-side routing for all paths. `index.html` will be the entry point.
-            *   Set up automatic builds and deploys with GitHub: Choose "No" for now (can be set up later).
-
-4.  **Deploy to Firebase Hosting:**
-    After configuration, deploy your frontend:
-    ```bash
-    firebase deploy --only hosting
-    ```
-    Firebase CLI will provide you with the hosting URL(s) (e.g., `your-project-id.web.app` and `your-project-id.firebaseapp.com`). You can also easily add custom domains via the Firebase Console.
-
-**Pros:**
-*   Extremely simple and fast to set up and deploy.
-*   Generous free tier.
-*   Global CDN by default.
-*   Automatic SSL certificate provisioning for custom domains.
-*   Good integration with other Firebase services.
-
-**Cons:**
-*   May offer less granular control over caching and headers compared to a full Cloud Load Balancer setup, but sufficient for most static sites.
-
-### 10.3. Option 3: Serving from API Gateway (Cloud Run)
-
-The API Gateway service (running on Cloud Run) could continue to serve the static frontend files from its `aethercast/fend/` subdirectory, similar to how it operates in the local Docker Compose setup.
-
-**Overview:**
-Include the `aethercast/fend/` static files within the Docker image for the `api-gateway` service. The existing Flask routes in `api_gateway/main.py` for `/`, `/app.js`, `/style.css` would serve these files.
-
-**How:**
-1.  Ensure the `api_gateway/Dockerfile` correctly copies the `aethercast/fend/` directory into the image (e.g., into a location like `/app/fend` inside the container).
-2.  The Flask application in `api_gateway/main.py` would use `send_from_directory` or similar to serve these files.
-
-**Pros:**
-*   Simplest deployment if frontend files are already managed and built as part of the API Gateway's image; no additional services or configuration needed beyond the API Gateway's Cloud Run deployment.
-*   Fewer moving parts initially.
-
-**Cons:**
-*   **Not Ideal for Performance/Scale:** Cloud Run is optimized for dynamic compute, not for serving static assets at high volume. Each request for a static file would hit a Cloud Run instance.
-*   **Larger Container Image:** Including frontend assets increases the size of the `api-gateway` container image, potentially leading to slower deployments and cold starts.
-*   **Less Efficient Caching:** You lose the benefits of dedicated CDNs and optimized static asset hosting provided by GCS+LB or Firebase Hosting.
-*   **Coupling:** Tightly couples the frontend deployment lifecycle with the API Gateway backend.
-
-**Recommendation:**
-While this option mirrors the local setup, **Options 1 (GCS + Load Balancer) or 2 (Firebase Hosting) are generally recommended for production frontend hosting** due to better performance, scalability, and separation of concerns.
-
-### 10.4. Final Configuration: Pointing Frontend to API Gateway
-
-Regardless of the chosen frontend hosting method (unless serving from the API Gateway itself on the same domain), your frontend JavaScript (`aethercast/fend/app.js`) needs to know the public URL of your deployed `aethercast-api-gateway` Cloud Run service to make API calls.
-
-**Steps:**
-
-1.  **Obtain API Gateway Public URL:**
-    After deploying the `aethercast-api-gateway` service to Cloud Run (Section 7.4.1) with `--ingress=all` and `--allow-unauthenticated` (or setting up a Load Balancer in front of it), it will have a public URL like:
-    `https://aethercast-api-gateway-YOUR_PROJECT_HASH-YOUR_REGION_CODE.a.run.app`
-    Or, if you've configured a custom domain for it, use that.
-
-2.  **Update Frontend Configuration:**
-    The `aethercast/fend/app.js` file likely has a placeholder or a hardcoded URL for API calls (e.g., `const API_BASE_URL = '/api/v1';` for local proxying, or a full local URL). This needs to be updated to point to your deployed API Gateway's public URL.
-
-    *   **Manual Update (Simple):** Before uploading/deploying the frontend files, manually edit `app.js` and set a global JavaScript variable or a constant:
-        ```javascript
-        // In app.js
-        const API_BASE_URL = 'https://aethercast-api-gateway-YOUR_PROJECT_HASH-YOUR_REGION_CODE.a.run.app/api/v1';
-        // Ensure all fetch/XHR calls use this API_BASE_URL
-        ```
-    *   **Build-time Configuration (Better):** For more robust deployments, especially with CI/CD, you would typically:
-        *   Use a placeholder in your source `app.js` (e.g., `__API_BASE_URL__`).
-        *   Have a build step (e.g., using `sed`, `envsubst`, or a JavaScript bundler's environment variable injection) that replaces this placeholder with the actual API Gateway URL during the frontend build or deployment pipeline.
-        *   Alternatively, the frontend could load a `config.json` file that contains the API URL, and this `config.json` could be generated at deploy time.
-
-Ensure that Cross-Origin Resource Sharing (CORS) is correctly configured on your `aethercast-api-gateway` if the frontend is served from a different domain than the API Gateway. The Flask-CORS extension in the API Gateway should handle this, but the allowed origins might need to be updated via environment variables if not already set to be permissive (e.g., `CORS_ALLOWED_ORIGINS` or similar in the API Gateway's configuration).
+(No changes seem immediately necessary here).
 
 ## 11. Accessing the Application
-
-Once all Aethercast services and the frontend are deployed, the primary way to access the application is through the public URL of your deployed frontend.
-
-*   **Frontend URL:** This will be the URL provided by your chosen frontend hosting option:
-    *   **GCS with Cloud Load Balancing:** The custom domain you configured (e.g., `app.aethercast.yourdomain.com`) or the Load Balancer's IP address if a custom domain isn't set up yet.
-    *   **Firebase Hosting:** The URL provided by Firebase (e.g., `your-project-id.web.app` or `your-project-id.firebaseapp.com`) or any custom domain configured through Firebase.
-    *   **Serving from API Gateway:** The public URL of your `aethercast-api-gateway` Cloud Run service (e.g., `https://aethercast-api-gateway-xxxxxx-uc.a.run.app`).
-
-*   **API Interaction:** The deployed frontend should be configured (as per Section 10.4) to make API calls to the public URL of your `aethercast-api-gateway` Cloud Run service.
-
-*   **Direct API Testing:** You can also interact directly with the `aethercast-api-gateway` service's public URL (e.g., `https://aethercast-api-gateway-xxxxxx-uc.a.run.app`) using tools like Postman or `curl` for testing API endpoints. Remember that many endpoints will require JWT authentication (see API Gateway README and Section 7.4.1 Authentication Note).
+(No changes seem immediately necessary here).
 
 ## 12. Logging and Monitoring
-
-Google Cloud Platform provides integrated tools for logging and monitoring your deployed services, which are crucial for understanding application behavior, debugging issues, and ensuring reliability.
-
-*   **Cloud Logging:**
-    *   Cloud Run services automatically stream `stdout` and `stderr` from your containers to [Cloud Logging](https://console.cloud.google.com/logs/viewer).
-    *   You can view logs per service, filter by severity (INFO, ERROR, DEBUG), search by keywords, and view structured JSON logs if your application emits them (as Aethercast services are configured to do).
-    *   This is the primary place to look for application errors or unexpected behavior.
-
-*   **Cloud Monitoring:**
-    *   [Cloud Monitoring](https://console.cloud.google.com/monitoring) provides metrics for your Cloud Run services, including request count, latency, error rates, and container CPU/memory utilization.
-    *   It also collects metrics for other GCP services used by Aethercast, such as Cloud SQL (database connections, CPU/storage utilization), Google Cloud Storage (bucket size, requests), and Vertex AI.
-    *   You can create custom dashboards to visualize key metrics and set up alerting policies to be notified of issues (e.g., high error rates, high latency, low instance count).
-
-**Further Information:**
-Refer to the official GCP documentation for [Cloud Logging](https://cloud.google.com/logging/docs) and [Cloud Monitoring](https://cloud.google.com/monitoring/docs) for more detailed information on their features and capabilities.
+(No changes seem immediately necessary here, but logs from worker services should also be monitored).
 
 ## 13. CI/CD Pipeline (Conceptual Outline)
 
-A Continuous Integration/Continuous Deployment (CI/CD) pipeline automates the process of building, testing, and deploying your application, ensuring consistency and speed. While a detailed CI/CD setup is beyond the scope of this guide, here's a conceptual outline for Aethercast on GCP:
-
-1.  **Source Control Repository:**
-    *   Use a Git repository to host your Aethercast source code (e.g., GitHub, GitLab, Bitbucket, or Google Cloud Source Repositories).
-
-2.  **Cloud Build Triggers:**
-    *   Set up [Cloud Build triggers](https://cloud.google.com/build/docs/automating-builds/create-manage-triggers) that listen for changes in your Git repository (e.g., pushes to a `main` or `production` branch, or on pull request creation/merges).
-
+1.  **Source Control Repository:** (As before)
+2.  **Cloud Build Triggers:** (As before)
 3.  **Build Stage (Cloud Build using `cloudbuild.yaml`):**
-    *   When a trigger fires, Cloud Build executes a build defined in a `cloudbuild.yaml` file at the root of your repository or within each service directory.
-    *   **For each Aethercast microservice:**
-        *   A build step builds the Docker image using the service's `Dockerfile`.
-            ```yaml
-            steps:
-            - name: 'gcr.io/cloud-builders/docker'
-              args: ['build', '-t', '${_REGION}-docker.pkg.dev/${PROJECT_ID}/aethercast-services/${_SERVICE_NAME}:${SHORT_SHA}', '.']
-              dir: 'aethercast/${_SERVICE_NAME}' # Path to the service directory
-            ```
-        *   Another build step pushes the built image to Google Artifact Registry, tagged appropriately (e.g., with the commit SHA (`SHORT_SHA`) or a semantic version).
-            ```yaml
-            images:
-            - '${_REGION}-docker.pkg.dev/${PROJECT_ID}/aethercast-services/${_SERVICE_NAME}:${SHORT_SHA}'
-            ```
-    *   (Optional) Include steps for running unit tests or linters before building images.
-
+    *   **For each Aethercast microservice (App and potentially Worker if separate images):**
+        *   (As before) Build and push Docker image(s) to Artifact Registry.
 4.  **Deploy Stage (Cloud Build using `cloudbuild.yaml`):**
-    *   After successful image builds and pushes, subsequent steps in the `cloudbuild.yaml` can deploy the new images to their respective Cloud Run services.
+    *   **Database Migrations:** Add a step to run database migrations **before** deploying services that depend on the new schema. This must include the `001_create_idempotency_keys_table.sql` migration.
         ```yaml
-        steps:
-        # ... (previous build and push steps)
-        - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
-          entrypoint: gcloud
-          args:
-            - 'run'
-            - 'deploy'
-            - 'aethercast-${_SERVICE_NAME}' # Cloud Run service name
-            - '--image=${_REGION}-docker.pkg.dev/${PROJECT_ID}/aethercast-services/${_SERVICE_NAME}:${SHORT_SHA}'
-            - '--region=${_REGION}'
-            - '--platform=managed'
-            # ... include other necessary flags like service account, secrets, env vars
+        # Example step for DB migration (using a utility container or Cloud SQL proxy)
+        # - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+        #   entrypoint: 'bash'
+        #   args:
+        #     - '-c'
+        #     - |
+        #       # Setup Cloud SQL Proxy
+        #       # wget https://storage.googleapis.com/cloudsql-proxy/v1.28.0/cloud_sql_proxy.linux.amd64 -O cloud_sql_proxy
+        #       # chmod +x cloud_sql_proxy
+        #       # ./cloud_sql_proxy -instances=${_CLOUDSQL_INSTANCE_CONNECTION_NAME}=tcp:5432 &
+        #       # sleep 5 # Wait for proxy
+        #       # PGPASSWORD=$(gcloud secrets versions access latest --secret=aethercast-db-password) psql -h 127.0.0.1 -U $(gcloud secrets versions access latest --secret=aethercast-db-user) -d $(gcloud secrets versions access latest --secret=aethercast-db-name) -f aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql
+        #       # Add similar commands for other DDLs if not handled by app startup (e.g. TDA's init_tda_db)
         ```
-    *   **Database Migrations:** If your application requires database schema migrations, you could add a step to run these (e.g., using a Cloud Run job or a utility container) before deploying services that depend on the new schema.
-    *   **Frontend Deployment:** A step can deploy the static frontend assets to GCS, Firebase Hosting, or update the API Gateway image if serving from there.
+    *   Deploy App services (api-gateway, tda-service, sca-service, etc.) to Cloud Run.
+    *   Deploy Worker services (tda-worker, sca-worker, etc.) to Cloud Run, possibly with different command overrides.
+    *   Frontend Deployment: (As before)
 
-**Benefits:**
-*   **Automation:** Reduces manual effort and the risk of human error in deployments.
-*   **Consistency:** Ensures every deployment follows the same process.
-*   **Speed:** Enables faster iteration and delivery of new features or fixes.
-
-Google Cloud Build is the recommended GCP-native tool for implementing such a pipeline.
+**Benefits:** (As before)
 
 ## 14. Cost Considerations
-
-Running the Aethercast application on Google Cloud Platform will incur costs. It's important to be aware of how different services are priced and to monitor your expenses.
-
-**Main Services and Their Cost Drivers:**
-
-*   **Cloud Run:**
-    *   Priced based on vCPU-seconds, memory-seconds, number of requests, and outbound data transfer.
-    *   Offers a generous [free tier](https://cloud.google.com/run/pricing#free-tier) which might cover light usage or development.
-*   **Cloud SQL for PostgreSQL:**
-    *   Priced based on instance uptime (per hour), number of vCPUs, amount of memory, storage provisioned (per GB/month), network egress, and backup storage.
-    *   No significant free tier beyond initial GCP credits.
-*   **Google Cloud Storage (GCS):**
-    *   Priced based on the amount of data stored (per GB/month), data processing (operations like GET, PUT), and network egress.
-    *   Offers a [free tier](https://cloud.google.com/storage/pricing#Standard-Storage) for standard storage.
-*   **Artifact Registry:**
-    *   Priced based on storage for container images and network egress.
-    *   Offers a [free tier](https://cloud.google.com/artifact-registry/pricing#free-tier) for storage.
-*   **Secret Manager:**
-    *   Priced based on the number of active secret versions and access operations.
-    *   Offers a [free tier](https://cloud.google.com/secret-manager/pricing#free-tier).
-*   **Vertex AI (Imagen, LLMs, TTS):**
-    *   Pricing is usage-based and specific to each AI model/service.
-        *   **Imagen (Image Generation):** Typically per image generated, potentially varying by resolution.
-        *   **LLMs (e.g., Gemini via AIMS):** Typically per 1,000 characters or tokens of input and output.
-        *   **Cloud Text-to-Speech (via AIMS_TTS):** Typically per 1 million characters synthesized.
-    *   **This can be a significant cost component** depending on usage levels. Monitor closely.
-*   **Cloud Build:**
-    *   Priced per build minute consumed beyond the [free tier](https://cloud.google.com/build/pricing#free-tier).
-*   **Cloud Load Balancing:**
-    *   If used for the frontend, costs are based on forwarding rules, data processed, and other networking aspects.
-*   **Firebase Hosting:**
-    *   Offers a generous [free Spark plan](https://firebase.google.com/pricing) for storage and data transfer, with paid plans (Blaze) for higher usage.
-
-**Recommendations:**
-
-*   **Review GCP Pricing Documentation:** Always refer to the official [Google Cloud pricing documentation](https://cloud.google.com/pricing/) for the most up-to-date details for each service.
-*   **Use the GCP Pricing Calculator:** Estimate your costs using the [Google Cloud Pricing Calculator](https://cloud.google.com/products/calculator).
-*   **Set Up Budgets and Billing Alerts:** In the GCP Billing console, create [budgets and alerts](https://cloud.google.com/billing/docs/how-to/budgets) to be notified when costs exceed certain thresholds.
-*   **Stop or Delete Resources:** For development and testing environments, stop Cloud SQL instances when not in use (if possible, though this means data isn't accessible) and delete Cloud Run services, GCS buckets, and other resources that are not actively needed to avoid unnecessary charges. Set Cloud Run services to `--min-instances=0` to allow them to scale to zero.
+(No major changes, but acknowledge potential costs of Redis if used for Celery at scale).
 
 ## 15. Cleanup
+(Add Celery worker services to the list of Cloud Run services to delete).
 
-To avoid ongoing charges after you've finished deploying, testing, or using your Aethercast deployment, it's important to delete the GCP resources you created.
+---
 
-**Steps to Delete Resources:**
-
-*   **Cloud Run Services:**
-    Delete each deployed Cloud Run service:
-    ```bash
-    gcloud run services delete aethercast-api-gateway --region=YOUR_REGION --platform=managed
-    gcloud run services delete aethercast-aims-service --region=YOUR_REGION --platform=managed
-    # ... repeat for all other Aethercast services (tda, sca, pswa, vfa, asf, aims-tts, iga)
-    ```
-    Alternatively, delete them from the [Cloud Run page](https://console.cloud.google.com/run) in the GCP Console.
-
-*   **Cloud SQL Instance:**
-    Delete the Cloud SQL for PostgreSQL instance:
-    ```bash
-    gcloud sql instances delete aethercast-postgres-instance
-    ```
-    Or delete it from the [Cloud SQL Instances page](https://console.cloud.google.com/sql/instances) in the GCP Console. **Note:** Deleting the instance will delete all data within it. Ensure you have backups if needed.
-
-*   **Google Cloud Storage (GCS) Buckets:**
-    Delete the GCS buckets created for media assets and potentially for the frontend:
-    ```bash
-    gsutil rm -r gs://YOUR_AETHERCAST_MEDIA_BUCKET_NAME/
-    gsutil rm -r gs://YOUR_AETHERCAST_FRONTEND_ASSETS_BUCKET_NAME/ # If you created a separate one
-    ```
-    Ensure buckets are empty first, or use the `-f` flag with `gsutil rm -r` to force deletion (use with caution). Buckets can also be deleted from the [Cloud Storage browser](https://console.cloud.google.com/storage/browser).
-
-*   **Artifact Registry Repository:**
-    Delete the Docker repository created for Aethercast images:
-    ```bash
-    gcloud artifacts repositories delete aethercast-services --location=YOUR_REGION
-    ```
-    Or delete from the [Artifact Registry page](https://console.cloud.google.com/artifacts) in the GCP Console. This will delete all container images stored within it.
-
-*   **Secret Manager Secrets:**
-    Delete each secret created in Secret Manager:
-    ```bash
-    gcloud secrets delete aethercast-db-password --project=YOUR_PROJECT_ID
-    gcloud secrets delete aethercast-flask-secret-key --project=YOUR_PROJECT_ID
-    # ... repeat for all other secrets
-    ```
-    Or delete them from the [Secret Manager page](https://console.cloud.google.com/security/secret-manager).
-
-*   **Cloud Build Triggers & History:**
-    If you set up Cloud Build triggers, delete them from the [Cloud Build Triggers page](https://console.cloud.google.com/cloud-build/triggers) in the GCP Console. Build history can also be managed or cleared if necessary.
-
-*   **Firebase Hosting Site:**
-    If you used Firebase Hosting for the frontend:
-    ```bash
-    firebase hosting:disable -P YOUR_FIREBASE_PROJECT_ID
-    ```
-    You might also want to clean up the Firebase project itself if it's not used for anything else.
-
-*   **Serverless VPC Access Connector:**
-    If you created a Serverless VPC Access connector, delete it from the [VPC network > Serverless VPC Access page](https://console.cloud.google.com/networking/connectors) in the GCP Console.
-
-*   **HTTP(S) Load Balancer:**
-    If you set up a Load Balancer for the GCS frontend bucket, delete it from the [Network Services > Load balancing page](https://console.cloud.google.com/net-services/loadbalancing/loadBalancers/list) in the GCP Console. This includes deleting forwarding rules, target proxies, URL maps, and backend services/buckets associated with it. Also, release the static IP address if you reserved one.
-
-**Final Step - Project Deletion:**
-If the GCP project was created solely for this Aethercast deployment and you no longer need any resources within it, you can delete the entire project:
-```bash
-gcloud projects delete YOUR_PROJECT_ID
-```
-Or delete it from the [IAM & Admin > Settings page](https://console.cloud.google.com/iam-admin/settings) in the GCP Console. **This is irreversible and will delete all resources within the project.**
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

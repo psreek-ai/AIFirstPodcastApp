@@ -14,12 +14,12 @@ The purpose of this document is to serve as a reference for understanding the ro
 
 All specialized AI agents within the Aethercast ecosystem adhere to the following general principles:
 
-* **Single Responsibility (Largely):** Each agent focuses on a well-defined set of tasks within its domain of expertise.
-* **Orchestrated Interaction:** Agents primarily interact via the CPOA. Direct inter-agent communication for main workflow tasks is minimized to maintain central control and observability, unless specifically designed for efficiency in tightly coupled operations.
-* **Statelessness (Preferred):** Agents should aim to be stateless where possible, receiving all necessary context and data for a given task from the CPOA. Any persistent state related to the task's execution within a larger workflow is managed by the CPOA or dedicated state stores.
-* **Standardized Communication:** Agents communicate using defined data formats (e.g., JSON, Protobuf) and protocols (e.g., asynchronous messaging via queues, synchronous APIs like gRPC/HTTP) as dictated by the CPOA.
-* **Error Reporting:** Agents must provide clear and structured error information to the CPOA upon task failure.
-* **Scalability:** Agents are designed to be independently scalable (e.g., as containerized microservices or serverless functions).
+* **Single Responsibility (Largely):** Each agent focuses on a well-defined set of tasks.
+* **Orchestrated Interaction:** Agents primarily interact via the CPOA.
+* **Statelessness (Task-Level):** For their core processing, agents aim to be stateless, receiving necessary context from CPOA. State related to long-running asynchronous tasks (e.g., for idempotency or retries) is managed externally, typically in a database (like PostgreSQL for idempotency).
+* **Standardized Communication:** Agents use defined data formats (JSON) and protocols (HTTP APIs, Celery tasks). Asynchronous tasks (TDA, SCA, PSWA, IGA, VFA) accept an `X-Idempotency-Key` header for idempotent operations.
+* **Error Reporting:** Agents provide structured error information to CPOA, and Celery tasks use `on_failure` handlers to update idempotency records.
+* **Scalability:** Agents (Flask app + Celery workers) are designed as containerized microservices for independent scalability.
 
 ## 3. Specialized AI Agent Profiles
 
@@ -27,20 +27,20 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ### 3.1. Agent Name: `TopicDiscoveryAgent` (TDA)
 
-* **Purpose/Mission:** To autonomously identify and propose relevant, engaging, and timely topics suitable for AI-generated podcast snippets and full episodes.
+* **Purpose/Mission:** To autonomously identify and propose relevant, engaging, and timely topics suitable for AI-generated podcast snippets and full episodes. TDA's primary operation (`discover_topics_task`) is asynchronous (Celery-based) and idempotent, using an `X-Idempotency-Key` provided by the client (via CPOA) and a shared PostgreSQL database for state tracking.
 * **Key Responsibilities:**
-    * Scan and analyze configured external data sources (e.g., news APIs, RSS feeds, social media trends, web search trends).
-    * Identify emerging trends, significant events, or interesting subject matter based on predefined criteria or learned patterns.
-    * Filter and rank potential topics based on relevance, potential user interest, and content availability.
-    * Provide a structured list of proposed topics to the CPOA, potentially with supporting metadata (e.g., source links, brief justification, initial keywords).
-    * (Future) Incorporate feedback from CPOA or user engagement data to refine topic selection strategies.
+    * Dispatches a Celery sub-task (`fetch_news_from_newsapi_task`) to scan and analyze configured external data sources (e.g., NewsAPI.org) or uses simulated data if configured.
+    * Processes fetched articles to identify emerging trends, significant events, or interesting subject matter.
+    * Filters and ranks potential topics.
+    * Saves discovered `TopicObject`s to a PostgreSQL database (`topics_snippets` table).
+    * Returns a structured list of proposed topics to the CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Natural Language Processing (NLP) for text analysis, keyword extraction, sentiment analysis, and summarization of potential source material.
-    * Trend analysis algorithms.
-    * (Future) Machine learning models for predicting topic popularity or relevance.
+    * External News APIs.
+    * NLP for text analysis (if further processing were added).
 * **Inputs:**
-    * Task request from CPOA.
-    * Configuration: List of data sources to monitor (e.g., API endpoints, keywords for social media).
+    * Task request from CPOA (including `X-Idempotency-Key`, `X-Workflow-ID`).
+    * Query parameters (keywords, limit).
+    * Configuration: News API credentials, default keywords/language.
     * Configuration: Criteria for topic selection (e.g., recency, specific categories, exclusion lists).
     * (Future) Feedback data on previously suggested topics.
 * **Outputs:**
@@ -52,13 +52,14 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
         * `potential_sources`: List of URLs or references to initial relevant information.
         * `relevance_score` or `priority_ranking` (optional).
         * `timestamp_discovered`.
-    * Format: JSON array.
+    * Format: JSON array of `TopicObject`s.
 * **Primary Interactions:**
-    * Tasked by: CPOA (often on a schedule or triggered by a need for fresh content).
-    * Outputs to: CPOA, which may store topics in `Data Stores (DS)`.
-    * Calls: External news APIs, social media APIs, web search engines.
+    * Tasked by: CPOA (receives `X-Idempotency-Key`).
+    * Outputs to: CPOA (returns task ID for its Celery task; results are polled).
+    * Database: Stores topics in PostgreSQL (`topics_snippets` table) and uses `idempotency_keys` table (PostgreSQL).
+    * Calls: Potentially `fetch_news_from_newsapi_task` (internal Celery task), which calls external News APIs.
 * **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Relevance and engagement potential of suggested topics (can be indirectly measured by click-through rates of snippets generated from these topics).
+    * Relevance and engagement potential of suggested topics.
     * Novelty and diversity of topics.
     * Coverage of configured areas of interest.
     * Processing time per discovery cycle.
@@ -81,41 +82,30 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ### 3.2. Agent Name: `SnippetCraftAgent` (SCA)
 
-* **Purpose/Mission:** To generate concise, compelling, and accurate text snippets (teasers) for podcast episodes, along with relevant metadata, to be displayed on the Aethercast landing page.
+* **Purpose/Mission:** To generate concise, compelling, and accurate text snippets (teasers) for podcast episodes, along with relevant metadata. SCA's primary operation (`sca_craft_snippet_task`) is asynchronous (Celery-based) and idempotent, using an `X-Idempotency-Key` and a shared PostgreSQL database.
 * **Key Responsibilities:**
-    * Receive a topic (and potentially some initial context/links) from the CPOA.
-    * (Optional) Briefly consult `WebContentHarvesterAgent` via CPOA for a small, targeted piece of information if the input topic context is insufficient.
-    * Utilize Large Language Models (LLMs) to generate:
-        * A catchy and informative title for the snippet.
-        * A short, engaging summary text (the snippet itself).
-        * (Future) Prompts for an `ImageGenerationAgent` to create associated cover art.
-    * Ensure generated text is factually grounded (to the extent possible with input) and aligns with Aethercast's content policies.
-    * Return the structured snippet data to the CPOA.
+    * Receive topic information from CPOA (including `X-Idempotency-Key`, `X-Workflow-ID`).
+    * Utilize Large Language Models (LLMs) via the AIMS service to generate:
+        * A catchy snippet title.
+        * A short, engaging summary text.
+        * A `cover_art_prompt` for IGA.
+    * Return the structured `SnippetDataObject` (including the `cover_art_prompt`) to CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Large Language Models (LLMs) for text generation (titles, summaries), and prompt generation.
-    * Prompt engineering techniques for controlling LLM output.
+    * LLMs (via AIMS service) for text generation.
+    * Prompt engineering.
 * **Inputs:**
-    * Task request from CPOA.
-    * `TopicObject`: Contains topic details, potentially keywords, summary, and initial source links.
-    * Configuration: Desired snippet length, stylistic guidelines, persona.
-    * (Optional) Small piece of context from `WebContentHarvesterAgent` if requested.
+    * Task request from CPOA (with `TopicObject`, `X-Idempotency-Key`).
+    * Configuration: LLM model preferences for AIMS.
 * **Outputs:**
-    * To CPOA: A `SnippetDataObject`. Each object includes:
-        * `snippet_id`: Unique identifier.
-        * `topic_id`: Reference to the original topic.
-        * `title`: Generated title for the snippet.
-        * `text_content`: The generated snippet text.
-        * `cover_art_prompt` (optional): A text prompt for image generation.
-        * `estimated_full_podcast_length` (optional, if inferable).
-        * `generation_timestamp`.
+    * To CPOA: A `SnippetDataObject` (via Celery result polling). Includes `snippet_id`, `topic_id`, `title`, `text_content`, `cover_art_prompt`.
     * Format: JSON.
 * **Primary Interactions:**
     * Tasked by: CPOA.
-    * Outputs to: CPOA.
-    * Calls: `AI Model Serving Infrastructure (AIMS)` for LLM inference.
-    * (Indirectly/Optionally) May trigger CPOA to request minimal context from `WebContentHarvesterAgent`.
+    * Outputs to: CPOA (task ID first, then result).
+    * Calls: AIMS service for LLM inference.
+    * Database: Uses `idempotency_keys` table (PostgreSQL).
 * **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Click-through rate (CTR) of snippets on the landing page.
+    * Engagement level of snippet text.
     * Clarity, conciseness, and engagement level of snippet text.
     * Accuracy of snippet in representing the potential full podcast topic.
     * Generation speed per snippet.
@@ -139,48 +129,25 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ### 3.3. Agent Name: `WebContentHarvesterAgent` (WCHA)
 
-* **Purpose/Mission:** To autonomously gather, retrieve, and pre-process relevant, up-to-date information from the web for a given topic, forming the factual basis for a full podcast episode.
+* **Purpose/Mission:** To autonomously gather, retrieve, and pre-process relevant, up-to-date information from the web for a given topic. WCHA functions primarily as a library called by CPOA.
 * **Key Responsibilities:**
-    * Receive a topic and constraints (e.g., desired depth, source type preferences, recency requirements) from the CPOA.
-    * Formulate and execute effective web search queries.
-    * Access and retrieve content from various web sources (articles, news sites, blogs, public data repositories, pre-approved APIs).
-    * Extract meaningful text content from HTML pages, PDFs, etc.
-    * Perform basic pre-processing:
-        * Text cleaning (e.g., removing boilerplate, ads, navigation).
-        * (Optional) Initial summarization of individual lengthy sources.
-        * (Optional) Fact extraction or named entity recognition to identify key pieces of information.
-        * (Optional) Source validation/scoring based on pre-defined heuristics or trusted domain lists.
-    * Consolidate and structure the harvested information.
-    * Return the collection of processed information to the CPOA.
+    * Receives a topic from CPOA.
+    * Uses web search (DuckDuckGo) to find relevant URLs.
+    * Fetches content from URLs and extracts main text using Trafilatura.
+    * Consolidates text and returns it to CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Web scraping and crawling technologies.
-    * HTML parsing and content extraction libraries.
-    * NLP for text cleaning, summarization (e.g., using smaller LLMs or extractive methods), NER.
-    * Search engine querying strategies.
+    * Web search libraries (`duckduckgo_search`).
+    * Content extraction libraries (`trafilatura`).
 * **Inputs:**
-    * Task request from CPOA.
-    * `TopicObject` or topic string.
-    * Configuration: List of preferred/trusted domains, list of blacklisted domains.
-    * Configuration: Search depth, number of sources to retrieve, recency filters.
-    * Configuration: API keys for any specific content APIs (e.g., news APIs).
+    * Topic string (from CPOA).
+    * Configuration: Max search results, request timeouts.
 * **Outputs:**
-    * To CPOA: A `HarvestedContentBundle`. This includes:
-        * `topic_id`: Reference to the input topic.
-        * `retrieval_timestamp`.
-        * A collection of `SourceData` objects, each containing:
-            * `source_url`: The original URL.
-            * `retrieved_text_content`: Cleaned and extracted text.
-            * `retrieval_datetime`: When this specific source was fetched.
-            * `title_of_source` (if available).
-            * `summary_of_source` (if agent performed summarization).
-            * `metadata` (e.g., publication date, author, if extractable).
-    * Format: JSON. If content is very large, may output references to data stored in an object store (e.g., S3 URIs).
+    * To CPOA: A string containing consolidated text from harvested sources, with source URLs indicated.
 * **Primary Interactions:**
-    * Tasked by: CPOA.
-    * Outputs to: CPOA.
-    * Calls: External Web (HTTP/HTTPS requests to websites, search engines, APIs).
+    * Called by: CPOA (as a Python library).
+    * Calls: External web (DuckDuckGo, target websites).
 * **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Relevance and quality of retrieved content to the given topic.
+    * Relevance and quality of retrieved content.
     * Comprehensiveness/coverage of the topic (within defined constraints).
     * Recency of information.
     * Efficiency of harvesting (time taken, resources consumed).
@@ -208,25 +175,24 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ### 3.4. Agent Name: `PodcastScriptWeaverAgent` (PSWA)
 
-* **Purpose/Mission:** To transform a collection of harvested web content and a given topic into a coherent, engaging, and well-structured podcast script, adhering to a specified persona and style.
+* **Purpose/Mission:** To transform a collection of harvested web content and a given topic into a coherent, engaging, and well-structured podcast script, adhering to a specified persona and style. PSWA's primary operation (`weave_script_task`) is asynchronous (Celery-based) and idempotent, using an `X-Idempotency-Key` and a shared PostgreSQL database. It also supports script caching (SQLite or PostgreSQL).
 * **Key Responsibilities:**
-    * Receive processed web content and a topic from the CPOA.
-    * Receive parameters defining the target podcast (e.g., desired length, persona of AI host, conversational style, target audience).
-    * Analyze and synthesize the input information.
-    * Structure the podcast script (e.g., introduction, main segments discussing different facets of the topic, transitions, conclusion/outro).
-    * Generate narrative, explanations, and dialogue (if applicable for the persona) using LLMs.
-    * Ensure factual consistency with the provided source material (mitigate hallucination).
-    * Incorporate elements to make the podcast engaging (e.g., rhetorical questions, varying pace, clear explanations).
-    * Format the script in a way that is easily consumable by the `VoiceForgeAgent` (e.g., with cues for tone or pauses, if supported).
-    * Return the final script to the CPOA.
+    * Receive processed web content, topic, persona, and narrative guidance from CPOA (including `X-Idempotency-Key`, `X-Workflow-ID`).
+    * Check cache for existing script; if found and fresh, return it.
+    * If not cached, utilize LLMs via AIMS service to:
+        * Analyze and synthesize input information.
+        * Structure the podcast script (intro, segments, outro).
+        * Generate narrative, explanations, and dialogue per persona.
+    * Ensure factual consistency and engagement.
+    * Save newly generated script to cache if enabled.
+    * Return the final `PodcastScript` object to CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Advanced Large Language Models (LLMs) for content synthesis, structuring, narrative generation, and stylistic writing.
-    * Sophisticated prompt engineering and potentially fine-tuned LLMs for specific podcast styles or personas.
-    * Fact-checking/grounding techniques (e.g., RAG - Retrieval Augmented Generation - principles if LLM supports it, or post-generation checks against source material).
+    * LLMs (via AIMS service).
+    * Advanced prompt engineering with persona and narrative guidance.
+    * Hashing for cache key generation.
 * **Inputs:**
-    * Task request from CPOA.
-    * `HarvestedContentBundle` from `WebContentHarvesterAgent`.
-    * `TopicObject` or topic string.
+    * Task request from CPOA (with content, topic, persona, guidance, `X-Idempotency-Key`).
+    * `HarvestedContentBundle` (implicitly part of the 'content' from CPOA).
     * Configuration:
         * `target_duration_minutes` (approximate).
         * `podcast_persona_id` (e.g., "informative_expert," "friendly_explainer," "dual_hosts_debate").
@@ -241,13 +207,14 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
         * `segments`: (Optional) Script broken down into logical segments (intro, main_1, main_2, outro) with potential metadata for each.
         * `estimated_reading_time_seconds`.
         * `persona_used`.
-    * Format: JSON containing the script text (potentially with light markup).
+    * Format: JSON (`PodcastScript` object).
 * **Primary Interactions:**
     * Tasked by: CPOA.
-    * Outputs to: CPOA.
-    * Calls: `AI Model Serving Infrastructure (AIMS)` for LLM inference.
+    * Outputs to: CPOA (task ID first, then result).
+    * Calls: AIMS service for LLM inference.
+    * Database: Uses `idempotency_keys` table (PostgreSQL) and potentially `generated_scripts` table for caching (SQLite or PostgreSQL).
 * **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Coherence, clarity, and engagement level of the generated script.
+    * Coherence and engagement of the generated script.
     * Factual accuracy relative to the provided source content.
     * Adherence to specified persona, style, and length.
     * Readability and suitability for TTS conversion.
@@ -275,22 +242,16 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ### 3.5. Agent Name: `VoiceForgeAgent` (VFA)
 
-* **Purpose/Mission:** To convert a finalized podcast script into a high-quality, natural-sounding audio stream using Text-to-Speech (TTS) technology, matching the specified voice persona.
+* **Purpose/Mission:** To convert a finalized podcast script into high-quality, natural-sounding audio using Text-to-Speech (TTS) technology, matching the specified voice persona. VFA's primary operation (`forge_voice_task`) is asynchronous (Celery-based) and idempotent, using an `X-Idempotency-Key` and a shared PostgreSQL database.
 * **Key Responsibilities:**
-    * Receive a podcast script and voice/persona parameters from the CPOA.
-    * Select the appropriate TTS voice model and settings based on the persona.
-    * Utilize TTS models to synthesize the script into audio.
-    * Manage prosody, pacing, and intonation to create an engaging listening experience.
-    * Generate audio in segments/chunks suitable for real-time streaming to the client.
-    * Handle any special phonetic pronunciations or markup within the script (if supported, e.g., SSML).
-    * Provide the audio stream (or metadata to access it) to the CPOA or a designated streaming service.
+    * Receive a `PodcastScript` and voice/persona parameters from CPOA (including `X-Idempotency-Key`, `X-Workflow-ID`).
+    * Prepare text from script for synthesis.
+    * Call the AIMS_TTS service to perform TTS and get a GCS URI for the audio.
+    * Return audio metadata (including GCS URI) to CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Advanced Text-to-Speech (TTS) models (e.g., neural TTS, generative TTS).
-    * (Potentially) Voice cloning or custom voice models for unique Aethercast personas.
-    * Speech Synthesis Markup Language (SSML) processing, if used in scripts.
+    * TTS models (via AIMS_TTS service).
 * **Inputs:**
-    * Task request from CPOA.
-    * `PodcastScript` object (containing the full text script).
+    * Task request from CPOA (with `PodcastScript`, voice parameters, `X-Idempotency-Key`).
     * Configuration:
         * `voice_id` or `persona_id` to select the TTS voice/style.
         * Audio output format (e.g., MP3, AAC, Opus), bitrate, sample rate.
@@ -301,13 +262,14 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
         * Or, metadata for accessing a fully rendered audio file if not streamed live (less ideal for the "real-time" goal but a possible fallback).
         * `audio_duration_seconds`.
         * `error_status`.
-    * Format: Raw audio chunks (e.g., PCM, or encoded like MP3 segments) or a manifest for a stream.
+    * Format: JSON containing audio metadata (GCS URI, duration, etc.).
 * **Primary Interactions:**
     * Tasked by: CPOA.
-    * Outputs to: CPOA or directly to an Audio Streaming Service which then serves the Frontend UI.
-    * Calls: `AI Model Serving Infrastructure (AIMS_TTS)` for TTS model inference.
+    * Outputs to: CPOA (task ID first, then result).
+    * Calls: AIMS_TTS service.
+    * Database: Uses `idempotency_keys` table (PostgreSQL).
 * **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Naturalness, clarity, and intelligibility of the generated audio.
+    * Naturalness and clarity of the generated audio.
     * Adherence to the specified voice persona and emotional tone (if applicable).
     * Low latency for first audio chunk (time-to-first-byte for streaming).
     * Continuous, uninterrupted streaming quality.
@@ -331,32 +293,29 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ---
 
-### 3.6. Agent Name: `ImageGenerationAgent` (IGA) (Optional/Future)
+### 3.6. Agent Name: `ImageGenerationAgent` (IGA)
 
-* **Purpose/Mission:** To dynamically generate relevant and aesthetically pleasing cover art or accompanying images for podcast snippets or episodes based on textual prompts.
+* **Purpose/Mission:** To dynamically generate relevant and aesthetically pleasing cover art or accompanying images for podcast snippets or episodes based on textual prompts, using Google Cloud Vertex AI Imagen models. IGA's primary operation (`generate_image_vertex_ai_task`) is asynchronous (Celery-based) and idempotent, using an `X-Idempotency-Key` and a shared PostgreSQL database.
 * **Key Responsibilities:**
-    * Receive textual prompts (e.g., from `SnippetCraftAgent` or `PodcastScriptWeaverAgent` via CPOA).
-    * Utilize text-to-image generation models to create images.
-    * Optimize prompts for desired style, aspect ratio, and content.
-    * Ensure generated images adhere to content safety policies.
-    * Provide the generated image (or a URL to it) back to the CPOA or a component that can associate it with the podcast content.
+    * Receive textual prompts (e.g., `cover_art_prompt` from SCA via CPOA), including `X-Idempotency-Key` and `X-Workflow-ID`.
+    * Utilize Vertex AI Imagen models to create images.
+    * Upload generated images to Google Cloud Storage (GCS).
+    * Return the GCS URI of the generated image to CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Text-to-image diffusion models or other generative image models (e.g., DALL-E series, Stable Diffusion, Midjourney API if available).
+    * Google Cloud Vertex AI Imagen (text-to-image models).
 * **Inputs:**
-    * Task request from CPOA.
-    * `text_prompt`: Detailed description of the desired image.
-    * Configuration: Image dimensions, style preferences, content filters.
+    * Task request from CPOA (with text prompt, `X-Idempotency-Key`).
+    * Configuration: GCP project/location, GCS bucket, Vertex AI model ID.
 * **Outputs:**
-    * To CPOA:
-        * `image_url` or image binary data.
-        * `generation_metadata` (e.g., prompt used, model version).
-    * Format: URL (string) or image file (e.g., JPEG, PNG).
+    * To CPOA: JSON containing `image_url` (GCS URI), `prompt_used`, `model_version` (via Celery result polling).
 * **Primary Interactions:**
-    * Tasked by: CPOA (triggered by snippet/script generation).
-    * Outputs to: CPOA (which then links it to snippet/podcast metadata).
-    * Calls: `AI Model Serving Infrastructure` (hosting image generation models).
+    * Tasked by: CPOA.
+    * Outputs to: CPOA (task ID first, then result).
+    * Calls: Google Cloud Vertex AI service.
+    * Stores images in: Google Cloud Storage.
+    * Database: Uses `idempotency_keys` table (PostgreSQL).
 * **Key Performance Indicators (KPIs)/Success Metrics:**
-    * Relevance of generated image to the prompt/podcast topic.
+    * Relevance and visual quality of generated image to the prompt.
     * Visual quality and aesthetic appeal.
     * Generation speed.
     * Adherence to safety guidelines.
@@ -422,3 +381,7 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
     * Experimentation with LLMs for generating specific UI component configurations or suggesting A/B test variations for UI elements.
     * Versioning of UI generation strategies.
 ---
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

@@ -7,42 +7,51 @@ Aethercast is a multi-service application designed to automate the creation of p
 The system consists of several microservices that work together:
 
 -   **API Gateway (API_GW):** The main entry point for clients (e.g., frontend UI). Routes requests, serves the frontend, and orchestrates calls to CPOA.
--   **Central Podcast Orchestrator (CPOA):** Manages the podcast generation lifecycle, coordinating other agents. (Note: Currently runs as part of the API Gateway's process).
--   **Topic Discovery Agent (TDA):** Identifies and suggests potential podcast topics from various sources.
--   **Snippet Craft Agent (SCA):** Generates short, engaging text snippets based on topics or content briefs.
--   **Podcast Script Weaver Agent (PSWA):** Generates a full podcast script from harvested content and a topic, using an LLM.
--   **Voice Forge Agent (VFA):** Synthesizes audio from the script using a Text-to-Speech (TTS) service.
+-   **Central Podcast Orchestrator (CPOA):** Manages the podcast generation lifecycle, coordinating other agents. Its state and task management are persisted in a PostgreSQL database. (Note: CPOA logic currently runs as part of the API Gateway's process).
+-   **Topic Discovery Agent (TDA):** Identifies and suggests potential podcast topics from various sources. Core Celery task operations are idempotent.
+-   **Snippet Craft Agent (SCA):** Generates short, engaging text snippets based on topics or content briefs, leveraging AIMS. Core Celery task operations are idempotent.
+-   **Podcast Script Weaver Agent (PSWA):** Generates a full podcast script from harvested content and a topic, using AIMS. Core Celery task operations are idempotent. It also features script caching in its configured database (SQLite or PostgreSQL, separate from the idempotency store).
+-   **Voice Forge Agent (VFA):** Synthesizes audio from the script by calling the AIMS_TTS service. (Idempotency for VFA tasks is a potential future enhancement).
 -   **Audio Stream Feeder (ASF):** Streams the generated audio to clients in real-time via WebSockets.
 
 ### Backend/Supporting Services
 
--   **AIMS Service (`aims_service`):** Provides access to general-purpose AI models (e.g., Large Language Models) used by other agents like SCA and PSWA.
--   **AIMS TTS Service (`aims_tts_service`):** Handles Text-to-Speech synthesis, converting scripts from VFA into audio. It's used by the VFA.
--   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen, based on prompts, storing them in GCS.
+-   **AIMS Service (`aims_service`):** (AI Model Service) Provides a unified interface to general-purpose AI models (e.g., Large Language Models like GPT). Used by SCA and PSWA for content generation.
+-   **AIMS TTS Service (`aims_tts_service`):** (AI Model Text-to-Speech Service) Handles Text-to-Speech synthesis using providers like Google Cloud TTS. It's called by the VFA to convert script segments into audio, which are then stored in GCS.
+-   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen models, based on input prompts. Stores generated images in GCS. Core Celery task operations are idempotent.
 
 ## Implemented Features
 
--   Automated topic discovery and suggestion (via TDA).
--   AI-driven script generation (via PSWA with AIMS).
--   Customizable voice synthesis (via VFA with AIMS_TTS using Google Cloud TTS, output to GCS).
--   Real-time audio streaming (via ASF, sourcing from GCS signed URLs).
--   Dynamic snippet generation for content previews (via SCA with AIMS, and IGA for images).
+-   Automated topic discovery and suggestion (TDA).
+-   AI-driven script generation (PSWA with AIMS).
+-   AI-driven snippet generation (SCA with AIMS).
+-   Dynamic image generation for podcast visuals (IGA with Vertex AI).
+-   Customizable voice synthesis (VFA with AIMS_TTS using Google Cloud TTS, output to GCS).
+-   Real-time audio streaming (ASF, sourcing from GCS signed URLs).
+-   **Idempotent Task Processing:** Key asynchronous operations in TDA, SCA, PSWA, and IGA are designed to be idempotent. Clients making requests to initiate these operations (via the API Gateway and CPOA) should include an `X-Idempotency-Key` header (typically a UUID). The services use this key, in conjunction with a shared `idempotency_keys` table in the PostgreSQL database, to ensure that identical requests (same key, same task type) are processed only once, preventing duplicate resource creation or processing.
+    -   If a request with a new key is received, the task proceeds and its outcome is stored.
+    -   If a request with a previously seen key is received:
+        -   If the original task is still processing, a conflict status is typically returned (e.g., HTTP 409 from the task status endpoint after initial 202 acceptance).
+        -   If the original task completed successfully, the stored result is returned without re-processing.
+        -   If the original task failed, it may be retried (depending on service logic).
 -   Topic exploration and "go deeper" functionalities.
--   **Header search functionality for discovering podcasts.**
--   **Email subscription option for users to receive updates.**
+-   Header search functionality for discovering podcasts.
+-   Email subscription option for users to receive updates.
 -   User authentication (registration and login with JWT).
--   User session management and basic preferences persistence.
+-   User session management.
 -   Storage of media files (audio, images) in Google Cloud Storage.
 -   Serving of GCS media files via short-lived signed URLs through the API Gateway.
 -   Internal API in API Gateway for services to request signed URLs.
 -   CPOA workflow and task state management in PostgreSQL database.
 -   Centralized logging format including `workflow_id` and `task_id`.
--   Comprehensive error handling and retry mechanisms in CPOA service calls.
+-   Comprehensive error handling and retry mechanisms in CPOA service calls and within idempotent Celery tasks.
 -   Advanced error diagnostics UI for tracing podcast generation.
+-   Script caching for PSWA to reduce redundant LLM calls (can be configured for SQLite or PostgreSQL).
 
 ## Features (Conceptual / Future Enhancements)
 
--   Enhanced caching mechanisms for scripts and snippets (beyond current direct DB storage).
+-   Idempotency for VFA (Voice Forge Agent) tasks.
+-   More advanced caching strategies (e.g., distributed caching, semantic caching for LLM results).
 -   More sophisticated user preference models and personalization.
 -   User feedback mechanisms for content quality.
 -   Adaptive/interactive podcast elements based on real-time user feedback.
@@ -52,26 +61,31 @@ The system consists of several microservices that work together:
 
 ## Project Structure
 
-The project is organized into services within the `aethercast/` directory:
+The project is organized into services within the `aethercast/` directory. Each service typically contains its own `main.py`, `Dockerfile`, `requirements.txt`, and an `.env.example` file.
 
 ```
 aethercast/
-├── api_gateway/    # API Gateway service
-├── asf/            # Audio Stream Feeder service
-├── common/         # Common utilities/modules (if any)
-├── cpoa/           # Central Podcast Orchestrator (logic module)
-├── fend/           # Frontend static files (HTML, CSS, JS)
-├── pswa/           # Podcast Script Weaver Agent service
-├── sca/            # Snippet Craft Agent service
-├── tda/            # Topic Discovery Agent service
-└── vfa/            # Voice Forge Agent service
+├── api_gateway/        # API Gateway: Main entry point, serves frontend, orchestrates CPOA.
+├── aims_service/       # AIMS: AI Model Service (for LLMs).
+├── aims_tts_service/   # AIMS_TTS: AI Model Text-to-Speech Service.
+├── asf/                # ASF: Audio Stream Feeder service.
+├── cpoa/               # CPOA: Central Podcast Orchestrator (logic module, runs in API_GW process).
+├── data_stores/        # Database related files, including:
+│   └── migrations/     # SQL migration scripts (e.g., for idempotency_keys table).
+├── fend/               # Frontend static files (HTML, CSS, JS).
+├── iga/                # IGA: Image Generation Agent.
+├── pswa/               # PSWA: Podcast Script Weaver Agent service.
+├── sca/                # SCA: Snippet Craft Agent service.
+├── tda/                # TDA: Topic Discovery Agent service.
+└── vfa/                # VFA: Voice Forge Agent service.
+docs/                   # Project documentation.
 tests/
-├── integration/    # Integration tests
-└── unit/           # (Conceptual, if unit tests were service-specific, e.g. aethercast/pswa/tests)
-common.env          # Common environment variables for Docker Compose
-docker-compose.yml  # Docker Compose configuration
-README.md           # This file
+├── integration/        # Integration tests for the full flow.
+common.env              # Common environment variables for Docker Compose.
+docker-compose.yml      # Docker Compose configuration.
+README.md               # This file.
 ```
+Unit tests are typically located within each service's `tests/` subdirectory (e.g., `aethercast/pswa/tests/`).
 
 ## GCP Prerequisites and Setup for Local Development
 
@@ -173,21 +187,26 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   Each service directory (e.g., `aethercast/api_gateway/`, `aethercast/tda/`, etc.) contains an `.env.example` file. For Docker Compose to work correctly with local overrides (like API keys), you should:
         *   Copy each `aethercast/service_name/.env.example` to `aethercast/service_name/.env`.
         *   **Edit these new `.env` files:**
-            *   Ensure variables like `DATABASE_FILE`, `PSWA_DATABASE_PATH`, `TDA_DATABASE_PATH` are set to `${DATABASE_FILE_PATH_CONTAINER}`.
-            *   Ensure `VFA_SHARED_AUDIO_DIR` is set to `${SHARED_AUDIO_DIR_CONTAINER}`.
-            *   Update inter-service URLs to use Docker Compose service names (e.g., `TDA_SERVICE_URL=http://tda:5000/discover_topics` in `api_gateway/.env`). The `.env.example` files should now reflect these Docker-friendly URLs.
-            *   For services requiring external API keys (like PSWA for OpenAI, VFA for Google TTS, TDA for NewsAPI):
-                *   If you want to run these services with their real external dependencies, populate the API key variables in the respective `.env` files.
-                *   For integration testing or running without external API access, ensure the "test mode" flags are enabled:
-                    *   In `aethercast/pswa/.env`: `PSWA_TEST_MODE_ENABLED=True` (bypasses LLM)
-                    *   In `aethercast/vfa/.env`: `VFA_TEST_MODE_ENABLED=True` (bypasses TTS)
-                    *   In `aethercast/tda/.env`: `USE_REAL_NEWS_API=False` (uses simulated news)
-                    The `common.env` file sets these test modes to `True` by default, but service-specific `.env` files can override them if needed.
-            *   **For Google Cloud Platform (GCP) configuration details (required for AIMS, AIMS_TTS, IGA, and GCS operations), please refer to the new '## GCP Prerequisites and Setup for Local Development' section.**
-            *   You will need to update `common.env` with your `GCP_PROJECT_ID`, `GCP_LOCATION`, and `GCS_BUCKET_NAME` as described in that section.
-            *   For services using GCP (AIMS, AIMS_TTS, IGA, API Gateway), ensure `GOOGLE_APPLICATION_CREDENTIALS` in their respective `.env` files is set as detailed in the GCP setup section.
+            *   **Database Configuration:** Most services (TDA, SCA, PSWA, IGA, API Gateway/CPOA) now rely on a **shared PostgreSQL database** for core functionalities like CPOA state management and idempotency tracking. Ensure the `POSTGRES_HOST`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `POSTGRES_PORT` variables are correctly set. These are typically defined in `common.env` and sourced by individual service `.env` files (e.g., `POSTGRES_HOST=${POSTGRES_HOST}`). The `postgres_db` service in `docker-compose.yml` provides this database.
+            *   **Idempotency Configuration:** Services implementing idempotency (TDA, SCA, PSWA, IGA) have specific environment variables in their `.env.example` files (e.g., `TDA_IDEMPOTENCY_STATUS_PROCESSING`, `TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`). Review these and ensure they are set as needed (defaults are provided). These configurations control the behavior of the idempotency mechanism for each service.
+            *   **Inter-service URLs:** Ensure these are set to use Docker Compose service names (e.g., `TDA_SERVICE_URL=http://tda:5000/discover_topics` in `api_gateway/.env`). The `.env.example` files generally reflect these Docker-friendly URLs.
+            *   **External API Keys & Test Modes:**
+                *   For services requiring external API keys (e.g., TDA for NewsAPI), populate these in the respective `.env` files if you intend to use the live services.
+                *   For development or testing without external calls, ensure "test mode" or placeholder flags are enabled (e.g., `USE_REAL_NEWS_API=False` in `tda/.env`, `PSWA_TEST_MODE_ENABLED=True` in `pswa/.env`). These are often defaulted in `common.env` but can be overridden.
+            *   **GCP Configuration:** For services interacting with GCP (AIMS, AIMS_TTS, IGA, API Gateway for GCS), follow the '## GCP Prerequisites and Setup for Local Development' section. This includes setting `GCP_PROJECT_ID`, `GCP_LOCATION`, `GCS_BUCKET_NAME` in `common.env`, and ensuring `GOOGLE_APPLICATION_CREDENTIALS` is correctly configured in service-specific `.env` files.
 
-2.  **Build and Run Services:**
+2.  **Database Initialization (PostgreSQL):**
+    *   The PostgreSQL service defined in `docker-compose.yml` (`postgres_db`) will initialize itself.
+    *   The `api_gateway` service (which includes CPOA logic) and other services like TDA, PSWA, SCA, IGA will attempt to connect to this database.
+    *   **Idempotency Table Migration:** A SQL migration script (`aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql`) creates the necessary `idempotency_keys` table used by TDA, SCA, PSWA, and IGA. **This script must be applied manually** to the PostgreSQL database after the `postgres_db` container is up and running. You can use a PostgreSQL client tool (e.g., `psql` via `docker exec`, or a GUI tool like DBeaver or pgAdmin) connected to the PostgreSQL container.
+        *   Example using `psql` via `docker exec`:
+            ```bash
+            docker exec -i $(docker-compose ps -q postgres_db) psql -U your_db_user -d aethercast_db < aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql
+            ```
+            (Replace `your_db_user` and `aethercast_db` with the actual values from your `.env` files if they differ from the defaults in `common.env` used by the `postgres_db` service).
+    *   **Other Tables:** Services like CPOA (via API Gateway) and TDA also manage their own tables (e.g., `cpoa_tasks`, `topics_snippets`). These are typically created or checked for existence by the services themselves on startup (see `init_cpoa_db()` in API Gateway, `init_tda_db()` in TDA).
+
+3.  **Build and Run Services:**
     Open a terminal at the project root (where `docker-compose.yml` is located) and run:
     ```bash
     docker-compose up --build
@@ -195,7 +214,7 @@ This project uses Docker Compose to manage and run the suite of microservices in
     -   `--build`: Forces Docker to rebuild the images if any Dockerfiles or application code has changed.
     -   Use `-d` to run in detached mode (in the background).
 
-3.  **Accessing Services:**
+4.  **Accessing Services:**
     *   **API Gateway / Frontend:** `http://localhost:5001`
     *   TDA: `http://localhost:5000`
     *   SCA: `http://localhost:5002`
@@ -204,21 +223,21 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   ASF: `ws://localhost:5006` (for WebSocket connections)
     *   AIMS Service: `http://localhost:8008` (maps to container port 8000)
     *   AIMS TTS Service: `http://localhost:9009` (maps to container port 9000)
-    *   IGA: `http://localhost:5007` (Image Generation Agent, now uses Vertex AI)
+    *   IGA: `http://localhost:5007`
 
-    Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes. The main interaction point for users is the API Gateway. IGA now performs real image generation using Vertex AI.
+    Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes.
 
-4.  **Shared Volumes:**
-    *   `postgres_data`: A named volume used by the PostgreSQL service to persist database data. This is the primary database for the application.
-    *   `aethercast_db_data`: (Legacy for SQLite, may be phased out) A named volume that previously stored the shared SQLite database.
-    *   `aethercast_audio_data`: (Legacy for local file sharing, less critical now) A named volume that was used for storing generated audio/image files locally. With GCS integration, final media assets are stored in the cloud. This volume might still be used for temporary files by some services or if local file handling is still partially active.
+5.  **Shared Volumes:**
+    *   `postgres_data`: A named volume used by the PostgreSQL service to persist database data. This is the primary database for the application, storing CPOA task states, idempotency records for TDA/SCA/PSWA/IGA, and potentially cached scripts (e.g., by PSWA if configured for PostgreSQL).
+    *   `aethercast_db_data`: (Legacy for SQLite) This volume was used for SQLite databases. Its role is diminished as core functionalities use PostgreSQL.
+    *   `aethercast_audio_data`: (Legacy for local file sharing) With GCS as the primary media store, this volume's importance is reduced.
 
-5.  **Stopping Services:**
+6.  **Stopping Services:**
     Press `Ctrl+C` in the terminal where `docker-compose up` is running. If in detached mode, use:
     ```bash
     docker-compose down
     ```
-    To remove volumes (and thus delete the shared database and audio files), use:
+    To remove volumes (and thus delete the PostgreSQL database data), use:
     ```bash
     docker-compose down -v
     ```
@@ -236,4 +255,4 @@ Once the Docker Compose environment is up and running (with services in their "t
 
 ## Individual Service READMEs
 
-For more detailed information on each service (configuration, API, running standalone), please refer to the `README.md` file within its respective directory in `aethercast/`.
+For more detailed information on each service (specific configurations, API details, and potentially how to run them standalone if supported), please refer to the `README.md` file within its respective directory in `aethercast/`. Note that these individual READMEs may not reflect all cross-cutting concerns like the centralized idempotency setup to the same level of detail as this main README.

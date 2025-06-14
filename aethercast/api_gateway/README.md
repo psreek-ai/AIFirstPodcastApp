@@ -7,16 +7,17 @@ The API Gateway is the primary entry point for external clients (like the fronte
 Key Responsibilities:
 
 1.  **Request Routing & Validation:** Receives HTTP requests from clients, validates them, and routes them to the appropriate internal services (primarily CPOA) or handles them directly.
-2.  **Service Orchestration (Delegation):** For most operations, it delegates to the Central Podcast Orchestrator Agent (CPOA), which handles complex tasks like podcast generation, snippet creation, and search.
+2.  **Service Orchestration (Delegation):** For most operations, it delegates to the Central Podcast Orchestrator Agent (CPOA), which handles complex tasks like podcast generation, snippet creation, and search. The CPOA logic runs within the API Gateway's process and utilizes a PostgreSQL database for state management.
 3.  **Frontend Serving:** Serves the static files (HTML, CSS, JavaScript) for the Aethercast web frontend.
-4.  **Database Interaction:** Manages interactions with a shared database (typically SQLite) for tasks such as:
-    *   Creating and updating records in the `podcasts` table for tracking podcast generation tasks.
+4.  **Idempotency Key Forwarding:** For client-initiated operations that trigger asynchronous backend tasks (e.g., podcast generation, topic exploration), the API Gateway forwards the `X-Idempotency-Key` and `X-Workflow-ID` headers (if provided by the client) to CPOA, which then propagates them to the relevant backend services (TDA, SCA, PSWA, IGA) to ensure idempotent processing.
+5.  **Database Interaction (Direct):** Manages interactions with its configured database (PostgreSQL, which also hosts CPOA's tables and the shared `idempotency_keys` table) for tasks such as:
     *   Managing user session data in the `user_sessions` table.
     *   Managing user accounts in the `users` table for authentication.
-    *   (Note: Direct caching from `topics_snippets` by the API Gateway for the main snippets endpoint has been removed in favor of CPOA-led generation.)
-5.  **Response Formatting:** Consolidates responses from CPOA (or its own data) and formats them into user-friendly JSON responses for the client.
-6.  **Session Management:** Provides endpoints for initializing user sessions and managing user preferences.
-7.  **User Authentication:** Provides endpoints for user registration and login, issuing JWTs for accessing protected routes.
+    *   Managing email subscriptions in the `subscribers` table.
+    *   (Note: CPOA manages the `podcasts` table for task tracking directly within the same database.)
+6.  **Response Formatting:** Consolidates responses from CPOA (or its own data) and formats them into user-friendly JSON responses for the client.
+7.  **Session Management:** Provides endpoints for initializing user sessions and managing user preferences.
+8.  **User Authentication:** Provides endpoints for user registration and login, issuing JWTs for accessing protected routes.
 
 ## Authentication
 
@@ -38,30 +39,31 @@ The API Gateway is configured via environment variables, typically managed in a 
 
 Key Environment Variables:
 
--   `SHARED_DATABASE_PATH`: Path to the SQLite database file. This **must** be the same path used by CPOA and other services for shared data access.
-    -   *Docker Default:* `/app/database/aethercast_podcasts.db`
-    -   *Local Default in `main.py` if not set:* `/app/database/aethercast_podcasts.db` (effective path depends on execution context).
--   `FLASK_SECRET_KEY`: **Required for JWT signing and session security.** A strong, random secret key. It's critical to set this to a persistent random value in your `.env` file for production. If not set, a temporary key is generated at startup (which is insecure and will invalidate tokens/sessions on restart).
+-   **PostgreSQL Database Configuration:** The API Gateway (including the CPOA logic it runs) relies on a PostgreSQL database for CPOA state management, user accounts, sessions, subscriptions, and for accessing the shared `idempotency_keys` table used by backend services. These variables are typically defined in `common.env` and sourced by the API Gateway's `.env` file:
+    -   `POSTGRES_HOST`: Hostname of the PostgreSQL server.
+    -   `POSTGRES_PORT`: Port of the PostgreSQL server.
+    -   `POSTGRES_USER`: Username for database connection.
+    -   `POSTGRES_PASSWORD`: Password for database connection.
+    -   `POSTGRES_DB`: Name of the database.
+-   `FLASK_SECRET_KEY`: **Required for JWT signing and session security.** A strong, random secret key.
     -   *Example in `.env`:* `FLASK_SECRET_KEY=your_random_generated_secret_string`
--   `TDA_SERVICE_URL`: The URL of the Topic Discovery Agent (TDA) service. (Note: Direct calls to TDA from API Gateway might be deprecated if CPOA handles all topic/snippet interactions).
-    -   *Default:* `http://localhost:5000/discover_topics`
+-   **Service URLs:** URLs for backend services that CPOA (running within API Gateway) might call. These should point to the Docker service names when running with Docker Compose.
+    -   `TDA_SERVICE_URL`: URL for the Topic Discovery Agent.
+    -   `SCA_SERVICE_URL`: URL for the Snippet Craft Agent.
+    -   `PSWA_SERVICE_URL`: URL for the Podcast Script Weaver Agent.
+    -   `VFA_SERVICE_URL`: URL for the Voice Forge Agent.
+    -   `IGA_SERVICE_URL`: URL for the Image Generation Agent.
+    -   `AIMS_SERVICE_BASE_URL_CONTAINER`: Base URL for the AIMS service (used by PSWA, SCA).
+    -   `AIMS_TTS_SERVICE_BASE_URL_CONTAINER`: Base URL for the AIMS TTS service (used by VFA).
 -   `API_GW_HOST`: Host for the API Gateway's Flask development server when run directly.
     -   *Default in `main.py` if run directly:* `0.0.0.0`
 -   `API_GW_PORT`: Port for the API Gateway's Flask development server when run directly.
     -   *Default in `main.py` if run directly:* `5001`
 -   `API_GW_DEBUG_MODE`: Enables or disables Flask debug mode when run directly (`True` or `False`).
     -   *Default in `main.py` if run directly:* `True`
--   `FEND_DIR`: (Optional) Path to the frontend static files directory.
-    -   *Note:* This is typically derived in `main.py` relative to its own location (e.g., `../fend`). Setting this environment variable can override the derivation.
--   `GCS_BUCKET_NAME`: The name of the Google Cloud Storage bucket used for Aethercast media assets. While the signed URL generation functionality within the API Gateway can often derive the bucket name from the full `gs://` URI provided by other services, this variable can be used for validation or as a default bucket if only an object path is provided. The setup of this bucket (creation, obtaining the name) is detailed in the main project README's section **'## GCP Prerequisites and Setup for Local Development'**.
-    -   *Example:* `GCS_BUCKET_NAME=your-aethercast-gcs-bucket`
--   `GOOGLE_APPLICATION_CREDENTIALS`: Path to the GCP service account key JSON file. This is essential for the API Gateway to authenticate with Google Cloud Storage (GCS) and generate signed URLs for accessing media files. The setup of the service account and the `gcp-credentials.json` key file, including its placement in the `aethercast/api_gateway/` directory for local Docker development, is detailed in the main project README's section **'## GCP Prerequisites and Setup for Local Development'**.
-    -   *Example (in Docker):* `/app/gcp-credentials.json` (assuming the key file is mounted there from `aethercast/api_gateway/gcp-credentials.json`).
-
-**Deprecated Environment Variables (for Snippet Fetching):**
-The following variables were previously used for API Gateway-level snippet caching but are no longer utilized by the `/api/v1/snippets` endpoint, as this logic is now handled by CPOA:
--   `API_GW_SNIPPET_CACHE_SIZE`
--   `API_GW_SNIPPET_CACHE_MAX_AGE_HOURS`
+-   `FEND_DIR`: (Optional) Path to the frontend static files directory. Default is derived relative to `main.py`.
+-   `GCS_BUCKET_NAME`: Name of the GCS bucket for media assets. Essential for generating signed URLs. See main project README for setup.
+-   `GOOGLE_APPLICATION_CREDENTIALS`: Path to GCP service account key JSON file (e.g., `/app/gcp-credentials.json` in Docker). Required for GCS operations like signed URL generation. See main project README for setup.
 
 **Standard Flask Environment Variables:**
 When using the `flask` command directly, you might set:
@@ -145,7 +147,8 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Snippets & Categories
 
 -   **`GET /api/v1/snippets`**
-    -   **Description:** Fetches dynamically generated podcast snippets via CPOA, suitable for a landing page. CPOA orchestrates topic discovery (TDA), snippet text generation (SCA), and image generation (IGA). `image_url`s for snippets (originally GCS URIs from IGA via CPOA) are converted to short-lived signed GCS HTTP URLs by the API Gateway before being sent to the client. If a valid `Authorization: Bearer <token>` is provided, the `user_id` is opportunistically passed to CPOA for potential personalization and is associated with the created workflow.
+    -   **Description:** Fetches dynamically generated podcast snippets via CPOA. CPOA orchestrates topic discovery (TDA), snippet text generation (SCA), and image generation (IGA). `image_url`s (GCS URIs) are converted to signed GCS HTTP URLs by API Gateway. If authenticated, `user_id` is passed to CPOA.
+    -   **Headers (Optional):** `X-Idempotency-Key` (string) can be provided by clients if they wish to ensure this potentially expensive read-like operation (which might trigger new CPOA workflows if data is stale or not found) is idempotent from their perspective, though the primary benefit of idempotency is for state-changing operations. CPOA may use this key if it decides to initiate a new workflow.
     -   **Query Parameters:** `limit` (optional, integer, default 6, max 20): Number of snippets.
     -   **Success Response (200 OK):**
         ```json
@@ -170,7 +173,8 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
     -   **Error Responses:** 503 (CPOA unavailable), 500 (CPOA error).
 
 -   **`POST /api/v1/topics/explore`**
-    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or a set of `keywords`. Delegates to CPOA's `orchestrate_topic_exploration`. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Explores topics related to a given `current_topic_id` or `keywords`. Delegates to CPOA. Authenticated `user_id` is passed to CPOA. `image_url`s are converted to signed GCS URLs.
+    -   **Headers (Recommended):** Include `X-Idempotency-Key` (string, UUID recommended) to ensure that if the request is retried (e.g., due to network issues), the underlying asynchronous topic exploration and generation tasks managed by CPOA are processed idempotently by backend services. `X-Workflow-ID` (string, optional) can also be provided for end-to-end tracking.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -208,7 +212,8 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Podcast Task Management
 
 -   **`POST /api/v1/podcasts`**
-    -   **Description:** (**Authentication Required.**) Initiates a new podcast generation task. Calls CPOA to orchestrate generation. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header.
+    -   **Description:** (**Authentication Required.**) Initiates a new podcast generation task via CPOA. Authenticated `user_id` is passed to CPOA.
+    -   **Headers (Strongly Recommended):** Include `X-Idempotency-Key` (string, UUID recommended) to ensure that the entire podcast generation workflow (which involves multiple asynchronous Celery tasks in backend services like PSWA, VFA, IGA) is processed idempotently. `X-Workflow-ID` (string, optional) can also be provided for end-to-end tracking.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -258,7 +263,8 @@ This includes `Flask`, `requests`, `python-dotenv`, `PyJWT` (for JWT handling), 
 ### Search
 
 -   **`POST /api/v1/search/podcasts`**
-    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. The authenticated user's `user_id` is passed to CPOA and associated with the workflow. `image_url`s in the returned snippets are converted to short-lived signed GCS HTTP URLs. If `client_id` is provided, user preferences from the session are fetched and passed to CPOA. Requires a valid Bearer token in the `Authorization` header. This endpoint is used by the header search bar and the search within the "Latest Episodes" section.
+    -   **Description:** (**Authentication Required.**) Searches for podcast topics via CPOA based on a query. Authenticated `user_id` is passed to CPOA. `image_url`s are converted to signed GCS URLs.
+    -   **Headers (Recommended):** Include `X-Idempotency-Key` (string, UUID recommended) if the search operation might trigger new CPOA workflows that involve asynchronous backend tasks, to ensure those are processed idempotently. `X-Workflow-ID` (string, optional) can also be provided.
     -   **Request Payload (JSON):**
         ```json
         {
@@ -372,19 +378,21 @@ The API Gateway, CPOA, and other services may utilize a shared database (Postgre
 -   **Key Columns (PostgreSQL types):** `id` (UUID PK), `type` (TEXT), `title` (TEXT), `summary` (TEXT), `keywords` (JSONB), `source_url` (TEXT), `source_name` (TEXT), `original_topic_details` (JSONB), `llm_model_used_for_snippet` (TEXT), `cover_art_prompt` (TEXT), `image_url` (TEXT - GCS URI), `generation_timestamp` (TIMESTAMPTZ), `last_accessed_timestamp` (TIMESTAMPTZ), `relevance_score` (REAL).
 
 ### `generated_scripts` Table
--   **Purpose:** Serves as a cache for podcast scripts generated by the Podcast Script Weaver Agent (PSWA), typically managed by CPOA. This helps avoid re-generating scripts for identical topics if a fresh script is already available.
--   **Key Columns:** `script_id` (PK), `topic_hash` (UNIQUE, hash of topic identifiers), `structured_script_json` (JSON of the script), `generation_timestamp`, `llm_model_used`, `last_accessed_timestamp`.
+-   **Purpose:** Serves as a cache for podcast scripts generated by PSWA, managed by CPOA. Stored in the PostgreSQL database if PSWA is configured for it.
+-   **Key Columns:** `script_id` (PK), `topic_hash` (UNIQUE), `structured_script_json` (JSONB), `generation_timestamp`, `llm_model_used`, `last_accessed_timestamp`.
+
+### `idempotency_keys` Table
+-   **Purpose:** Shared table used by TDA, SCA, PSWA, and IGA services to track the state of idempotent operations. Ensures that tasks initiated with the same `X-Idempotency-Key` are not processed multiple times. Stored in the main PostgreSQL database.
+-   **Key Columns (PostgreSQL types):** `idempotency_key` (TEXT PK), `task_name` (TEXT), `workflow_id` (TEXT, nullable), `created_at` (TIMESTAMPTZ), `locked_at` (TIMESTAMPTZ, nullable), `status` (TEXT), `result_payload` (JSONB, nullable), `error_payload` (JSONB, nullable).
 
 ### `user_sessions` Table
--   **Purpose:** Stores user session identifiers (client IDs) and their associated preferences, allowing for personalized experiences across requests.
--   **Key Columns:** `session_id` (PK, corresponds to `client_id`), `created_timestamp`, `last_seen_timestamp`, `preferences_json` (JSON string for user preferences).
+-   **Purpose:** Stores user session identifiers (`client_id`) and their associated preferences. Stored in the PostgreSQL database.
+-   **Key Columns (PostgreSQL types):** `session_id` (TEXT PK), `user_id` (UUID FK, nullable), `created_timestamp` (TIMESTAMPTZ), `last_seen_timestamp` (TIMESTAMPTZ), `preferences_json` (JSONB).
 
 ### `users` Table
--   **Purpose:** Stores user account information for authentication.
+-   **Purpose:** Stores user account information for authentication. Stored in the PostgreSQL database.
 -   **Key Columns (PostgreSQL types):** `user_id` (UUID PK), `username` (TEXT UNIQUE), `email` (TEXT UNIQUE), `hashed_password` (TEXT), `created_at` (TIMESTAMPTZ).
 
 ### `subscribers` Table
--   **Purpose:** Stores email addresses of users who have subscribed for updates.
--   **Key Columns (PostgreSQL types):**
-    -   `email` (VARCHAR(255) PK): User's email address.
-    -   `subscribed_at` (TIMESTAMPTZ): Timestamp of subscription.
+-   **Purpose:** Stores email addresses of users who have subscribed for updates. Stored in the PostgreSQL database.
+-   **Key Columns (PostgreSQL types):** `email` (TEXT PK), `subscribed_at` (TIMESTAMPTZ).

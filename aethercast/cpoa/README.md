@@ -8,52 +8,32 @@ Key responsibilities include:
 
 -   **Workflow Management:** Orchestrating multi-step workflows involving other agents:
     -   **Full Podcast Generation (`orchestrate_podcast_generation`):** Coordinates with WebContentHarvesterAgent (WCHA - as a library), PodcastScriptWeaverAgent (PSWA - service), and VoiceForgeAgent (VFA - service).
-        -   Receives a structured JSON script from PSWA, which it then forwards to VFA.
-        -   VFA returns a GCS URI for the generated audio (e.g., `gs://bucket/audio.mp3`), which is stored as `final_audio_filepath` in the database.
-        -   Accepts optional voice parameters and an optional `client_id` (for UI updates). Voice parameters are forwarded to VFA.
-        -   Notifies the AudioStreamFeeder (ASF) when new audio is ready, providing the GCS URI as the `filepath`.
-    -   **Individual Snippet Generation (`orchestrate_snippet_generation`):** Coordinates with SnippetCraftAgent (SCA - service) to generate snippet text and a `cover_art_prompt`. After SCA, it calls the Image Generation Agent (IGA - service) with the `cover_art_prompt` to get an `image_url`. This `image_url` is a GCS URI (e.g., `gs://bucket/image.png`). The final `SnippetDataObject` (containing snippet text, `cover_art_prompt`, and the GCS URI for the image) is **returned by this function**. This `SnippetDataObject` is then used by calling functions (like search or topic exploration). The `_save_snippet_to_db` helper function within CPOA saves this snippet data, including the GCS URI for `image_url`, to the `topics_snippets` table.
-    -   **Search Results Generation (`orchestrate_search_results_generation`):**
-        -   Accepts a search query. Calls the Topic Discovery Agent (TDA - service) to find relevant topics.
-        -   For each topic, calls `orchestrate_snippet_generation` (which includes IGA call to get a GCS URI for the image) to generate a descriptive snippet.
-        -   Returns a list of these generated snippets.
-    -   **Landing Page Snippet Orchestration (`orchestrate_landing_page_snippets`):**
-        -   Orchestrates the generation of multiple diverse snippets for the application's landing page.
-        -   It calls the Topic Discovery Agent (TDA) to fetch a list of diverse topics based on general keywords or user preferences.
-        -   For each relevant topic from TDA, it then calls `orchestrate_snippet_generation` (which internally calls SCA for text and IGA for an image URL) to create a complete snippet.
-        -   The function returns a list of these fully generated snippets, ready for display on the landing page.
-        -   This function is implemented in `aethercast/cpoa/main.py` and used by the API Gateway's `/api/v1/snippets` endpoint.
-    -   **Popular Category Provisioning (`get_popular_categories`):**
-        -   Provides a predefined list of popular podcast categories.
--   **Task State Management:** Updates the status of podcast generation tasks in the `podcasts` table of a shared database.
+    -   **Individual Snippet Generation (`orchestrate_snippet_generation`):** Coordinates with SnippetCraftAgent (SCA - service) and Image Generation Agent (IGA - service).
+    -   **Search Results Generation (`orchestrate_search_results_generation`):** Calls Topic Discovery Agent (TDA - service) and then `orchestrate_snippet_generation` for each topic.
+    -   **Landing Page Snippet Orchestration (`orchestrate_landing_page_snippets`):** Calls TDA and then `orchestrate_snippet_generation`.
+    -   **Popular Category Provisioning (`get_popular_categories`):** Provides a predefined list of popular podcast categories.
+-   **Task State Management:** Manages the state of podcast generation and other orchestrated workflows using a PostgreSQL database (see "Workflow State Management" below).
 -   **Agent Communication:** Makes HTTP requests to downstream services (PSWA, VFA, SCA, ASF, TDA, IGA).
+-   **Idempotency Key Propagation:** When initiating operations that involve backend Celery tasks in downstream services (TDA, SCA, PSWA, IGA), CPOA is responsible for forwarding the `X-Idempotency-Key` (if received from its caller, e.g., the API Gateway) and typically uses its own generated `workflow_id` as the `X-Workflow-ID` for these calls. This facilitates end-to-end idempotent processing.
 -   **Real-time UI Updates:** Sends status updates to ASF if a `client_id` is provided.
--   **Error Handling and Resilience:** Implements retry mechanisms for service calls and manages failures.
+-   **Error Handling and Resilience:** Implements retry mechanisms for service calls and manages failures within its orchestrated workflows.
 
-CPOA itself is not a directly exposed service but a Python module called by the API Gateway.
+CPOA itself is not a directly exposed service but a Python module called by the API Gateway. Its logic runs within the API Gateway's process.
 
 ## Configuration
 
-CPOA is configured via environment variables, typically in an `.env` file in `aethercast/cpoa/`.
+CPOA is configured via environment variables, typically inherited from the API Gateway's environment (as it runs in the same process) or set in an `.env` file if run standalone for testing. Many of these are service URLs for the agents it orchestrates.
 
--   `PSWA_SERVICE_URL`: URL of PodcastScriptWeaverAgent. Default: `http://localhost:5004/weave_script`.
--   `VFA_SERVICE_URL`: URL of VoiceForgeAgent. Default: `http://localhost:5005/forge_voice`.
--   `ASF_NOTIFICATION_URL`: URL for notifying ASF about new audio. Default: `http://localhost:5006/asf/internal/notify_new_audio`.
--   `ASF_WEBSOCKET_BASE_URL`: Base WebSocket URL for ASF. Default: `ws://localhost:5006/api/v1/podcasts/stream`.
--   `SCA_SERVICE_URL`: URL of SnippetCraftAgent. Default: `http://localhost:5002/craft_snippet`.
--   `CPOA_ASF_SEND_UI_UPDATE_URL`: Internal URL on ASF for CPOA to send UI updates. Default: `http://localhost:5006/asf/internal/send_ui_update`.
--   `IGA_SERVICE_URL`: URL of Image Generation Agent. Default: `http://localhost:5007`.
--   `TDA_SERVICE_URL`: URL of Topic Discovery Agent. Used by functions like `orchestrate_search_results_generation` and `orchestrate_topic_exploration`. Default: `http://localhost:5000/discover_topics`.
--   `SHARED_DATABASE_PATH`: Path to the shared SQLite database (used if `DATABASE_TYPE` is `sqlite`). Default: `/app/database/aethercast_podcasts.db`.
--   `DATABASE_TYPE`: Specifies the database type (`sqlite` or `postgres`).
--   `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: PostgreSQL connection details (used if `DATABASE_TYPE` is `postgres`).
--   `CPOA_SERVICE_RETRY_COUNT`: Number of retries for failed HTTP requests. Default: `3`.
+-   **Service URLs:** (e.g., `PSWA_SERVICE_URL`, `VFA_SERVICE_URL`, `SCA_SERVICE_URL`, `IGA_SERVICE_URL`, `TDA_SERVICE_URL`, `ASF_NOTIFICATION_URL`, `CPOA_ASF_SEND_UI_UPDATE_URL`). These should point to the correct addresses of the respective services (e.g., `http://pswa:5004/v1/weave_script` in a Docker environment).
+-   **Database Configuration:** CPOA uses PostgreSQL for its workflow state management and this database also hosts the shared `idempotency_keys` table used by backend services. These are critical:
+    -   `DATABASE_TYPE`: Must be set to `postgres`.
+    -   `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`: Standard PostgreSQL connection details. These are typically sourced from `common.env`.
+-   `CPOA_SERVICE_RETRY_COUNT`: Number of retries for failed HTTP requests to downstream services. Default: `3`.
 -   `CPOA_SERVICE_RETRY_BACKOFF_FACTOR`: Base factor for exponential backoff (seconds). Default: `0.5`.
--   `# WCHA_SERVICE_URL`: (Commented out) WCHA is used as a library.
 
 ## Dependencies
 
-Listed in `requirements.txt` (e.g., `requests`, `python-dotenv`).
+Listed in `requirements.txt` (e.g., `requests`, `python-dotenv`, `psycopg2-binary`).
 
 ## Running and Testing
 
@@ -68,42 +48,31 @@ Formal unit tests are in `aethercast/cpoa/tests/`. Run with `python -m unittest 
 
 ## Database Interaction & Data Persistence Notes
 
--   CPOA updates the `podcasts` table for task tracking.
+-   CPOA updates the `podcasts` table (legacy) and primarily uses `workflow_instances` and `task_instances` tables for task tracking.
 -   **Snippet Data Persistence:**
     -   The `orchestrate_snippet_generation` function calls SCA and IGA. The `image_url` obtained from IGA is a GCS URI and is part of the returned `SnippetDataObject`.
-    -   The helper `_save_snippet_to_db` saves snippet information (title, summary, text, cover_art_prompt, `image_url` as GCS URI, etc.) to the `topics_snippets` table.
--   CPOA functions accept `task_id` and optional `voice_params_input`, `client_id`, `user_preferences`, and `test_scenarios`. The `db_path` parameter has been removed as CPOA now uses its configured `DATABASE_TYPE`.
+-   The helper `_save_snippet_to_db` saves snippet information (including the GCS URI for `image_url`) to the `topics_snippets` table in the PostgreSQL database.
+-   CPOA functions accept `task_id` (legacy, new primary key is `workflow_id` from `workflow_instances` table), optional `voice_params_input`, `client_id`, `user_preferences`, and `test_scenarios`.
+-   When calling backend services that support idempotency, CPOA passes the `X-Idempotency-Key` (if provided by the client to the API Gateway) and uses its own `workflow_id` as the `X-Workflow-ID` for those calls.
 -   `user_preferences` can influence agent calls (e.g., preferred VFA voice).
 -   `test_scenarios` allow passing headers like `X-Test-Scenario` to downstream services for testing.
--   The final dictionary from `orchestrate_podcast_generation` includes status, error messages, ASF details, the GCS URI for the audio (`final_audio_filepath`), stream ID, actual TTS settings used, a detailed CPOA internal orchestration log, and now also a `workflow_id`.
+-   The final dictionary from `orchestrate_podcast_generation` includes status, error messages, ASF details, the GCS URI for the audio (`final_audio_filepath`), stream ID, actual TTS settings used, a detailed CPOA internal orchestration log, and the `workflow_id`.
 
 ## Workflow State Management
 
-CPOA now implements robust state management for its orchestration flows using two primary PostgreSQL tables: `workflow_instances` and `task_instances`. This provides enhanced observability, debugging capabilities, and a foundation for future features like workflow resumption.
+CPOA implements robust state management for its orchestration flows using two primary PostgreSQL tables: `workflow_instances` and `task_instances`. This provides enhanced observability, debugging capabilities, and a foundation for future features like workflow resumption. The same PostgreSQL database also hosts the `idempotency_keys` table used by backend services (TDA, SCA, PSWA, IGA).
 
--   **`workflow_instances`**: Each call to a major CPOA orchestration function (e.g., `orchestrate_podcast_generation`, `orchestrate_landing_page_snippets`) creates a record here. This table tracks the overall workflow, including:
-    -   `workflow_id` (unique identifier for the entire process).
-    -   `user_id` (if provided from an authenticated API Gateway call).
-    -   `trigger_event_type` (e.g., "podcast_generation", "landing_page_snippets").
-    -   `trigger_event_details_json` (initial parameters of the request).
-    -   `overall_status` ("pending", "in_progress", "completed", "failed", "completed_with_errors").
-    -   Timestamps, evolving context data (like generated GCS URIs), and top-level error messages.
--   **`task_instances`**: Each call to an external agent (TDA, SCA, PSWA, VFA, IGA) or significant internal step within a workflow is logged as a task instance. This table tracks:
-    -   `task_id` (unique identifier for the specific task).
-    -   `workflow_id` (linking back to the parent workflow).
-    -   `agent_name` (e.g., "TDA", "PSWA").
-    -   `task_order`, `status`, `input_params_json`, `output_result_summary_json`, `error_details_json`, timestamps, and `retry_count`.
+-   **`workflow_instances`**: Each call to a major CPOA orchestration function creates a record here. This table tracks the overall workflow. The `workflow_id` from this table is also passed as the `X-Workflow-ID` header to downstream services.
+-   **`task_instances`**: Each call to an external agent or significant internal step is logged here, linked to the parent `workflow_id`.
 
 **Interaction Flow:**
-1.  When a CPOA orchestration function is called, it first creates a `workflow_instance` record.
-2.  Before each call to an agent (e.g., TDA, PSWA), a `task_instance` record is created.
-3.  After the agent call completes or fails, the corresponding `task_instance` record is updated with the status and outcome.
-4.  Once all steps in the workflow are done, or if a critical error occurs, the `workflow_instances` record is updated to its final status.
+1.  A CPOA orchestration function creates a `workflow_instance`.
+2.  Before each agent call, a `task_instance` is created.
+3.  After the agent call, the `task_instance` is updated.
+4.  The `workflow_instances` record is updated to its final status upon completion or critical failure.
 
-**Key Changes to Orchestration Functions:**
--   They now accept an optional `user_id: Optional[str]` parameter, which is passed by the API Gateway for authenticated requests and stored in `workflow_instances`.
--   They now return a `workflow_id` (string) as part of their primary response dictionary, allowing callers (like the API Gateway) to reference the specific workflow instance.
+This detailed state tracking occurs in the PostgreSQL database. For more details on the schema, see `docs/architecture/CPOA_State_Management.md`.
 
-This detailed state tracking occurs in the PostgreSQL database, managed by internal CPOA helper functions (`_create_workflow_instance`, `_update_task_instance_status`, etc.). For more details on the schema, see `docs/architecture/CPOA_State_Management.md`.
-The legacy `podcasts` table is still updated by `orchestrate_podcast_generation` for backward compatibility with existing API Gateway logic, but the new `workflow_instances` and `task_instances` tables provide a more granular and comprehensive state management solution.
-```
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

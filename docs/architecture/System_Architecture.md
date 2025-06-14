@@ -13,76 +13,126 @@ The system is built around a central **Podcast Orchestrator Agent** that coordin
 
 ```mermaid
 graph TD
-    %% Node Definitions - Using double quotes for all labels for robustness
+    %% Node Definitions
     User["User"]
     FEND["Frontend UI / Client App"]
-    APIGW["API Gateway"]
-    CPOA["Central Podcast Orchestrator Agent"]
-    SCA["SnippetCraftAgent"]
-    TDA["TopicDiscoveryAgent"]
-    WCHA["WebContentHarvesterAgent"]
-    PSWA["PodcastScriptWeaverAgent"]
-    VFA["VoiceForgeAgent"]
-    DUIA["DynamicUIAgent (DUIA)"]
-    AIMS["AI Models - LLM"]
-    AIMS_TTS["AI Models - TTS"]
-    Internet["External Web and APIs"]
-    DS["Data Stores - Main"]
+    APIGW["API Gateway (runs CPOA logic)"]
+    CPOA["Central Podcast Orchestrator (logic within APIGW)"]
 
-    %% Subgraphs and Connections - Using quoted edge labels
-    subgraph User Facing
-        User --> FEND
+    subgraph Asynchronous Agents (Celery-based)
+        TDA_Service["TDA Service (Flask App)"]
+        TDA_Worker["TDA Worker (Celery)"]
+        SCA_Service["SCA Service (Flask App)"]
+        SCA_Worker["SCA Worker (Celery)"]
+        PSWA_Service["PSWA Service (Flask App)"]
+        PSWA_Worker["PSWA Worker (Celery)"]
+        IGA_Service["IGA Service (Flask App)"]
+        IGA_Worker["IGA Worker (Celery)"]
+        VFA_Service["VFA Service (Flask App)"]
+        VFA_Worker["VFA Worker (Celery)"]
     end
 
-    subgraph Backend Services
-        FEND -- "HTTPS Requests / WebSocket" --> APIGW
-        APIGW --> CPOA
+    WCHA["WebContentHarvesterAgent (Library)"]
+    DUIA["DynamicUIAgent (DUIA - Conceptual/Module)"]
 
-        CPOA -- "Task Delegation" --> SCA
-        CPOA -- "Task Delegation" --> TDA
-        CPOA -- "Task Delegation" --> WCHA
-        CPOA -- "Task Delegation" --> PSWA
-        CPOA -- "Task Delegation" --> VFA
-
-        CPOA -- "Content/Context for UI" --> DUIA
-        DUIA -- "UI Definition JSON" --> APIGW
-        %% APIGW then sends UI Definition to FEND
-
-        SCA --> AIMS
-        PSWA --> AIMS
-        VFA --> AIMS_TTS
-
-        WCHA -- "Web Requests" --> Internet
-        TDA -- "Web Analysis" --> Internet
-
-        CPOA -- "State Read/Write" --> DS
-        SCA -- "Metadata Write" --> DS
-        TDA -- "Topic Data Write" --> DS
-        PSWA -- "Script Cache (Optional)" --> DS
-        User -- "User Preferences (Future)" --> DS
+    subgraph AI Model Services
+        AIMS_SVC["AIMS Service (LLM Proxy)"]
+        AIMS_TTS_SVC["AIMS_TTS Service (TTS Proxy)"]
+        VertexAI_IMG["Vertex AI Imagen (Google Cloud)"]
     end
 
     subgraph Supporting Infrastructure
-        AIMS
-        AIMS_TTS
-        DS
-        Internet
+        PostgresDB["PostgreSQL DB </br>(CPOA State, Idempotency, Topics, Scripts, Users etc.)"]
+        Redis["Redis </br>(Celery Broker, Caching)"]
+        GCS["Google Cloud Storage </br>(Audio, Images)"]
+        Internet["External Web / News APIs"]
+        ASF["Audio Stream Feeder"]
     end
+
+    %% Connections
+    User --> FEND
+    FEND -- "HTTPS Requests / WebSocket (to ASF)" --> APIGW
+    APIGW -- "includes" --> CPOA
+
+    CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> TDA_Service
+    TDA_Service -- "Celery Task" --> Redis
+    Redis --> TDA_Worker
+    TDA_Worker -- "HTTP Call" --> Internet
+    TDA_Worker -- "DB Read/Write" --> PostgresDB
+    TDA_Service -- "Task Status Poll by CPOA" --> CPOA
+
+    CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> SCA_Service
+    SCA_Service -- "Celery Task" --> Redis
+    Redis --> SCA_Worker
+    SCA_Worker -- "HTTP Call" --> AIMS_SVC
+    SCA_Worker -- "DB Read/Write (Idempotency)" --> PostgresDB
+    SCA_Service -- "Task Status Poll by CPOA" --> CPOA
+
+    CPOA -- "Call as Library" --> WCHA
+    WCHA -- "HTTP Call" --> Internet
+
+    CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> PSWA_Service
+    PSWA_Service -- "Celery Task" --> Redis
+    Redis --> PSWA_Worker
+    PSWA_Worker -- "HTTP Call" --> AIMS_SVC
+    PSWA_Worker -- "DB Read/Write (Idempotency, Script Cache)" --> PostgresDB
+    PSWA_Service -- "Task Status Poll by CPOA" --> CPOA
+
+    CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> VFA_Service
+    VFA_Service -- "Celery Task" --> Redis
+    Redis --> VFA_Worker
+    VFA_Worker -- "HTTP Call" --> AIMS_TTS_SVC
+    VFA_Worker -- "DB Read/Write (Idempotency)" --> PostgresDB
+    VFA_Service -- "Task Status Poll by CPOA" --> CPOA
+
+    CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> IGA_Service
+    IGA_Service -- "Celery Task" --> Redis
+    Redis --> IGA_Worker
+    IGA_Worker -- "API Call" --> VertexAI_IMG
+    IGA_Worker -- "GCS Write" --> GCS
+    IGA_Worker -- "DB Read/Write (Idempotency)" --> PostgresDB
+    IGA_Service -- "Task Status Poll by CPOA" --> CPOA
+
+    AIMS_TTS_SVC -- "GCS Write" --> GCS
+
+    CPOA -- "Content/Context for UI" --> DUIA
+    DUIA -- "UI Definition JSON" --> APIGW
+
+    CPOA -- "Notify New Audio (GCS URI)" --> ASF
+    ASF -- "Get Signed URL" --> APIGW
+    APIGW -- "GCS Read (for Signed URL)" --> GCS
+    FEND -- "WebSocket Audio Stream" --> ASF
+    ASF -- "Stream from GCS via Signed URL" --> FEND
+
+
+    CPOA -- "DB Read/Write (Workflow State)" --> PostgresDB
+    APIGW -- "DB Read/Write (Users, Sessions)" --> PostgresDB
+
 
     %% Styling
     style User fill:#f9f,stroke:#333,stroke-width:2px
     style FEND fill:#bbf,stroke:#333,stroke-width:2px
     style APIGW fill:#ccf,stroke:#333,stroke-width:2px
     style CPOA fill:#f00,stroke:#333,stroke-width:3px,color:#fff
-    style SCA fill:#ff9,stroke:#333,stroke-width:2px
-    style TDA fill:#ff9,stroke:#333,stroke-width:2px
-    style WCHA fill:#ff9,stroke:#333,stroke-width:2px
-    style PSWA fill:#ff9,stroke:#333,stroke-width:2px
-    style VFA fill:#ff9,stroke:#333,stroke-width:2px
-    style DUIA fill:#f9c,stroke:#333,stroke-width:2px %% Style for DUIA
-    style AIMS fill:#9cf,stroke:#333,stroke-width:2px
-    style AIMS_TTS fill:#9cf,stroke:#333,stroke-width:2px
-    style DS fill:#9c9,stroke:#333,stroke-width:2px
+    style TDA_Service fill:#ff9,stroke:#333,stroke-width:2px
+    style SCA_Service fill:#ff9,stroke:#333,stroke-width:2px
+    style PSWA_Service fill:#ff9,stroke:#333,stroke-width:2px
+    style VFA_Service fill:#ff9,stroke:#333,stroke-width:2px
+    style IGA_Service fill:#ff9,stroke:#333,stroke-width:2px
+    style TDA_Worker fill:#fde,stroke:#333,stroke-width:2px
+    style SCA_Worker fill:#fde,stroke:#333,stroke-width:2px
+    style PSWA_Worker fill:#fde,stroke:#333,stroke-width:2px
+    style VFA_Worker fill:#fde,stroke:#333,stroke-width:2px
+    style IGA_Worker fill:#fde,stroke:#333,stroke-width:2px
+    style WCHA fill:#fdb,stroke:#333,stroke-width:2px
+    style DUIA fill:#f9c,stroke:#333,stroke-width:2px
+    style AIMS_SVC fill:#9cf,stroke:#333,stroke-width:2px
+    style AIMS_TTS_SVC fill:#9cf,stroke:#333,stroke-width:2px
+    style VertexAI_IMG fill:#9cf,stroke:#333,stroke-width:2px
+    style PostgresDB fill:#9c9,stroke:#333,stroke-width:2px
+    style Redis fill:#f69,stroke:#333,stroke-width:2px
+    style GCS fill:#9c9,stroke:#333,stroke-width:2px
+    style ASF fill:#f99,stroke:#333,stroke-width:2px
     style Internet fill:#ccc,stroke:#333,stroke-width:2px
 ```
 
@@ -118,85 +168,75 @@ Below are descriptions of the major components depicted in the architecture diag
     * **Potential Technologies:** AWS API Gateway, Azure API Management, Google Cloud API Gateway, Kong, Tyk.
 
 * **Central Podcast Orchestrator Agent (CPOA):**
-    * **Description:** The "brain" of the application. A sophisticated agent responsible for interpreting user requests, managing the overall workflow of podcast generation, delegating tasks to specialized AI agents, and managing state.
-    * **Key Responsibilities:**
-        * Receive and interpret requests from the API Gateway.
-        * Maintain user session state and context.
-        * Coordinate the sequence of operations for snippet and full podcast generation.
-        * Delegate tasks to `SnippetCraftAgent`, `TopicDiscoveryAgent`, `WebContentHarvesterAgent`, `PodcastScriptWeaverAgent`, and `VoiceForgeAgent`.
-        * Manage agent communication and data flow between agents.
-        * Handle errors and retries in the generation pipeline.
-        * Send UI update instructions back to the Frontend (e.g., via WebSocket through APIGW or directly).
-    * **Potential Technologies:** Python (with frameworks like FastAPI, Flask, or agentic frameworks like Langchain, AutoGen), Node.js, Go. Message queues (RabbitMQ, Kafka, Redis Streams) for inter-agent communication.
+    * **Description:** Runs as part of the API Gateway process. Orchestrates podcast generation by dispatching asynchronous Celery tasks to specialized agents (TDA, SCA, PSWA, IGA, VFA). Manages overall workflow state in PostgreSQL. Propagates `X-Idempotency-Key` and its own `workflow_id` (as `X-Workflow-ID`) to downstream agents.
+    * **Key Responsibilities:** Workflow management, task delegation (Celery), polling for task results, state persistence (PostgreSQL), error handling.
+    * **Potential Technologies:** Python, Flask (as part of API GW).
 
-* **Specialized AI Agents:**
-  These agents perform specific tasks in the content generation pipeline, orchestrated by the CPOA. They are likely implemented as microservices or serverless functions.
-
-    * **`SnippetCraftAgent` (SCA):**
-        * **Description:** Generates compelling, short-form text snippets and associated metadata (e.g., titles, potential cover art prompts) for display on the landing page. May also determine which topics are suitable for snippet generation based on input from `TopicDiscoveryAgent`.
-        * **Interaction:** Receives tasks from CPOA, uses LLMs from AIMS, writes metadata to Data Stores.
-        * **Potential Technologies:** Python, LLM SDKs (OpenAI, Hugging Face Transformers).
+* **Specialized AI Agents (TDA, SCA, PSWA, IGA, VFA):**
+  Each of these agents is now a microservice consisting of a Flask app (for task status polling and potentially direct interaction if ever needed) and Celery workers for asynchronous task processing. They implement idempotency for their core Celery tasks using `X-Idempotency-Key` and a shared PostgreSQL table (`idempotency_keys`).
 
     * **`TopicDiscoveryAgent` (TDA):**
-        * **Description:** Identifies trending, relevant, or niche topics suitable for podcast generation. May analyze web trends, news feeds, or other sources.
-        * **Interaction:** Receives tasks from CPOA, accesses External Web/APIs, writes topic data to Data Stores.
-        * **Potential Technologies:** Python, web scraping libraries (Beautiful Soup, Scrapy), news API clients, NLP libraries for trend analysis.
+        * **Description:** Asynchronously discovers topics via its `discover_topics_task` (Celery). Uses NewsAPI (via `fetch_news_from_newsapi_task` sub-task) or simulated data. Stores topics in PostgreSQL.
+        * **Interaction:** Receives Celery task from CPOA (with idempotency keys). Uses PostgreSQL for idempotency and topic storage. Calls external News APIs.
+        * **Potential Technologies:** Python, Flask, Celery, NewsAPI client, PostgreSQL.
+
+    * **`SnippetCraftAgent` (SCA):**
+        * **Description:** Asynchronously crafts snippets via its `sca_craft_snippet_task` (Celery). Calls AIMS for LLM.
+        * **Interaction:** Receives Celery task from CPOA. Uses AIMS. Uses PostgreSQL for idempotency.
+        * **Potential Technologies:** Python, Flask, Celery, Requests, PostgreSQL.
 
     * **`WebContentHarvesterAgent` (WCHA):**
-        * **Description:** Given a specific topic by the CPOA, this agent autonomously browses the web, identifies relevant sources, retrieves, and pre-processes information to form the factual basis of a podcast.
-        * **Interaction:** Receives topic from CPOA, accesses External Web/APIs, provides processed content to `PodcastScriptWeaverAgent` (possibly via CPOA or shared storage).
-        * **Potential Technologies:** Python, web scraping/Browse automation tools (Selenium, Playwright), content extraction libraries (article-parser, trafilatura).
+        * **Description:** (As before) Functions as a Python library called directly by CPOA for synchronous web content fetching and extraction. Does not have its own Celery task or direct idempotency handling (idempotency of its use would be covered by the calling CPOA workflow if CPOA's operation involving WCHA was idempotent).
+        * **Interaction:** Called as a library by CPOA. Accesses External Web.
+        * **Potential Technologies:** Python, `duckduckgo_search`, `trafilatura`.
 
     * **`PodcastScriptWeaverAgent` (PSWA):**
-        * **Description:** An advanced LLM-based agent that takes processed web content, a target persona/style, and the podcast topic to write an engaging, coherent, informative podcast script.
-        * **Interaction:** Receives processed content and parameters from CPOA, uses LLMs from AIMS, provides script to `VoiceForgeAgent` (via CPOA). May cache scripts in Data Stores.
-        * **Potential Technologies:** Python, LLM SDKs, prompt engineering frameworks.
+        * **Description:** Asynchronously weaves scripts via `weave_script_task` (Celery). Calls AIMS. Supports script caching (SQLite or PostgreSQL).
+        * **Interaction:** Receives Celery task from CPOA. Uses AIMS. Uses PostgreSQL for idempotency and optionally for script caching.
+        * **Potential Technologies:** Python, Flask, Celery, Requests, PostgreSQL, SQLite.
 
     * **`VoiceForgeAgent` (VFA):**
-        * **Description:** A state-of-the-art Text-to-Speech (TTS) agent that renders the script from PSWA into a natural, high-quality audio stream. Manages voice selection, tone, and pacing.
-        * **Interaction:** Receives script from CPOA, uses TTS models from AIMS_TTS, produces audio stream delivered to the user (potentially chunked for real-time streaming).
-        * **Potential Technologies:** Python, TTS SDKs/APIs (e.g., ElevenLabs, Azure TTS, Google TTS, Coqui TTS).
+        * **Description:** Asynchronously forges voice via `forge_voice_task` (Celery). Calls AIMS_TTS service (which handles TTS and GCS upload).
+        * **Interaction:** Receives Celery task from CPOA. Calls AIMS_TTS. Uses PostgreSQL for idempotency.
+        * **Potential Technologies:** Python, Flask, Celery, Requests, PostgreSQL.
 
-    * **`DynamicUIAgent` (DUIA) (Conceptual):**
-        * **Description:** Responsible for generating a structured UI Definition JSON based on data from CPOA and user context. This schema instructs the frontend on how to render components, layout, and styles.
-        * **Interaction:** Receives content and context from CPOA, outputs UI Definition JSON (which CPOA forwards to APIGW, then to FEND).
-        * **Potential Technologies:** Python, logic for programmatic schema construction, (future) rule engines or LLM integration for parts of the schema.
+    * **`ImageGenerationAgent` (IGA):**
+        * **Description:** Asynchronously generates images via `generate_image_vertex_ai_task` (Celery). Calls Google Vertex AI Imagen and uploads to GCS.
+        * **Interaction:** Receives Celery task from CPOA. Calls Vertex AI. Uploads to GCS. Uses PostgreSQL for idempotency.
+        * **Potential Technologies:** Python, Flask, Celery, `google-cloud-aiplatform`, `google-cloud-storage`, PostgreSQL.
+
+    * **`DynamicUIAgent` (DUIA) (Conceptual):** (As before)
 
 ### 3.3. Supporting Infrastructure
 
-* **AI Model Serving Infrastructure (AIMS & AIMS_TTS):**
-    * **Description:** Dedicated infrastructure for hosting and serving the various AI models (LLMs for text generation, TTS models for audio synthesis). Optimized for low-latency inference and scalability.
-    * **Key Responsibilities:**
-        * Provide API endpoints for AI model inference.
-        * Manage model versions and deployments.
-        * Scale model serving capacity based on demand.
-    * **Potential Technologies:** NVIDIA Triton Inference Server, TensorFlow Serving, PyTorch Serve, Seldon Core, KServe, Cloud-specific solutions (AWS SageMaker, Azure Machine Learning, Google Vertex AI). GPUs/TPUs for acceleration.
-
-* **Data Stores (DS):**
-    * **Description:** Persistent storage for various types of data required by the application.
-    * **Key Responsibilities & Data Types:**
-        * **User Session State:** Current context of user interaction (managed by CPOA).
-        * **Generated Content Metadata:** Information about snippets, generated scripts (e.g., source URLs, generation parameters for `topics_snippets` and `generated_scripts` tables).
-        * **Workflow and Task Instance State (CPOA):** Detailed tracking of CPOA orchestration flows (`workflow_instances` table) and individual agent task statuses (`task_instances` table). This is crucial for observability and debugging.
-        * **Topic Cache:** Storing discovered or processed topics (potentially in `topics_snippets` or a dedicated cache).
-        * **Script Cache (Optional):** Caching generated scripts (in `generated_scripts` table) to avoid re-generation.
-        * **User Preferences (Future):** Storing user feedback or preferences for personalization.
-    * **Potential Technologies:**
-        * Session/Cache: Redis, Memcached.
-        * Metadata/Agent State: PostgreSQL, MySQL, MongoDB, DynamoDB, Firestore.
-        * Object Storage (for larger artifacts like cached audio segments if any): AWS S3, Azure Blob Storage, Google Cloud Storage.
-
-* **External Web / APIs (Internet):**
-    * **Description:** Represents the public internet, from which the `WebContentHarvesterAgent` and `TopicDiscoveryAgent` retrieve information. This includes websites, news sources, public APIs, etc.
-    * **Interaction:** Accessed via standard HTTP/HTTPS protocols.
+* **AI Model Services:**
+    * **`AIMS Service (AIMS_SVC)`:** Synchronous HTTP proxy for general LLMs (e.g., GPT via Vertex AI).
+    * **`AIMS_TTS Service (AIMS_TTS_SVC)`:** Synchronous HTTP proxy for TTS services (e.g., Google TTS via Vertex AI), handles audio generation and upload to GCS, returns GCS URI.
+    * **`Vertex AI Imagen`:** Google Cloud service for image generation, called by IGA.
+* **Databases & Messaging:**
+    * **`PostgreSQL DB`:** Central relational database storing:
+        * CPOA workflow and task instance state (`workflow_instances`, `task_instances`).
+        * Shared `idempotency_keys` table for TDA, SCA, PSWA, IGA, VFA.
+        * TDA's discovered topics (`topics_snippets` table).
+        * PSWA's script cache (if configured for PostgreSQL).
+        * User accounts, sessions, subscriptions (managed by API Gateway).
+    * **`Redis`:** Acts as the Celery message broker for task queuing and potentially for results backend or general caching.
+* **Storage:**
+    * **`Google Cloud Storage (GCS)`:** Primary storage for generated media files (audio from AIMS_TTS via VFA, images from IGA).
+* **`Audio Stream Feeder (ASF)`:** WebSocket server for streaming audio (fetched from GCS via signed URLs) to clients.
+* **`External Web / News APIs (Internet)`:** (As before)
 
 ## 4. Key Considerations
 
-* **Scalability:** All components, especially the AI agents, model serving, and the CPOA, must be designed for horizontal scalability to handle a growing number of users and concurrent generation requests.
-* **Latency:** Minimizing latency in the end-to-end podcast generation pipeline (user click -> audio stream start) is critical for user experience. This involves optimizing each agent, model inference, and data transfer.
-* **Cost:** AI model inference (especially LLMs and high-quality TTS) can be expensive. The architecture should allow for monitoring and optimizing these costs.
-* **Modularity & Maintainability:** A microservices-oriented or agent-based architecture promotes modularity, making the system easier to develop, test, deploy, and maintain.
-* **Resilience & Fault Tolerance:** The system should be resilient to failures in individual components or agents. The CPOA should implement error handling, retries, and potentially fallback strategies.
-* **Security:** Robust security measures are needed at the API Gateway, for data stores, and for managing access to AI models and external services.
+* **Scalability:** All components, especially API Gateway (running CPOA), AI agents (Flask app + Celery workers), AI Model Services, and databases must be designed for horizontal scalability. Celery workers allow for distributed task processing.
+* **Latency:** (As before) Minimized by asynchronous processing where appropriate. Polling for Celery task results introduces some latency but decouples services.
+* **Cost:** (As before)
+* **Modularity & Maintainability:** (As before) Microservice architecture with Celery tasks enhances this.
+* **Resilience & Fault Tolerance:** Celery's retry mechanisms, coupled with the implemented idempotency in backend agents, significantly improve resilience. CPOA manages overall workflow recovery.
+* **Security:** (As before) Secure Celery broker communication, database credentials.
 
 This System Architecture document provides a foundational understanding. More detailed designs for each component and their interactions will be elaborated in subsequent architecture documents (e.g., `Agent_Orchestration.md`, `Data_Flows.md`).
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

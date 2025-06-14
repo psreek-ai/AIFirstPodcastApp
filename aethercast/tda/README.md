@@ -7,126 +7,142 @@ The Topic Discovery Agent (TDA) is a component of the Aethercast system designed
 Key Responsibilities:
 
 1.  **Data Source Interaction:**
-    *   If configured for real API use, it fetches articles from a news API (e.g., NewsAPI.org) based on keywords, categories, or other criteria.
-    *   If not using a real API, it falls back to a set of simulated articles.
-2.  **Topic Identification & Transformation:**
-    *   Processes fetched articles (or simulated data) to extract key information.
-    *   Transforms these articles into a structured `TopicObject` format, including a generated `topic_id`, title suggestion, summary, keywords, potential sources, relevance score, publication date, and category suggestion.
-3.  **Output:** Provides a list of these `TopicObject` dictionaries to the calling service, typically the API Gateway or CPOA.
-4.  **Database Interaction:** Saves all successfully identified `TopicObject`s to a shared database (`topics_snippets` table, using the path from `SHARED_DATABASE_PATH` configuration), making them available for other services.
+    *   If configured for real API use (`USE_REAL_NEWS_API=true`), its Celery sub-task (`fetch_news_from_newsapi_task`) fetches articles from a news API (e.g., NewsAPI.org).
+    *   Otherwise, it uses simulated data (`identify_topics_from_sources`).
+2.  **Topic Identification & Transformation:** Processes data and transforms it into `TopicObject` format.
+3.  **Output:** The main Celery task (`discover_topics_task`) returns a list of these `TopicObject` dictionaries.
+4.  **Database Interaction:** Saves all successfully identified `TopicObject`s to a PostgreSQL database (`topics_snippets` table).
+5.  **Idempotent Task Processing:** The primary `discover_topics_task` is idempotent. If the same discovery request (identified by an `X-Idempotency-Key`) is submitted multiple times, it will be processed only once, with state managed in a shared PostgreSQL `idempotency_keys` table.
+
+The service operates **asynchronously** using Celery for its main topic discovery process.
 
 ## Configuration
 
-TDA is configured via environment variables, typically managed in a `.env` file within the `aethercast/tda/` directory. Create one by copying the example:
+TDA is configured via environment variables, typically managed in a `.env` file within the `aethercast/tda/` directory. Copy `.env.example` to `.env` and customize.
 
 ```bash
 cp .env.example .env
 ```
 
-Then, edit the `.env` file. The following variables are used:
+Key environment variables:
 
--   `TDA_NEWS_API_KEY`: Your API key for the news provider (e.g., NewsAPI.org). Required if `USE_REAL_NEWS_API` is `true`.
--   `TDA_NEWS_API_BASE_URL`: Base URL for the news API. Default: `https://newsapi.org/v2/`.
--   `TDA_NEWS_API_ENDPOINT`: Specific endpoint (e.g., `everything`, `top-headlines`). Default: `everything`.
--   `TDA_NEWS_DEFAULT_KEYWORDS`: Comma-separated default keywords. Default: `AI,technology,science,innovation`.
--   `TDA_NEWS_DEFAULT_LANGUAGE`: Default language for news. Default: `en`.
--   `USE_REAL_NEWS_API`: Set to `true` for real News API; `false` for simulated data. Default: `false`.
--   `TDA_NEWS_PAGE_SIZE`: Articles to fetch per request. Default: `25`.
--   `TDA_NEWS_REQUEST_TIMEOUT`: Timeout for news API requests (seconds). Default: `15`.
--   `TDA_NEWS_USER_AGENT`: User-Agent for HTTP requests. Default: `AethercastTopicDiscovery/0.1`.
--   `SHARED_DATABASE_PATH`: Path to the shared SQLite database file. This path is typically set via this environment variable (which TDA's code uses internally as `tda_config['SHARED_DATABASE_PATH']`). In a Docker environment, this usually points to `/app/database/aethercast_podcasts.db` on a shared volume. This **must** be the same path used by API Gateway and CPOA.
-
-**Flask Application Parameters (used when running `main.py` directly):**
--   `TDA_HOST`: Host for the TDA Flask server. Default: `0.0.0.0`. (Can also be set by `FLASK_RUN_HOST`).
--   `TDA_PORT`: Port for the TDA Flask server. Default: `5000`. (Can also be set by `FLASK_RUN_PORT`). Note: The TDA service typically runs on port 5000.
--   `TDA_DEBUG_MODE`: Enables/disables Flask debug mode (`True`/`False`). Default: `True`. (Can also be set by `FLASK_DEBUG=1` or `0`).
-
-When using the `flask` command directly, you might set:
--   `FLASK_APP=aethercast/tda/main.py`
+-   `TDA_NEWS_API_KEY`: API key for the news provider. Required if `USE_REAL_NEWS_API=true`.
+-   `TDA_NEWS_API_BASE_URL`: Base URL for the news API. *Default: `https://newsapi.org/v2/`*.
+-   `TDA_NEWS_API_ENDPOINT`: Specific endpoint. *Default: `everything`*.
+-   `TDA_NEWS_DEFAULT_KEYWORDS`: Comma-separated default keywords. *Default: `AI,technology,science,innovation`*.
+-   `TDA_NEWS_DEFAULT_LANGUAGE`: Default language for news. *Default: `en`*.
+-   `USE_REAL_NEWS_API`: `true` for real News API; `false` for simulated data. *Default: `false`*.
+-   `TDA_NEWS_PAGE_SIZE`: Articles to fetch per request. *Default: `25`*.
+-   `TDA_NEWS_REQUEST_TIMEOUT`: Timeout for news API requests. *Default: `15`*.
+-   `TDA_NEWS_USER_AGENT`: User-Agent for HTTP requests. *Default: `AethercastTopicDiscovery/0.1`*.
+-   **Database Configuration:** TDA uses PostgreSQL for storing discovered topics (`topics_snippets` table) and for idempotency. Variables are typically from `common.env`:
+    -   `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`.
+-   **Flask Application Parameters:**
+    -   `TDA_HOST`, `TDA_PORT`, `TDA_DEBUG_MODE`.
+-   **Celery Configuration:**
+    -   `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`.
+-   **NewsAPI Sub-Task Polling:**
+    -   `TDA_NEWSAPI_POLLING_INTERVAL_SECONDS`, `TDA_NEWSAPI_POLLING_TIMEOUT_SECONDS`.
+-   **Idempotency Behavior Configuration (TDA-specific):**
+    -   These are typically managed by constants within `main.py` but can be overridden by environment variables if `main.py` is adapted to load them into `tda_config` (e.g., `TDA_IDEMPOTENCY_STATUS_PROCESSING`, `TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`). The `.env.example` file shows the default string values used by the application code. Refer to `tda_config` initialization in `main.py` for specifics.
+        -   `TDA_IDEMPOTENCY_STATUS_PROCESSING`: Default "processing"
+        -   `TDA_IDEMPOTENCY_STATUS_COMPLETED`: Default "completed"
+        -   `TDA_IDEMPOTENCY_STATUS_FAILED`: Default "failed"
+        -   `TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Default 1800 seconds (30 minutes)
 
 ## Dependencies
 
-Project dependencies are listed in `requirements.txt` (includes `Flask`, `requests`, `python-dotenv`). Install with `pip install -r requirements.txt`.
+Project dependencies are listed in `requirements.txt`. Key dependencies include `Flask`, `requests`, `python-dotenv`, `celery`, `redis`, and `psycopg2-binary`. Install with:
+```bash
+pip install -r requirements.txt
+```
 
 ## Running the Service (Standalone)
 
-The TDA's Flask application can be run as a standalone service:
-
-1.  Ensure environment variables are set. If using real News API, `TDA_NEWS_API_KEY` is essential.
-2.  Run the Flask development server:
-    ```bash
-    python aethercast/tda/main.py
-    ```
-    By default, this starts the service on `http://0.0.0.0:5000`.
-
-Alternatively, using the `flask` command:
-```bash
-export FLASK_APP=aethercast/tda/main.py
-export FLASK_DEBUG=1 # Optional
-flask run --host=0.0.0.0 --port=5000
-```
+1.  Set Environment Variables.
+2.  Start PostgreSQL & Redis.
+3.  Apply Database Migrations (`topics_snippets` table is initialized by TDA on startup if needed; `idempotency_keys` table needs manual migration).
+4.  Run Flask App: `python aethercast/tda/main.py`
+5.  Run Celery Worker: `celery -A aethercast.tda.main.celery_app worker -l info` (from project root)
 
 ## API Endpoints
 
-### Discover Topics
+TDA operates asynchronously using Celery.
+
+### 1. Initiate Topic Discovery
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/discover_topics`
--   **Description:** Called by other services to request potential podcast topics.
+-   **Description:** Dispatches a Celery task to discover topics.
+-   **Headers:**
+    -   `X-Idempotency-Key` (string, **Required**): Unique key for idempotent processing.
+    -   `X-Workflow-ID` (string, Optional): Identifier for correlation.
 -   **Request Payload Example (JSON):**
     ```json
     {
-        "query": "artificial intelligence in education", // Optional, string.
-        "limit": 5, // Optional, integer (1-50). Invalid types or out-of-range values will result in a 400 error.
-        "error_trigger": null // Optional: for testing, e.g., "tda_error"
+        "query": "artificial intelligence in education",
+        "limit": 5,
+        "error_trigger": null
     }
     ```
-    If `query` is not provided, default keywords are used.
--   **Success Response (200 OK) Example (JSON):**
+-   **Success Response (202 Accepted - JSON):**
     ```json
     {
-        "discovered_topics": [
-            {
-                "topic_id": "topic_abc123xyz",
-                "source_feed_name": "news_api_org", // Or "simulated_data"
-                "title_suggestion": "AI Revolutionizes Personalized Learning Paths",
-                "summary": "Educational institutions are increasingly adopting AI...",
-                "keywords": ["AI", "education", "personalized learning"],
-                "potential_sources": [{"url": "...", "title": "...", "source_name": "..."}],
-                "relevance_score": 0.85,
-                "publication_date": "2024-03-14T10:00:00Z",
-                "category_suggestion": "Technology"
-            }
-            // ... more TopicObjects
-        ]
+        "task_id": "celery_task_uuid_string",
+        "status_url": "/v1/tasks/celery_task_uuid_string",
+        "message": "Topic discovery task initiated. Poll task ID for results.",
+        "idempotency_key_processed": "client_provided_idempotency_key"
     }
     ```
--   **Success Response (200 OK - No Topics Found) Example (JSON):**
-    ```json
-    {
-        "message": "No topics discovered from NewsAPI for the given query.", // Or from simulated sources
-        "topics": []
-    }
-    ```
--   **Error Response Examples (JSON):**
-    -   **400 Bad Request (Invalid Input):**
-        -   `{"error_code": "TDA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": "..."}`
-        -   `{"error_code": "TDA_INVALID_QUERY", "message": "Validation failed: 'query' must be a non-empty string if provided."}`
-        -   `{"error_code": "TDA_INVALID_LIMIT_TYPE", "message": "Validation failed: 'limit' must be a valid integer."}`
-        -   `{"error_code": "TDA_INVALID_LIMIT_RANGE", "message": "Validation failed: 'limit' must be an integer between 1 and 50."}`
-    -   **500 Internal Server Error (Simulated):**
-        -   `{"error_code": "TDA_SIMULATED_ERROR", "message": "A simulated error occurred in TDA.", "details": "..."}`
-    -   **502 Bad Gateway (NewsAPI Failure):**
-        -   `{"error_code": "TDA_NEWSAPI_FAILURE", "message": "Failed to retrieve topics from the external NewsAPI.", "details": "..."}`
-    -   **500 Internal Server Error (Generic):**
-        -   `{"error_code": "INTERNAL_SERVER_ERROR_TDA", "message": "An unexpected error occurred in the Topic Discovery Agent.", "details": "..."}`
+-   **Error Responses (JSON):**
+    -   **400 Bad Request**: If `X-Idempotency-Key` is missing, or for payload validation errors.
 
-```
-**Note on Ports:** The `main.py` for TDA defaults to port 5000 in its configuration. Ensure ports are distinct for each service in a running Aethercast deployment. This README reflects the code's current default.
-```
+### 2. Get Task Status / Result
+
+-   **Endpoint:** `GET /v1/tasks/<task_id>`
+-   **Description:** Poll this endpoint to check the status of the topic discovery task.
+-   **Success Response (200 OK - JSON, if task completed successfully):**
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "SUCCESS",
+        "result": { /* Result from discover_topics_task */ }
+    }
+    ```
+-   **Conflict Response (409 Conflict - JSON, if idempotency conflict):**
+    If the task execution determined a conflict (e.g., another task with the same idempotency key is currently processing and not timed out).
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "SUCCESS", // Celery task itself finished by returning the conflict info
+        "result": {
+            "status": "PROCESSING_CONFLICT",
+            "message": "Task with this idempotency key is already processing.",
+            "idempotency_key": "client_provided_idempotency_key"
+        }
+    }
+    ```
+-   **Error Response (500 Internal Server Error - JSON, if task failed):**
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "FAILURE",
+        "result": { "error": {"type": "task_failed", "message": "..."} }
+    }
+    ```
+-   **Response (202 Accepted - JSON, if task is still pending/processing without conflict):**
+    ```json
+    {
+        "task_id": "celery_task_uuid_string",
+        "status": "PENDING", // Or STARTED, RETRY
+        "result": null
+    }
+    ```
 
 ## Monitoring and Logging
 
-This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, and NewsAPI call performance, are also logged as part of these structured logs.
+Structured JSON logs are output by this service. Refer to main project documentation for details.
 
-For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs tda`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+---
+
+*For overarching project details, see the main [README.md](../../../README.md).*

@@ -1,7 +1,11 @@
-# NoSQL Data Store: TopicObjects Collection
+**Note:** This document describes a **conceptual NoSQL collection (e.g., for MongoDB/DynamoDB)** for storing topic objects. The Aethercast system currently stores discovered topics in the **`topics_snippets` table in PostgreSQL**. This table is managed by the Topic Discovery Agent (TDA).
+
+This document outlines a potential alternative or more granular NoSQL-based approach considered previously. For details on the current PostgreSQL-based storage, refer to the main `aethercast/data_stores/README.md` and `aethercast/tda/README.md`.
+---
+# NoSQL Data Store: TopicObjects Collection (Conceptual)
 
 ## Purpose
-Stores information about various topics that can be used to generate podcast snippets and full podcasts.
+Conceptually stores information about various topics. (Currently, this data is stored in the `topics_snippets` PostgreSQL table by TDA).
 
 ## Schema
 ```json

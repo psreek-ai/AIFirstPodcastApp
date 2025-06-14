@@ -26,44 +26,40 @@ It is a single-page application (SPA) built with HTML, CSS, and vanilla JavaScri
 The core client-side logic resides in `aethercast/fend/app.js`.
 
 1.  **Snippet Handling:**
-    *   **Fetch Snippets:** On page load (and potentially via a refresh mechanism), it makes a `GET` request to the API Gateway's `/api/v1/snippets` endpoint.
-    *   **Display Snippets:** Dynamically renders received snippets (title, summary, cover image) as cards in the `#snippet-list-container`.
-    *   **Trigger Podcast from Snippet:** Each snippet card has a "Listen Now" button that uses the snippet's title to initiate a full podcast generation task.
+    *   **Fetch Snippets:** Makes a `GET` request to `/api/v1/snippets`.
+        *   *Idempotency Note:* While optional for GET, `app.js` could send an `X-Idempotency-Key` if this action might trigger significant backend generation via CPOA.
+    *   **Display Snippets:** (As before).
+    *   **Trigger Podcast from Snippet:** (As before, this initiates a podcast generation flow).
 
-2.  **Popular Categories:**
-    *   **Fetch Categories:** `app.js` fetches a list of popular categories from the API Gateway's `/api/v1/categories` endpoint (e.g., on page load or when a specific section becomes visible).
-    *   **Display Categories:** It dynamically renders these categories, typically as clickable links or buttons, into the `.category-list-container` within the `#popular-categories-section` of `index.html`. This allows users to browse or filter content by category.
+2.  **Popular Categories:** (As before - likely no idempotency key needed for this read operation).
 
 3.  **Search Functionality:**
-    *   **User Inputs:** `app.js` handles search queries from two main sources:
-        *   The dedicated search bar within the "Latest Episodes" section (`#episodes-search-input` and `#episodes-search-btn`).
-        *   The site-wide search bar in the header (`#header-search-input`), which triggers a search when the 'Enter' key is pressed.
-    *   **API Call:** For both search inputs, a `POST` request is made to the `/api/v1/search/podcasts` endpoint. This request includes the search query and, if available, the `client_id` for session context. This endpoint requires user authentication.
-    *   **Display Results:** Search results (a list of snippets) are rendered into the `#snippet-list-container`. The `#snippet-status-message` is updated to reflect the search context (e.g., "Search Results for: '[query]'") and the outcome (number of results, "No results found," or errors).
+    *   **API Call:** Makes a `POST` request to `/api/v1/search/podcasts`.
+        *   `app.js` **should** generate a unique `X-Idempotency-Key` (e.g., UUID) and include it in the headers for this request to ensure the search operation (which can trigger CPOA workflows) is processed idempotently by backend services. An `X-Workflow-ID` can also be included.
+    *   **Display Results:** (As before).
 
 4.  **Podcast Generation (from Topic Input or Snippet):**
-    *   **User Input:** Allows users to enter a topic directly into an input field (`#topic-input` - though this specific ID might be deprecated if search/snippet interaction is primary).
-    *   **API Call:** When generation is triggered, it makes a `POST` request to `/api/v1/podcasts` with the topic and `client_id`.
-    *   **Status Display:** The UI displays progress updates in `#generation-progress-display` (relayed via WebSocket from CPOA through ASF) and final status messages in `#status-messages`.
+    *   **API Call:** When generation is triggered, `app.js` makes a `POST` request to `/api/v1/podcasts`.
+        *   It **must** generate a unique `X-Idempotency-Key` (e.g., UUID) and include it in the headers. An `X-Workflow-ID` (which could be the same as the idempotency key or a separate tracking ID) can also be sent.
+        *   The request payload includes topic, `client_id`, etc.
+    *   **Initial Response Handling:** The API Gateway returns a 202 Accepted response with a CPOA `workflow_id` (often referred to as `podcast_id` in this context for client tracking) and a `status_url` (e.g., `/api/v1/podcasts/<workflow_id>`).
+    *   **Status Polling & Display:**
+        *   `app.js` polls the received `status_url` to get updates on the CPOA workflow.
+        *   Progress updates (if available from CPOA state and relayed via API GW or WebSocket) are shown in `#generation-progress-display`.
+        *   Final status messages (success or failure) are displayed in `#status-messages`.
 
 5.  **Podcast Playback & Streaming:**
-    *   **Response Handling:** Handles responses from `/api/v1/podcasts`.
-    *   **Direct Playback:** If a direct `audio_url` is provided, uses the standard `<audio id="audio-player">`.
-    *   **WebSocket/MSE Streaming:** If `asf_websocket_url` and `stream_id` are provided, it connects to ASF via WebSockets using the `/api/v1/podcasts/stream` namespace.
-        *   Uses `<audio id="audio-player-mse">` with `MediaSource Extensions`.
-        *   Manages `audio_chunk` events, appends them to a `SourceBuffer`, and handles stream control signals (`start_of_stream`, `end_of_stream`).
-        *   Displays buffering and streaming status in `#streaming-status`.
-        *   Includes a retry mechanism (`#retry-stream-btn`) for failed streams.
+    *   **Obtaining Audio Info:** When polling the CPOA workflow status (e.g., `/api/v1/podcasts/<workflow_id>`), a successful completion will include an `audio_url` (which is a relative path like `/api/v1/podcasts/<workflow_id>/audio.mp3` for API Gateway to stream from GCS) and potentially an `asf_websocket_url` and `stream_id` if real-time streaming via ASF is configured and ready.
+    *   **Streaming via ASF:** If `asf_websocket_url` and `stream_id` are provided by the backend (after CPOA confirms VFA success and notifies ASF), `app.js` connects to ASF via WebSockets.
+        *   (As before) Uses MSE, handles chunks, displays status.
+    *   **Direct GCS Stream/Download (via API Gateway):** The `audio_url` (e.g., `/api/v1/podcasts/<podcast_id>/audio.mp3`) on the API Gateway will stream the final audio file from GCS (using signed URLs internally). This can be used by a standard HTML5 `<audio>` tag. The frontend decides whether to use this or ASF based on the response from the main podcast status polling.
 
-6.  **UI Updates (via WebSockets):**
-    *   After session initialization, connects to ASF's UI updates namespace (e.g., `/ui_updates`).
-    *   Subscribes to updates using the `client_id` by sending a `subscribe_to_ui_updates` event.
-    *   Listens for dynamic events (e.g., `generation_status`, `task_error`) relayed by ASF from CPOA, and updates the `#generation-progress-display` or other relevant UI elements accordingly.
+6.  **UI Updates (via WebSockets):** (Largely as before) CPOA sends detailed progress updates via ASF, which `app.js` listens to for the active `client_id`.
 
-7.  **Topic Exploration:** (Description largely accurate, assuming this functionality is maintained)
-    *   Triggered by "Explore Related" buttons on snippet cards or keyword input (`#explore-keywords-input`).
+7.  **Topic Exploration:**
     *   Calls `POST /api/v1/topics/explore`.
-    *   Renders new explored snippets in `#explored-topics-container`. Status in `#explored-topics-status`.
+    *   `app.js` **should** generate and send an `X-Idempotency-Key` for this request, as it can trigger new content generation workflows in CPOA.
+    *   Renders results as before.
 
 8.  **Advanced Error Diagnostics:** (Description largely accurate)
     *   "View Diagnostics" button appears after podcast generation attempts.
@@ -83,6 +79,8 @@ The core client-side logic resides in `aethercast/fend/app.js`.
     *   Displays success or error messages from the subscription attempt in `#subscribe-modal-status`.
 
 ## HTML Structure (`index.html`)
+
+(No significant changes expected in this section due to backend idempotency logic, but ensure it's generally accurate.)
 
 The `index.html` file provides the foundational layout for the single-page application. Key structural elements include:
 

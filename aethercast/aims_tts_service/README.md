@@ -117,3 +117,7 @@ The service will then be accessible to other Dockerized services (like VFA) via 
 This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, Google Cloud TTS call performance, and GCS upload times, are also logged as part of these structured logs.
 
 For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs aims_tts_service`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

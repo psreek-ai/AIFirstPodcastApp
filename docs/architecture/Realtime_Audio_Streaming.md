@@ -30,42 +30,43 @@ This document focuses on the flow of audio data from the point of generation by 
 
 The real-time audio streaming process involves several key components from the `System_Architecture.md`:
 
-1.  **`VoiceForgeAgent` (VFA):** Responsible for receiving the podcast script from the CPOA and using Text-to-Speech (TTS) models to synthesize audio data in manageable chunks.
-2.  **`AI Model Serving Infrastructure (AIMS_TTS)`:** Hosts the TTS models used by the VFA.
-3.  **`Central Podcast Orchestrator Agent` (CPOA):** Initiates the audio generation task for VFA and provides the FEND with the necessary information (e.g., a `stream_id`) to connect to the audio stream.
-4.  **`Audio Stream Feeder` (ASF - Conceptual Service):**
-    * This is a logical component responsible for receiving audio chunks from the VFA and pushing them to the connected FEND client.
-    * It manages active stream connections (e.g., WebSocket connections).
-    * It could be implemented as a dedicated microservice, part of the VFA's responsibilities, or integrated within a broader API Gateway/backend infrastructure designed for real-time communication. For clarity, we'll treat it as a distinct logical service.
-5.  **`Frontend UI` (FEND):** The client application (web or mobile) that establishes a connection to the ASF, receives audio chunks, buffers them, and plays them back using appropriate audio APIs.
-6.  **`API Gateway` (APIGW):** May be involved in the initial WebSocket handshake upgrade request or routing to the ASF.
+1.  **`VoiceForgeAgent` (VFA):** Its primary `forge_voice_task` (an asynchronous, idempotent Celery task) is responsible for receiving the podcast script from CPOA. This task then calls the AIMS_TTS service to synthesize audio and obtain a GCS URI for the generated audio file.
+2.  **`AI Model Serving Infrastructure (AIMS_TTS)`:** Hosts the TTS models. It's called by VFA's Celery task, performs TTS, and saves the audio to GCS, returning the GCS URI to VFA.
+3.  **`Central Podcast Orchestrator Agent` (CPOA):** Initiates the `forge_voice_task` in VFA (passing `X-Idempotency-Key` and `X-Workflow-ID`). Once VFA's task successfully completes and CPOA retrieves the audio GCS URI (by polling VFA's task status endpoint), CPOA notifies ASF, providing it with a `stream_id` and the audio GCS URI. CPOA also provides the `stream_id` and ASF's WebSocket URL to the client via the API Gateway.
+4.  **`Audio Stream Feeder` (ASF):**
+    * Receives notification from CPOA about a new audio stream, including its `stream_id` and GCS URI.
+    * Manages WebSocket connections from clients. When a client requests a `stream_id`, ASF fetches the audio from the GCS URI (using a signed URL obtained from the API Gateway) and streams it in chunks.
+5.  **`Frontend UI` (FEND):** (As before) Establishes WebSocket connection to ASF, receives, buffers, and plays audio.
+6.  **`API Gateway` (APIGW):** (As before) Involved in initial WebSocket handshake and provides an internal endpoint for ASF to get signed GCS URLs.
 
 ## 4. Streaming Initiation Process
 
-This process outlines how a FEND client initiates and establishes an audio stream. (Referenced from `Data_Flows.md` - Flow 2).
+This process outlines how a FEND client initiates and establishes an audio stream.
 
-1.  **User Action:** User clicks "Listen" on a snippet or requests a podcast.
-2.  **FEND Request:** FEND sends a request to APIGW (e.g., `POST /api/v1/podcasts/generate`) to start podcast generation.
-3.  **CPOA Orchestration:** CPOA receives the request and initiates the podcast generation workflow, eventually tasking the VFA.
-4.  **Stream Identifier Generation:** CPOA (or VFA upon task initiation) generates a unique `stream_id`.
-5.  **CPOA Initial Response to FEND:** CPOA, via APIGW, sends an initial response to FEND.
-    * **Data:** `{"status": "GENERATING", "stream_id": "unique_stream_id_xyz", "estimated_wait_time_seconds": 10, "websocket_url": "wss://aethercast.example.com/api/v1/podcasts/stream"}`.
-    * The `websocket_url` is the endpoint for the ASF.
-6.  **FEND Establishes Stream Connection:**
-    * Upon receiving the `stream_id` and `websocket_url`, FEND initiates a WebSocket connection to the ASF.
-    * During the WebSocket handshake or as the first message after connection, FEND sends the `stream_id` to ASF for identification and association with the ongoing VFA generation task.
-    * Example WebSocket connection request: `wss://aethercast.example.com/api/v1/podcasts/stream?streamId=unique_stream_id_xyz` (passing `stream_id` as a query parameter is common).
+1.  **User Action & Podcast Generation Request:** User requests a podcast. API Gateway forwards to CPOA, which orchestrates WCHA, PSWA, and eventually VFA by dispatching its `forge_voice_task` (with `X-Idempotency-Key`). CPOA receives a Celery `task_id` for the VFA operation.
+2.  **Stream Identifier Generation:** CPOA generates a unique `stream_id` that will be associated with the VFA's audio generation task and the resulting audio.
+3.  **CPOA Initial Response to FEND (via APIGW):** CPOA might provide an initial response indicating podcast generation is in progress. This response includes the `stream_id` and the `websocket_url` for ASF. Crucially, the audio is not yet ready for streaming at this point.
+    * **Data Example:** `{"status": "GENERATING", "cpoa_workflow_id": "cpoa_workflow_uuid", "stream_id": "unique_stream_id_xyz", "websocket_url": "wss://aethercast.example.com/api/v1/podcasts/stream"}`.
+4.  **VFA Task Completion & ASF Notification:**
+    * CPOA polls VFA's `/v1/tasks/<vfa_celery_task_id>` endpoint.
+    * Once VFA's `forge_voice_task` completes successfully, its result (containing the GCS URI of the audio, e.g., `gs://bucket/audio.mp3`) is retrieved by CPOA.
+    * CPOA then makes an HTTP POST request to ASF's internal `/asf/internal/notify_new_audio` endpoint, providing the `stream_id` and the audio `filepath` (the GCS URI).
+5.  **FEND Establishes Stream Connection:**
+    * Upon receiving the initial response from CPOA (with `stream_id` and `websocket_url`), FEND initiates a WebSocket connection to ASF.
+    * FEND sends the `stream_id` to ASF. ASF will now have (or soon receive) the GCS URI for this `stream_id` from CPOA's notification. Once ASF has the GCS URI, it can begin fetching and streaming the audio.
 
-## 5. Audio Generation and Chunking (VFA & AIMS_TTS)
+## 5. Audio Generation and Chunking (AIMS_TTS, VFA Task, ASF)
 
-1.  **Script Segmentation:** VFA receives the full podcast script from CPOA. It may break the script into smaller segments (e.g., sentences, paragraphs) suitable for individual TTS synthesis calls. This helps in achieving lower first-chunk latency and allows for pipelining.
-2.  **TTS Synthesis:** For each script segment, VFA calls AIMS_TTS.
-3.  **Audio Output Format from TTS:** AIMS_TTS returns raw audio data (e.g., PCM).
-4.  **Encoding & Chunking by VFA/ASF:**
-    * The raw audio (PCM) is encoded into a streaming-friendly and efficient codec. **Opus** is highly recommended for voice due to its quality at various bitrates and low latency characteristics. Alternatives include AAC or MP3, but Opus is generally superior for this use case.
-    * The encoded audio is then packetized/chunked into manageable sizes by VFA or the ASF before being sent over the WebSocket.
-    * **Chunk Size:** A balance between latency and overhead. Smaller chunks mean lower latency for each piece but more network/processing overhead. Typical chunk durations might be 200ms to 1 second of audio.
-    * Each chunk should ideally be self-contained or carry enough information for the client to decode it. For Opus, this typically means sending individual Opus packets.
+1.  **Script Segmentation (VFA Task):** VFA's Celery task prepares the script text.
+2.  **TTS Synthesis (VFA Task calling AIMS_TTS):** VFA's task calls AIMS_TTS (which is itself async and returns a task_id that VFA polls). AIMS_TTS synthesizes audio and saves it to GCS, returning the GCS URI to VFA.
+3.  **Audio Fetching by ASF:** Once ASF is notified by CPOA and a client connects for a `stream_id`, ASF:
+    *   Obtains a short-lived signed HTTP URL for the GCS URI (by calling an internal API Gateway endpoint).
+    *   Fetches the audio from this signed URL via a streaming HTTP GET request.
+4.  **Encoding & Chunking by ASF:**
+    *   The audio from GCS is already in a final encoded format (e.g., MP3, OGG Opus, as determined by AIMS_TTS).
+    *   ASF reads this audio data in chunks from the HTTP stream.
+    *   These chunks are then sent as binary WebSocket messages.
+    *   **Chunk Size:** A balance between latency and overhead. (As before).
 
 ## 6. Streaming Protocol: WebSockets
 
@@ -134,52 +135,42 @@ This process outlines how a FEND client initiates and establishes an audio strea
         * Simpler: VFA continues generating, ASF continues sending, FEND just stops appending to `SourceBuffer` or stops playback. When resuming, FEND starts appending/playing again. This is easier but less resource-efficient on the backend if pauses are long.
     * **Resume:** FEND resumes the HTML `Audio` element. If backend generation was paused, FEND signals ASF/CPOA (`{"type": "resume_request"}`) to restart generation/sending.
 * **Stream Termination:**
-    * **Normal End:** VFA finishes synthesizing the entire script. It signals "end of script" to ASF. ASF sends the remaining audio chunks, followed by a final control message to FEND (e.g., `{"type": "stream_end"}`). FEND stops trying to buffer more data once the `SourceBuffer` update ends and the `ended` event fires on the audio element.
-    * **User Closes Player/Navigates Away:** FEND closes the WebSocket connection. ASF detects the closure and signals VFA (via CPOA) to stop the generation task for that `stream_id` to free up resources.
-    * **Server-Initiated Termination (Error):** If VFA or ASF encounters an unrecoverable error, ASF sends an error message to FEND (e.g., `{"type": "error", "message": "..."}`) and closes the WebSocket.
-* **Reconnection Logic (FEND):**
-    * If the WebSocket connection drops unexpectedly, FEND should attempt to reconnect (with exponential backoff).
-    * Upon reconnection, FEND would need to inform ASF of the `stream_id` and potentially the last received chunk/timestamp to attempt a seamless resume. This requires ASF and VFA to support resuming generation or re-transmitting missed chunks, which adds significant complexity.
-    * Simpler initial approach: If connection drops, the stream is considered failed, and the user might need to restart. Robust resume is a v2 feature.
+    * **Normal End:** ASF finishes streaming all audio chunks from the GCS file. It sends a final control message to FEND (e.g., `{"type": "stream_end"}`).
+    * **User Closes Player/Navigates Away:** FEND closes the WebSocket connection. ASF detects the closure. Since VFA's task is likely already complete (audio is on GCS), no specific action needs to be taken on VFA unless it was an exceptionally long audio file still being "virtually" processed by VFA post-generation for some reason (unlikely in current model). CPOA would be aware of the main podcast generation workflow's state.
+    * **Server-Initiated Termination (Error):** If ASF encounters an unrecoverable error (e.g., cannot get signed URL, GCS file deleted), it sends an error message to FEND and closes the WebSocket.
+* **Reconnection Logic (FEND):** (As before - simpler initial approach is likely stream failure).
 
 ## 11. Latency Considerations & Optimization
 
-* **TTS Inference Time:** The primary source of latency.
-    * Use highly optimized TTS models and serving infrastructure (AIMS_TTS).
-    * VFA should segment scripts into small enough pieces for quick TTS processing per segment.
-* **Network Latency:** Between all components (FEND-ASF, ASF-VFA, VFA-AIMS_TTS). Minimized by geographically distributed services and efficient protocols.
-* **Chunk Size:** Smaller audio chunks reduce perceived latency for each piece but increase overhead. Optimize based on testing.
-* **Processing Overhead:** Minimize processing in VFA, ASF, and FEND for encoding, decoding, and message handling.
-* **Pipelining:** VFA should pipeline script segmentation, TTS calls, and chunk encoding/sending to ASF. ASF pipelines receiving from VFA and sending to FEND. FEND pipelines receiving, decoding, and buffering.
-* **Early Metadata:** Send codec/stream metadata to FEND as soon as possible so it can initialize `MediaSource` and `SourceBuffer` while the first audio chunks are being generated.
+* **VFA Task Completion Time:** The time taken for VFA's Celery task (including AIMS_TTS interaction and GCS upload) is now a prerequisite before ASF can even start streaming. This is a shift from a model where VFA might stream chunks *as* they are generated internally.
+* **AIMS_TTS Inference Time:** (As before) Key latency factor for VFA's task.
+* **ASF Fetch & Stream Latency:** Once ASF is notified and has the GCS URI:
+    * Latency to get signed URL from API Gateway.
+    * Latency for ASF to start fetching from GCS.
+    * Network Latency between FEND-ASF.
+* **Chunk Size:** (As before) Still relevant for ASF's streaming to FEND.
+* **Pipelining:** CPOA pipelines agent calls. VFA's internal polling of AIMS_TTS is a form of pipelining. ASF fetches from GCS and streams to FEND.
+* **Early Metadata:** (As before) ASF should send this once it starts processing a stream.
 
 ## 12. Error Handling and Resilience
 
-* **VFA/AIMS_TTS Failure:**
-    * If TTS fails for a segment, VFA reports to CPOA/ASF.
-    * ASF can send an error message to FEND.
-    * Options:
-        * Terminate stream.
-        * Attempt to skip the problematic segment and continue (if script structure allows).
-        * (Fallback) VFA uses a simpler/backup TTS model for that segment.
-* **ASF Failure:** If ASF crashes, WebSocket connections drop. CPOA should detect ASF unhealthiness.
-* **Network Disconnection (WebSocket):**
-    * FEND: Detects `onclose` or `onerror` WebSocket events. Attempts reconnection as per Section 10.
-    * ASF: Detects client disconnection. Notifies CPOA/VFA to halt generation for that `stream_id`.
-* **FEND Playback Errors:**
-    * MSE errors (e.g., `MediaError` on audio element, errors appending to `SourceBuffer`): Log and potentially display a user-friendly error.
-    * Decoding errors: If audio chunks are corrupted.
-* **Buffer Underrun on FEND:** Pause playback, show buffering indicator, resume when sufficient buffer is available. ASF should ideally send data at a rate that prevents this under normal network conditions.
+* **VFA Celery Task Failure:**
+    * If VFA's `forge_voice_task` fails (e.g., AIMS_TTS error, GCS upload error), its `on_failure` handler updates the idempotency record in PostgreSQL.
+    * CPOA, when polling VFA's task status endpoint, will see the failure. CPOA updates its own `task_instance` and `workflow_instance` in PostgreSQL.
+    * CPOA's workflow logic determines if retries (by re-dispatching VFA task with same idempotency key) are appropriate or if the overall podcast generation fails.
+    * If ASF was already notified or a client connected, CPOA might need to signal ASF to terminate the (now invalid) stream_id.
+* **ASF Failure:** (As before)
+* **Network Disconnection (WebSocket):** (As before - ASF detects client disconnect).
+* **FEND Playback Errors:** (As before)
+* **Buffer Underrun on FEND:** (As before)
 
 ## 13. Scalability of Streaming Infrastructure
 
-* **ASF (`Audio Stream Feeder`):** This component must be highly scalable.
-    * Likely implemented using technologies optimized for many concurrent connections (e.g., Node.js, Go, or Java/Kotlin with non-blocking I/O like Netty/Vert.x).
-    * Deployed as multiple instances behind a load balancer that supports WebSocket sticky sessions (if ASF instances maintain stream-specific state not shared externally) or can route based on `stream_id`.
-    * Stateless ASF instances are preferable, with stream state managed externally (e.g., Redis) or by VFA.
-* **VFA:** Scaled independently based on the number of concurrent TTS generation tasks.
-* **AIMS_TTS:** Scaled based on TTS inference load.
-* **Bandwidth:** Ensure sufficient network bandwidth for outgoing audio streams from ASF.
+* **ASF (`Audio Stream Feeder`):** (As before - needs to be highly scalable for WebSocket connections).
+* **VFA Celery Workers:** Scaled independently based on the number of concurrent TTS generation tasks.
+* **AIMS_TTS:** (As before) Scaled based on TTS inference load.
+* **Bandwidth:** (As before) For ASF outgoing streams.
+* **PostgreSQL Database:** The database handling idempotency records and CPOA state must be scalable.
 
 ## 14. Security Considerations
 
@@ -213,3 +204,7 @@ This process outlines how a FEND client initiates and establishes an audio strea
 * **Logging:** Detailed logs from ASF, VFA, and FEND (client-side) correlated with `stream_id` and `user_id` for debugging.
 
 This detailed specification should provide a strong foundation for implementing the real-time audio streaming functionality in Aethercast.
+
+---
+
+*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*

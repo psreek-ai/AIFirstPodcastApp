@@ -1,14 +1,15 @@
-**Note:** This document describes a **conceptual Key-Value store (e.g., Redis)** for caching and session management. The Aethercast system currently implements similar functionalities using its primary **SQLite database**. Specifically:
-- User session state and preferences are managed in the `user_sessions` table.
-- Podcast generation status is tracked in the `podcasts` table.
-- Caching for topics and snippets primarily relies on the `topics_snippets` table and on-demand generation logic in CPOA.
+**Note:** This document describes a **conceptual Key-Value store (e.g., Redis)** for caching and session management. The Aethercast system currently implements:
+- User session state and preferences in the **PostgreSQL** `user_sessions` table (managed by API Gateway).
+- Podcast generation status tracking via CPOA's `workflow_instances` and `task_instances` tables in **PostgreSQL**.
+- Caching for topics and snippets relies on the `topics_snippets` table in **PostgreSQL** and PSWA's script cache (`generated_scripts` table, which can be PostgreSQL or SQLite).
+- Redis is primarily used as the **Celery message broker and results backend**.
 
-Refer to the main `aethercast/data_stores/README.md` and the schema definition in `aethercast/api_gateway/main.py` for details on the current SQLite-based implementation. This document outlines potential future enhancements or alternative data storage strategies.
+Refer to the main `aethercast/data_stores/README.md`, `docs/architecture/CPOA_State_Management.md`, and relevant service READMEs for details on the current PostgreSQL-based implementations. This document outlines potential future or auxiliary uses for a dedicated Key-Value store.
 ---
 # Key-Value Store (e.g., Redis) Definitions
 
 ## Purpose
-Provides fast access to frequently used data, user session information, and caches.
+Conceptually provides fast access to frequently used data, user session information, and caches. In the current Aethercast system, Redis serves primarily as the Celery broker/backend, while PostgreSQL handles most persistent state and some caching.
 
 ---
 
@@ -96,5 +97,8 @@ A JSON string indicating the current status of a podcast generation task:
 - Short TTL, e.g., 1-5 minutes, or until the status changes to "ready_to_stream" or "error".
 
 ### Use Case
-- Providing quick status updates for the `status_url` returned by `POST /api/v1/podcasts/generate`.
-- Reducing load on the `AgentTaskState` collection for status polling.
+- Providing quick status updates for the `status_url` returned by asynchronous task submissions.
+- Reducing load on primary databases for status polling if such a cache were implemented.
+---
+
+*For information on the overarching Aethercast project architecture, current data storage solutions (primarily PostgreSQL and GCS), and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*
