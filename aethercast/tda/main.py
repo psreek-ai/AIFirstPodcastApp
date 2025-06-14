@@ -17,6 +17,15 @@ import time # Added for metric logging
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
 load_dotenv(dotenv_path=dotenv_path)
 
+from typing import Optional, Dict, Any # For type hinting
+from celery import Task # For custom Task class
+
+# Conditional import for psycopg2 (already present, ensure it's used for idempotency)
+# PSYCOPG2_AVAILABLE can be set based on successful import if needed by helper functions
+
+# --- Idempotency Constants ---
+IDEMPOTENCY_KEY_HEADER = "X-Idempotency-Key"
+
 # --- Celery Configuration ---
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
 CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
@@ -94,7 +103,13 @@ tda_config = {
 
     "TDA_HOST": os.getenv("TDA_HOST", os.getenv("FLASK_RUN_HOST", "0.0.0.0")),
     "TDA_PORT": int(os.getenv("TDA_PORT", os.getenv("FLASK_RUN_PORT", "5000"))),
-    "TDA_DEBUG_MODE": os.getenv("TDA_DEBUG_MODE", "True").lower() == "true"
+    "TDA_DEBUG_MODE": os.getenv("TDA_DEBUG_MODE", "True").lower() == "true",
+
+    # Idempotency related configurations
+    "TDA_IDEMPOTENCY_STATUS_PROCESSING": os.getenv('TDA_IDEMPOTENCY_STATUS_PROCESSING', 'processing'),
+    "TDA_IDEMPOTENCY_STATUS_COMPLETED": os.getenv('TDA_IDEMPOTENCY_STATUS_COMPLETED', 'completed'),
+    "TDA_IDEMPOTENCY_STATUS_FAILED": os.getenv('TDA_IDEMPOTENCY_STATUS_FAILED', 'failed'),
+    "TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": int(os.getenv('TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS', '1800')),
 }
 
 
@@ -152,9 +167,9 @@ NEWS_API_STATUS_OK = "ok"
 
 # Flask app is initialized earlier now for logging setup
 
-# --- Database Helper Functions ---
-def _get_db_connection():
-    """Establishes a PostgreSQL database connection."""
+# --- Database Helper Functions (TDA General + Idempotency) ---
+def _get_tda_db_connection(): # Renamed for clarity and specific idempotency use
+    """Establishes a PostgreSQL database connection with RealDictCursor."""
     try:
         conn = psycopg2.connect(
             host=tda_config["POSTGRES_HOST"],
@@ -162,11 +177,80 @@ def _get_db_connection():
             user=tda_config["POSTGRES_USER"],
             password=tda_config["POSTGRES_PASSWORD"],
             dbname=tda_config["POSTGRES_DB"],
-            cursor_factory=RealDictCursor
+            cursor_factory=RealDictCursor # Ensures dictionary-like row access
         )
+        app.logger.debug("TDA DB: Successfully connected to PostgreSQL with RealDictCursor.")
         return conn
     except psycopg2.Error as e:
-        app.logger.error(f"Error connecting to PostgreSQL database: {e}")
+        app.logger.error(f"TDA DB: Error connecting to PostgreSQL database: {e}", exc_info=True)
+        raise # Re-raise to be handled by caller
+
+def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
+    """Checks for an existing idempotency key record."""
+    log_extra = {"task_id": "TDAIdempotencyCheck", "idempotency_key": idempotency_key, "task_name": task_name}
+    try:
+        with db_conn.cursor() as cur:
+            cur.execute(
+                "SELECT idempotency_key, task_name, workflow_id, created_at, locked_at, status, result_payload, error_payload FROM idempotency_keys WHERE idempotency_key = %s AND task_name = %s",
+                (idempotency_key, task_name)
+            )
+            record = cur.fetchone()
+            if record:
+                app.logger.info(f"Idempotency key found. Status: '{record['status']}'.", extra=log_extra)
+                if isinstance(record.get('result_payload'), str):
+                    record['result_payload'] = json.loads(record['result_payload'])
+                if isinstance(record.get('error_payload'), str):
+                    record['error_payload'] = json.loads(record['error_payload'])
+                return dict(record)
+            app.logger.info("No existing idempotency key found.", extra=log_extra)
+            return None
+    except (psycopg2.Error, json.JSONDecodeError) as e:
+        app.logger.error(f"TDA Idempotency: DB/JSON error checking key: {e}", exc_info=True, extra=log_extra)
+        raise
+
+def _store_idempotency_record(db_conn, idempotency_key: str, task_name: str, status: str, workflow_id: Optional[str] = None, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None, is_new_key: bool = True):
+    """Stores or updates an idempotency record."""
+    log_extra = {"task_id": "TDAIdempotencyStore", "idempotency_key": idempotency_key, "task_name": task_name, "new_status": status}
+    current_ts_utc = datetime.now(timezone.utc) # Use timezone-aware datetime
+    locked_at_val = current_ts_utc if status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'] else None
+
+    try:
+        with db_conn.cursor() as cur:
+            if is_new_key:
+                app.logger.info("Storing new idempotency key.", extra=log_extra)
+                cur.execute(
+                    """
+                    INSERT INTO idempotency_keys (idempotency_key, task_name, workflow_id, locked_at, status, result_payload, error_payload, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (idempotency_key) DO UPDATE SET
+                        task_name = EXCLUDED.task_name, workflow_id = EXCLUDED.workflow_id,
+                        locked_at = EXCLUDED.locked_at, status = EXCLUDED.status,
+                        result_payload = EXCLUDED.result_payload, error_payload = EXCLUDED.error_payload,
+                        created_at = idempotency_keys.created_at;
+                    """,
+                    (idempotency_key, task_name, workflow_id, locked_at_val, status,
+                     json.dumps(result_payload) if result_payload else None,
+                     json.dumps(error_payload) if error_payload else None, current_ts_utc)
+                )
+            else: # Update existing key
+                app.logger.info("Updating existing idempotency key.", extra=log_extra)
+                set_clauses = ["status = %s", "result_payload = %s", "error_payload = %s"]
+                params_update = [status, json.dumps(result_payload) if result_payload else None, json.dumps(error_payload) if error_payload else None]
+
+                if status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']:
+                    set_clauses.append("locked_at = %s")
+                    params_update.append(current_ts_utc)
+                elif status in [tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'], tda_config['TDA_IDEMPOTENCY_STATUS_FAILED']]:
+                    set_clauses.append("locked_at = NULL")
+
+                params_update.extend([idempotency_key, task_name])
+                cur.execute(
+                    f"UPDATE idempotency_keys SET {', '.join(set_clauses)} WHERE idempotency_key = %s AND task_name = %s;",
+                    tuple(params_update)
+                )
+            app.logger.info("Successfully stored/updated TDA idempotency key.", extra=log_extra)
+    except (psycopg2.Error, json.JSONDecodeError) as e:
+        app.logger.error(f"TDA Idempotency: DB/JSON error storing key: {e}", exc_info=True, extra=log_extra)
         raise
 
 def init_tda_db():
@@ -175,9 +259,9 @@ def init_tda_db():
     conn = None
     cursor = None
     try:
-        conn = _get_db_connection()
+        conn = _get_tda_db_connection() # Use renamed function
         cursor = conn.cursor()
-        # Check if table exists for PostgreSQL
+        # Check if table exists for PostgreSQL (topics_snippets)
         cursor.execute("""
             SELECT EXISTS (
                     SELECT FROM information_schema.tables
@@ -211,7 +295,7 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
     conn = None
     cursor = None
     try:
-        conn = _get_db_connection()
+        conn = _get_tda_db_connection() # Use renamed function
         cursor = conn.cursor()
 
         keywords_data = topic_object.get("keywords", [])
@@ -461,14 +545,60 @@ def calculate_relevance_score(article: dict, query: str = None) -> float:
 def discover_topics_task(self, request_id_main: str, query: Optional[str], limit: int, use_real_news_api: bool, error_trigger: Optional[str] = None):
     """
     Celery task to discover topics, potentially calling another Celery task for NewsAPI.
+    Now with Idempotency.
     """
-    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id_main}): Starting topic discovery. Query: '{query}', Limit: {limit}, UseNewsAPI: {use_real_news_api}")
+    task_log_id = self.request.id
+    log_extra_base = {"orig_req_id": request_id_main, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "query": query}
+    app.logger.info(f"TDA Celery Task {task_log_id}: Starting. Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}", extra=log_extra_base)
 
-    if error_trigger == "tda_error": # For testing celery task failure
-        logger.info(f"Celery Task {self.request.id}: Simulated TDA error triggered in task.")
-        raise Exception("Simulated TDA error in Celery task.")
+    if not idempotency_key:
+        app.logger.error(f"TDA Task {task_log_id}: Idempotency key not provided. This is required.", extra=log_extra_base)
+        raise ValueError("Idempotency key is required for TDA task execution.")
 
-    discovered_topics = []
+    # Assuming PSYCOPG2_AVAILABLE is checked globally or by _get_tda_db_connection
+    # For simplicity here, directly proceed; _get_tda_db_connection will raise if not available.
+
+    db_conn = None
+    try:
+        db_conn = _get_tda_db_connection()
+        db_conn.autocommit = False # Explicit transaction management
+
+        existing_record = _check_idempotency_key(db_conn, idempotency_key, self.name)
+        if existing_record:
+            status = existing_record['status']
+            locked_at = existing_record.get('locked_at')
+
+            if status == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED']:
+                app.logger.info(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra=log_extra_base)
+                db_conn.rollback()
+                return existing_record['result_payload']
+
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']:
+                timeout_seconds = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < timeout_seconds:
+                    app.logger.warning(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' is already PROCESSING (lock not timed out). Conflict.", extra=log_extra_base)
+                    db_conn.rollback()
+                    return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                else:
+                    app.logger.warning(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' was PROCESSING but lock timed out/missing. Re-processing.", extra=log_extra_base)
+                    _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED']:
+                app.logger.info(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' previously FAILED. Retrying.", extra=log_extra_base)
+                _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+        else: # No existing record
+            app.logger.info(f"TDA Task {task_log_id}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra=log_extra_base)
+            _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+
+        db_conn.commit() # Commit the PROCESSING state change
+
+        if error_trigger == "tda_error": # For testing celery task failure
+            app.logger.info(f"TDA Task {task_log_id}: Simulated TDA error triggered in task for key '{idempotency_key}'.", extra=log_extra_base)
+            raise Exception("Simulated TDA error in Celery task.")
+
+        # --- Main Task Logic ---
+        app.logger.info(f"TDA Task {task_log_id}: Proceeding with topic discovery for key '{idempotency_key}'.", extra=log_extra_base)
+        discovered_topics = []
     if use_real_news_api:
         request_keywords = [k.strip() for k in query.split(',')] if query else None
         logger.info(f"Celery Task {self.request.id}: Dispatching NewsAPI sub-task. Keywords: {request_keywords}")
@@ -518,18 +648,182 @@ def discover_topics_task(self, request_id_main: str, query: Optional[str], limit
         logger.info(f"Celery Task {self.request.id}: Simulated data discovery found {len(discovered_topics)} topics.")
 
     # Return the final list of topics (or an error structure if preferred)
+    task_result_payload = {}
     if not discovered_topics:
-        return {"status": "success_no_topics", "message": "No topics discovered.", "topics": []}
+        task_result_payload = {"status": "success_no_topics", "message": "No topics discovered.", "topics": []}
+    else:
+        task_result_payload = {"status": "success", "discovered_topics": discovered_topics, "message": f"Successfully discovered {len(discovered_topics)} topics."}
 
-    return {"status": "success", "discovered_topics": discovered_topics, "message": f"Successfully discovered {len(discovered_topics)} topics."}
+    _store_idempotency_record(db_conn, idempotency_key, self.name,
+                              tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'],
+                              workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
+    db_conn.commit()
+    app.logger.info(f"TDA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'.", extra=log_extra_base)
+    return task_result_payload
+
+    # Exception handling for the main task logic (idempotency part is above)
+    except Exception as e:
+        app.logger.error(f"TDA Task {task_log_id}: Error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
+        # on_failure handler will be invoked by Celery
+        raise # Re-raise to trigger on_failure and standard Celery error handling.
+    finally:
+        if db_conn:
+            if not db_conn.closed:
+                db_conn.close()
+                app.logger.debug(f"TDA Task {task_log_id}: Closed DB connection for key '{idempotency_key}'.", extra=log_extra_base)
+
+
+# --- Custom Celery Task Class for TDA with Idempotency ---
+class TdaCeleryTask(Task):
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        app.logger.error(f'Celery Task {task_id} (TDA DiscoverTopics) failed: {exc}', exc_info=einfo)
+        idempotency_key = kwargs.get('idempotency_key')
+        task_name = self.name
+
+        # Check if PSYCOPG2_AVAILABLE before attempting DB operations
+        # This check should ideally be at a higher level or ensure config reflects availability
+        if idempotency_key: # and PSYCOPG2_AVAILABLE: (Assume check is handled by _get_tda_db_connection)
+            db_conn_fail = None
+            try:
+                db_conn_fail = _get_tda_db_connection() # This will raise if not configured/available
+                if db_conn_fail:
+                    db_conn_fail.autocommit = False
+                    error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
+                    _store_idempotency_record(db_conn_fail, idempotency_key, task_name,
+                                              tda_config['TDA_IDEMPOTENCY_STATUS_FAILED'],
+                                              error_payload=error_payload, is_new_key=False)
+                    db_conn_fail.commit()
+                    app.logger.info(f"Idempotency record for key {idempotency_key} marked as FAILED for TDA task.")
+            except Exception as db_err: # Catch broad exceptions for DB operations during failure handling
+                app.logger.error(f"Failed to update idempotency record to FAILED for key {idempotency_key} (TDA task) after task failure: {db_err}", exc_info=True)
+                if db_conn_fail: db_conn_fail.rollback()
+            finally:
+                if db_conn_fail and not db_conn_fail.closed:
+                    try: db_conn_fail.close()
+                    except Exception: pass
+
+
+# Re-define discover_topics_task with the new base class
+@celery_app.task(bind=True, base=TdaCeleryTask, name='discover_topics_task') # Name matches original
+def discover_topics_task(self, request_id_main: str, query: Optional[str], limit: int, use_real_news_api_flag: bool, error_trigger: Optional[str] = None, idempotency_key: Optional[str] = None, workflow_id: Optional[str] = None):
+    # Task logic from above, refactored into this new definition
+    # (The entire logic of the previous discover_topics_task function body goes here)
+    # For brevity, I'll just show the call to the actual logic, assuming it's moved or called.
+    # This is a simplified representation. The actual implementation would move the previous function's body here.
+    # The core logic of discovering topics (simulated or real)
+    task_log_id = self.request.id
+    log_extra_base = {"orig_req_id": request_id_main, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "query": query}
+    app.logger.info(f"TDA Celery Task {task_log_id}: Starting. Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}", extra=log_extra_base)
+
+    if not idempotency_key:
+        app.logger.error(f"TDA Task {task_log_id}: Idempotency key not provided. This is required.", extra=log_extra_base)
+        raise ValueError("Idempotency key is required for TDA task execution.")
+
+    # Idempotency DB connection and checks
+    db_conn = None
+    try:
+        db_conn = _get_tda_db_connection()
+        db_conn.autocommit = False
+
+        existing_record = _check_idempotency_key(db_conn, idempotency_key, self.name)
+        if existing_record:
+            status = existing_record['status']
+            locked_at = existing_record.get('locked_at')
+            if status == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED']:
+                app.logger.info(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra=log_extra_base)
+                db_conn.rollback()
+                return existing_record['result_payload']
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']:
+                timeout_seconds = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < timeout_seconds:
+                    app.logger.warning(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' is already PROCESSING. Conflict.", extra=log_extra_base)
+                    db_conn.rollback()
+                    return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                else:
+                    app.logger.warning(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' was PROCESSING but lock timed out. Re-processing.", extra=log_extra_base)
+                    _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED']:
+                app.logger.info(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' previously FAILED. Retrying.", extra=log_extra_base)
+                _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+        else:
+            app.logger.info(f"TDA Task {task_log_id}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra=log_extra_base)
+            _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+        db_conn.commit()
+
+        if error_trigger == "tda_error":
+            app.logger.info(f"TDA Task {task_log_id}: Simulated TDA error triggered for key '{idempotency_key}'.", extra=log_extra_base)
+            raise Exception("Simulated TDA error in Celery task.")
+
+        # --- Main Task Logic (copied from original discover_topics_task) ---
+        discovered_topics = []
+        if use_real_news_api_flag:
+            request_keywords = [k.strip() for k in query.split(',')] if query else None
+            app.logger.info(f"Celery Task {self.request.id}: Dispatching NewsAPI sub-task. Keywords: {request_keywords}", extra=log_extra_base)
+            news_task = fetch_news_from_newsapi_task.delay(request_id_celery=self.request.id, keywords=request_keywords, language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")) # Removed max_results, not a param
+            app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} dispatched. Polling...", extra=log_extra_base)
+
+            polling_start_time = time.time()
+            news_polling_interval = int(os.getenv("TDA_NEWSAPI_POLLING_INTERVAL_SECONDS", "5"))
+            news_polling_timeout = int(os.getenv("TDA_NEWSAPI_POLLING_TIMEOUT_SECONDS", "120"))
+
+            while True:
+                if time.time() - polling_start_time > news_polling_timeout:
+                    app.logger.error(f"Celery Task {self.request.id}: Polling NewsAPI sub-task {news_task.id} timed out.", extra=log_extra_base)
+                    raise Exception(f"Polling NewsAPI sub-task {news_task.id} timed out.")
+                news_task_result = AsyncResult(news_task.id, app=celery_app)
+                app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} status: {news_task_result.status}", extra=log_extra_base)
+                if news_task_result.successful():
+                    sub_task_output = news_task_result.result
+                    if sub_task_output.get("status") == "success":
+                        discovered_topics = sub_task_output.get("discovered_topics", [])
+                        app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task successful. Found {len(discovered_topics)} topics.", extra=log_extra_base)
+                    else:
+                        app.logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} reported failure: {sub_task_output.get('message')}", extra=log_extra_base)
+                        raise Exception(f"NewsAPI sub-task failed: {sub_task_output.get('message', 'Unknown error')}")
+                    break
+                elif news_task_result.failed():
+                    app.logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} failed with Celery status FAILED. Info: {news_task_result.info}", extra=log_extra_base)
+                    raise Exception(f"NewsAPI sub-task failed: {str(news_task_result.info)}")
+                time.sleep(news_polling_interval)
+        else:
+            app.logger.info(f"Celery Task {self.request.id}: Using simulated data sources. Query: '{query}', Limit: {limit}", extra=log_extra_base)
+            discovered_topics = identify_topics_from_sources(query=query, limit=limit)
+            app.logger.info(f"Celery Task {self.request.id}: Simulated data discovery found {len(discovered_topics)} topics.", extra=log_extra_base)
+
+        task_result_payload = {}
+        if not discovered_topics:
+            task_result_payload = {"status": "success_no_topics", "message": "No topics discovered.", "topics": []}
+        else:
+            task_result_payload = {"status": "success", "discovered_topics": discovered_topics, "message": f"Successfully discovered {len(discovered_topics)} topics."}
+
+        _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'], workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
+        db_conn.commit()
+        app.logger.info(f"TDA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'.", extra=log_extra_base)
+        return task_result_payload
+
+    except Exception as e:
+        app.logger.error(f"TDA Task {task_log_id}: Error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
+        raise
+    finally:
+        if db_conn:
+            if not db_conn.closed:
+                db_conn.close()
+                app.logger.debug(f"TDA Task {task_log_id}: Closed DB connection for key '{idempotency_key}'.", extra=log_extra_base)
 
 
 # --- API Endpoint ---
 @app.route("/discover_topics", methods=["POST"])
-def discover_topics_async_endpoint(): # Renamed endpoint function
-    request_start_time = time.time() # For overall endpoint response time, not full task time
+def discover_topics_async_endpoint():
+    request_start_time = time.time()
     request_id_main = f"tda_req_{uuid.uuid4().hex[:8]}"
-    logger.info(f"Request {request_id_main}: Received async /discover_topics request.")
+    app.logger.info(f"Request {request_id_main}: Received async /discover_topics request.") # Use app.logger
+
+    idempotency_key = flask.request.headers.get(IDEMPOTENCY_KEY_HEADER)
+    workflow_id = flask.request.headers.get("X-Workflow-ID")
+
+    if not idempotency_key:
+        app.logger.warning(f"Request {request_id_main}: Missing X-Idempotency-Key header.")
+        return flask.jsonify({"error_code": "TDA_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
 
     try:
         request_data = flask.request.get_json() if flask.request.content_length else {}
@@ -559,27 +853,30 @@ def discover_topics_async_endpoint(): # Renamed endpoint function
 
     use_real_news_api_flag = tda_config["USE_REAL_NEWS_API"]
 
-    logger.info(f"Request {request_id_main}: Dispatching topic discovery to Celery task. Query: '{query}', Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}")
+    app.logger.info(f"Request {request_id_main}: Dispatching topic discovery to Celery task. Query: '{query}', Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}, Idempotency-Key: {idempotency_key}") # Use app.logger
 
     task = discover_topics_task.delay(
         request_id_main=request_id_main,
         query=query,
         limit=limit,
         use_real_news_api_flag=use_real_news_api_flag,
-        error_trigger=error_trigger # Pass error_trigger for testing task failure if needed
+        error_trigger=error_trigger,
+        idempotency_key=idempotency_key,
+        workflow_id=workflow_id
     )
 
-    logger.info(f"Request {request_id_main}: Topic discovery task {task.id} dispatched.")
+    app.logger.info(f"Request {request_id_main}: Topic discovery task {task.id} dispatched.") # Use app.logger
     return flask.jsonify({
         "task_id": task.id,
         "status_url": f"/v1/tasks/{task.id}",
-        "message": "Topic discovery task initiated. Poll task ID for results."
+        "message": "Topic discovery task initiated. Poll task ID for results.",
+        "idempotency_key_processed": idempotency_key
     }), 202
 
 
 @app.route('/v1/tasks/<task_id>', methods=['GET'])
 def get_tda_task_status(task_id: str):
-    logger.info(f"Received request for TDA task status: {task_id}")
+    app.logger.info(f"Received request for TDA task status: {task_id}") # Use app.logger
     task_result = AsyncResult(task_id, app=celery_app)
     response_data = {"task_id": task_id, "status": task_result.status, "result": None}
 
@@ -588,9 +885,11 @@ def get_tda_task_status(task_id: str):
         response_data["result"] = task_output
         http_status = 200
         # Example: check if the task's internal logic indicated an issue
-        if isinstance(task_output, dict) and task_output.get("status") != "success":
-             # Could map specific task error messages to HTTP status codes if desired
-             http_status = 500 # Default for task-level errors reported in a successful Celery execution
+        if isinstance(task_output, dict) and task_output.get("status") != "success" and task_output.get("status") != "success_no_topics":
+             http_status = 500
+        # Idempotency conflict reported by the task
+        if isinstance(task_output, dict) and task_output.get("status") == "PROCESSING_CONFLICT":
+            return flask.jsonify(response_data), 409 # Conflict
         return flask.jsonify(response_data), http_status
     elif task_result.failed():
         error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
@@ -600,12 +899,20 @@ def get_tda_task_status(task_id: str):
         return flask.jsonify(response_data), 202
 
 if __name__ == "__main__":
-    if tda_config.get("DATABASE_TYPE") == "sqlite" and not tda_config.get("SHARED_DATABASE_PATH"):
-        app.logger.warning("SHARED_DATABASE_PATH not configured for TDA SQLite mode. Topic saving to DB will fail if not using Postgres.")
-    elif tda_config.get("DATABASE_TYPE") == "postgres" and not all(tda_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]):
-        app.logger.warning("PostgreSQL is configured as DATABASE_TYPE, but one or more connection variables are missing. DB operations might fail.")
+    # Startup checks for psycopg2 and PostgreSQL config
+    try:
+        # Attempt a basic check for psycopg2 presence if not done elsewhere,
+        # though PSYCOPG2_AVAILABLE flag based on import is better.
+        # This is more about ensuring config is present if the lib is there.
+        if not psycopg2: # This will cause NameError if psycopg2 failed to import
+            app.logger.warning("TDA Warning: psycopg2 library is not available. Idempotency features will be disabled.")
+    except NameError:
+        app.logger.warning("TDA Warning: psycopg2 library failed to import. Idempotency features will be disabled.")
 
-    init_tda_db() # Call init_db based on configured DB_TYPE
+    if not all(tda_config.get(k) for k in required_pg_vars): # required_pg_vars defined globally
+        app.logger.warning("TDA Warning: PostgreSQL connection details not fully configured. Idempotency and DB operations may fail.")
+
+    init_tda_db()
 
     host = tda_config.get("TDA_HOST")
     port = tda_config.get("TDA_PORT")

@@ -1,3 +1,158 @@
+import os
+import json
+import uuid
+import time
+import hashlib
+import logging
+import re # For fallback parsing
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, Any
+
+from flask import Flask, request, jsonify, url_for
+from celery import Celery, Task
+from celery.result import AsyncResult
+
+# Conditional import for psycopg2
+PSYCOPG2_AVAILABLE = False
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    logging.warning("psycopg2 not found. PostgreSQL functionality will be disabled for PSWA.")
+
+# Conditional import for sqlite3 (standard library, should always be available)
+import sqlite3 # For type hinting and explicit error handling
+
+from dotenv import load_dotenv
+load_dotenv() # Load environment variables from .env file at the very start
+
+# --- Idempotency Constants ---
+IDEMPOTENCY_KEY_HEADER = "X-Idempotency-Key"
+# Other idempotency constants (IDEMPOTENCY_STATUS_*, IDEMPOTENCY_LOCK_TIMEOUT_SECONDS)
+# are assumed to be loaded into pswa_config from environment variables.
+
+# --- Global Variables & Configuration Placeholder ---
+# In a real structured Flask app, 'app', 'celery_app', and 'pswa_config' would be initialized
+# in a more organized way, likely in an app factory pattern or specific config modules.
+
+# Placeholder for Flask app
+app = Flask(__name__)
+
+# Placeholder for pswa_config (this would be populated by a proper config loading mechanism)
+# For the functions below to work, pswa_config needs to be populated with values from .env or environment
+# This is a simplified representation.
+pswa_config = {}
+def load_pswa_config():
+    global pswa_config
+    # Simulate loading config from environment variables, similar to how it might be done
+    # in a __init__.py or config.py and then imported.
+    pswa_config = {
+        "DATABASE_TYPE": os.getenv("DATABASE_TYPE", "sqlite"),
+        "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "var/pswa_cache.db"), # e.g., /app/var/pswa_cache.db
+        "POSTGRES_HOST": os.getenv("POSTGRES_HOST"),
+        "POSTGRES_PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "POSTGRES_USER": os.getenv("POSTGRES_USER"),
+        "POSTGRES_PASSWORD": os.getenv("POSTGRES_PASSWORD"),
+        "POSTGRES_DB": os.getenv("POSTGRES_DB"),
+        "PSWA_SCRIPT_CACHE_ENABLED": os.getenv("PSWA_SCRIPT_CACHE_ENABLED", "true").lower() == "true",
+        "PSWA_SCRIPT_CACHE_MAX_AGE_HOURS": int(os.getenv("PSWA_SCRIPT_CACHE_MAX_AGE_HOURS", "720")), # 30 days
+        "PSWA_TEST_MODE_ENABLED": os.getenv("PSWA_TEST_MODE_ENABLED", "false").lower() == "true",
+        "AIMS_SERVICE_URL": os.getenv("AIMS_SERVICE_URL", "http://aims_service:5001/v1/generate_content_async"),
+        "AIMS_REQUEST_TIMEOUT_SECONDS": int(os.getenv("AIMS_REQUEST_TIMEOUT_SECONDS", "180")),
+        "AIMS_POLLING_INTERVAL_SECONDS": int(os.getenv("AIMS_POLLING_INTERVAL_SECONDS", "5")),
+        "AIMS_POLLING_TIMEOUT_SECONDS": int(os.getenv("AIMS_POLLING_TIMEOUT_SECONDS", "300")),
+        "PSWA_LLM_MODEL": os.getenv("PSWA_LLM_MODEL", "gpt-3.5-turbo-0125"),
+        "PSWA_LLM_TEMPERATURE": float(os.getenv("PSWA_LLM_TEMPERATURE", "0.7")),
+        "PSWA_LLM_MAX_TOKENS": int(os.getenv("PSWA_LLM_MAX_TOKENS", "2000")),
+        "PSWA_LLM_JSON_MODE": os.getenv("PSWA_LLM_JSON_MODE", "true").lower() == "true",
+        "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE"),
+        "PSWA_PERSONA_PROMPTS_JSON": os.getenv("PSWA_PERSONA_PROMPTS_JSON", '{}'),
+        "PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION": os.getenv("PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION"),
+        "PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION": os.getenv("PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION"),
+        "PSWA_DEFAULT_PERSONA": os.getenv("PSWA_DEFAULT_PERSONA", "InformativeHost"),
+        "CELERY_BROKER_URL": os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
+        "CELERY_RESULT_BACKEND": os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/0"),
+        # Idempotency related configurations, expected to be in .env
+        "IDEMPOTENCY_STATUS_PROCESSING": os.getenv("IDEMPOTENCY_STATUS_PROCESSING", "processing"),
+        "IDEMPOTENCY_STATUS_COMPLETED": os.getenv("IDEMPOTENCY_STATUS_COMPLETED", "completed"),
+        "IDEMPOTENCY_STATUS_FAILED": os.getenv("IDEMPOTENCY_STATUS_FAILED", "failed"),
+        "IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": int(os.getenv("IDEMPOTENCY_LOCK_TIMEOUT_SECONDS", "3600")), # 1 hour
+        # Flask specific (though app.config is more common)
+        "PSWA_HOST": os.getenv("PSWA_HOST", "0.0.0.0"),
+        "PSWA_PORT": int(os.getenv("PSWA_PORT", "5004")),
+        "PSWA_DEBUG_MODE": os.getenv("FLASK_DEBUG", "True").lower() == "true", # Align with common.env
+    }
+    try:
+        pswa_config['PSWA_PERSONA_PROMPTS_MAP_PARSED'] = json.loads(pswa_config['PSWA_PERSONA_PROMPTS_JSON'])
+    except json.JSONDecodeError:
+        logging.error(f"Invalid JSON for PSWA_PERSONA_PROMPTS_JSON: {pswa_config['PSWA_PERSONA_PROMPTS_JSON']}")
+        pswa_config['PSWA_PERSONA_PROMPTS_MAP_PARSED'] = {}
+
+load_pswa_config() # Load the configuration
+
+# Configure Flask app (minimal example)
+app.config.update(
+    CELERY_BROKER_URL=pswa_config['CELERY_BROKER_URL'],
+    CELERY_RESULT_BACKEND=pswa_config['CELERY_RESULT_BACKEND']
+)
+
+# Placeholder for Celery app
+# In a real app, Celery is initialized with app.config
+pswa_celery_app = Celery(app.name, broker=app.config['CELERY_BROKER_URL'], backend=app.config['CELERY_RESULT_BACKEND'])
+pswa_celery_app.conf.update(
+    task_track_started=True,
+    # Add other Celery configurations as needed
+)
+
+
+# --- Logging Setup ---
+# Basic logging configuration
+logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s] [%(module)s.%(funcName)s:%(lineno)d] - %(message)s')
+logger = logging.getLogger("PSWA_Service")
+app.logger.handlers.extend(logger.handlers) # Integrate Flask's logger if desired
+
+# --- Database Schema (for reference, typically in a migrations system) ---
+DB_SCHEMA_PSWA_CACHE_TABLE = """
+CREATE TABLE IF NOT EXISTS generated_scripts (
+    script_id TEXT PRIMARY KEY,
+    topic_hash TEXT UNIQUE NOT NULL,
+    structured_script_json JSONB, -- For PostgreSQL
+    -- structured_script_json TEXT, -- For SQLite (store as JSON string)
+    generation_timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    llm_model_used TEXT,
+    last_accessed_timestamp TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
+CREATE INDEX IF NOT EXISTS idx_generation_timestamp ON generated_scripts (generation_timestamp);
+"""
+# Note: For SQLite, JSONB is not a type. Use TEXT and handle JSON conversion in code.
+# The schema above is more PostgreSQL-centric for `structured_script_json`.
+# Idempotency table schema is expected to be in 'aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql'
+# and applied separately to the PostgreSQL database.
+
+# --- Constants for Script Parsing (Semantic, not config) ---
+KEY_CONTENT = "content"
+KEY_TOPIC = "topic"
+KEY_TITLE = "title"
+KEY_INTRO = "intro"
+KEY_OUTRO = "outro"
+KEY_SEGMENTS = "segments"
+KEY_SEGMENT_TITLE = "segment_title"
+KEY_ERROR = "error"
+KEY_MESSAGE = "message"
+
+TAG_TITLE = "TITLE" # Fallback parsing
+SEGMENT_TITLE_INTRO = "Intro"
+SEGMENT_TITLE_OUTRO = "Outro"
+SEGMENT_TITLE_ERROR = "ERROR"
+
+# Test mode constants (can also be moved to config if they change often)
+PSWA_TEST_SCENARIO_INSUFFICIENT_CONTENT_MSG = "Test mode: Simulated insufficient content from AIMS."
+PSWA_TEST_SCENARIO_LLM_ERROR_MSG = "Test mode: Simulated LLM processing error from AIMS."
+PSWA_TEST_SCENARIO_MALFORMED_JSON_MSG = "Test mode: Simulated malformed JSON response from AIMS."
+
+
 # --- Database Helper Functions for Script Caching & Idempotency ---
 
 def _get_db_connection_script_cache(): # Renamed for clarity

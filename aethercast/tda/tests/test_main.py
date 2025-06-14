@@ -1,825 +1,590 @@
-# aethercast/tda/tests/test_main.py
-import unittest
-from unittest.mock import patch, MagicMock
 import os
-import json # For creating mock API responses
+import sys
+import json
+import uuid
+import unittest
+from unittest.mock import patch, MagicMock, ANY
+from datetime import datetime, timezone, timedelta
 
-# Attempt to import from parent directory - this might need adjustment based on test runner setup
-# For example, if running with `python -m unittest discover`, PYTHONPATH might need to be set.
-# Assuming aethercast.tda.main can be imported.
-from aethercast.tda import main as tda_main # Alias for clarity
+# Adjust path to import TDA main module
+current_dir = os.path.dirname(os.path.abspath(__file__))
+tda_dir = os.path.dirname(current_dir) # Should be /aethercast/tda
+aethercast_dir = os.path.dirname(tda_dir) # Should be /aethercast
+project_root_dir = os.path.dirname(aethercast_dir) # Should be / (root of repo)
 
-class TestTDAIntegration(unittest.TestCase):
+if project_root_dir not in sys.path:
+    sys.path.insert(0, project_root_dir)
+if aethercast_dir not in sys.path:
+    sys.path.insert(0, aethercast_dir)
 
+# Imports from TDA service
+from aethercast.tda.main import app as flask_app
+from aethercast.tda.main import celery_app as tda_celery_app
+from aethercast.tda.main import tda_config, load_tda_configuration # For accessing config
+from aethercast.tda.main import IDEMPOTENCY_KEY_HEADER, discover_topics_task
+from aethercast.tda.main import _get_tda_db_connection # To mock it
+
+# --- Mock Database Connection Registry ---
+mock_db_connection_registry_tda = {}
+
+def mock_get_tda_db_connection_side_effect():
+    instance_id = os.getpid()
+    if instance_id not in mock_db_connection_registry_tda:
+        conn = MagicMock(name=f"MockTdaPsycopg2Connection_{instance_id}")
+        cursor_mock = MagicMock(name="MockTdaCursor")
+        cursor_mock.fetchone.return_value = None # Default: key not found
+        cursor_mock.rowcount = 0
+        conn.cursor.return_value.__enter__.return_value = cursor_mock
+        conn.commit = MagicMock()
+        conn.rollback = MagicMock()
+        conn.close = MagicMock()
+        mock_db_connection_registry_tda[instance_id] = conn
+    return mock_db_connection_registry_tda[instance_id]
+
+def reset_mock_tda_db_connections():
+    mock_db_connection_registry_tda.clear()
+
+# --- Base Test Case ---
+class BaseTdaServiceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        tda_main.app.config['TESTING'] = True
-        # Disable actual logging to keep test output clean, if not already handled by Flask's TESTING config
-        # You might also want to set a specific logger level for tests if needed.
-        # For example, tda_main.app.logger.setLevel(logging.WARNING)
-        cls.client = tda_main.app.test_client()
-
-    # --- 1. Setup and Mocking ---
-    # This section outlines general setup and mocking strategies.
-    # Specific mocks will be detailed in each test section.
+        tda_celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        flask_app.testing = True
+        load_tda_configuration()
 
     def setUp(self):
-        # This method is called before each test.
-        # Common setup can go here, e.g., resetting parts of tda_main.py if necessary.
-        # For instance, if tda_config is loaded at module level and modified by tests,
-        # it might need to be reloaded or reset.
-        # For now, we assume tda_config is freshly evaluated or mocked per test using patch.dict.
+        self.app = flask_app.test_client()
+        reset_mock_tda_db_connections()
 
-        # Reset or re-patch critical configurations if they are modified by tests directly
-        # For example, ensure USE_REAL_NEWS_API is reset to a known state if a test changes it globally.
-        # However, using `with patch.dict(...)` within tests is the preferred way to manage config per test.
-        pass
-
-    # Example of how os.getenv might be mocked for configuration tests
-    # @patch('os.getenv') 
-    # def test_example_mock_os_getenv(self, mock_getenv):
-    #     mock_getenv.return_value = "some_value"
-    #     # ... test logic ...
-
-    # Example of how requests.get might be mocked for API call tests
-    # @patch('requests.get')
-    # def test_example_mock_requests_get(self, mock_get):
-    #     mock_response = MagicMock()
-    #     mock_response.status_code = 200
-    #     mock_response.json.return_value = {"status": "ok", "articles": []}
-    #     mock_get.return_value = mock_response
-    #     # ... test logic ...
-
-    # --- 2. Configuration Loading Tests ---
-
-    @patch.dict(os.environ, {
-        "TDA_NEWS_API_KEY": "test_api_key_from_env",
-        "TDA_NEWS_API_BASE_URL": "https://test.newsapi.org/v2/",
-        "TDA_NEWS_API_ENDPOINT": "everything-test",
-        "TDA_NEWS_DEFAULT_KEYWORDS": "test,keywords",
-        "TDA_NEWS_DEFAULT_LANGUAGE": "xx",
-        "USE_REAL_NEWS_API": "True" 
-    })
-    @patch('aethercast.tda.main.load_dotenv') # Mock load_dotenv to prevent actual file loading
-    def test_config_loading_from_env_variables(self, mock_load_dotenv):
-        # Purpose: Test that environment variables are correctly loaded into tda_config.
-        # Mocking:
-        # - os.environ is patched using @patch.dict to simulate set env vars.
-        # - load_dotenv is mocked to prevent it from trying to read a .env file.
-        
-        # We need to simulate the module being reloaded or tda_config being re-initialized
-        # This is tricky if tda_config is defined at the module level.
-        # A common pattern is to have a function that initializes config.
-        # Assuming tda_main.tda_config is directly usable and reflects os.getenv at import time.
-        # For this test, we might need to re-import or re-run the config part of tda_main.
-        # Simplification: Assume we can trigger a re-evaluation of tda_config or test its components.
-        
-        # Re-evaluate tda_config (conceptual - depends on how tda_main is structured)
-        # If tda_config is top-level, we might need to reload the module or test a function that builds it.
-        # For this outline, let's assume we can access a freshly loaded tda_config
-        # or that tda_main.py is structured to allow re-initialization of tda_config for tests.
-
-        # Let's assume tda_main.tda_config is re-evaluated based on the patched os.environ when tda_main is imported
-        # or when a specific config loading function is called.
-        # For this conceptual outline, we'll directly inspect a hypothetical reloaded_config.
-        
-        # This would require a mechanism to reload tda_main or its config part.
-        # For example, if config loading is in a function:
-        # reloaded_config = tda_main.load_app_configuration()
-        
-        # Assertions (assuming tda_main.tda_config reflects the patched os.environ):
-        self.assertEqual(tda_main.tda_config["TDA_NEWS_API_KEY"], "test_api_key_from_env")
-        self.assertEqual(tda_main.tda_config["TDA_NEWS_API_BASE_URL"], "https://test.newsapi.org/v2/")
-        self.assertEqual(tda_main.tda_config["TDA_NEWS_API_ENDPOINT"], "everything-test")
-        self.assertEqual(tda_main.tda_config["TDA_NEWS_DEFAULT_KEYWORDS"], ["test", "keywords"]) # Assuming .split(',')
-        self.assertEqual(tda_main.tda_config["TDA_NEWS_DEFAULT_LANGUAGE"], "xx")
-        self.assertTrue(tda_main.tda_config["USE_REAL_NEWS_API"]) # Assuming .lower() == "true"
-        mock_load_dotenv.assert_called_once() # Ensure dotenv loading was attempted (even if bypassed)
-
-    @patch('aethercast.tda.main.logging.error')
-    @patch.dict(os.environ, {
-        "USE_REAL_NEWS_API": "True",
-        "TDA_NEWS_API_KEY": "" # Missing API Key
-    })
-    # We would need to reload tda_main or trigger its startup check logic.
-    # This is a conceptual test.
-    def test_startup_check_api_key_missing(self, mock_logging_error):
-        # Purpose: Test that a critical error is logged if USE_REAL_NEWS_API is True but TDA_NEWS_API_KEY is missing.
-        # Mocking:
-        # - os.environ patched to simulate USE_REAL_NEWS_API=True and no API key.
-        # - logging.error to capture log messages.
-        
-        # This test implies that the startup check logic in tda_main.py is executed.
-        # This might happen at module import time. If so, reloading the module would be needed.
-        # import importlib
-        # importlib.reload(tda_main) # This can have side effects and complexities.
-        
-        # Conceptual: Assuming the check runs and calls logging.error
-        # For this to work, the conditional check in tda_main.py must be re-evaluated.
-        # If the check is:
-        # if tda_config["USE_REAL_NEWS_API"] and not tda_config["TDA_NEWS_API_KEY"]:
-        #    logging.error(...)
-        # We need tda_config to be updated first based on the patched os.environ.
-        
-        # This test is more of an integration test of module loading.
-        # A simpler unit test would be to extract the check into a function and test that function.
-        
-        # Assuming the check is re-run:
-        # tda_main.perform_startup_checks() # If such a function existed
-        
-        # Assertions:
-        # mock_logging_error.assert_called_with(
-        #     "CRITICAL: USE_REAL_NEWS_API is True, but TDA_NEWS_API_KEY is not set. Real News API calls will fail."
-        # )
-        pass # Placeholder for the complex setup of re-running module-level code
-
-
-    # --- 3. `call_real_news_api` Function Tests (Mocking `requests.get`) ---
-
-    @patch('requests.get')
-    @patch('aethercast.tda.main.generate_topic_id', return_value="mock_topic_id_123")
-    def test_call_real_news_api_successful(self, mock_generate_id, mock_requests_get):
-        # Purpose: Test successful API call, JSON parsing, and transformation to TopicObjects.
-        # Mocking:
-        # - requests.get is mocked to return a successful response.
-        # - generate_topic_id to provide predictable topic IDs.
-        # - tda_main.tda_config needs to be set up for this test (e.g., API key present).
-
-        # Setup mock response from requests.get
-        mock_api_response = {
-            "status": "ok",
-            "totalResults": 1,
-            "articles": [
-                {
-                    "source": {"id": "test-source", "name": "Test Source"},
-                    "author": "Test Author",
-                    "title": "Test Article Title",
-                    "description": "Test article description.",
-                    "url": "http://example.com/test-article",
-                    "urlToImage": "http://example.com/image.jpg",
-                    "publishedAt": "2024-01-01T12:00:00Z",
-                    "content": "Test content."
-                }
-            ]
+        self.test_config_overrides = {
+            "TDA_DEBUG_MODE": False,
+            "POSTGRES_HOST": "mock_pg_host_tda",
+            "POSTGRES_USER": "mock_pg_user_tda",
+            "POSTGRES_PASSWORD": "mock_pg_password_tda",
+            "POSTGRES_DB": "mock_pg_db_tda",
+            "TDA_IDEMPOTENCY_STATUS_PROCESSING": "processing",
+            "TDA_IDEMPOTENCY_STATUS_COMPLETED": "completed",
+            "TDA_IDEMPOTENCY_STATUS_FAILED": "failed",
+            "TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": 60,
+            "USE_REAL_NEWS_API": False, # Default to simulated for most tests
         }
-        mock_response_obj = MagicMock()
-        mock_response_obj.status_code = 200
-        mock_response_obj.json.return_value = mock_api_response
-        mock_requests_get.return_value = mock_response_obj
-
-        # Setup tda_config for this call
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = "fake_key"
-        tda_main.tda_config["TDA_NEWS_API_BASE_URL"] = "https://newsapi.org/v2/"
-        tda_main.tda_config["TDA_NEWS_API_ENDPOINT"] = "everything"
-        tda_main.tda_config["TDA_NEWS_DEFAULT_KEYWORDS"] = ["default"]
-        tda_main.tda_config["TDA_NEWS_DEFAULT_LANGUAGE"] = "en"
-
-        # Call the function
-        result_topics = tda_main.call_real_news_api(keywords=["test", "api"])
-
-        # Assertions:
-        self.assertEqual(len(result_topics), 1)
-        topic = result_topics[0]
-        self.assertEqual(topic["topic_id"], "mock_topic_id_123")
-        self.assertEqual(topic["title_suggestion"], "Test Article Title")
-        self.assertEqual(topic["summary"], "Test article description.")
-        self.assertEqual(topic["keywords"], ["test", "api"]) # Should use the passed keywords
-        self.assertEqual(topic["potential_sources"][0]["url"], "http://example.com/test-article")
-        self.assertEqual(topic["publication_date"], "2024-01-01T12:00:00Z")
+        self.config_patcher = patch.dict(tda_config, self.test_config_overrides, clear=False)
+        self.mocked_tda_config = self.config_patcher.start()
         
-        # Assert requests.get was called correctly
-        expected_url = "https://newsapi.org/v2/everything"
-        expected_params = {"q": "test,api", "language": "en"}
-        expected_headers = {"X-Api-Key": "fake_key"}
-        mock_requests_get.assert_called_once()
-        args, kwargs = mock_requests_get.call_args
-        self.assertEqual(args[0], expected_url)
-        self.assertEqual(kwargs['params'], expected_params)
-        self.assertEqual(kwargs['headers']['X-Api-Key'], expected_headers['X-Api-Key'])
-
-
-    @patch('requests.get')
-    @patch('aethercast.tda.main.logging.error')
-    def test_call_real_news_api_key_missing(self, mock_logging_error, mock_requests_get):
-        # Purpose: Test that if API key is missing, the function returns empty list and logs error.
-        # Mocking:
-        # - tda_config to have no API key.
-        # - logging.error to check for error logging.
-        # - requests.get to ensure it's not called.
-        
-        original_api_key = tda_main.tda_config.get("TDA_NEWS_API_KEY")
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = "" # Set API key to empty
-
-        result_topics = tda_main.call_real_news_api(keywords=["test"])
-
-        # Assertions:
-        self.assertEqual(result_topics, [])
-        mock_logging_error.assert_called_with("call_real_news_api: Missing TDA_NEWS_API_KEY. Cannot make request.")
-        mock_requests_get.assert_not_called()
-        
-        # Restore original key if necessary for other tests (better to mock tda_config per test)
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = original_api_key
-
-
-    @patch('requests.get')
-    @patch('aethercast.tda.main.logging.error')
-    def test_call_real_news_api_http_error(self, mock_logging_error, mock_requests_get):
-        # Purpose: Test handling of HTTP errors from API (e.g., 401, 429).
-        # Mocking:
-        # - requests.get to return an error status_code.
-        # - logging.error.
-        
-        mock_response_obj = MagicMock()
-        mock_response_obj.status_code = 401
-        mock_response_obj.text = "Unauthorized"
-        mock_requests_get.return_value = mock_response_obj
-        # Simulate raise_for_status behavior for HTTPError
-        mock_response_obj.raise_for_status = MagicMock(side_effect=requests.exceptions.HTTPError(response=mock_response_obj))
-
-
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = "fake_key" # Ensure key is present for call attempt
-        result_topics = tda_main.call_real_news_api(keywords=["test"])
-
-        # Assertions:
-        self.assertEqual(result_topics, [])
-        # Check that a log message containing the error details was made
-        self.assertTrue(any("HTTP error occurred" in call_args[0][0] for call_args in mock_logging_error.call_args_list))
-        mock_requests_get.assert_called_once()
-
-
-    @patch('requests.get', side_effect=requests.exceptions.ConnectionError("Test connection error"))
-    @patch('aethercast.tda.main.logging.error')
-    def test_call_real_news_api_connection_error(self, mock_logging_error, mock_requests_get):
-        # Purpose: Test handling of network errors like ConnectionError.
-        # Mocking:
-        # - requests.get to raise ConnectionError.
-        # - logging.error.
-        
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = "fake_key"
-        result_topics = tda_main.call_real_news_api(keywords=["test"])
-
-        # Assertions:
-        self.assertEqual(result_topics, [])
-        mock_logging_error.assert_called_with("Connection error occurred: Test connection error")
-        mock_requests_get.assert_called_once()
-
-
-    @patch('requests.get')
-    @patch('aethercast.tda.main.logging.error')
-    def test_call_real_news_api_json_decode_error(self, mock_logging_error, mock_requests_get):
-        # Purpose: Test handling of invalid JSON in API response.
-        # Mocking:
-        # - requests.get returns a response where .json() raises JSONDecodeError.
-        # - logging.error.
-        
-        mock_response_obj = MagicMock()
-        mock_response_obj.status_code = 200
-        mock_response_obj.text = "invalid json"
-        mock_response_obj.json.side_effect = requests.exceptions.JSONDecodeError("Error decoding JSON", "doc", 0)
-        mock_requests_get.return_value = mock_response_obj
-        
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = "fake_key"
-        result_topics = tda_main.call_real_news_api(keywords=["test"])
-
-        # Assertions:
-        self.assertEqual(result_topics, [])
-        self.assertTrue(any("Failed to decode JSON from NewsAPI" in call_args[0][0] for call_args in mock_logging_error.call_args_list))
-        mock_requests_get.assert_called_once()
-
-
-    @patch('requests.get')
-    @patch('aethercast.tda.main.logging.error')
-    def test_call_real_news_api_logical_error_in_response(self, mock_logging_error, mock_requests_get):
-        # Purpose: Test handling of API's own error messages (e.g., status: "error").
-        # Mocking:
-        # - requests.get returns a response with status:"error".
-        # - logging.error.
-
-        mock_api_response = {"status": "error", "message": "Your API key is invalid."}
-        mock_response_obj = MagicMock()
-        mock_response_obj.status_code = 200 # API call itself was successful
-        mock_response_obj.json.return_value = mock_api_response
-        mock_requests_get.return_value = mock_response_obj
-
-        tda_main.tda_config["TDA_NEWS_API_KEY"] = "fake_key"
-        result_topics = tda_main.call_real_news_api(keywords=["test"])
-
-        # Assertions:
-        self.assertEqual(result_topics, [])
-        mock_logging_error.assert_called_with("NewsAPI returned error status: error. Message: Your API key is invalid.")
-        mock_requests_get.assert_called_once()
-
-
-    # --- 4. `discover_topics_endpoint` Toggle Logic Tests ---
-    # These tests focus on the branching logic within discover_topics_endpoint
-    # based on USE_REAL_NEWS_API.
-    # Direct testing of Flask endpoints is more complex and might use app.test_client().
-    # Here, we conceptually test the core logic, perhaps by refactoring it into a helper
-    # or by directly manipulating tda_config and mocking the called functions.
-
-    @patch('aethercast.tda.main.call_real_news_api')
-    @patch('aethercast.tda.main.identify_topics_from_sources')
-    def test_discover_topics_endpoint_uses_real_api_when_true(self, mock_identify_simulated, mock_call_real):
-        # Purpose: Verify that call_real_news_api is used when USE_REAL_NEWS_API is True.
-        # Mocking:
-        # - tda_config["USE_REAL_NEWS_API"] = True
-        # - call_real_news_api to return mock data and allow assertion of its call.
-        # - identify_topics_from_sources to ensure it's NOT called.
-        
-        # Setup tda_config for this test case
-        original_use_real_api = tda_main.tda_config.get("USE_REAL_NEWS_API")
-        tda_main.tda_config["USE_REAL_NEWS_API"] = True
-        tda_main.tda_config["TDA_NEWS_DEFAULT_LANGUAGE"] = "en" # Ensure this is set
-
-        mock_call_real.return_value = [{"topic_id": "real_topic_1"}]
-        
-        # This simulates calling the core logic of the endpoint.
-        # In a real scenario, you might use app.test_client().post('/discover_topics', json={...})
-        # For this conceptual test, we assume access to a part of the endpoint logic.
-        # Let's assume we can call a helper or the main block of discover_topics_endpoint.
-        # For simplicity, we'll assume the test is for a refactored version or directly invokes the logic.
-        
-        # This would be part of the discover_topics_endpoint logic:
-        query_params = {"query": "AI,מה חדש", "limit": 1} # Example query
-        
-        # Simulate the part of discover_topics_endpoint that decides which data source to use
-        # This is highly conceptual as we are not using a Flask test client here.
-        # The actual endpoint function would be `tda_main.discover_topics_endpoint()`,
-        # but calling it directly without a Flask request context is not straightforward.
-        
-        # For the purpose of this outline, let's assume we can test the branching logic:
-        if tda_main.tda_config["USE_REAL_NEWS_API"]:
-            request_keywords = [k.strip() for k in query_params["query"].split(',')] if query_params.get("query") else None
-            discovered_topics = tda_main.call_real_news_api(
-                keywords=request_keywords, 
-                language=tda_main.tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")
-            )
-            if query_params.get("limit", 0) > 0 and discovered_topics:
-                 discovered_topics = discovered_topics[:query_params["limit"]]
-        else:
-            # This branch should not be taken in this test
-            discovered_topics = tda_main.identify_topics_from_sources(
-                query=query_params.get("query"),
-                limit=query_params.get("limit")
-            )
-
-        # Assertions:
-        mock_call_real.assert_called_once_with(
-            keywords=["AI", "מה חדש"], 
-            language="en"
-        )
-        mock_identify_simulated.assert_not_called()
-        self.assertEqual(discovered_topics, [{"topic_id": "real_topic_1"}]) # Assuming limit=1 and mock return has 1 item
-
-        # Restore config
-        tda_main.tda_config["USE_REAL_NEWS_API"] = original_use_real_api
-
-
-    @patch('aethercast.tda.main.call_real_news_api')
-    @patch('aethercast.tda.main.identify_topics_from_sources')
-    def test_discover_topics_endpoint_uses_simulated_data_when_false(self, mock_identify_simulated, mock_call_real):
-        # Purpose: Verify that identify_topics_from_sources is used when USE_REAL_NEWS_API is False.
-        # Mocking:
-        # - tda_config["USE_REAL_NEWS_API"] = False
-        # - identify_topics_from_sources to return mock data and allow assertion of its call.
-        # - call_real_news_api to ensure it's NOT called.
-
-        original_use_real_api = tda_main.tda_config.get("USE_REAL_NEWS_API")
-        tda_main.tda_config["USE_REAL_NEWS_API"] = False
-
-        mock_identify_simulated.return_value = [{"topic_id": "sim_topic_1"}]
-
-        # Conceptual call to the endpoint's core logic (as above)
-        query_params = {"query": "space", "limit": 1}
-        
-        if tda_main.tda_config["USE_REAL_NEWS_API"]:
-            # This branch should not be taken
-            request_keywords = [k.strip() for k in query_params["query"].split(',')] if query_params.get("query") else None
-            discovered_topics = tda_main.call_real_news_api(
-                keywords=request_keywords, 
-                language=tda_main.tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")
-            )
-            if query_params.get("limit", 0) > 0 and discovered_topics:
-                 discovered_topics = discovered_topics[:query_params["limit"]]
-        else:
-            discovered_topics = tda_main.identify_topics_from_sources(
-                query=query_params.get("query"),
-                limit=query_params.get("limit")
-            )
-            
-        # Assertions:
-        mock_identify_simulated.assert_called_once_with(query="space", limit=1)
-        mock_call_real.assert_not_called()
-        self.assertEqual(discovered_topics, [{"topic_id": "sim_topic_1"}])
-        
-        # Restore config
-        tda_main.tda_config["USE_REAL_NEWS_API"] = original_use_real_api
-
-    @patch('aethercast.tda.main.identify_topics_from_sources') # Mocks the simulated data path
-    def test_discover_topics_endpoint_simulated_success(self, mock_identify_simulated):
-        # Ensure USE_REAL_NEWS_API is False for this test
-        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}):
-            mock_topics = [{"topic_id": "sim1", "title_suggestion": "Simulated Topic"}]
-            mock_identify_simulated.return_value = mock_topics
-
-            response = self.client.post('/discover_topics', json={'query': 'simulated', 'limit': 1})
-            self.assertEqual(response.status_code, 200)
-            data = response.get_json()
-            self.assertEqual(data['discovered_topics'], mock_topics)
-            mock_identify_simulated.assert_called_once_with(query='simulated', limit=1)
-
-    @patch('aethercast.tda.main.call_real_news_api') # Mocks the real API call path
-    def test_discover_topics_endpoint_real_api_success(self, mock_call_real_api):
-        # Need to ensure TDA_NEWS_API_KEY is set for USE_REAL_NEWS_API=True path
-        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": True, "TDA_NEWS_API_KEY": "fake_key_for_test", "TDA_NEWS_DEFAULT_LANGUAGE": "en"}):
-            mock_topics = [{"topic_id": "real1", "title_suggestion": "Real API Topic"}]
-            mock_call_real_api.return_value = mock_topics
-
-            response = self.client.post('/discover_topics', json={'query': 'real', 'limit': 1})
-            self.assertEqual(response.status_code, 200)
-            data = response.get_json()
-            self.assertEqual(data['discovered_topics'], mock_topics)
-            mock_call_real_api.assert_called_once_with(keywords=['real'], language="en")
-
-    def test_discover_topics_endpoint_empty_payload(self):
-        # Should use default keywords for simulated path if USE_REAL_NEWS_API is False
-        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}), \
-             patch('aethercast.tda.main.identify_topics_from_sources') as mock_identify_simulated:
-            mock_identify_simulated.return_value = [{"topic_id": "default_topic"}]
-
-            response = self.client.post('/discover_topics', json={}) # Empty JSON payload
-            self.assertEqual(response.status_code, 200)
-            data = response.get_json()
-            self.assertIn('discovered_topics', data)
-            if data.get('discovered_topics'): # Check if list is not empty
-                 self.assertEqual(data['discovered_topics'][0]['topic_id'], "default_topic")
-            # Default limit is 5 in endpoint, query is None if not provided
-            mock_identify_simulated.assert_called_once_with(query=None, limit=5)
-
-    def test_discover_topics_endpoint_no_topics_found(self):
-        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}), \
-             patch('aethercast.tda.main.identify_topics_from_sources') as mock_identify_simulated:
-            mock_identify_simulated.return_value = [] # No topics found
-
-            response = self.client.post('/discover_topics', json={'query': 'very_specific_query'})
-            self.assertEqual(response.status_code, 200)
-            data = response.get_json()
-            self.assertEqual(data['topics'], [])
-            self.assertIn("No topics discovered", data['message'])
-
-    def test_discover_topics_endpoint_simulated_error_trigger(self):
-        # This tests the error_trigger mechanism in the endpoint itself
-        response = self.client.post('/discover_topics', json={'error_trigger': 'tda_error'})
-        self.assertEqual(response.status_code, 500)
-        data = response.get_json()
-        self.assertEqual(data['error_code'], "TDA_SIMULATED_ERROR")
-        self.assertIn("simulated error occurred in TDA", data['message'])
-
-    @patch('aethercast.tda.main.identify_topics_from_sources')
-    def test_discover_topics_endpoint_general_exception(self, mock_identify_simulated):
-        # Test general exception handling in the endpoint
-        with patch.dict(tda_main.tda_config, {"USE_REAL_NEWS_API": False}):
-            mock_identify_simulated.side_effect = Exception("Unexpected TDA core logic failure")
-
-            response = self.client.post('/discover_topics', json={'query': 'trigger_exception'})
-            self.assertEqual(response.status_code, 500)
-            data = response.get_json()
-            self.assertEqual(data['error_code'], "INTERNAL_SERVER_ERROR_TDA") # From tda_main constant
-            self.assertIn("Unexpected TDA core logic failure", data['details'])
-
-
-class TestTDAHelpers(unittest.TestCase):
-
-    def setUp(self):
-        # Mock tda_config for these helper tests
-        self.mock_tda_config = {
-            # "SHARED_DATABASE_PATH": ":memory:", # Removed
-            "TDA_NEWS_DEFAULT_KEYWORDS": ["default", "keyword"],
+        # Mock for the NewsAPI sub-task `fetch_news_from_newsapi_task`
+        # This mock will return a successful-like structure.
+        self.mock_news_task_success_payload = {
+            "status": "success",
+            "discovered_topics": [{"topic_id": "news_topic_1", "title_suggestion": "News Topic 1"}],
+            "message": "Fetched 1 topics."
         }
-        self.config_patcher = patch.dict(tda_main.tda_config, self.mock_tda_config, clear=True)
-        self.mock_config = self.config_patcher.start()
-
-        # Add PG env vars for _get_db_connection if it were not mocked in each test
-        self.pg_env_vars = {
-            "POSTGRES_HOST": "mock_pg_host_helper",
-            "POSTGRES_USER": "mock_pg_user_helper",
-            "POSTGRES_PASSWORD": "mock_pg_password_helper",
-            "POSTGRES_DB": "mock_pg_db_helper"
-        }
-        self.env_patcher = patch.dict(os.environ, self.pg_env_vars)
-        self.env_patcher.start()
+        # If discover_topics_task directly calls call_real_news_api or identify_topics_from_sources
+        # then those would be mocked instead/additionally.
+        # Current discover_topics_task calls fetch_news_from_newsapi_task if USE_REAL_NEWS_API is true,
+        # or identify_topics_from_sources if false.
+        
+        self.patch_fetch_news_task = patch('aethercast.tda.main.fetch_news_from_newsapi_task.delay')
+        self.mock_fetch_news_task_delay = self.patch_fetch_news_task.start()
+        # Configure the mock for .delay().get() or .delay().id for polling
+        mock_async_result = MagicMock()
+        mock_async_result.id = f"mock_news_task_id_{uuid.uuid4().hex[:8]}"
+        mock_async_result.successful.return_value = True
+        mock_async_result.result = self.mock_news_task_success_payload
+        self.mock_fetch_news_task_delay.return_value = mock_async_result
+        
+        # Mock for identify_topics_from_sources (used when USE_REAL_NEWS_API is False)
+        self.mock_simulated_topics_payload = [{"topic_id": "sim_topic_1", "title_suggestion": "Simulated Topic 1"}]
+        self.patch_identify_simulated = patch('aethercast.tda.main.identify_topics_from_sources', return_value=self.mock_simulated_topics_payload)
+        self.mock_identify_topics_from_sources = self.patch_identify_simulated.start()
 
 
     def tearDown(self):
         self.config_patcher.stop()
-        self.env_patcher.stop()
+        self.patch_fetch_news_task.stop()
+        self.patch_identify_simulated.stop()
+        reset_mock_tda_db_connections()
 
-    def test_generate_summary_from_title(self):
-        title = "Test Title for Summary"
-        expected_summary = "This topic explores test title for summary, focusing on its recent developments and potential impact."
-        self.assertEqual(tda_main.generate_summary_from_title(title), expected_summary)
-        self.assertEqual(tda_main.generate_summary_from_title("Another"), "This topic explores another, focusing on its recent developments and potential impact.")
+# --- Flask Endpoint Idempotency Tests ---
+@patch('aethercast.tda.main._get_tda_db_connection', side_effect=mock_get_tda_db_connection_side_effect)
+class TestTdaIdempotencyFlask(BaseTdaServiceTest):
 
-    def test_calculate_relevance_score(self):
-        article_match = {"keywords": ["ai", "ml"], "title": "AI in Healthcare"}
-        article_no_match = {"keywords": ["space", "mars"], "title": "Exploring Space"}
+    def test_missing_idempotency_key_header(self, mock_db_conn_getter):
+        """Test TDA Flask endpoint /discover_topics rejects if X-Idempotency-Key is missing."""
+        payload = {"query": "AI"}
+        response = self.app.post('/discover_topics', json=payload, headers={})
+        self.assertEqual(response.status_code, 400)
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "TDA_MISSING_IDEMPOTENCY_KEY")
 
-        # Test with matching query
-        score_match = tda_main.calculate_relevance_score(article_match, query="ai healthcare")
-        self.assertTrue(0.5 <= score_match <= 1.0) # Base is 0.5-0.9, boost can take it to 1.0
+    def test_new_idempotency_key_task_success(self, mock_db_conn_getter):
+        """Test TDA Flask endpoint with a new idempotency key, Celery task runs and succeeds."""
+        idempotency_key = f"tda-test-new-{uuid.uuid4()}"
+        payload = {"query": "latest tech"}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        
+        # USE_REAL_NEWS_API is False by default, so identify_topics_from_sources will be called by the task
+        
+        response = self.app.post('/discover_topics', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202, f"Response JSON: {response.get_data(as_text=True)}")
+        json_response = response.get_json()
+        self.assertIn("task_id", json_response)
+        task_id = json_response["task_id"]
+        self.assertEqual(json_response.get("idempotency_key_processed"), idempotency_key)
 
-        # Test with non-matching query (should be lower than a boosted score, but still in base range)
-        score_no_match_with_query = tda_main.calculate_relevance_score(article_no_match, query="ai")
-        self.assertTrue(0.5 <= score_no_match_with_query <= 0.9) # No boost from keywords/title
+        status_response = self.app.get(json_response["status_url"])
+        self.assertEqual(status_response.status_code, 200)
+        status_json = status_response.get_json()
+        self.assertEqual(status_json["status"], "SUCCESS")
+        self.assertIn("discovered_topics", status_json["result"])
+        # Check content from the mocked identify_topics_from_sources
+        self.assertEqual(status_json["result"]["discovered_topics"], self.mock_simulated_topics_payload)
 
-        # Test without query (base random score)
-        score_no_query = tda_main.calculate_relevance_score(article_match) # Query is None
-        self.assertTrue(0.5 <= score_no_query <= 0.9)
+        mock_conn = mock_db_connection_registry_tda[os.getpid()]
+        self.assertTrue(mock_db_conn_getter.called)
+        execute_calls = mock_conn.cursor.return_value.__enter__.return_value.execute.call_args_list
+        
+        self.assertGreaterEqual(len(execute_calls), 3)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
+        self.assertEqual(execute_calls[1][0][1][4], tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'])
+        self.assertIn("UPDATE idempotency_keys SET status = %s", execute_calls[2][0][0])
+        self.assertEqual(execute_calls[2][0][1][0], tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'])
+        self.assertEqual(mock_conn.commit.call_count, 2)
 
-        # Test that a matching query usually gives a higher score than no query for the same article
-        # This is probabilistic, so run a few times or accept occasional equality for low random rolls
-        # For simplicity, we assume a match will likely boost it above a non-boosted score.
-        # This could be made more robust by mocking random.uniform if needed.
-        # self.assertTrue(score_match > score_no_query or score_match == 1.0) # Simplified check
+    def test_completed_idempotency_key_returns_stored_result(self, mock_db_conn_getter):
+        """Test TDA Flask endpoint returns stored result for a COMPLETED idempotency key."""
+        idempotency_key = f"tda-test-completed-{uuid.uuid4()}"
+        payload = {"query": "completed query"}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 
-    @patch('aethercast.tda.main._save_topic_to_db') # Mock to verify it's called
-    @patch('aethercast.tda.main.generate_topic_id') # Mock to control topic_id
-    @patch('aethercast.tda.main.calculate_relevance_score') # Mock to control relevance
-    def test_identify_topics_from_sources_with_query_and_limit(self, mock_calc_relevance, mock_gen_id, mock_save_db):
-        mock_calc_relevance.return_value = 0.9 # Consistent relevance
-        # Calculate total articles to generate enough IDs
-        total_articles_in_sim_data = sum(len(source["articles"]) for source in tda_main.SIMULATED_DATA_SOURCES)
-        mock_gen_id.side_effect = [f"topic_id_{i}" for i in range(total_articles_in_sim_data)]
-
-
-        # Test with a query that should match some articles
-        # (SIMULATED_DATA_SOURCES has "AI", "Healthcare", "Technology")
-        query = "AI"
-        limit = 2
-
-        # Ensure SHARED_DATABASE_PATH is set for _save_topic_to_db to be called
-        # This will use the "dummy.db" from the setUp's self.mock_tda_config if not overridden here
-        # Let's explicitly set it to a non-None value for this test's scope.
-        with patch.dict(tda_main.tda_config, {"SHARED_DATABASE_PATH": "dummy_test_db.db", "TDA_NEWS_DEFAULT_KEYWORDS": self.mock_tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]}):
-            identified_topics = tda_main.identify_topics_from_sources(query=query, limit=limit)
-
-        self.assertEqual(len(identified_topics), limit)
-        self.assertTrue(all(isinstance(topic, dict) for topic in identified_topics))
-        self.assertTrue(all("topic_id" in topic for topic in identified_topics))
-        self.assertTrue(all(topic["relevance_score"] == 0.9 for topic in identified_topics)) # Due to mock
-
-        self.assertEqual(mock_save_db.call_count, total_articles_in_sim_data)
-
-    @patch('aethercast.tda.main._save_topic_to_db')
-    def test_identify_topics_from_sources_no_query_default_limit(self, mock_save_db):
-        # Test with no query, should use all simulated articles up to default limit
-        default_limit_in_func = 5 # Default limit in identify_topics_from_sources
-
-        # Patching SHARED_DATABASE_PATH to ensure _save_topic_to_db is called
-        with patch.dict(tda_main.tda_config, {"SHARED_DATABASE_PATH": "another_dummy.db", "TDA_NEWS_DEFAULT_KEYWORDS": self.mock_tda_config["TDA_NEWS_DEFAULT_KEYWORDS"]}):
-             identified_topics = tda_main.identify_topics_from_sources() # No query, no limit
-
-        self.assertTrue(len(identified_topics) <= default_limit_in_func)
-        # Further assertions on content can be added if needed
-
-        total_articles_in_sim_data = sum(len(source["articles"]) for source in tda_main.SIMULATED_DATA_SOURCES)
-        self.assertEqual(mock_save_db.call_count, total_articles_in_sim_data)
-
-    @patch('aethercast.tda.main._save_topic_to_db')
-    def test_identify_topics_from_sources_db_path_not_configured(self, mock_save_db):
-        # This test's premise changes as SHARED_DATABASE_PATH is removed from tda_config
-        # _save_topic_to_db now relies on _get_db_connection, which itself checks PG env vars.
-        # If PG env vars are not set, _get_db_connection would raise an error.
-        # If _save_topic_to_db is called, it implies a connection was intended.
-        # For this test, we'll assume _save_topic_to_db is called, and its internal PG connection logic is tested elsewhere or mocked.
-        # The original intent was about SHARED_DATABASE_PATH, which is no longer relevant for this function's direct logic.
-        # We can verify that if _save_topic_to_db is called (meaning a DB interaction was intended),
-        # it's called correctly, regardless of the old SHARED_DATABASE_PATH config.
-        # If the goal is to test that identify_topics_from_sources *doesn't* try to save if DB is unavailable,
-        # that would require mocking _get_db_connection to raise an error, and then checking identify_topics_from_sources behavior.
-        # For now, let's assume this test is less relevant or needs rethinking due to PG-only shift.
-        # We will keep the mock_save_db.assert_not_called() if that's the desired outcome under some condition,
-        # but the condition "SHARED_DATABASE_PATH not configured" is gone.
-
-        # If PG vars are missing, _get_db_connection (if not mocked) would fail.
-        # Let's test that identify_topics_from_sources still proceeds and calls _save_topic_to_db
-        # (which is mocked here, so its internal DB connection logic doesn't run).
-        # This means the responsibility of DB availability is now on _get_db_connection and _save_topic_to_db.
-
-        tda_main.identify_topics_from_sources(query="test")
-        # _save_topic_to_db should still be called if articles are found.
-        # The number of calls depends on how many articles in SIMULATED_DATA_SOURCES match "test".
-        # For simplicity, let's just assert it was called if any articles are processed.
-        if any("test" in article["title"].lower() for source in tda_main.SIMULATED_DATA_SOURCES for article in source["articles"]):
-            mock_save_db.assert_called()
-        else:
-            mock_save_db.assert_not_called()
-
-
-    @patch('aethercast.tda.main._get_db_connection')
-    def test_save_topic_to_db_success(self, mock_get_db_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_db_conn.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
-
-        topic_obj = {
-            "topic_id": "topic_db_test_001",
-            "title_suggestion": "DB Test Topic",
-            "summary": "Summary for DB test.",
-            "keywords": ["db", "test"],
-            "potential_sources": [{"url": "http://db.test/source", "source_name": "TestSource"}],
-            "relevance_score": 0.88,
-            "publication_date": "2024-01-15T10:00:00Z"
+        stored_task_result = {
+            "status": "success",
+            "discovered_topics": [{"topic_id": "tda_completed_1", "title_suggestion": "Stored TDA Topic"}],
+            "message": "Successfully discovered 1 topics."
         }
+        
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        completed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'],
+            'result_payload': stored_task_result,
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = completed_record
 
-        # Call the function, db_path is no longer an argument
-        tda_main._save_topic_to_db(mock_conn, topic_obj) # Pass the mocked connection
+        response = self.app.post('/discover_topics', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202)
+        
+        task_id = response.get_json()["task_id"]
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200)
+        json_result = status_response.get_json()
 
-        mock_get_db_conn.assert_not_called() # Connection is passed directly
-        mock_conn.cursor.assert_called_once()
-        self.assertEqual(mock_cursor.execute.call_count, 1)
-        args, _ = mock_cursor.execute.call_args
+        self.assertEqual(json_result["status"], "SUCCESS")
+        self.assertEqual(json_result["result"], stored_task_result)
 
-        self.assertIn("INSERT INTO topics_snippets", args[0])
-        # PostgreSQL uses %s placeholders
-        self.assertIn("VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)", args[0])
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
 
-        params = args[1]
-        self.assertEqual(params[0], "topic_db_test_001")
-        self.assertEqual(params[1], tda_main.DB_TYPE_TOPIC)
-        self.assertEqual(params[2], "DB Test Topic")
-        self.assertEqual(params[3], "Summary for DB test.")
-        self.assertEqual(params[4], json.dumps(["db", "test"]))
-        self.assertEqual(params[5], "http://db.test/source")
-        self.assertEqual(params[6], "TestSource")
-        self.assertIsNone(params[7]) # original_topic_details
-        self.assertIsNone(params[8]) # llm_model_used_for_snippet
-        self.assertIsNone(params[9]) # cover_art_prompt
-        # publication_date is now correctly mapped to generation_timestamp
-        from datetime import datetime # Ensure datetime is available for type check
-        self.assertIsInstance(params[10], datetime) # generation_timestamp (from publication_date)
-        self.assertEqual(params[10].isoformat(), "2024-01-15T10:00:00") # Check value
-        self.assertIsInstance(params[11], datetime) # last_accessed_timestamp
-        self.assertEqual(params[12], 0.88)
+    def test_processing_idempotency_key_conflict(self, mock_db_conn_getter):
+        """Test TDA Flask endpoint returns 409 for a 'processing' and not timed out key."""
+        idempotency_key = f"tda-test-processing-{uuid.uuid4()}"
+        payload = {"query": "processing query"}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 
-        mock_conn.commit.assert_called_once()
-        # mock_conn.close() is not called by _save_topic_to_db; connection is managed by caller
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': datetime.now(timezone.utc) # Not timed out
+        }
+        cursor_mock.fetchone.return_value = processing_record
 
-    @patch('aethercast.tda.main._get_db_connection')
-    def test_save_topic_to_db_psycopg2_error(self, mock_get_db_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_db_conn.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
-        # Import psycopg2 if not already imported at the top of the test file
-        import psycopg2 # Add this import if not present
-        mock_cursor.execute.side_effect = psycopg2.Error("Simulated DB execute error")
+        response = self.app.post('/discover_topics', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202) # Task dispatched
 
-        topic_obj = {"topic_id": "topic_db_fail", "title_suggestion": "DB Fail Topic"}
+        task_id = response.get_json()["task_id"]
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 409) # Expecting 409 Conflict
+        json_result = status_response.get_json()
+        
+        self.assertEqual(json_result["status"], "SUCCESS")
+        self.assertIsNotNone(json_result["result"])
+        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
+        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
 
-        with patch.object(tda_main.logging, 'error') as mock_logger_error:
-            # The function now expects the connection to be passed
-            with self.assertRaises(psycopg2.Error): # The function should re-raise the error
-                 tda_main._save_topic_to_db(mock_conn, topic_obj)
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1) # Only SELECT
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
 
-            found_log = False
-            for call_arg_tuple in mock_logger_error.call_args_list:
-                log_message = call_arg_tuple[0][0]
-                if "Database error saving topic topic_db_fail" in log_message and \
-                   "Simulated DB execute error" in str(call_arg_tuple[0][1]): # Error object is second arg
-                    found_log = True
-                    break
-            self.assertTrue(found_log, "Expected database error log message not found.")
+    def test_processing_key_lock_timeout(self, mock_db_conn_getter):
+        """Test TDA Flask endpoint re-processes if 'processing' lock has timed out."""
+        idempotency_key = f"tda-test-lock-timeout-{uuid.uuid4()}"
+        payload = {"query": "lock timeout query"}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 
-        mock_conn.commit.assert_not_called()
-        # mock_conn.close() is not called by _save_topic_to_db
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        
+        lock_timeout_seconds = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+        stale_locked_at = datetime.now(timezone.utc) - timedelta(seconds=lock_timeout_seconds + 60)
 
-    @patch('aethercast.tda.main._get_db_connection')
-    def test_save_topic_to_db_unexpected_error(self, mock_get_db_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_db_conn.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.execute.side_effect = TypeError("Simulated unexpected type error")
+        stale_processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': stale_locked_at
+        }
+        cursor_mock.fetchone.return_value = stale_processing_record
 
-        topic_obj = {"topic_id": "topic_db_unexpected_fail", "title_suggestion": "DB Unexpected Fail Topic"}
+        response = self.app.post('/discover_topics', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202, f"Response JSON: {response.get_data(as_text=True)}")
+        task_id = response.get_json()["task_id"]
 
-        with patch.object(tda_main.logging, 'error') as mock_logger_error:
-            with self.assertRaises(TypeError): # Expect the original TypeError to be re-raised
-                tda_main._save_topic_to_db(mock_conn, topic_obj)
-
-            found_log = False
-            for call_arg_tuple in mock_logger_error.call_args_list:
-                log_message = call_arg_tuple[0][0]
-
-                is_message_match = "Unexpected error saving topic topic_db_unexpected_fail" in log_message
-                # Check if the logged error details contain the simulated error string
-                is_details_match = "Simulated unexpected type error" in str(call_arg_tuple[0][1])
-
-
-                if is_message_match and is_details_match:
-                    found_log = True
-                    break
-            self.assertTrue(found_log, f"Expected unexpected error log message not found. Logs: {mock_logger_error.call_args_list}")
-
-        mock_conn.commit.assert_not_called()
-        # mock_conn.close() is not called
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200) # Task should succeed
+        status_json = status_response.get_json()
+        self.assertEqual(status_json["status"], "SUCCESS")
+        self.assertEqual(status_json["result"]["discovered_topics"], self.mock_simulated_topics_payload)
 
 
-# Import psycopg2 for error simulation if not already at the top
-import psycopg2
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'] and
+            call[0][1][3] > stale_locked_at
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found or params incorrect.")
 
-class TestInitTdaDb(unittest.TestCase):
-    @patch('aethercast.tda.main._get_db_connection')
-    @patch.object(tda_main.app.logger, 'info') # To check for info logs
-    def test_init_db_creates_table_if_not_exists(self, mock_logger_info, mock_get_db_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_db_conn.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED']
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found or params incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
 
-        # Simulate table does not exist
-        mock_cursor.fetchone.return_value = (False,) # Or {'exists': False} depending on query
+    def test_task_failure_marks_idempotency_failed(self, mock_db_conn_getter):
+        """Test task failure updates idempotency record to 'failed' via Flask for TDA."""
+        idempotency_key = f"tda-test-failure-{uuid.uuid4()}"
+        # Pass error_trigger to make the task fail intentionally
+        payload = {"query": "failure query", "error_trigger": "tda_error"}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key
 
-        tda_main.init_tda_db()
+        response = self.app.post('/discover_topics', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202) # Task accepted
+        task_id = response.get_json()["task_id"]
 
-        # Check that execute was called for table existence check AND for creation
-        self.assertGreaterEqual(mock_cursor.execute.call_count, 2)
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 500)
+        json_result = status_response.get_json()
+        self.assertEqual(json_result["status"], "FAILURE")
+        self.assertIn("Simulated TDA error in Celery task", str(json_result["result"]["error"]["message"]))
 
-        # Check for the schema creation call
-        schema_creation_call_found = False
-        for call_args_tuple in mock_cursor.execute.call_args_list:
-            sql_command = call_args_tuple[0][0] # First argument of the first call
-            if "CREATE TABLE IF NOT EXISTS topics_snippets" in sql_command:
-                 # Check for some key columns to be reasonably sure it's the right schema
-                self.assertIn("id UUID PRIMARY KEY", sql_command)
-                self.assertIn("title TEXT", sql_command)
-                self.assertIn("keywords JSONB", sql_command)
-                self.assertIn("relevance_score FLOAT", sql_command)
-                schema_creation_call_found = True
-                break
-        self.assertTrue(schema_creation_call_found, "Schema creation SQL command not found or incorrect.")
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, INSERT (PROC), UPDATE (FAILED)
+        
+        update_failed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_failed_update = any(
+            update_failed_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED'] and
+            "Simulated TDA error" in call[0][1][2] # error_payload
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_failed_update, "Update to FAILED status not found or error payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2) # PROCESSING, then FAILED
 
-        mock_conn.commit.assert_called_once()
-        mock_conn.close.assert_called_once()
-        mock_logger_info.assert_any_call("Database initialized successfully and table 'topics_snippets' is present.")
+    def test_retry_after_failure_succeeds(self, mock_db_conn_getter):
+        """Test task re-processes and succeeds after a 'failed' record via Flask for TDA."""
+        idempotency_key = f"tda-test-retry-{uuid.uuid4()}"
+        # No error_trigger on retry, expect success
+        payload = {"query": "retry query"}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 
-    @patch('aethercast.tda.main._get_db_connection')
-    @patch.object(tda_main.app.logger, 'info')
-    def test_init_db_does_not_create_table_if_exists(self, mock_logger_info, mock_get_db_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_db_conn.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        
+        failed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_FAILED'],
+            'error_payload': json.dumps({"error": "Previous TDA failure"}),
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = failed_record
 
-        # Simulate table exists
-        # The actual query in init_tda_db is:
-        # "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'topics_snippets');"
-        # So fetchone() will return a tuple like (True,) or (False,)
-        mock_cursor.fetchone.return_value = (True,)
+        # Ensure underlying task mocks (simulated data) are set for success
+        self.mock_identify_topics_from_sources.return_value = self.mock_simulated_topics_payload
+        self.mock_identify_topics_from_sources.side_effect = None
 
-        tda_main.init_tda_db()
 
-        # Check execute calls: Once for existence check, not for creation.
-        # Let's be specific about which calls we expect.
-        calls = mock_cursor.execute.call_args_list
-        self.assertEqual(len(calls), 1) # Only the existence check
-        self.assertIn("SELECT EXISTS", calls[0][0][0])
-        self.assertNotIn("CREATE TABLE", calls[0][0][0])
+        response = self.app.post('/discover_topics', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202)
+        task_id = response.get_json()["task_id"]
 
-        mock_conn.commit.assert_not_called() # No changes, so no commit
-        mock_conn.close.assert_called_once()
-        mock_logger_info.assert_any_call("Table 'topics_snippets' already exists. No action taken.")
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200)
+        json_result = status_response.get_json()
+        self.assertEqual(json_result["status"], "SUCCESS")
+        self.assertEqual(json_result["result"]["discovered_topics"], self.mock_simulated_topics_payload)
 
-    @patch('aethercast.tda.main._get_db_connection')
-    @patch.object(tda_main.app.logger, 'error')
-    def test_init_db_handles_psycopg2_error_on_connection(self, mock_logger_error, mock_get_db_conn):
-        mock_get_db_conn.side_effect = psycopg2.Error("Simulated DB connection error")
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+        
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found.")
 
-        tda_main.init_tda_db()
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'] and
+            json.dumps(self.mock_simulated_topics_payload) in call[0][1][1] # Check result_payload
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found or result payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
 
-        mock_logger_error.assert_called_once()
-        self.assertIn("Error during TDA DB initialization (connection)", mock_logger_error.call_args[0][0])
-        self.assertIsInstance(mock_logger_error.call_args[0][1], psycopg2.Error)
 
-    @patch('aethercast.tda.main._get_db_connection')
-    @patch.object(tda_main.app.logger, 'error')
-    def test_init_db_handles_psycopg2_error_on_execute(self, mock_logger_error, mock_get_db_conn):
-        mock_conn = MagicMock()
-        mock_cursor = MagicMock()
-        mock_get_db_conn.return_value = mock_conn
-        mock_conn.cursor.return_value = mock_cursor
-        mock_cursor.execute.side_effect = psycopg2.Error("Simulated DB execute error")
+# --- Direct Celery Task Idempotency Tests for TDA ---
+@patch('aethercast.tda.main._get_tda_db_connection', side_effect=mock_get_tda_db_connection_side_effect)
+class TestTdaTaskDirectlyIdempotency(BaseTdaServiceTest):
 
-        tda_main.init_tda_db()
+    def test_new_key_task_success_direct_call(self, mock_db_conn_getter):
+        """Test discover_topics_task directly with a new idempotency key."""
+        idempotency_key = f"tda-direct-new-{uuid.uuid4()}"
+        
+        # Ensure underlying data source mock (simulated by default) is set for success
+        self.mock_identify_topics_from_sources.return_value = self.mock_simulated_topics_payload
+        self.mock_identify_topics_from_sources.side_effect = None
 
-        mock_logger_error.assert_called_once()
-        self.assertIn("Error during TDA DB initialization (execution)", mock_logger_error.call_args[0][0])
-        self.assertIsInstance(mock_logger_error.call_args[0][1], psycopg2.Error)
-        mock_conn.rollback.assert_called_once() # Ensure rollback on error
-        mock_conn.close.assert_called_once()
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key
+
+        task_result = discover_topics_task.apply(
+            kwargs={
+                'request_id_main': "req_tda_direct_new", 'query': "direct new query", 'limit': 3,
+                'use_real_news_api_flag': False, # Uses identify_topics_from_sources mock
+                'idempotency_key': idempotency_key
+            }
+        ).get()
+
+        self.assertIsNotNone(task_result)
+        self.assertEqual(task_result.get("status"), "success")
+        self.assertEqual(task_result.get("discovered_topics"), self.mock_simulated_topics_payload)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
+        self.assertEqual(execute_calls[1][0][1][4], tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'])
+        self.assertIn("UPDATE idempotency_keys SET status = %s", execute_calls[2][0][0])
+        self.assertEqual(execute_calls[2][0][1][0], tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'])
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_completed_key_task_returns_stored_result_direct_call(self, mock_db_conn_getter):
+        """Test direct task call with a COMPLETED key returns stored result (TDA)."""
+        idempotency_key = f"tda-direct-completed-{uuid.uuid4()}"
+        stored_result_payload = {
+            "status": "success",
+            "discovered_topics": [{"topic_id": "tda_direct_completed_1", "title_suggestion": "Stored TDA Topic Direct"}]
+        }
+        
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        completed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'],
+            'result_payload': stored_result_payload,
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = completed_record
+
+        # Ensure actual data fetching functions are not called
+        self.mock_identify_topics_from_sources.reset_mock()
+        self.mock_fetch_news_task_delay.reset_mock()
+
+        task_result = discover_topics_task.apply(
+            kwargs={
+                'request_id_main': "req_tda_direct_compl", 'query': "direct completed query", 'limit': 3,
+                'use_real_news_api_flag': False,
+                'idempotency_key': idempotency_key
+            }
+        ).get()
+
+        self.assertEqual(task_result, stored_result_payload)
+        self.mock_identify_topics_from_sources.assert_not_called()
+        self.mock_fetch_news_task_delay.assert_not_called()
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1) # Only SELECT
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
+
+    def test_processing_key_conflict_direct_call(self, mock_db_conn_getter):
+        """Test direct task call with 'processing' key (not timed out) returns conflict (TDA)."""
+        idempotency_key = f"tda-direct-processing-conflict-{uuid.uuid4()}"
+        
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': datetime.now(timezone.utc)
+        }
+        cursor_mock.fetchone.return_value = processing_record
+
+        task_result = discover_topics_task.apply(
+            kwargs={'request_id_main': 'req_id', 'query': 'query', 'limit': 1,
+                    'use_real_news_api_flag': False, 'idempotency_key': idempotency_key}
+        ).get()
+
+        self.assertEqual(task_result.get("status"), "PROCESSING_CONFLICT")
+        self.assertEqual(task_result.get("idempotency_key"), idempotency_key)
+        self.assertEqual(len(cursor_mock.execute.call_args_list), 1)
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
+
+    def test_processing_key_lock_timeout_direct_call(self, mock_db_conn_getter):
+        """Test direct task call with 'processing' key (timed out) re-processes (TDA)."""
+        idempotency_key = f"tda-direct-lock-timeout-{uuid.uuid4()}"
+        lock_timeout_seconds = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+        stale_locked_at = datetime.now(timezone.utc) - timedelta(seconds=lock_timeout_seconds + 120)
+
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        stale_processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': stale_locked_at
+        }
+        cursor_mock.fetchone.return_value = stale_processing_record
+        
+        self.mock_identify_topics_from_sources.return_value = self.mock_simulated_topics_payload
+        self.mock_identify_topics_from_sources.side_effect = None
+
+        task_result = discover_topics_task.apply(
+            kwargs={'request_id_main': 'req_id', 'query': 'Lock Timeout Query TDA', 'limit': 1,
+                    'use_real_news_api_flag': False, 'idempotency_key': idempotency_key}
+        ).get()
+
+        self.assertEqual(task_result.get("status"), "success")
+        self.assertEqual(task_result.get("discovered_topics"), self.mock_simulated_topics_payload)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'] and
+            call[0][1][3] > stale_locked_at
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found or params incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_task_failure_direct_call_marks_idempotency_failed(self, mock_db_conn_getter):
+        """Test direct task call, if task logic fails, idempotency record is 'failed' (TDA)."""
+        idempotency_key = f"tda-direct-failure-{uuid.uuid4()}"
+
+        # Use error_trigger to cause failure in the task
+        error_trigger_message = "Simulated TDA direct task internal failure"
+        
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key
+
+        with self.assertRaises(Exception) as context:
+            discover_topics_task.apply(
+                kwargs={'request_id_main': 'req_id', 'query': 'query', 'limit': 1,
+                        'use_real_news_api_flag': False,
+                        'idempotency_key': idempotency_key,
+                        'error_trigger': 'tda_error'} # Trigger internal failure
+            ).get()
+        self.assertIn("Simulated TDA error in Celery task", str(context.exception)) # Matches error_trigger
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        update_failed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_failed = any(
+            update_failed_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED'] and
+            "Simulated TDA error" in call[0][1][2] # error_payload check
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_update_failed, "Update to FAILED status not found or error payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_retry_after_failure_direct_call_succeeds(self, mock_db_conn_getter):
+        """Test direct task call re-processes and succeeds after 'failed' record (TDA)."""
+        idempotency_key = f"tda-direct-retry-{uuid.uuid4()}"
+
+        mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        failed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
+            'status': tda_config['TDA_IDEMPOTENCY_STATUS_FAILED'],
+            'error_payload': json.dumps({"error": "Previous direct TDA failure"}),
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = failed_record
+
+        self.mock_identify_topics_from_sources.return_value = self.mock_simulated_topics_payload
+        self.mock_identify_topics_from_sources.side_effect = None
+
+        task_result = discover_topics_task.apply(
+            kwargs={'request_id_main': 'req_id', 'query': 'Retry Query TDA', 'limit': 1,
+                    'use_real_news_api_flag': False,
+                    'idempotency_key': idempotency_key,
+                    'error_trigger': None} # No error on retry
+        ).get()
+
+        self.assertEqual(task_result.get("status"), "success")
+        self.assertEqual(task_result.get("discovered_topics"), self.mock_simulated_topics_payload)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found.")
+
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'] and
+            json.dumps(self.mock_simulated_topics_payload) in call[0][1][1] # result_payload
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found or result payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
 
 
 if __name__ == '__main__':
-    unittest.main()
+    unittest.main(verbosity=2)

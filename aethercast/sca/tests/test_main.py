@@ -1,160 +1,591 @@
-import unittest
-from unittest.mock import patch, MagicMock
-import json
 import os
+import sys
+import json
+import uuid
+import unittest
+from unittest.mock import patch, MagicMock, ANY
+from datetime import datetime, timezone, timedelta
 
-# Ensure the SCA main module can be imported
-from aethercast.sca import main as sca_main
+# Adjust path to import SCA main module
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sca_dir = os.path.dirname(current_dir) # Should be /aethercast/sca
+aethercast_dir = os.path.dirname(sca_dir) # Should be /aethercast
+project_root_dir = os.path.dirname(aethercast_dir) # Should be / (root of repo)
 
-class TestCraftSnippetEndpoint(unittest.TestCase):
+if project_root_dir not in sys.path:
+    sys.path.insert(0, project_root_dir)
+if aethercast_dir not in sys.path:
+    sys.path.insert(0, aethercast_dir)
+
+# Imports from SCA service
+from aethercast.sca.main import app as flask_app
+from aethercast.sca.main import celery_app as sca_celery_app
+from aethercast.sca.main import sca_config, load_sca_configuration # For accessing config
+from aethercast.sca.main import IDEMPOTENCY_KEY_HEADER, craft_snippet_task
+from aethercast.sca.main import _get_sca_db_connection # To mock it
+
+# --- Mock Database Connection Registry ---
+mock_db_connection_registry_sca = {}
+
+def mock_get_sca_db_connection_side_effect():
+    instance_id = os.getpid()
+    if instance_id not in mock_db_connection_registry_sca:
+        conn = MagicMock(name=f"MockScaPsycopg2Connection_{instance_id}")
+        cursor_mock = MagicMock(name="MockScaCursor")
+        cursor_mock.fetchone.return_value = None # Default: key not found
+        cursor_mock.rowcount = 0
+        conn.cursor.return_value.__enter__.return_value = cursor_mock
+        conn.commit = MagicMock()
+        conn.rollback = MagicMock()
+        conn.close = MagicMock()
+        mock_db_connection_registry_sca[instance_id] = conn
+    return mock_db_connection_registry_sca[instance_id]
+
+def reset_mock_sca_db_connections():
+    mock_db_connection_registry_sca.clear()
+
+# --- Base Test Case ---
+class BaseScaServiceTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        sca_celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        flask_app.testing = True
+        load_sca_configuration()
 
     def setUp(self):
-        sca_main.app.config['TESTING'] = True
-        self.client = sca_main.app.test_client()
+        self.app = flask_app.test_client()
+        reset_mock_sca_db_connections()
 
-        # Default mock config for most tests
-        self.mock_sca_config = {
-            "AIMS_SERVICE_URL": "http://mockaims.test/v1/generate",
-            "AIMS_REQUEST_TIMEOUT_SECONDS": 10,
-            "SCA_LLM_MODEL_ID": "test-model-sca",
-            "SCA_LLM_MAX_TOKENS_SNIPPET": 100,
-            "SCA_LLM_TEMPERATURE_SNIPPET": 0.5,
-            "USE_REAL_LLM_SERVICE": False # Default to placeholder for many tests
+        self.test_config_overrides = {
+            "SCA_DEBUG_MODE": False,
+            "POSTGRES_HOST": "mock_pg_host_sca",
+            "POSTGRES_USER": "mock_pg_user_sca",
+            "POSTGRES_PASSWORD": "mock_pg_password_sca",
+            "POSTGRES_DB": "mock_pg_db_sca",
+            "SCA_IDEMPOTENCY_STATUS_PROCESSING": "processing",
+            "SCA_IDEMPOTENCY_STATUS_COMPLETED": "completed",
+            "SCA_IDEMPOTENCY_STATUS_FAILED": "failed",
+            "SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": 60,
+            "USE_REAL_LLM_SERVICE": False, # Default to placeholder for most tests
+            "AIMS_SERVICE_URL": "http://mockaims.test/v1/generate", # For when USE_REAL_LLM_SERVICE is True
         }
-        self.config_patcher = patch.dict(sca_main.sca_config, self.mock_sca_config)
-        self.mock_config = self.config_patcher.start()
+        self.config_patcher = patch.dict(sca_config, self.test_config_overrides, clear=False)
+        self.mocked_sca_config = self.config_patcher.start()
+
+        # Mock for call_real_llm_service (which includes AIMS polling)
+        # This mock will return a successful-like structure. Individual tests can override its side_effect.
+        self.mock_llm_success_payload = {
+            "status": "success", "title": "Mocked LLM Title", "text_content": "Mocked LLM content.",
+            "summary": "Mocked LLM content.", "llm_model_used": "mocked-model-v1",
+            "llm_prompt_sent": "Test prompt", "llm_raw_output": "Mocked LLM Title\nMocked LLM content."
+        }
+        self.patch_call_real_llm = patch('aethercast.sca.main.call_real_llm_service', return_value=self.mock_llm_success_payload)
+        self.mock_call_real_llm_service = self.patch_call_real_llm.start()
+
+        # Mock for call_aims_llm_placeholder (used if USE_REAL_LLM_SERVICE is False)
+        self.mock_placeholder_success_payload = {
+            "status": "success_placeholder", "title": "Placeholder Title", "text_content": "Placeholder content.",
+            "summary": "Placeholder content.", "llm_model_used": "placeholder-model-v1",
+            "llm_prompt_sent": "Test prompt", "llm_response_direct": {}
+        }
+        self.patch_call_placeholder = patch('aethercast.sca.main.call_aims_llm_placeholder', return_value=self.mock_placeholder_success_payload)
+        self.mock_call_placeholder_llm_service = self.patch_call_placeholder.start()
+
 
     def tearDown(self):
         self.config_patcher.stop()
+        self.patch_call_real_llm.stop()
+        self.patch_call_placeholder.stop()
+        reset_mock_sca_db_connections()
 
-    def test_craft_snippet_missing_payload(self):
-        response = self.client.post('/craft_snippet', data=None, content_type='application/json')
+# --- Flask Endpoint Idempotency Tests ---
+@patch('aethercast.sca.main._get_sca_db_connection', side_effect=mock_get_sca_db_connection_side_effect)
+class TestScaIdempotencyFlask(BaseScaServiceTest):
+
+    def test_missing_idempotency_key_header(self, mock_db_conn_getter):
+        """Test SCA Flask endpoint /craft_snippet rejects if X-Idempotency-Key is missing."""
+        payload = {"topic_id": "t1", "content_brief": "brief", "topic_info": {}}
+        response = self.app.post('/craft_snippet', json=payload, headers={})
         self.assertEqual(response.status_code, 400)
-        json_data = response.get_json()
-        self.assertEqual(json_data['error_code'], 'SCA_INVALID_PAYLOAD')
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "SCA_MISSING_IDEMPOTENCY_KEY")
 
-    def test_craft_snippet_missing_fields(self):
-        response = self.client.post('/craft_snippet', json={'topic_id': 't1'})
-        self.assertEqual(response.status_code, 400)
-        json_data = response.get_json()
-        self.assertEqual(json_data['error_code'], 'SCA_MISSING_FIELDS')
-        self.assertIn("'content_brief' are required", json_data['message'])
+    def test_new_idempotency_key_task_success(self, mock_db_conn_getter):
+        """Test SCA Flask endpoint with a new idempotency key, Celery task runs and succeeds."""
+        idempotency_key = f"sca-test-new-{uuid.uuid4()}"
+        payload = {"topic_id": "t_new", "content_brief": "new brief", "topic_info": {"title_suggestion":"New Topic"}}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 
-    def test_craft_snippet_placeholder_success(self):
-        # USE_REAL_LLM_SERVICE is False by default from setUp
-        payload = {
-            "topic_id": "topic_placeholder_test",
-            "content_brief": "Brief for placeholder",
-            "topic_info": {"title_suggestion": "Placeholder Topic Suggestion"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202, f"Response JSON: {response.get_data(as_text=True)}")
+        json_response = response.get_json()
+        self.assertIn("task_id", json_response)
+        task_id = json_response["task_id"]
+        self.assertEqual(json_response.get("idempotency_key_processed"), idempotency_key)
+
+        status_response = self.app.get(json_response["status_url"])
+        self.assertEqual(status_response.status_code, 200)
+        status_json = status_response.get_json()
+        self.assertEqual(status_json["status"], "SUCCESS")
+        self.assertIn("snippet_id", status_json["result"])
+        # Since USE_REAL_LLM_SERVICE is False by default in BaseScaServiceTest, placeholder is called
+        self.assertEqual(status_json["result"]["title"], self.mock_placeholder_success_payload["title"])
+
+
+        mock_conn = mock_db_connection_registry_sca[os.getpid()]
+        self.assertTrue(mock_db_conn_getter.called)
+        execute_calls = mock_conn.cursor.return_value.__enter__.return_value.execute.call_args_list
+
+        self.assertGreaterEqual(len(execute_calls), 3)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
+        self.assertEqual(execute_calls[1][0][1][4], sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'])
+        self.assertIn("UPDATE idempotency_keys SET status = %s", execute_calls[2][0][0])
+        self.assertEqual(execute_calls[2][0][1][0], sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'])
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_completed_idempotency_key_returns_stored_result(self, mock_db_conn_getter):
+        """Test SCA Flask endpoint returns stored result for a COMPLETED idempotency key."""
+        idempotency_key = f"sca-test-completed-{uuid.uuid4()}"
+        payload = {"topic_id": "t_completed", "content_brief": "completed brief", "topic_info": {}}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+
+        stored_snippet_data = {
+            "snippet_id": "snippet_prev_completed", "topic_id": "t_completed",
+            "title": "Previously Completed Snippet", "summary": "Prev content."
         }
-        response = self.client.post('/craft_snippet', json=payload)
-        self.assertEqual(response.status_code, 200)
-        json_data = response.get_json()
 
-        self.assertTrue(json_data['snippet_id'].startswith("snippet_"))
-        self.assertEqual(json_data['topic_id'], "topic_placeholder_test")
-        self.assertIn("Placeholder Topic Suggestion", json_data['title']) # Placeholder title is dynamic
-        self.assertIn("placeholder response", json_data['summary'].lower()) # Placeholder content
-        self.assertEqual(json_data['llm_model_used'], "AetherLLM-Placeholder-DynamicSnippet-v0.2")
-
-    @patch('requests.post')
-    def test_craft_snippet_aims_success(self, mock_requests_post):
-        # Override config for this test to use "real" AIMS
-        with patch.dict(sca_main.sca_config, {"USE_REAL_LLM_SERVICE": True}):
-            aims_llm_text_output = "AIMS Generated Title\nAIMS generated content for the snippet."
-            mock_aims_response = MagicMock()
-            mock_aims_response.status_code = 200
-            mock_aims_response.json.return_value = {
-                "request_id": "aims_req_sca_success",
-                "model_id": "aims-model-dynamic",
-                "choices": [{"text": aims_llm_text_output, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 20, "completion_tokens": 30, "total_tokens": 50}
-            }
-            mock_requests_post.return_value = mock_aims_response
-
-            payload = {
-                "topic_id": "topic_aims_ok",
-                "content_brief": "AIMS success brief",
-                "topic_info": {"title_suggestion": "AIMS Success Suggestion"}
-            }
-            response = self.client.post('/craft_snippet', json=payload)
-            self.assertEqual(response.status_code, 200)
-            json_data = response.get_json()
-
-            mock_requests_post.assert_called_once()
-            called_url = mock_requests_post.call_args[0][0]
-            called_payload = mock_requests_post.call_args[1]['json']
-            self.assertEqual(called_url, self.mock_sca_config['AIMS_SERVICE_URL'])
-            self.assertIn("AIMS success brief", called_payload['prompt'])
-            self.assertEqual(called_payload['model_id_override'], self.mock_sca_config['SCA_LLM_MODEL_ID'])
-
-            self.assertEqual(json_data['title'], "AIMS Generated Title")
-            self.assertEqual(json_data['summary'], "AIMS generated content for the snippet.")
-            self.assertEqual(json_data['llm_model_used'], "aims-model-dynamic")
-            self.assertEqual(json_data['topic_id'], "topic_aims_ok")
-
-    @patch('requests.post')
-    def test_craft_snippet_aims_http_error(self, mock_requests_post):
-        with patch.dict(sca_main.sca_config, {"USE_REAL_LLM_SERVICE": True}):
-            mock_aims_response = MagicMock()
-            mock_aims_response.status_code = 500
-            mock_aims_response.reason = "AIMS Internal Server Error"
-            mock_aims_response.text = '{"error": {"type": "aims_internal_error", "message": "AIMS exploded"}}'
-            def json_raise(): raise json.JSONDecodeError("err", "doc", 0)
-            mock_aims_response.json.side_effect = json_raise # Simulate non-JSON error payload for one path
-
-            # Simulate requests.post raising an HTTPError
-            mock_requests_post.side_effect = requests.exceptions.HTTPError(response=mock_aims_response)
-
-            payload = {"topic_id": "topic_aims_http_err", "content_brief": "AIMS HTTP error test"}
-            response = self.client.post('/craft_snippet', json=payload)
-
-            self.assertEqual(response.status_code, 500) # Should reflect AIMS error or SCA's interpretation
-            json_data = response.get_json()
-            self.assertEqual(json_data['error_code'], 'SCA_AIMS_HTTP_ERROR')
-            self.assertIn("AIMS HTTP Error 500", json_data['details'])
-            self.assertIn("AIMS Internal Server Error", json_data['details'])
-            self.assertIn("AIMS exploded", json_data['details']) # Check if raw text is included
-
-    @patch('requests.post')
-    def test_craft_snippet_aims_timeout(self, mock_requests_post):
-        with patch.dict(sca_main.sca_config, {"USE_REAL_LLM_SERVICE": True}):
-            mock_requests_post.side_effect = requests.exceptions.Timeout("AIMS request timed out")
-
-            payload = {"topic_id": "topic_aims_timeout", "content_brief": "AIMS timeout test"}
-            response = self.client.post('/craft_snippet', json=payload)
-            self.assertEqual(response.status_code, 408) # Request Timeout
-            json_data = response.get_json()
-            self.assertEqual(json_data['error_code'], 'SCA_AIMS_REQUEST_TIMEOUT')
-            self.assertIn("Request to AIMS timed out", json_data['message'])
-
-    @patch('requests.post')
-    def test_craft_snippet_aims_bad_response_structure(self, mock_requests_post):
-        with patch.dict(sca_main.sca_config, {"USE_REAL_LLM_SERVICE": True}):
-            mock_aims_response = MagicMock()
-            mock_aims_response.status_code = 200
-            mock_aims_response.json.return_value = {"model_id": "aims_bad_struct", "choices": [{"wrong_key": "no text here"}]} # Missing 'text'
-            mock_requests_post.return_value = mock_aims_response
-
-            payload = {"topic_id": "topic_aims_bad_struct", "content_brief": "AIMS bad structure"}
-            response = self.client.post('/craft_snippet', json=payload)
-            self.assertEqual(response.status_code, 500) # SCA internal error due to bad structure from AIMS
-            json_data = response.get_json()
-            self.assertEqual(json_data['error_code'], 'SCA_AIMS_BAD_RESPONSE_STRUCTURE')
-            self.assertIn("Missing 'choices[0].text'", json_data['details'])
-
-    def test_craft_snippet_simulated_sca_error(self):
-        # Test the error_trigger mechanism
-        payload = {
-            "topic_id": "topic_sim_error",
-            "content_brief": "Simulate SCA internal error",
-            "error_trigger": "sca_error"
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        completed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'],
+            'result_payload': stored_snippet_data,
+            'locked_at': None
         }
-        response = self.client.post('/craft_snippet', json=payload)
-        self.assertEqual(response.status_code, 500)
-        json_data = response.get_json()
-        self.assertEqual(json_data['error_code'], 'SCA_SIMULATED_ERROR')
-        self.assertIn("simulated error occurred in SCA", json_data['message'].lower())
+        cursor_mock.fetchone.return_value = completed_record
+
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202)
+
+        task_id = response.get_json()["task_id"]
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200)
+        json_result = status_response.get_json()
+
+        self.assertEqual(json_result["status"], "SUCCESS")
+        self.assertEqual(json_result["result"], stored_snippet_data)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
+
+    def test_processing_idempotency_key_conflict(self, mock_db_conn_getter):
+        """Test SCA Flask endpoint returns 409 for a 'processing' and not timed out key."""
+        idempotency_key = f"sca-test-processing-{uuid.uuid4()}"
+        payload = {"topic_id": "t_proc", "content_brief": "processing brief", "topic_info": {}}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': datetime.now(timezone.utc) # Not timed out
+        }
+        cursor_mock.fetchone.return_value = processing_record
+
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202) # Task dispatched
+
+        task_id = response.get_json()["task_id"]
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 409) # Expecting 409 Conflict
+        json_result = status_response.get_json()
+
+        self.assertEqual(json_result["status"], "SUCCESS") # Celery task completed by returning conflict info
+        self.assertIsNotNone(json_result["result"])
+        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
+        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1) # Only SELECT
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
+
+    def test_processing_key_lock_timeout(self, mock_db_conn_getter):
+        """Test SCA Flask endpoint re-processes if 'processing' lock has timed out."""
+        idempotency_key = f"sca-test-lock-timeout-{uuid.uuid4()}"
+        payload = {"topic_id": "t_lock_timeout", "content_brief": "lock timeout brief", "topic_info": {"title_suggestion":"Lock Topic"}}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+
+        lock_timeout_seconds = sca_config['SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+        stale_locked_at = datetime.now(timezone.utc) - timedelta(seconds=lock_timeout_seconds + 60) # Expired
+
+        stale_processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': stale_locked_at
+        }
+        cursor_mock.fetchone.return_value = stale_processing_record
+
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202, f"Response JSON: {response.get_data(as_text=True)}")
+        task_id = response.get_json()["task_id"]
+
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200) # Task should succeed
+        status_json = status_response.get_json()
+        self.assertEqual(status_json["status"], "SUCCESS")
+        self.assertIn("snippet_id", status_json["result"])
+        self.assertEqual(status_json["result"]["title"], self.mock_placeholder_success_payload["title"])
+
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, UPDATE (re-lock), UPDATE (completed)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'] and
+            call[0][1][3] > stale_locked_at
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found or params incorrect.")
+
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED']
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found or params incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_task_failure_marks_idempotency_failed(self, mock_db_conn_getter):
+        """Test task failure updates idempotency record to 'failed' via Flask endpoint for SCA."""
+        idempotency_key = f"sca-test-failure-{uuid.uuid4()}"
+        payload = {"topic_id": "t_fail", "content_brief": "failure brief", "topic_info": {}}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+
+        # Ensure we are in a path that would call the mocked LLM functions
+        # Default is USE_REAL_LLM_SERVICE = False, so call_aims_llm_placeholder is used by the task.
+        # We will patch this function to raise an error.
+        self.mock_call_placeholder_llm_service.side_effect = Exception("Simulated LLM placeholder failure")
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key
+
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202) # Task accepted
+        task_id = response.get_json()["task_id"]
+
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 500)
+        json_result = status_response.get_json()
+        self.assertEqual(json_result["status"], "FAILURE")
+        self.assertIn("Simulated LLM placeholder failure", str(json_result["result"]["error"]["message"]))
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        update_failed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_failed_update = any(
+            update_failed_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_FAILED'] and
+            "Simulated LLM placeholder failure" in call[0][1][2] # error_payload
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_failed_update, "Update to FAILED status not found or error payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2) # PROCESSING, then FAILED
+
+    def test_retry_after_failure_succeeds(self, mock_db_conn_getter):
+        """Test task re-processes and succeeds after a previous 'failed' record via Flask for SCA."""
+        idempotency_key = f"sca-test-retry-{uuid.uuid4()}"
+        payload = {"topic_id": "t_retry", "content_brief": "retry brief", "topic_info": {"title_suggestion":"Retry Topic"}}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+
+        failed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_FAILED'],
+            'error_payload': json.dumps({"error": "Previous simulated failure"}),
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = failed_record
+
+        # Ensure LLM call (placeholder in this case by default) succeeds on this retry
+        self.mock_call_placeholder_llm_service.side_effect = None # Clear previous side_effect
+        self.mock_call_placeholder_llm_service.return_value = self.mock_placeholder_success_payload
+
+
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202)
+        task_id = response.get_json()["task_id"]
+
+        status_response = self.app.get(f'/v1/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200)
+        json_result = status_response.get_json()
+        self.assertEqual(json_result["status"], "SUCCESS")
+        self.assertEqual(json_result["result"]["title"], self.mock_placeholder_success_payload["title"])
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, UPDATE (PROC), UPDATE (COMPL)
+
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING']
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found.")
+
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'] and
+            self.mock_placeholder_success_payload["title"] in call[0][1][1] # result_payload check
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found or result payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+
+# --- Direct Celery Task Idempotency Tests for SCA ---
+@patch('aethercast.sca.main._get_sca_db_connection', side_effect=mock_get_sca_db_connection_side_effect)
+class TestScaTaskDirectlyIdempotency(BaseScaServiceTest): # Inherits mocks from BaseScaServiceTest
+
+    def test_new_key_task_success_direct_call(self, mock_db_conn_getter):
+        """Test craft_snippet_task directly with a new idempotency key."""
+        idempotency_key = f"sca-direct-new-{uuid.uuid4()}"
+        request_id = "req_sca_direct_new"
+        topic_id = "topic_direct_new"
+        content_brief = "Direct call new brief for SCA"
+        topic_info = {"title_suggestion": "SCA Direct New Topic"}
+
+        # DB initially returns no record for this key
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None
+
+        # Ensure placeholder is used and returns successfully (default from BaseScaServiceTest)
+        self.mock_call_placeholder_llm_service.side_effect = None
+        self.mock_call_placeholder_llm_service.return_value = self.mock_placeholder_success_payload
+
+        task_result = craft_snippet_task.apply(
+            kwargs={
+                'request_id': request_id, 'topic_id': topic_id,
+                'content_brief': content_brief, 'topic_info': topic_info,
+                'idempotency_key': idempotency_key
+            }
+        ).get()
+
+        self.assertIsNotNone(task_result)
+        self.assertIn("snippet_id", task_result)
+        self.assertEqual(task_result["title"], self.mock_placeholder_success_payload["title"])
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, INSERT (PROC), UPDATE (COMPL)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
+        self.assertEqual(execute_calls[1][0][1][4], sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'])
+        self.assertIn("UPDATE idempotency_keys SET status = %s", execute_calls[2][0][0])
+        self.assertEqual(execute_calls[2][0][1][0], sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'])
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_completed_key_task_returns_stored_result_direct_call(self, mock_db_conn_getter):
+        """Test direct task call with a COMPLETED key returns stored result (SCA)."""
+        idempotency_key = f"sca-direct-completed-{uuid.uuid4()}"
+        stored_result_payload = {
+            "snippet_id": "snippet_sca_direct_completed",
+            "title": "SCA Direct Stored Title"
+        }
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        completed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'],
+            'result_payload': stored_result_payload,
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = completed_record
+
+        # Ensure actual LLM call functions are not called
+        self.mock_call_placeholder_llm_service.reset_mock()
+        self.mock_call_real_llm_service.reset_mock()
+
+        task_result = craft_snippet_task.apply(
+            kwargs={
+                'request_id': "req_id", 'topic_id': "topic_id",
+                'content_brief': "brief", 'topic_info': {},
+                'idempotency_key': idempotency_key
+            }
+        ).get()
+
+        self.assertEqual(task_result, stored_result_payload)
+        self.mock_call_placeholder_llm_service.assert_not_called()
+        self.mock_call_real_llm_service.assert_not_called()
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1) # Only SELECT
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
+
+    def test_processing_key_conflict_direct_call(self, mock_db_conn_getter):
+        """Test direct task call with 'processing' key (not timed out) returns conflict (SCA)."""
+        idempotency_key = f"sca-direct-processing-conflict-{uuid.uuid4()}"
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': datetime.now(timezone.utc) # Not timed out
+        }
+        cursor_mock.fetchone.return_value = processing_record
+
+        task_result = craft_snippet_task.apply(
+            kwargs={'request_id': 'req_id', 'topic_id': 't_id', 'content_brief': 'brief',
+                    'topic_info': {}, 'idempotency_key': idempotency_key}
+        ).get()
+
+        self.assertEqual(task_result.get("status"), "PROCESSING_CONFLICT")
+        self.assertEqual(task_result.get("idempotency_key"), idempotency_key)
+        self.assertEqual(len(cursor_mock.execute.call_args_list), 1)
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1)
+
+    def test_processing_key_lock_timeout_direct_call(self, mock_db_conn_getter):
+        """Test direct task call with 'processing' key (timed out) re-processes (SCA)."""
+        idempotency_key = f"sca-direct-lock-timeout-{uuid.uuid4()}"
+        lock_timeout_seconds = sca_config['SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+        stale_locked_at = datetime.now(timezone.utc) - timedelta(seconds=lock_timeout_seconds + 120)
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        stale_processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': stale_locked_at
+        }
+        cursor_mock.fetchone.return_value = stale_processing_record
+
+        # Ensure placeholder is used and returns successfully
+        self.mock_call_placeholder_llm_service.side_effect = None
+        self.mock_call_placeholder_llm_service.return_value = self.mock_placeholder_success_payload
+
+        task_result = craft_snippet_task.apply(
+            kwargs={'request_id': 'req_id', 'topic_id': 't_id',
+                    'content_brief': 'Lock Timeout Brief SCA', 'topic_info': {"title_suggestion":"Lock SCA"},
+                    'idempotency_key': idempotency_key}
+        ).get()
+
+        self.assertIn("snippet_id", task_result) # Should succeed
+        self.assertEqual(task_result["title"], self.mock_placeholder_success_payload["title"])
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'] and
+            call[0][1][3] > stale_locked_at # New locked_at
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found or params incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    def test_task_failure_direct_call_marks_idempotency_failed(self, mock_db_conn_getter):
+        """Test direct task call, if task logic fails, idempotency record is 'failed' (SCA)."""
+        idempotency_key = f"sca-direct-failure-{uuid.uuid4()}"
+
+        # Mock the placeholder LLM call (default for tests) to raise an error
+        self.mock_call_placeholder_llm_service.side_effect = Exception("Simulated direct SCA task LLM failure")
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key
+
+        with self.assertRaises(Exception) as context:
+            craft_snippet_task.apply(
+                kwargs={'request_id': 'req_id', 'topic_id': 't_id', 'content_brief': 'brief',
+                        'topic_info': {}, 'idempotency_key': idempotency_key}
+            ).get()
+        self.assertIn("Simulated direct SCA task LLM failure", str(context.exception))
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, INSERT (PROC), UPDATE (FAILED)
+
+        update_failed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_failed = any(
+            update_failed_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_FAILED'] and
+            "Simulated direct SCA task LLM failure" in call[0][1][2] # error_payload check
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_update_failed, "Update to FAILED status not found or error payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2) # For PROCESSING, then for FAILED in on_failure
+
+    def test_retry_after_failure_direct_call_succeeds(self, mock_db_conn_getter):
+        """Test direct task call re-processes and succeeds after 'failed' record (SCA)."""
+        idempotency_key = f"sca-direct-retry-{uuid.uuid4()}"
+
+        mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        failed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
+            'status': sca_config['SCA_IDEMPOTENCY_STATUS_FAILED'],
+            'error_payload': json.dumps({"error": "Previous direct SCA failure"}),
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = failed_record
+
+        # Ensure placeholder LLM call succeeds on this retry
+        self.mock_call_placeholder_llm_service.side_effect = None
+        self.mock_call_placeholder_llm_service.return_value = self.mock_placeholder_success_payload
+
+        task_result = craft_snippet_task.apply(
+            kwargs={'request_id': 'req_id', 'topic_id': 't_id',
+                    'content_brief': 'Retry Brief SCA', 'topic_info': {"title_suggestion":"Retry SCA"},
+                    'idempotency_key': idempotency_key}
+        ).get()
+
+        self.assertIn("snippet_id", task_result)
+        self.assertEqual(task_result["title"], self.mock_placeholder_success_payload["title"])
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, UPDATE (PROC), UPDATE (COMPL)
+
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING']
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_reprocessing_update, "Update to re-lock PROCESSING not found.")
+
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'] and
+            self.mock_placeholder_success_payload["title"] in call[0][1][1] # result_payload check
+            for call in execute_calls if "UPDATE idempotency_keys" in str(call[0][0])
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found or result payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

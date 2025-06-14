@@ -1,8 +1,10 @@
-import unittest
-from unittest.mock import patch, MagicMock
 import os
 import sys
 import json
+import time
+import uuid
+import unittest
+from unittest.mock import patch, MagicMock, ANY
 
 # Explicitly add user site-packages to sys.path
 # This is a workaround for potential PYTHONPATH issues in the execution environment.
@@ -12,500 +14,816 @@ if user_site_packages not in sys.path:
 
 # Adjust path to import PSWA main module
 current_dir = os.path.dirname(os.path.abspath(__file__))
-pswa_dir = os.path.dirname(current_dir)
-aethercast_dir = os.path.dirname(pswa_dir)
-project_root_dir = os.path.dirname(aethercast_dir)
+pswa_dir = os.path.dirname(current_dir) # Should be /aethercast/pswa
+aethercast_dir = os.path.dirname(pswa_dir) # Should be /aethercast
+project_root_dir = os.path.dirname(aethercast_dir) # Should be / (root of repo)
 
-sys.path.insert(0, project_root_dir)
-sys.path.insert(0, aethercast_dir)
+# Add project root and aethercast to allow aethercast.pswa.main import
+if project_root_dir not in sys.path:
+    sys.path.insert(0, project_root_dir)
+if aethercast_dir not in sys.path:
+    sys.path.insert(0, aethercast_dir)
 
-from aethercast.pswa import main as pswa_main
-# Import openai for mocking openai.error.OpenAIError if not already imported in main for placeholders
-if not hasattr(pswa_main, 'openai') or not hasattr(pswa_main.openai, 'error'):
-    # Define placeholder if main module's import failed and didn't set up a dummy
-    class OpenAIErrorPlaceholder(Exception): pass
-    class DummyOpenAIError: OpenAIError = OpenAIErrorPlaceholder
-    if 'openai' not in sys.modules:
-        openai = MagicMock()
-        openai.error = DummyOpenAIError()
-    else:
-        import openai
-        if not hasattr(openai, 'error'):
-            openai.error = DummyOpenAIError()
-        elif not hasattr(openai.error, 'OpenAIError'):
-            openai.error.OpenAIError = OpenAIErrorPlaceholder
-else:
-    import openai
+
+# Now, try to import the main module components
+# Assuming main.py is structured to allow importing 'app' and 'pswa_celery_app'
+# This might require adjustments in main.py if it's not set up for testing.
+from aethercast.pswa.main import app as flask_app
+from aethercast.pswa.main import pswa_celery_app, weave_script_task, pswa_config, load_pswa_config
+from aethercast.pswa.main import IDEMPOTENCY_KEY_HEADER
+from aethercast.pswa.main import _get_pswa_db_connection_idempotency # For patching
 
 # For mocking datetime
-from datetime import datetime, timedelta
+from datetime import datetime as dt, timezone, timedelta
 
 
-class TestCalculateContentHash(unittest.TestCase):
-    def test_hash_consistency(self):
-        hash1 = pswa_main._calculate_content_hash("Topic A", "Content for topic A, first 1000 chars.")
-        hash2 = pswa_main._calculate_content_hash("Topic A", "Content for topic A, first 1000 chars.")
-        self.assertEqual(hash1, hash2)
+# Helper to simulate DB connection for idempotency checks
+mock_db_connection_registry = {}
 
-    def test_hash_case_insensitivity(self):
-        hash1 = pswa_main._calculate_content_hash("Topic B", "Some Content.")
-        hash2 = pswa_main._calculate_content_hash("topic b", "some content.")
-        self.assertEqual(hash1, hash2)
+def mock_get_pswa_db_connection_idempotency_side_effect():
+    # This allows us to return different mocks or the same mock for specific tests
+    # For basic tests, a simple MagicMock is often enough.
+    # For more advanced tests (e.g. context manager behavior), it might need to be more complex.
+    instance_id = os.getpid() # Or some other unique identifier for the call if needed
+    if instance_id not in mock_db_connection_registry:
+        # Default mock: key not found, successful commit/rollback
+        conn = MagicMock(name=f"MockPsycopg2Connection_{instance_id}")
+        cursor_mock = MagicMock(name="MockCursor")
+        cursor_mock.fetchone.return_value = None # Default: key not found
+        cursor_mock.rowcount = 0
+        conn.cursor.return_value.__enter__.return_value = cursor_mock
+        conn.commit = MagicMock()
+        conn.rollback = MagicMock()
+        conn.close = MagicMock()
+        mock_db_connection_registry[instance_id] = conn
+    return mock_db_connection_registry[instance_id]
 
-    def test_hash_content_truncation(self):
-        base_content = "c" * 1000
-        extended_content = base_content + "extra content that should not affect hash"
-        hash1 = pswa_main._calculate_content_hash("Topic C", base_content)
-        hash2 = pswa_main._calculate_content_hash("Topic C", extended_content)
-        self.assertEqual(hash1, hash2)
-
-        # Ensure that if the first 1000 chars change, the hash changes
-        different_base_content = "d" * 1000
-        hash3 = pswa_main._calculate_content_hash("Topic C", different_base_content)
-        self.assertNotEqual(hash1, hash3)
-
-    def test_hash_topic_sensitivity(self):
-        hash1 = pswa_main._calculate_content_hash("Topic D1", "Common Content")
-        hash2 = pswa_main._calculate_content_hash("Topic D2", "Common Content")
-        self.assertNotEqual(hash1, hash2)
+def reset_mock_db_connections():
+    mock_db_connection_registry.clear()
 
 
-class TestWeaveScriptLogic(unittest.TestCase):
+class TestPswaIdempotency(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        # Configure Celery for testing (task_always_eager=True runs tasks synchronously)
+        pswa_celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        flask_app.testing = True
+
+        # Ensure pswa_config is loaded initially. Tests can override specific values.
+        # The main.py now has load_pswa_config() which initializes pswa_config from os.getenv
+        # We call it here to ensure it's populated with defaults or test .env values.
+        load_pswa_config()
+
 
     def setUp(self):
-        self.maxDiff = None
-        self.mock_pswa_config_defaults = {
-            "AIMS_SERVICE_URL": "http://mockaims.test/v1/generate", # New
-            "AIMS_REQUEST_TIMEOUT_SECONDS": 10, # New
-            "PSWA_LLM_MODEL": "gpt-3.5-turbo-1106", # Request to AIMS
-            "PSWA_LLM_TEMPERATURE": 0.5, # Request to AIMS
-            "PSWA_LLM_MAX_TOKENS": 1000, # Request to AIMS
-            "PSWA_LLM_JSON_MODE": True, # Request to AIMS
-            "PSWA_DEFAULT_PROMPT_SYSTEM_MESSAGE": "System prompt for JSON",
-            "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": "User prompt for JSON: {topic} - {content}",
-            "PSWA_DATABASE_PATH": ":memory:",
-            "PSWA_SCRIPT_CACHE_ENABLED": True,
-            "PSWA_SCRIPT_CACHE_MAX_AGE_HOURS": 720
+        self.app = flask_app.test_client()
+        reset_mock_db_connections() # Ensure fresh mock DB for each test
+
+        # Patch pswa_config for specific test needs if necessary.
+        # Default test config values:
+        self.test_config_overrides = {
+            "PSWA_TEST_MODE_ENABLED": True, # Ensures AIMS is not actually called
+            "DATABASE_TYPE": "postgres", # Idempotency always uses PostgreSQL
+            "POSTGRES_HOST": "mock_pg_host", # Mocked, not connecting
+            "POSTGRES_USER": "mock_pg_user",
+            "POSTGRES_PASSWORD": "mock_pg_password",
+            "POSTGRES_DB": "mock_pg_db",
+            "IDEMPOTENCY_STATUS_PROCESSING": "processing", # Ensure these are strings
+            "IDEMPOTENCY_STATUS_COMPLETED": "completed",
+            "IDEMPOTENCY_STATUS_FAILED": "failed",
+            "IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": 60, # Short timeout for tests
+            "CELERY_BROKER_URL": "memory://", # Use in-memory broker for tests
+            "CELERY_RESULT_BACKEND": "rpc://" # Use RPC backend for results
         }
-        self.current_test_config = self.mock_pswa_config_defaults.copy()
+        self.config_patcher = patch.dict(pswa_config, self.test_config_overrides, clear=False)
+        self.mocked_pswa_config = self.config_patcher.start()
 
-        # Patch pswa_main.pswa_config directly. This is simpler if pswa_config is a global dict.
-        self.current_test_config = self.mock_pswa_config_defaults.copy()
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.current_test_config, clear=True)
-        self.mock_config = self.config_patcher.start()
-
-        # PSWA_IMPORTS_SUCCESSFUL is for OpenAI, not relevant here as we mock requests to AIMS
-        # If there was a check for `requests` library, we'd patch that.
 
     def tearDown(self):
         self.config_patcher.stop()
+        reset_mock_db_connections()
 
-    @patch('requests.post') # Mock the call to AIMS
-    def test_weave_script_success_json_mode_via_aims(self, mock_requests_post):
-        aims_llm_output_json_str = json.dumps({
-            "title": "AI in Education (AIMS JSON)",
-            "intro": "Welcome to an AIMS JSON discussion on AI in education.",
-            "segments": [{"segment_title": "Personalized Learning (AIMS JSON)", "content": "AI offers AIMS tailored learning."}],
-            "outro": "AIMS JSON AI will reshape learning."
-        })
+    def test_missing_idempotency_key_header_flask_endpoint(self):
+        """Test Flask endpoint /v1/weave_script rejects request if X-Idempotency-Key header is missing."""
+        payload = {"topic": "Test Topic", "content": "Some test content."}
+        response = self.app.post('/v1/weave_script', json=payload, headers={}) # No Idempotency Key header
+        self.assertEqual(response.status_code, 400)
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "PSWA_MISSING_IDEMPOTENCY_KEY")
+
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    # We are testing the integrated behavior, so we don't mock _check and _store directly here for the endpoint test.
+    # Instead, we let the Celery task (running eagerly) call them.
+    def test_new_idempotency_key_flask_endpoint_task_success(self, mock_db_conn_fn_getter):
+        """Test Flask endpoint /v1/weave_script with a new idempotency key. Task runs and succeeds."""
+        idempotency_key = f"test-key-new-{uuid.uuid4()}"
+        payload = {"topic": "New Topic", "content": "Fresh content for testing."}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, 'X-Test-Scenario': 'default_success'}
+
+        # Get the mock connection that will be used by the task
+        # (via mock_get_pswa_db_connection_idempotency_side_effect)
+        # This setup is a bit complex because the connection is obtained within the Celery task.
+        # We rely on the side_effect to provide a mock we can inspect.
+
+        # Expected sequence of DB interactions for a new key and successful task:
+        # 1. _check_pswa_idempotency_key: returns None (key not found)
+        # 2. _store_pswa_idempotency_result: (key, task_name, PROCESSING, is_new_key=True)
+        # 3. (Task executes - in test mode, returns dummy script)
+        # 4. _store_pswa_idempotency_result: (key, task_name, COMPLETED, result_payload, is_new_key=False)
+
+        # Configure the mock cursor for the first _check_pswa_idempotency_key call (key not found)
+        # This happens inside the Celery task.
+        # We need to ensure the mock_db_connection_registry provides a cursor that returns None initially.
+        # The default mock_get_pswa_db_connection_idempotency_side_effect already does this.
+
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 202, f"Response JSON: {response.get_data(as_text=True)}") # Task accepted
+        json_response = response.get_json()
+        self.assertIn("task_id", json_response)
+        task_id = json_response["task_id"]
+        self.assertEqual(json_response.get("idempotency_key_processed"), idempotency_key)
+
+        # Since task_always_eager=True, the task has run. Now check its status.
+        status_response = self.app.get(json_response["status_url"])
+        self.assertEqual(status_response.status_code, 200)
+        status_json = status_response.get_json()
+        self.assertEqual(status_json["status"], "SUCCESS")
+        self.assertIsNotNone(status_json["result"])
+        self.assertIn("script_data", status_json["result"]) # Test mode returns dummy script in script_data
+
+        # Verify database interactions (these happened inside the Celery task)
+        # Get the connection mock that was used for this test
+        mock_conn = mock_db_connection_registry[os.getpid()]
+        self.assertTrue(mock_db_conn_fn_getter.called) # Ensure our mock connection factory was used
+
+        # Check calls to cursor methods
+        # _check_pswa_idempotency_key: SELECT ... WHERE idempotency_key = %s
+        # _store_pswa_idempotency_result (PROCESSING): INSERT INTO idempotency_keys ...
+        # _store_pswa_idempotency_result (COMPLETED): UPDATE idempotency_keys SET status = %s, result_payload = %s ...
+
+        # Example check on execute calls (very detailed, might be brittle)
+        execute_calls = mock_conn.cursor.return_value.__enter__.return_value.execute.call_args_list
+
+        # 1. SELECT call from _check_pswa_idempotency_key
+        self.assertIn(f"SELECT idempotency_key, task_name, workflow_id, created_at, locked_at, status, result_payload, error_payload FROM idempotency_keys WHERE idempotency_key = %s AND task_name = %s", execute_calls[0][0][0])
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, 'pswa.weave_script_task'))
+
+        # 2. INSERT call from _store_pswa_idempotency_result (status=PROCESSING)
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
+        self.assertEqual(execute_calls[1][0][1][0], idempotency_key) # key
+        self.assertEqual(execute_calls[1][0][1][1], 'pswa.weave_script_task') # task_name
+        self.assertEqual(execute_calls[1][0][1][4], pswa_config['IDEMPOTENCY_STATUS_PROCESSING']) # status
+
+        # 3. UPDATE call from _store_pswa_idempotency_result (status=COMPLETED)
+        self.assertIn("UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s", execute_calls[2][0][0])
+        self.assertEqual(execute_calls[2][0][1][0], pswa_config['IDEMPOTENCY_STATUS_COMPLETED']) # status
+        self.assertIsNotNone(execute_calls[2][0][1][1]) # result_payload (JSON string)
+        self.assertIsNone(execute_calls[2][0][1][2]) # error_payload
+        self.assertEqual(execute_calls[2][0][1][4], idempotency_key) # key
+        self.assertEqual(execute_calls[2][0][1][5], 'pswa.weave_script_task') # task_name
+
+        # Check commits
+        self.assertEqual(mock_conn.commit.call_count, 2) # One for PROCESSING, one for COMPLETED
+
+
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_repeated_idempotency_key_for_completed_task_flask_endpoint(self, mock_db_conn_fn_getter):
+        """Test Flask endpoint returns stored result for a repeated key of a COMPLETED task."""
+        idempotency_key = f"test-key-completed-{uuid.uuid4()}"
+        payload = {"topic": "Completed Topic", "content": "Content for completed task."}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, 'X-Test-Scenario': 'default_success'}
+
+        # --- First Request (new key) ---
+        # Mock DB for _check_pswa_idempotency_key to return "not found"
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # Initially not found
+
+        response1 = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response1.status_code, 202)
+        task_id1 = response1.get_json()["task_id"]
         
-        mock_aims_response = MagicMock()
-        mock_aims_response.status_code = 200
-        mock_aims_response.json.return_value = {
-            "request_id": "aims_req_123",
-            "model_id": "aims-gpt-3.5-turbo-0125", # Model reported by AIMS
-            "choices": [{"text": aims_llm_output_json_str, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60}
+        # Wait for task to "complete" (it's eager, so it's done)
+        status_response1 = self.app.get(f'/tasks/{task_id1}')
+        self.assertEqual(status_response1.status_code, 200)
+        result1_payload = status_response1.get_json()["result"]
+
+        # --- Second Request (repeated key) ---
+        # Now, mock DB for _check_pswa_idempotency_key to return the COMPLETED record
+        completed_record = {
+            'idempotency_key': idempotency_key,
+            'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_COMPLETED'],
+            'result_payload': result1_payload, # Stored result from first call
+            'locked_at': None
         }
-        mock_requests_post.return_value = mock_aims_response
+        cursor_mock.fetchone.return_value = completed_record # Simulate key found and completed
 
-        result = pswa_main.weave_script("Some harvested content", "AI in Education via AIMS JSON")
+        response2 = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response2.status_code, 202, f"Response JSON: {response2.get_data(as_text=True)}")
+        task_id2 = response2.get_json()["task_id"]
 
-        mock_requests_post.assert_called_once_with(
-            pswa_main.pswa_config['AIMS_SERVICE_URL'],
-            json=unittest.mock.ANY, # Check payload in more detail below
-            timeout=pswa_main.pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS']
-        )
-        # Check specific parts of the payload sent to AIMS
-        sent_payload = mock_requests_post.call_args.kwargs['json']
-        self.assertIn("User prompt for JSON: AI in Education via AIMS JSON - Some harvested content", sent_payload['prompt'])
-        self.assertEqual(sent_payload['model_id_override'], self.current_test_config['PSWA_LLM_MODEL'])
-        self.assertEqual(sent_payload['response_format'], {"type": "json_object"})
+        # The task should not re-run; it should return the stored result.
+        # Check status of the second task_id (it should also reflect the original result)
+        status_response2 = self.app.get(f'/tasks/{task_id2}')
+        self.assertEqual(status_response2.status_code, 200)
+        result2_payload = status_response2.get_json()["result"]
 
-        self.assertNotIn("error_code", result)
-        self.assertEqual(result["topic"], "AI in Education via AIMS JSON")
-        self.assertEqual(result["title"], "AI in Education (AIMS JSON)")
-        self.assertEqual(result["llm_model_used"], "aims-gpt-3.5-turbo-0125") # From AIMS response
-        self.assertEqual(result["full_raw_script"], aims_llm_output_json_str)
-        self.assertEqual(result.get("source"), "generation_via_aims")
-        self.assertEqual(len(result["segments"]), 3) # Intro, 1 segment, Outro
-        self.assertEqual(result["segments"][0]["content"], "Welcome to an AIMS JSON discussion on AI in education.")
+        self.assertEqual(result1_payload, result2_payload, "Result from repeated key should match original.")
 
-    @patch('requests.post')
-    def test_weave_script_success_fallback_parsing_via_aims(self, mock_requests_post):
-        with patch.dict(pswa_main.pswa_config, {"PSWA_LLM_JSON_MODE": False}):
-            aims_llm_text_output = """[TITLE]AI Education (AIMS Fallback)
-[INTRO]AIMS Tag-based intro.
-[OUTRO]AIMS Tag-based outro."""
+        # Ensure DB interactions for second call:
+        # _check_pswa_idempotency_key was called and returned the completed_record.
+        # _store_pswa_idempotency_result should NOT have been called to store PROCESSING or new COMPLETED.
+        # The execute calls list would have grown from the first request.
+        # Count how many times INSERT or UPDATE were called after the first request completed.
+        initial_execute_call_count = len(cursor_mock.execute.call_args_list)
 
-            mock_aims_response = MagicMock()
-            mock_aims_response.status_code = 200
-            mock_aims_response.json.return_value = {
-                "request_id": "aims_req_fallback", "model_id": "aims-fallback-model",
-                "choices": [{"text": aims_llm_text_output, "finish_reason": "stop"}], "usage": {}
-            }
-            mock_requests_post.return_value = mock_aims_response
+        # Re-trigger the second call logic path by calling the task method directly (as Celery would)
+        # This is a bit of a workaround to inspect the DB calls for the "already completed" path.
+        # In a real scenario, the Celery worker would pick this up.
+        # Here, task_always_eager means it ran. We need to simulate the DB part of that.
 
-            result = pswa_main.weave_script("Content", "AI Education AIMS Fallback")
+        # For the second call, _check_pswa_idempotency_key returns 'completed_record'.
+        # The weave_script_task should see this and return 'result1_payload' immediately.
+        # No new INSERT/UPDATE to idempotency_keys table should occur.
 
-            sent_payload = mock_requests_post.call_args.kwargs['json']
-            self.assertNotIn("response_format", sent_payload) # JSON mode was off
+        # Reset fetchone to return the completed record again for the direct task call simulation
+        cursor_mock.fetchone.return_value = completed_record
 
-            self.assertNotIn("error_code", result)
-            self.assertEqual(result["title"], "AI Education (AIMS Fallback)")
-            self.assertEqual(result.get("source"), "generation_via_aims")
-            self.assertEqual(len(result["segments"]), 2) # Intro, Outro
-            self.assertEqual(result["segments"][0]["content"], "AIMS Tag-based intro.")
+        # Simulate the task being called again by Celery (even though it's the same endpoint call)
+        # This is tricky because the task is already "run" by the endpoint.
+        # The key is that the DB mock (cursor_mock.fetchone) controlled its behavior.
 
-    @patch('requests.post')
-    def test_weave_script_aims_returns_error_json(self, mock_requests_post):
-        mock_aims_error_response = MagicMock()
-        mock_aims_error_response.status_code = 400 # e.g., AIMS had an invalid request
-        aims_error_payload = {"error": {"type": "invalid_request", "message": "AIMS: Prompt too long"}}
-        mock_aims_error_response.json.return_value = aims_error_payload
-        mock_aims_error_response.text = json.dumps(aims_error_payload) # For HTTPError text
+        # Check that no new INSERT/UPDATE occurred for the second HTTP call.
+        # The number of execute calls related to storing/updating idempotency should be the same as after 1st call.
+        # Original calls for 1st request: SELECT, INSERT (processing), UPDATE (completed) = 3
+        # For 2nd request: SELECT (finds completed) = 1. Total = 4
+        self.assertEqual(len(cursor_mock.execute.call_args_list), 4)
 
-        # Simulate requests.post raising an HTTPError for the 400 status
-        mock_requests_post.side_effect = requests.exceptions.HTTPError(response=mock_aims_error_response)
+        # Verify no further commits after the first request's commits.
+        self.assertEqual(mock_conn.commit.call_count, 2) # Should remain 2 (from the first successful run)
 
-        result = pswa_main.weave_script("Content", "AIMS Error Test")
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_repeated_key_for_processing_task_conflict_flask_endpoint(self, mock_db_conn_fn_getter):
+        """Test Flask endpoint returns conflict for a key already 'processing' and not timed out."""
+        idempotency_key = f"test-key-processing-{uuid.uuid4()}"
+        payload = {"topic": "Processing Topic", "content": "Content for processing task."}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, 'X-Test-Scenario': 'default_success'}
 
-        self.assertIn("error_code", result)
-        self.assertEqual(result["error_code"], "PSWA_AIMS_HTTP_ERROR")
-        self.assertIn("AIMS service returned HTTP 400", result["message"])
-        self.assertEqual(result["details"], aims_error_payload) # AIMS JSON error is in details
+        # Mock DB for _check_pswa_idempotency_key to return "processing" record
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
 
-    @patch('requests.post')
-    def test_weave_script_aims_request_timeout(self, mock_requests_post):
-        mock_requests_post.side_effect = requests.exceptions.Timeout("AIMS request timed out")
-
-        result = pswa_main.weave_script("Content", "AIMS Timeout Test")
-        self.assertIn("error_code", result)
-        self.assertEqual(result["error_code"], "PSWA_AIMS_TIMEOUT")
-        self.assertIn("AIMS request timed out", result["details"])
-
-    def test_weave_script_aims_url_not_configured(self):
-        with patch.dict(pswa_main.pswa_config, {"AIMS_SERVICE_URL": ""}):
-            # Need to reload config in pswa_main or ensure weave_script re-reads it.
-            # For this test, we assume load_pswa_configuration would be called or its effect matters.
-            # The check for AIMS_SERVICE_URL is at the end of load_pswa_configuration.
-            # To properly test this, we might need to trigger re-evaluation or test the loader.
-            # However, if weave_script directly accesses pswa_config, this change should be seen.
-            # The current structure of weave_script gets it from pswa_config at call time.
-            # The critical check is in load_pswa_configuration. If it raises ValueError,
-            # the app wouldn't start. If it doesn't, then weave_script might try to use an empty URL.
-            # Let's assume the initial load_pswa_configuration would have failed.
-            # This test is more about the ValueError from load_pswa_configuration.
-            with self.assertRaises(ValueError) as context:
-                pswa_main.load_pswa_configuration() # Trigger the check
-            self.assertIn("AIMS_SERVICE_URL is not set", str(context.exception))
-            # If the test reaches weave_script with empty URL, it would be a requests.exceptions.MissingSchema
-            # For now, the load_pswa_configuration should prevent this.
-
-    @patch('requests.post') # To ensure it's NOT called
-    @patch('aethercast.pswa.main._save_script_to_cache')
-    @patch('aethercast.pswa.main._get_cached_script')
-    def test_weave_script_cache_hit_no_aims_call(self, mock_get_cached_script, mock_save_script_to_cache, mock_requests_post):
-        self.current_test_config['PSWA_SCRIPT_CACHE_ENABLED'] = True
-        with patch.dict(pswa_main.pswa_config, self.current_test_config, clear=True):
-            topic = "Cache Hit Topic AIMS"
-            content = "Content for AIMS cache hit."
-            mock_cached_data = {
-                "script_id": "cached_script_aims", "topic": topic, "title": "Cached AIMS Title",
-                "full_raw_script": "Cached script text for AIMS",
-                "segments": [{"segment_title": "INTRO", "content": "Cached intro AIMS"}],
-                "llm_model_used": "aims-cached-model", "source": "cache"
-            }
-            mock_get_cached_script.return_value = mock_cached_data
-
-            result = pswa_main.weave_script(content, topic)
-
-            mock_get_cached_script.assert_called_once()
-            mock_requests_post.assert_not_called() # AIMS should not be called
-            mock_save_script_to_cache.assert_not_called()
-            self.assertEqual(result, mock_cached_data)
-            self.assertEqual(result["source"], "cache")
-
-# Test class for the parsing logic (remains largely the same as it processes text)
-# No changes needed here as it parses the text provided by AIMS.
-class TestParseLlmScriptOutput(unittest.TestCase):
-    # Test the parser directly. This class primarily tests the TAG-BASED parser.
-    # JSON parsing is simpler (json.loads) and its failure modes are tested within weave_script tests.
-    def setUp(self):
-        self.mock_pswa_config = {
-            "PSWA_LLM_MODEL": "parser-test-model", # Used as default by parser
-            # PSWA_LLM_JSON_MODE is not directly used by parse_llm_script_output,
-            # its effect is on what kind of string is passed to the parser.
+        processing_record = {
+            'idempotency_key': idempotency_key,
+            'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_PROCESSING'],
+            'result_payload': None,
+            'locked_at': dt.now(timezone.utc) # Current time, so not timed out
         }
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True)
-        self.mock_config = self.config_patcher.start()
+        cursor_mock.fetchone.return_value = processing_record
 
-    def tearDown(self):
-        self.config_patcher.stop()
+        # Make the POST request
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
 
-# Renaming this class to be more specific about testing the tag-based parser.
-class TestTagBasedParseLlmScriptOutput(unittest.TestCase):
-    def setUp(self):
-        self.mock_pswa_config = {"PSWA_LLM_MODEL": "parser-test-model"}
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config, clear=True) # Use clear=True
-        self.mock_config = self.config_patcher.start()
+        # The Celery task itself will see the "PROCESSING_CONFLICT" and return it.
+        # The endpoint then packages this. The HTTP status for the *task status endpoint* might be 200
+        # but the result payload would indicate the conflict.
+        # The initial POST to /v1/weave_script should still be 202 as the task is dispatched.
+        self.assertEqual(response.status_code, 202)
+        task_id = response.get_json()["task_id"]
 
-    def tearDown(self):
-        self.config_patcher.stop()
-    def test_parse_perfect_script(self): # Testing TAG-BASED parser
-        raw_script = """[TITLE]Perfect Podcast Title
-[INTRO]This is the introduction. It has multiple lines.
-Welcome!
-[SEGMENT_1_TITLE]First Segment Title
-[SEGMENT_1_CONTENT]Content for the first segment.
-More content for segment 1.
-[SEGMENT_2_TITLE]Second Segment
-[SEGMENT_2_CONTENT]Content for the second segment.
-[OUTRO]This is the outro.
-Thanks for listening!"""
-        # Note: parse_llm_script_output is the tag-based parser.
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Perfect Topic")
-        self.assertEqual(parsed["title"], "Perfect Podcast Title")
-        self.assertEqual(len(parsed["segments"]), 4)
-        self.assertEqual(parsed["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(parsed["segments"][0]["content"], "This is the introduction. It has multiple lines.\nWelcome!")
-        self.assertEqual(parsed["segments"][1]["segment_title"], "First Segment Title")
-        self.assertEqual(parsed["segments"][1]["content"], "Content for the first segment.\nMore content for segment 1.")
-        self.assertEqual(parsed["segments"][2]["segment_title"], "Second Segment")
-        self.assertEqual(parsed["segments"][2]["content"], "Content for the second segment.")
-        self.assertEqual(parsed["segments"][3]["segment_title"], "OUTRO")
-        self.assertEqual(parsed["segments"][3]["content"], "This is the outro.\nThanks for listening!")
+        # Check the task's result
+        status_response = self.app.get(f'/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200) # Task itself completed (by returning conflict)
+        json_result = status_response.get_json()
 
-    def test_parse_minimal_script(self): # Testing TAG-BASED parser
-        raw_script = "[TITLE]Minimal\n[INTRO]Just intro.\n[OUTRO]Just outro."
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Minimal Topic")
-        self.assertEqual(parsed["title"], "Minimal")
-        self.assertEqual(len(parsed["segments"]), 2)
-        self.assertEqual(parsed["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(parsed["segments"][0]["content"], "Just intro.")
-        self.assertEqual(parsed["segments"][1]["segment_title"], "OUTRO")
-        self.assertEqual(parsed["segments"][1]["content"], "Just outro.")
+        self.assertEqual(json_result["status"], "SUCCESS") # Celery task finished
+        self.assertIsNotNone(json_result["result"])
+        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
+        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
 
-    def test_parse_missing_optional_tags(self): # Testing TAG-BASED parser
-        raw_script = "[TITLE]No Segments\n[INTRO]Only intro and outro here.\n[OUTRO]Bye."
-        parsed = pswa_main.parse_llm_script_output(raw_script, "No Segments Topic")
-        self.assertEqual(parsed["title"], "No Segments")
-        self.assertEqual(len(parsed["segments"]), 2)
-        self.assertEqual(parsed["segments"][0]["content"], "Only intro and outro here.")
+        # Verify DB interactions:
+        # _check_pswa_idempotency_key was called and returned the processing_record.
+        # _store_pswa_idempotency_result should NOT have been called again.
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1) # Only the SELECT call
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
 
-    def test_parse_extra_whitespace_and_newlines(self): # Testing TAG-BASED parser
-        raw_script = """  [TITLE]   Spaced Out Title
+        # No new commits
+        self.assertEqual(mock_conn.commit.call_count, 0) # Or 1 if autocommit is false and rollback happens
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT if autocommit is off for the connection
 
-[INTRO]
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_repeated_key_for_processing_task_lock_timeout_flask_endpoint(self, mock_db_conn_fn_getter):
+        """Test Flask endpoint re-processes a task if the 'processing' lock has timed out."""
+        idempotency_key = f"test-key-lock-timeout-{uuid.uuid4()}"
+        payload = {"topic": "Lock Timeout Topic", "content": "Content for lock timeout task."}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, 'X-Test-Scenario': 'default_success'}
 
-  Intro with spaces.
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
 
-[OUTRO]  Outro also spaced.
-"""
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Whitespace Topic")
-        self.assertEqual(parsed["title"], "Spaced Out Title")
-        self.assertEqual(parsed["segments"][0]["segment_title"], "INTRO")
-        self.assertEqual(parsed["segments"][0]["content"], "Intro with spaces.")
-        self.assertEqual(parsed["segments"][1]["segment_title"], "OUTRO")
-        self.assertEqual(parsed["segments"][1]["content"], "Outro also spaced.")
+        lock_timeout_seconds = pswa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+        stale_locked_at = dt.now(timezone.utc) - timedelta(seconds=lock_timeout_seconds + 60) # Expired lock
 
-    def test_parse_segment_title_no_content(self):
-        raw_script = "[TITLE]Seg Title No Content\n[INTRO]Intro.\n[SEGMENT_1_TITLE]Title Only\n[OUTRO]End."
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Seg Title No Content")
-        self.assertEqual(parsed["segments"][1]["segment_title"], "Title Only") # Content of the [SEGMENT_1_TITLE] tag
-        self.assertEqual(parsed["segments"][1]["content"], "") # No matching [SEGMENT_1_CONTENT]
+        stale_processing_record = {
+            'idempotency_key': idempotency_key,
+            'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_PROCESSING'],
+            'result_payload': None,
+            'locked_at': stale_locked_at
+        }
+        cursor_mock.fetchone.return_value = stale_processing_record # Simulate finding this stale record
 
-    def test_parse_segment_content_no_title(self):
-        # This case is tricky because [SEGMENT_1_CONTENT] without a preceding _TITLE might be ignored or attached to INTRO.
-        # Current parser might treat it as a generic segment if it doesn't match _CONTENT for a _TITLE.
-        # The current parser logic might put this into a segment with "SEGMENT_1_CONTENT" as title.
-        raw_script = "[TITLE]Seg Content No Title\n[INTRO]Intro.\n[SEGMENT_1_CONTENT]Content without specific title.\n[OUTRO]End."
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Seg Content No Title")
-        found_unmatched_content = False
-        for seg in parsed["segments"]:
-            if seg["segment_title"] == "SEGMENT_1_CONTENT" and seg["content"] == "Content without specific title.":
-                found_unmatched_content = True
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202, f"Response JSON: {response.get_data(as_text=True)}")
+        task_id = response.get_json()["task_id"]
+
+        # Task should run and succeed (due to test mode)
+        status_response = self.app.get(f'/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200)
+        status_json = status_response.get_json()
+        self.assertEqual(status_json["status"], "SUCCESS")
+        self.assertIn("script_data", status_json["result"])
+
+        # Verify database interactions:
+        # 1. _check_pswa_idempotency_key: returns stale_processing_record
+        # 2. _store_pswa_idempotency_result: (key, task_name, PROCESSING, is_new_key=False) -> updates lock
+        # 3. _store_pswa_idempotency_result: (key, task_name, COMPLETED, result_payload, is_new_key=False)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        # 1. SELECT call
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, 'pswa.weave_script_task'))
+
+        # 2. UPDATE call for new PROCESSING state (is_new_key=False, but status is PROCESSING)
+        # The actual SQL might be an UPDATE ... SET status = %s, locked_at = %s ...
+        # In _store_pswa_idempotency_result, if is_new_key is False, it's an UPDATE.
+        # If status is PROCESSING, locked_at is updated.
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_processing = False
+        for call_args in execute_calls:
+            if update_processing_sql_part in str(call_args[0][0]):
+                 # Check params for this call
+                params = call_args[0][1]
+                self.assertEqual(params[0], pswa_config['IDEMPOTENCY_STATUS_PROCESSING']) # status
+                self.assertIsNone(params[1]) # result_payload
+                self.assertIsNone(params[2]) # error_payload
+                self.assertIsNotNone(params[3]) # locked_at (new timestamp)
+                self.assertGreater(params[3], stale_locked_at) # ensure locked_at is updated
+                self.assertEqual(params[4], idempotency_key) # key
+                self.assertEqual(params[5], 'pswa.weave_script_task') # task_name
+                found_update_processing = True
                 break
-        self.assertTrue(found_unmatched_content, "Content for SEGMENT_1_CONTENT without title not found as expected.")
+        self.assertTrue(found_update_processing, "UPDATE call to re-lock for PROCESSING not found or params incorrect.")
+
+        # 3. UPDATE call for COMPLETED state
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_completed = False
+        for call_args in execute_calls:
+            if update_completed_sql_part in str(call_args[0][0]):
+                params = call_args[0][1]
+                self.assertEqual(params[0], pswa_config['IDEMPOTENCY_STATUS_COMPLETED']) # status
+                self.assertIsNotNone(params[1]) # result_payload
+                self.assertEqual(params[4], idempotency_key)
+                found_update_completed = True
+                break
+        self.assertTrue(found_update_completed, "UPDATE call for COMPLETED not found or params incorrect.")
+
+        self.assertEqual(mock_conn.commit.call_count, 2) # Commit for re-lock, commit for completion
+
+    @patch('aethercast.pswa.main.pswa_config', new_callable=MagicMock) # To control PSWA_TEST_MODE_ENABLED
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    @patch('aethercast.pswa.main._call_aims_service_for_script') # Mock the actual work part of the task
+    def test_task_failure_marks_idempotency_failed(self, mock_call_aims, mock_db_conn_fn_getter, mock_dynamic_pswa_config):
+        """Test that if a task fails, the idempotency record is marked as 'failed'."""
+        # Override specific config values for this test if needed, otherwise defaults from setUp are used.
+        # Ensure test mode is OFF for this test so it tries to call AIMS, which we mock to fail.
+        # Accessing the global pswa_config dictionary updated by the patcher in setUp
+        current_config = pswa_config.copy()
+        current_config["PSWA_TEST_MODE_ENABLED"] = False # Force it to go through _call_aims_service_for_script
+        mock_dynamic_pswa_config.return_value = current_config # Mock if pswa_config is accessed as a function
+                                                              # If it's a dict, patch.dict in setUp is enough.
+                                                              # For safety, let's assume it might be a module-level dict.
+                                                              # The setup already patches pswa_config dict.
+
+        idempotency_key = f"test-key-task-fails-{uuid.uuid4()}"
+        payload = {"topic": "Failure Topic", "content": "Content that causes failure."}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key} # No X-Test-Scenario, relying on PSWA_TEST_MODE_ENABLED=False
+
+        # Mock the AIMS call to simulate an exception
+        mock_call_aims.side_effect = Exception("Simulated AIMS call failure")
+
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key initially
+
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202) # Task still accepted
+        task_id = response.get_json()["task_id"]
+
+        # Check task status - it should be FAILURE
+        status_response = self.app.get(f'/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 500) # Flask endpoint returns 500 for failed task
+        json_result = status_response.get_json()
+        self.assertEqual(json_result["status"], "FAILURE")
+        self.assertIn("Simulated AIMS call failure", str(json_result["result"]["error"]["message"]))
+
+        # Verify DB interactions:
+        # 1. _check_pswa_idempotency_key: returns None
+        # 2. _store_pswa_idempotency_result: (key, PROCESSING, is_new_key=True)
+        # 3. _store_pswa_idempotency_result: (key, FAILED, error_payload, is_new_key=False) - called by on_failure
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 2) # SELECT, INSERT (processing), UPDATE (failed)
+
+        # Check INSERT for PROCESSING
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[0][0][0]) # Might be 1 if SELECT isn't counted by some mock setups
+                                                                              # Let's assume SELECT is the first one.
+        select_call_index = 0 if "SELECT" in execute_calls[0][0][0] else -1 # Adjust if needed
+        insert_processing_call_index = select_call_index + 1
+
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[insert_processing_call_index][0][0])
+        self.assertEqual(execute_calls[insert_processing_call_index][0][1][4], pswa_config['IDEMPOTENCY_STATUS_PROCESSING'])
+
+        # Check UPDATE for FAILED (this is the crucial part for this test)
+        # This call is made by the WeaveScriptTask.on_failure handler
+        update_failed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_failed = False
+        for call_args in execute_calls:
+            # Check if the SQL string contains the key components of the update statement for failure
+            sql_statement = str(call_args[0][0])
+            if "UPDATE idempotency_keys" in sql_statement and "status = %s" in sql_statement and "error_payload = %s" in sql_statement:
+                params = call_args[0][1]
+                if params[0] == pswa_config['IDEMPOTENCY_STATUS_FAILED'] and params[4] == idempotency_key:
+                    self.assertIsNotNone(params[2]) # error_payload should be populated
+                    self.assertIn("Simulated AIMS call failure", params[2]) # Check error message in payload
+                    found_update_failed = True
+                    break
+        self.assertTrue(found_update_failed, "UPDATE call for FAILED status not found or params incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2) # Commit for PROCESSING, commit for FAILED
 
 
-    def test_parse_llm_error_message(self):
-        raw_script = "[ERROR] Insufficient content provided to generate a full podcast script for the topic: Error Topic"
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Error Topic")
-        self.assertTrue(parsed["title"].startswith("Error: Insufficient Content"))
-        self.assertEqual(len(parsed["segments"]), 1)
-        self.assertEqual(parsed["segments"][0]["segment_title"], "ERROR")
-        self.assertEqual(parsed["segments"][0]["content"], raw_script)
+    @patch('aethercast.pswa.main.pswa_config', new_callable=MagicMock)
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    @patch('aethercast.pswa.main._call_aims_service_for_script')
+    def test_retry_after_failure_with_same_key_success(self, mock_call_aims, mock_db_conn_fn_getter, mock_dynamic_pswa_config):
+        """Test task re-processes and succeeds after a previous failure with the same key."""
+        current_config = pswa_config.copy()
+        current_config["PSWA_TEST_MODE_ENABLED"] = False # Ensure AIMS call path
+        mock_dynamic_pswa_config.return_value = current_config
 
-    def test_parse_empty_string(self):
-        raw_script = ""
-        parsed = pswa_main.parse_llm_script_output(raw_script, "Empty Topic")
-        self.assertTrue(parsed["title"].startswith("Podcast on Empty Topic")) # Default title
-        self.assertEqual(len(parsed["segments"]), 0) # No segments
+        idempotency_key = f"test-key-retry-success-{uuid.uuid4()}"
+        payload = {"topic": "Retry Topic", "content": "Content for retry."}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 
-    def test_parse_no_valid_tags(self):
-        raw_script = "This is just a plain sentence without any of our special tags."
-        parsed = pswa_main.parse_llm_script_output(raw_script, "No Tags Topic")
-        self.assertTrue(parsed["title"].startswith("Podcast on No Tags Topic")) # Default title
-        # The current parser might create a segment with the raw text if no tags are found,
-        # depending on how it handles untagged content.
-        # Let's check if segments list is empty or contains the raw text.
-        # Based on current logic, it should be empty because no tags are processed.
-        self.assertEqual(len(parsed["segments"]), 0, f"Segments found: {parsed['segments']}")
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+
+        # Simulate that the key was previously recorded as FAILED
+        failed_record = {
+            'idempotency_key': idempotency_key,
+            'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_FAILED'],
+            'result_payload': None,
+            'error_payload': json.dumps({"error": "Previous failure"}),
+            'locked_at': None
+        }
+        cursor_mock.fetchone.return_value = failed_record # First check finds this failed record
+
+        # Mock AIMS call to succeed on the retry
+        mock_call_aims.return_value = { # This is the structured_script like object
+            "title": "Retry Success Title", "intro": "Intro",
+            "segments": [{"segment_title": "s1", "content": "c1"}], "outro": "Outro",
+            "model_id_used": "test-model-on-retry" # from AIMS actual response
+        }
 
 
-class TestWeaveScriptEndpoint(unittest.TestCase):
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 202)
+        task_id = response.get_json()["task_id"]
+
+        status_response = self.app.get(f'/tasks/{task_id}')
+        self.assertEqual(status_response.status_code, 200)
+        json_result = status_response.get_json()
+        self.assertEqual(json_result["status"], "SUCCESS")
+        self.assertIn("script_data", json_result["result"])
+        self.assertEqual(json_result["result"]["script_data"]["title"], "Retry Success Title")
+
+        # Verify DB interactions:
+        # 1. _check_pswa_idempotency_key: returns failed_record
+        # 2. _store_pswa_idempotency_result: (key, PROCESSING, is_new_key=False) -> updates from FAILED
+        # 3. (Task executes successfully via mock_call_aims)
+        # 4. _store_pswa_idempotency_result: (key, COMPLETED, result_payload, is_new_key=False)
+
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+
+        # 1. SELECT call
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+
+        # 2. UPDATE to PROCESSING from FAILED
+        # SQL: UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s ...
+        # Check params for this call (status=PROCESSING, locked_at=new_timestamp)
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_reprocessing = False
+        for call_args in execute_calls:
+             if update_processing_sql_part in str(call_args[0][0]):
+                params = call_args[0][1]
+                if params[0] == pswa_config['IDEMPOTENCY_STATUS_PROCESSING'] and params[4] == idempotency_key:
+                    self.assertIsNotNone(params[3]) # new locked_at
+                    found_update_reprocessing = True
+                    break
+        self.assertTrue(found_update_reprocessing, "UPDATE call to re-set to PROCESSING not found or params incorrect.")
+
+        # 3. UPDATE to COMPLETED
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_completed = False
+        for call_args in execute_calls:
+            if update_completed_sql_part in str(call_args[0][0]):
+                params = call_args[0][1]
+                if params[0] == pswa_config['IDEMPOTENCY_STATUS_COMPLETED'] and params[4] == idempotency_key:
+                    self.assertIsNotNone(params[1]) # result_payload
+                    self.assertIn("Retry Success Title", params[1])
+                    found_update_completed = True
+                    break
+        self.assertTrue(found_update_completed, "UPDATE call for COMPLETED status not found or params incorrect.")
+
+        self.assertEqual(mock_conn.commit.call_count, 2) # For PROCESSING, For COMPLETED
+
+    # TODO: Add tests for:
+    # - Direct Celery task unit tests (not just via Flask endpoint)
+
+
+# --- Direct Celery Task Idempotency Tests ---
+class TestWeaveScriptTaskDirectly(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        pswa_celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        # pswa_config should be loaded by main.py, tests can override
+        load_pswa_config()
 
     def setUp(self):
-        pswa_main.app.config['TESTING'] = True
-        self.client = pswa_main.app.test_client()
-        # Config for endpoint tests, especially PSWA_TEST_MODE_ENABLED
-        self.mock_pswa_config_endpoint = {
-            "AIMS_SERVICE_URL": "http://mockaims.test/v1/generate", # Still needed even if test mode bypasses
-            "AIMS_REQUEST_TIMEOUT_SECONDS": 5,
-            "PSWA_LLM_MODEL": "gpt-endpoint-model", # For requests to AIMS if not in test mode
-            "PSWA_LLM_JSON_MODE": True,
-            "PSWA_TEST_MODE_ENABLED": True # Critical for these tests
+        reset_mock_db_connections()
+        self.test_config_overrides = {
+            "PSWA_TEST_MODE_ENABLED": True,
+            "DATABASE_TYPE": "postgres",
+            "POSTGRES_HOST": "mock_pg_host",
+            "IDEMPOTENCY_STATUS_PROCESSING": "processing",
+            "IDEMPOTENCY_STATUS_COMPLETED": "completed",
+            "IDEMPOTENCY_STATUS_FAILED": "failed",
+            "IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": 60,
         }
-        self.config_patcher = patch.dict(pswa_main.pswa_config, self.mock_pswa_config_endpoint, clear=True)
-        self.mock_config = self.config_patcher.start()
-
-        # PSWA_IMPORTS_SUCCESSFUL is for OpenAI, not directly relevant now AIMS is used.
-        # If there was a check for `requests` library for AIMS calls, that would be relevant.
-        # For now, assuming `requests` is available.
+        self.config_patcher = patch.dict(pswa_config, self.test_config_overrides, clear=False)
+        self.mocked_pswa_config = self.config_patcher.start()
 
     def tearDown(self):
         self.config_patcher.stop()
+        reset_mock_db_connections()
 
-    @patch('aethercast.pswa.main.weave_script') # Still mock weave_script for endpoint unit tests
-    def test_handle_weave_script_success(self, mock_weave_script_func):
-        mock_structured_script = {
-            "script_id": "pswa_script_test123", "topic": "Test Topic",
-            "title": "Great Test Podcast", "full_raw_script": "[TITLE]Great Test Podcast...",
-            "segments": [{"segment_title": "INTRO", "content": "Intro content"}],
-            "llm_model_used": "gpt-endpoint-model"
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_new_key_task_success_direct_call(self, mock_db_conn_fn_getter):
+        """Test weave_script_task directly with a new idempotency key, expecting success."""
+        idempotency_key = f"direct-task-new-{uuid.uuid4()}"
+        request_id_celery = "test_req_id_direct_new"
+        topic = "Direct Task New Topic"
+        content = "Direct task new content."
+
+        # DB initially returns no record for this key (default mock behavior)
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None
+
+        # Call the task. Since task_always_eager=True, this will execute synchronously.
+        task_result = weave_script_task.apply(
+            args=[request_id_celery, content, topic],
+            kwargs={'idempotency_key': idempotency_key, 'test_scenario_header': 'default_success'}
+        ).get() # .get() will raise exceptions if the task failed
+
+        self.assertIsNotNone(task_result)
+        self.assertIn("script_data", task_result) # From test mode
+        self.assertEqual(task_result["script_data"]["topic"], topic)
+
+        # Verify DB interactions (similar to the Flask endpoint test)
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3) # SELECT, INSERT (proc), UPDATE (compl)
+
+        # 1. SELECT call
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, 'pswa.weave_script_task'))
+
+        # 2. INSERT call for PROCESSING
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
+        self.assertEqual(execute_calls[1][0][1][4], pswa_config['IDEMPOTENCY_STATUS_PROCESSING'])
+
+        # 3. UPDATE call for COMPLETED
+        self.assertIn("UPDATE idempotency_keys SET status = %s, result_payload = %s", execute_calls[2][0][0])
+        self.assertEqual(execute_calls[2][0][1][0], pswa_config['IDEMPOTENCY_STATUS_COMPLETED'])
+        self.assertIsNotNone(execute_calls[2][0][1][1]) # result_payload
+
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_completed_key_task_returns_stored_result_direct_call(self, mock_db_conn_fn_getter):
+        """Test weave_script_task directly with a completed key, returns stored result."""
+        idempotency_key = f"direct-task-completed-{uuid.uuid4()}"
+        request_id_celery = "test_req_id_direct_completed"
+        topic = "Direct Task Completed Topic"
+        content = "Direct task completed content."
+
+        stored_result_payload = {"script_data": {"topic": topic, "title": "Previously Stored Title", "source": "cache_or_previous_run"}, "status_for_metric": "success_from_idempotency"}
+
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        completed_record = {
+            'idempotency_key': idempotency_key,
+            'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_COMPLETED'],
+            'result_payload': stored_result_payload, # Already a dict, _check_pswa_idempotency_key should handle if it's JSON string
+            'locked_at': None
         }
-        mock_weave_script_func.return_value = mock_structured_script
+        # If result_payload from DB is a string, _check_pswa_idempotency_key is expected to parse it.
+        # For this mock, we provide it as dict as that's what the task expects after parsing.
+        cursor_mock.fetchone.return_value = completed_record
 
-        response = self.client.post('/weave_script', json={'content': 'Some content', 'topic': 'Test Topic'})
-        self.assertEqual(response.status_code, 200)
-        json_data = response.get_json()
+        task_result = weave_script_task.apply(
+            args=[request_id_celery, content, topic],
+            kwargs={'idempotency_key': idempotency_key}
+        ).get()
 
-        self.assertEqual(json_data["script_id"], "pswa_script_test123")
-        self.assertEqual(json_data["title"], "Great Test Podcast")
+        self.assertEqual(task_result, stored_result_payload)
 
-    def test_handle_weave_script_missing_params(self):
-        response = self.client.post('/weave_script', json={'content': 'Some content'})
-        self.assertEqual(response.status_code, 400)
-        json_data = response.get_json()
-        self.assertIn("Missing required parameters", json_data['error'])
+        # Verify DB: Only a SELECT call, no INSERT or UPDATE for idempotency table.
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertEqual(len(execute_calls), 1)
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT
 
-    @patch('aethercast.pswa.main.weave_script')
-    def test_handle_weave_script_insufficient_content(self, mock_weave_script_func):
-        error_message_from_llm = "[ERROR] Insufficient content provided for topic: Bad Topic"
-        # Simulate what parse_llm_script_output would return for this
-        mock_weave_script_func.return_value = {
-            "script_id": "pswa_script_err", "topic": "Bad Topic",
-            "title": "Error: Insufficient Content for Bad Topic",
-            "full_raw_script": error_message_from_llm,
-            "segments": [{"segment_title": "ERROR", "content": error_message_from_llm}],
-            "llm_model_used": "gpt-endpoint-model"
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_processing_key_conflict_direct_call(self, mock_db_conn_fn_getter):
+        """Test direct task call with a 'processing' key (not timed out) returns conflict."""
+        idempotency_key = f"direct-task-processing-{uuid.uuid4()}"
+
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': dt.now(timezone.utc) # Not timed out
         }
+        cursor_mock.fetchone.return_value = processing_record
+
+        task_result = weave_script_task.apply(
+            args=["req_id", "content", "topic"], kwargs={'idempotency_key': idempotency_key}
+        ).get()
+
+        self.assertEqual(task_result.get("status"), "PROCESSING_CONFLICT")
+        self.assertEqual(task_result.get("idempotency_key"), idempotency_key)
+        # DB: Only SELECT, no update/insert for idempotency table
+        self.assertEqual(len(cursor_mock.execute.call_args_list), 1)
+        self.assertEqual(mock_conn.commit.call_count, 0)
+
+
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    def test_processing_key_lock_timeout_direct_call(self, mock_db_conn_fn_getter):
+        """Test direct task call with 'processing' key (timed out) re-processes."""
+        idempotency_key = f"direct-task-lock-timeout-{uuid.uuid4()}"
+        lock_timeout_seconds = pswa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+        stale_locked_at = dt.now(timezone.utc) - timedelta(seconds=lock_timeout_seconds + 120)
+
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        stale_processing_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': stale_locked_at
+        }
+        cursor_mock.fetchone.return_value = stale_processing_record
+
+        # Task should run and succeed (due to test mode)
+        task_result = weave_script_task.apply(
+            args=["req_id", "content", "Lock Timeout Topic"],
+            kwargs={'idempotency_key': idempotency_key, 'test_scenario_header': 'default_success'}
+        ).get()
+
+        self.assertIn("script_data", task_result)
+        self.assertEqual(task_result["script_data"]["topic"], "Lock Timeout Topic")
+
+        # DB: SELECT, UPDATE (to re-lock PROCESSING), UPDATE (to COMPLETED)
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
+        # Check re-lock update
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and call[0][1][0] == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']
+            for call in execute_calls
+        )
+        self.assertTrue(found_reprocessing_update)
+        self.assertEqual(mock_conn.commit.call_count, 2)
+
+    @patch('aethercast.pswa.main.pswa_config', new_callable=MagicMock)
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    @patch('aethercast.pswa.main._call_aims_service_for_script')
+    def test_task_failure_direct_call_marks_failed(self, mock_call_aims, mock_db_conn_fn_getter, mock_dynamic_pswa_config):
+        """Test direct task call, if task logic fails, idempotency record is 'failed'."""
+        current_config = pswa_config.copy()
+        current_config["PSWA_TEST_MODE_ENABLED"] = False # To make it call _call_aims_service_for_script
+        mock_dynamic_pswa_config.return_value = current_config
+
+
+        idempotency_key = f"direct-task-failure-{uuid.uuid4()}"
+        mock_call_aims.side_effect = Exception("Simulated direct task internal failure")
+
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        cursor_mock.fetchone.return_value = None # New key
+
+        with self.assertRaises(Exception) as context: # Task failure will propagate due to task_eager_propagates
+            weave_script_task.apply(
+                args=["req_id", "content", "topic"],
+                kwargs={'idempotency_key': idempotency_key}
+            ).get()
+        self.assertIn("Simulated direct task internal failure", str(context.exception))
+
+        # DB: SELECT, INSERT (PROCESSING), UPDATE (FAILED by on_failure)
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 2) # SELECT, INSERT, then UPDATE in on_failure
+
+        update_failed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_update_failed = any(
+            update_failed_sql_part in str(call[0][0]) and
+            call[0][1][0] == pswa_config['IDEMPOTENCY_STATUS_FAILED'] and
+            "Simulated direct task internal failure" in call[0][1][2] # error_payload
+            for call in execute_calls
+        )
+        self.assertTrue(found_update_failed, "Update to FAILED status not found or error payload incorrect.")
+        self.assertEqual(mock_conn.commit.call_count, 2) # For PROCESSING, then for FAILED in on_failure
+
+
+    @patch('aethercast.pswa.main.pswa_config', new_callable=MagicMock)
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    @patch('aethercast.pswa.main._call_aims_service_for_script')
+    def test_retry_after_failure_direct_call_success(self, mock_call_aims, mock_db_conn_fn_getter, mock_dynamic_pswa_config):
+        """Test direct task call re-processes and succeeds after a previous 'failed' record."""
+        current_config = pswa_config.copy()
+        current_config["PSWA_TEST_MODE_ENABLED"] = False
+        mock_dynamic_pswa_config.return_value = current_config
+
+        idempotency_key = f"direct-task-retry-success-{uuid.uuid4()}"
         
-        response = self.client.post('/weave_script', json={'content': 'short', 'topic': 'Bad Topic'})
-        self.assertEqual(response.status_code, 400)
-        json_data = response.get_json()
-        self.assertTrue(json_data['error'].startswith("[ERROR] Insufficient content"))
-
-    @patch('aethercast.pswa.main.weave_script')
-    def test_handle_weave_script_llm_api_error(self, mock_weave_script_func):
-        # Simulate weave_script returning an error that came from AIMS
-        mock_weave_script_func.return_value = {"error_code": "PSWA_AIMS_REQUEST_ERROR", "message": "AIMS down", "details": "Connection refused"}
-
-        response = self.client.post('/weave_script', json={'content': 'content', 'topic': 'topic'})
-        # Assuming PSWA_AIMS_REQUEST_ERROR maps to a 502 or 503 type error
-        self.assertIn(response.status_code, [500, 502, 503, 504])
-        json_data = response.get_json()
-        self.assertEqual(json_data["error_code"], "PSWA_AIMS_REQUEST_ERROR")
-        self.assertEqual(json_data["message"], "AIMS down")
-
-    @patch('aethercast.pswa.main.weave_script')
-    def test_handle_script_parsing_failure_in_endpoint(self, mock_weave_script_func):
-        # Simulate a case where LLM output was fine, but parsing failed to get essential fields
-        mock_structured_script_bad_parse = {
-            "script_id": "pswa_script_badparse", "topic": "Test Topic Bad Parse",
-            "title": None, # Simulate title not being parsed
-            "full_raw_script": "Some raw output without clear tags for title or intro",
-            "segments": [], # Simulate no segments parsed
-            "llm_model_used": "gpt-endpoint-model"
+        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        failed_record = {
+            'idempotency_key': idempotency_key, 'task_name': 'pswa.weave_script_task',
+            'status': pswa_config['IDEMPOTENCY_STATUS_FAILED'],
+            'error_payload': json.dumps({"error": "Previous failure details"}),
+            'locked_at': None
         }
-        mock_weave_script_func.return_value = mock_structured_script_bad_parse
+        cursor_mock.fetchone.return_value = failed_record
 
-        response = self.client.post('/weave_script', json={'content': 'content', 'topic': 'Test Topic Bad Parse'})
-        self.assertEqual(response.status_code, 500)
-        json_data = response.get_json()
-        self.assertEqual(json_data["error"], "PSWA_SCRIPT_PARSING_FAILURE")
-        self.assertIn("Failed to parse essential script structure", json_data["details"]) # Changed message to details to match other errors
+        # Mock AIMS to succeed on this retry
+        mock_call_aims.return_value = {
+            "title": "Retry Direct Success", "intro": "Intro", "segments": [], "outro": "Outro",
+            "model_id_used": "test-model-retry-direct"
+        }
 
+        task_result = weave_script_task.apply(
+            args=["req_id", "content", "Retry Success Topic"],
+            kwargs={'idempotency_key': idempotency_key}
+        ).get()
 
-    # --- New Tests for Scenario-Based Test Mode ---
-    def test_weave_script_test_mode_default_scenario(self):
-        """Test test mode with no scenario header, should return default script."""
-        # No X-Test-Scenario header, or an unrecognised one.
-        response = self.client.post('/weave_script', json={'content': 'Some content', 'topic': 'Test Default Scenario'})
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
+        self.assertIn("script_data", task_result)
+        self.assertEqual(task_result["script_data"]["title"], "Retry Direct Success")
 
-        self.assertEqual(data['source'], 'test_mode_scenario_default')
-        self.assertEqual(data['topic'], 'Test Default Scenario')
-        self.assertTrue(data['title'].startswith("Test Mode: Test Default Scenario")) # Title is dynamic
-        self.assertTrue(data['intro'].startswith("This is the intro for the test mode topic: Test Default Scenario"))
-        self.assertEqual(len(data['segments']), pswa_main.SCENARIO_DEFAULT_SCRIPT_CONTENT['segments'].__len__())
-        # Check full_raw_script reflects the dynamic title and intro
-        raw_script_content = json.loads(data['full_raw_script'])
-        self.assertTrue(raw_script_content['title'].startswith("Test Mode: Test Default Scenario"))
+        # DB: SELECT (finds FAILED), UPDATE (to PROCESSING), UPDATE (to COMPLETED)
+        execute_calls = cursor_mock.execute.call_args_list
+        self.assertGreaterEqual(len(execute_calls), 3)
 
-    def test_weave_script_test_mode_insufficient_content_scenario(self):
-        """Test test mode with 'insufficient_content' scenario header."""
-        headers = {'X-Test-Scenario': 'insufficient_content'}
-        response = self.client.post('/weave_script', json={'content': 'Tiny content', 'topic': 'Test Insufficient'}, headers=headers)
-        self.assertEqual(response.status_code, 200) # PSWA itself doesn't error, it returns the error structure from LLM
-        data = response.get_json()
+        # Check for update to PROCESSING
+        update_processing_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = %s WHERE idempotency_key = %s AND task_name = %s;"
+        found_reprocessing_update = any(
+            update_processing_sql_part in str(call[0][0]) and call[0][1][0] == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']
+            for call in execute_calls
+        )
+        self.assertTrue(found_reprocessing_update)
 
-        self.assertEqual(data['source'], 'test_mode_scenario_insufficient_content')
-        self.assertEqual(data['topic'], 'Test Insufficient')
-        self.assertEqual(data[pswa_main.KEY_ERROR], "Insufficient content")
-        self.assertIn("Test Insufficient", data[pswa_main.KEY_MESSAGE])
-        # The endpoint might interpret this as a 400, check endpoint logic if this fails.
-        # Current endpoint logic for insufficient content:
-        # if result_data.get(KEY_SEGMENTS) and result_data[KEY_SEGMENTS][0][KEY_SEGMENT_TITLE] == SEGMENT_TITLE_ERROR ... returns 400
-        # This is not directly hit here as the returned structure for this scenario is {"error": ..., "message": ...}
-        # The endpoint test for insufficient content (`test_handle_weave_script_insufficient_content`) covers the 400.
-        # This unit test for weave_script just checks the direct output of weave_script.
-
-    def test_weave_script_test_mode_empty_segments_scenario(self):
-        """Test test mode with 'empty_segments' scenario header."""
-        headers = {'X-Test-Scenario': 'empty_segments'}
-        response = self.client.post('/weave_script', json={'content': 'Content for empty seg', 'topic': 'Test Empty Segments'}, headers=headers)
-        self.assertEqual(response.status_code, 200)
-        data = response.get_json()
-
-        self.assertEqual(data['source'], 'test_mode_scenario_empty_segments')
-        self.assertEqual(data['topic'], 'Test Empty Segments')
-        self.assertEqual(data[pswa_main.KEY_TITLE], pswa_main.SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT[pswa_main.KEY_TITLE])
-        self.assertEqual(data[pswa_main.KEY_INTRO], pswa_main.SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT[pswa_main.KEY_INTRO])
-        self.assertEqual(len(data[pswa_main.KEY_SEGMENTS]), 0) # Key check: segments list is empty
-        self.assertEqual(data[pswa_main.KEY_OUTRO], pswa_main.SCENARIO_EMPTY_SEGMENTS_SCRIPT_CONTENT[pswa_main.KEY_OUTRO])
+        # Check for update to COMPLETED
+        update_completed_sql_part = "UPDATE idempotency_keys SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL WHERE idempotency_key = %s AND task_name = %s;"
+        found_completed_update = any(
+            update_completed_sql_part in str(call[0][0]) and
+            call[0][1][0] == pswa_config['IDEMPOTENCY_STATUS_COMPLETED'] and
+            "Retry Direct Success" in call[0][1][1] # result_payload
+            for call in execute_calls
+        )
+        self.assertTrue(found_completed_update)
+        self.assertEqual(mock_conn.commit.call_count, 2)
 
 
 if __name__ == '__main__':
