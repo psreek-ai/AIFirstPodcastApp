@@ -147,9 +147,42 @@ def _get_vfa_db_connection():
         logger.error(f"VFA: Unable to connect to PostgreSQL for idempotency: {e}", exc_info=True)
         raise ConnectionError(f"VFA: PostgreSQL connection for idempotency failed: {e}") from e
 
-# TODO: Consider creating a VfaCeleryTask(Task) class with an on_failure method
-#       to robustly update idempotency records to 'failed', similar to other services.
-#       This would involve changing ` @celery_app.task(...)` to use `base=VfaCeleryTask`.
+# --- Custom Celery Task Class for VFA with Idempotency ---
+class VfaCeleryTask(Celery.Task): # Inherit from celery.Task
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        logger.error(f'Celery Task {task_id} (VFA ForgeVoice) failed: {exc}', exc_info=einfo)
+        idempotency_key = kwargs.get('idempotency_key')
+        workflow_id = kwargs.get('workflow_id') # Retrieve workflow_id
+        task_name = self.name # self.name will be 'forge_voice_task'
+
+        # Check for PSYCOPG2_AVAILABLE - defined globally in main.py
+        # For simplicity, assuming it's accessible here or rely on _get_vfa_db_connection to check/raise.
+        # A more explicit check: if not vfa_main.PSYCOPG2_AVAILABLE: logger.error(...); return
+
+        if idempotency_key: # Attempt to mark idempotency record as failed if key is present
+            db_conn = None
+            try:
+                db_conn = _get_vfa_db_connection()
+                if db_conn:
+                    db_conn.autocommit = False # Manage transaction
+                    error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
+                    # Use the correct config key for failed status
+                    _store_vfa_idempotency_result(db_conn, idempotency_key, task_name,
+                                              vfa_config['IDEMPOTENCY_STATUS_FAILED'], # Use config
+                                              error_payload=error_payload,
+                                              workflow_id=workflow_id, # Pass workflow_id
+                                              is_new_key=False) # Should exist if task started
+                    db_conn.commit()
+                    logger.info(f"Idempotency record for key {idempotency_key} marked as FAILED for VFA task {task_name}.")
+            except Exception as db_err:
+                logger.error(f"Failed to update idempotency record to FAILED for key {idempotency_key} (VFA task {task_name}) after task failure: {db_err}", exc_info=True)
+                if db_conn: db_conn.rollback()
+            finally:
+                if db_conn and not db_conn.closed:
+                    try: db_conn.close()
+                    except Exception: pass # Ignore errors on close during failure handling
+        # Default Celery failure handling will still occur
+
 def _check_vfa_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
     logger_extra_info = {"task_id": "VFAIdempotencyCheck", "idempotency_key": idempotency_key, "check_task_name": task_name}
     try:
@@ -218,7 +251,7 @@ def _store_vfa_idempotency_result(db_conn, idempotency_key: str, task_name: str,
         raise
 
 
-@celery_app.task(bind=True, name='forge_voice_task') # Consider adding base=VfaCeleryTask if created
+@celery_app.task(bind=True, base=VfaCeleryTask, name='forge_voice_task') # Use VfaCeleryTask as base
 def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_params_input: Optional[dict] = None, test_scenario_header: Optional[str] = None, idempotency_key: Optional[str] = None, workflow_id: Optional[str] = None) -> dict:
     logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id_celery}, Idempotency Key: {idempotency_key}, Workflow ID: {workflow_id}): Starting voice forging. Topic: {script_input.get('topic', 'N/A')}")
     stream_id = f"strm_{self.request.id}"
@@ -402,17 +435,13 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
         return vfa_success_payload
 
     except Exception as e:
-        logger.error(f"Celery Task {self.request.id} (Idempotency Key: {idempotency_key}): Error in forge_voice_task: {e}", exc_info=True, extra={"orig_req_id": request_id_celery})
-        error_payload_for_idempotency = {"error_message": str(e), "error_type": type(e).__name__}
-        if db_conn:
-            try:
-                _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_FAILED'], error_payload=error_payload_for_idempotency, workflow_id=workflow_id, is_new_key=False)
-                db_conn.commit()
-            except Exception as db_e:
-                logger.error(f"Celery Task {self.request.id}: Failed to store idempotency failure status for key {idempotency_key}: {db_e}", exc_info=True, extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
-                if db_conn: db_conn.rollback()
-        # Let Celery handle retry with original exception for visibility
-        raise self.retry(exc=e, countdown=10, max_retries=2)
+        logger.error(f"Celery Task {self.request.id} (Idempotency Key: {idempotency_key}): Error in forge_voice_task: {e}", exc_info=True, extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
+        # The on_failure handler will now manage updating the idempotency record.
+        # Re-raise the exception so Celery calls on_failure.
+        # If using self.retry, on_failure is only called if retries are exhausted or it's not a retryable exception.
+        # For simplicity here, just re-raise. If specific retry logic for certain exceptions is needed
+        # before marking as FAILED, that would be more complex.
+        raise # This will trigger VfaCeleryTask.on_failure
     finally:
         if db_conn:
             try:

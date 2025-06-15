@@ -188,133 +188,132 @@ class TestPswaIdempotency(unittest.TestCase):
         self.assertEqual(mock_conn.commit.call_count, 2) # One for PROCESSING, one for COMPLETED
 
 
-    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency') # Apply side_effect inside test
     def test_repeated_idempotency_key_for_completed_task_flask_endpoint(self, mock_db_conn_fn_getter):
-        """Test Flask endpoint returns stored result for a repeated key of a COMPLETED task."""
+        """Test Flask endpoint returns 200 with stored result for a COMPLETED key."""
         idempotency_key = f"test-key-completed-{uuid.uuid4()}"
         payload = {"topic": "Completed Topic", "content": "Content for completed task."}
         headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, 'X-Test-Scenario': 'default_success'}
+        service_name = pswa_config['SERVICE_NAME_FOR_IDEMPOTENCY']
 
         # --- First Request (new key) ---
-        # Mock DB for _check_pswa_idempotency_key to return "not found"
-        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
-        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
-        cursor_mock.fetchone.return_value = None # Initially not found
+        # Mock for Flask pre-check (key not found)
+        mock_conn_flask_initial = MagicMock(name="FlaskInitialConn")
+        cursor_mock_flask_initial = mock_conn_flask_initial.cursor.return_value.__enter__.return_value
+        cursor_mock_flask_initial.fetchone.return_value = None # Key not found
+        mock_conn_flask_initial.autocommit = True # As in main.py
+
+        # Mock for Celery task (key also not found initially by task, or finds 'PROCESSING')
+        mock_conn_task = MagicMock(name="TaskConn")
+        cursor_mock_task = mock_conn_task.cursor.return_value.__enter__.return_value
+        # Task will find the 'PROCESSING' record stored by Flask pre-check.
+        processing_record_for_task = {
+            'idempotency_key': idempotency_key, 'task_name': service_name,
+            'status': pswa_config['IDEMPOTENCY_STATUS_PROCESSING'],
+            'locked_at': dt.now(timezone.utc) # Should be fresh
+        }
+        cursor_mock_task.fetchone.return_value = processing_record_for_task
+        mock_conn_task.autocommit = False # Task manages commits
+
+        # Set up side_effect for the db connection getter
+        # First call (Flask pre-check for initial request): returns mock_conn_flask_initial
+        # Second call (Celery task): returns mock_conn_task
+        mock_db_conn_fn_getter.side_effect = [mock_conn_flask_initial, mock_conn_task]
 
         response1 = self.app.post('/v1/weave_script', json=payload, headers=headers)
-        self.assertEqual(response1.status_code, 202)
+        self.assertEqual(response1.status_code, 202) # Task dispatched
         task_id1 = response1.get_json()["task_id"]
-        
-        # Wait for task to "complete" (it's eager, so it's done)
+
+        # Trigger task execution by getting status (due to eager config)
         status_response1 = self.app.get(f'/tasks/{task_id1}')
         self.assertEqual(status_response1.status_code, 200)
-        result1_payload = status_response1.get_json()["result"]
+        result1_payload = status_response1.get_json()["result"] # This is the task's result
 
         # --- Second Request (repeated key) ---
-        # Now, mock DB for _check_pswa_idempotency_key to return the COMPLETED record
-        completed_record = {
+        # Mock for Flask pre-check (key found as COMPLETED)
+        completed_record_for_flask_check = {
             'idempotency_key': idempotency_key,
-            'task_name': 'pswa.weave_script_task',
+            'task_name': service_name,
             'status': pswa_config['IDEMPOTENCY_STATUS_COMPLETED'],
             'result_payload': result1_payload, # Stored result from first call
             'locked_at': None
         }
-        cursor_mock.fetchone.return_value = completed_record # Simulate key found and completed
+        mock_conn_flask_repeat = MagicMock(name="FlaskRepeatConn")
+        cursor_mock_flask_repeat = mock_conn_flask_repeat.cursor.return_value.__enter__.return_value
+        cursor_mock_flask_repeat.fetchone.return_value = completed_record_for_flask_check
+        mock_conn_flask_repeat.autocommit = True
+
+        # Update side_effect: next call to getter is for the second Flask pre-check
+        mock_db_conn_fn_getter.side_effect = [mock_conn_flask_repeat]
 
         response2 = self.app.post('/v1/weave_script', json=payload, headers=headers)
-        self.assertEqual(response2.status_code, 202, f"Response JSON: {response2.get_data(as_text=True)}")
-        task_id2 = response2.get_json()["task_id"]
 
-        # The task should not re-run; it should return the stored result.
-        # Check status of the second task_id (it should also reflect the original result)
-        status_response2 = self.app.get(f'/tasks/{task_id2}')
-        self.assertEqual(status_response2.status_code, 200)
-        result2_payload = status_response2.get_json()["result"]
+        self.assertEqual(response2.status_code, 200, f"Response JSON: {response2.get_data(as_text=True)}")
+        result2_payload_direct = response2.get_json()
+        # The result1_payload is what was stored in DB, which should be what's returned directly.
+        self.assertEqual(result1_payload, result2_payload_direct, "Result from repeated key (direct from endpoint) should match original.")
 
-        self.assertEqual(result1_payload, result2_payload, "Result from repeated key should match original.")
+        # Verify DB interactions:
+        # Flask Pre-check 1 (mock_conn_flask_initial): SELECT (no key), INSERT (PROCESSING)
+        self.assertEqual(cursor_mock_flask_initial.execute.call_count, 2)
+        self.assertIn("SELECT", cursor_mock_flask_initial.execute.call_args_list[0][0][0])
+        self.assertIn("INSERT INTO idempotency_keys", cursor_mock_flask_initial.execute.call_args_list[1][0][0])
 
-        # Ensure DB interactions for second call:
-        # _check_pswa_idempotency_key was called and returned the completed_record.
-        # _store_pswa_idempotency_result should NOT have been called to store PROCESSING or new COMPLETED.
-        # The execute calls list would have grown from the first request.
-        # Count how many times INSERT or UPDATE were called after the first request completed.
-        initial_execute_call_count = len(cursor_mock.execute.call_args_list)
+        # Celery Task (mock_conn_task): SELECT (finds PROCESSING), then UPDATE (COMPLETED)
+        self.assertEqual(cursor_mock_task.execute.call_count, 2) # SELECT, then UPDATE to COMPLETED
+        self.assertIn("SELECT", cursor_mock_task.execute.call_args_list[0][0][0])
+        self.assertIn("UPDATE idempotency_keys SET status = %s, result_payload = %s", cursor_mock_task.execute.call_args_list[1][0][0])
+        self.assertEqual(mock_conn_task.commit.call_count, 1) # For COMPLETED state
 
-        # Re-trigger the second call logic path by calling the task method directly (as Celery would)
-        # This is a bit of a workaround to inspect the DB calls for the "already completed" path.
-        # In a real scenario, the Celery worker would pick this up.
-        # Here, task_always_eager means it ran. We need to simulate the DB part of that.
+        # Flask Pre-check 2 (mock_conn_flask_repeat): SELECT (finds COMPLETED)
+        self.assertEqual(cursor_mock_flask_repeat.execute.call_count, 1)
+        self.assertIn("SELECT", cursor_mock_flask_repeat.execute.call_args_list[0][0][0])
+        self.assertEqual(mock_conn_flask_repeat.commit.call_count, 0) # Autocommit=True, no explicit commit
 
-        # For the second call, _check_pswa_idempotency_key returns 'completed_record'.
-        # The weave_script_task should see this and return 'result1_payload' immediately.
-        # No new INSERT/UPDATE to idempotency_keys table should occur.
-
-        # Reset fetchone to return the completed record again for the direct task call simulation
-        cursor_mock.fetchone.return_value = completed_record
-
-        # Simulate the task being called again by Celery (even though it's the same endpoint call)
-        # This is tricky because the task is already "run" by the endpoint.
-        # The key is that the DB mock (cursor_mock.fetchone) controlled its behavior.
-
-        # Check that no new INSERT/UPDATE occurred for the second HTTP call.
-        # The number of execute calls related to storing/updating idempotency should be the same as after 1st call.
-        # Original calls for 1st request: SELECT, INSERT (processing), UPDATE (completed) = 3
-        # For 2nd request: SELECT (finds completed) = 1. Total = 4
-        self.assertEqual(len(cursor_mock.execute.call_args_list), 4)
-
-        # Verify no further commits after the first request's commits.
-        self.assertEqual(mock_conn.commit.call_count, 2) # Should remain 2 (from the first successful run)
-
-    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency') # Apply side_effect inside test
     def test_repeated_key_for_processing_task_conflict_flask_endpoint(self, mock_db_conn_fn_getter):
-        """Test Flask endpoint returns conflict for a key already 'processing' and not timed out."""
+        """Test Flask endpoint returns 409 conflict for a key already 'processing' and not timed out."""
         idempotency_key = f"test-key-processing-{uuid.uuid4()}"
         payload = {"topic": "Processing Topic", "content": "Content for processing task."}
         headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, 'X-Test-Scenario': 'default_success'}
+        service_name = pswa_config['SERVICE_NAME_FOR_IDEMPOTENCY']
 
-        # Mock DB for _check_pswa_idempotency_key to return "processing" record
-        mock_conn = mock_db_connection_registry.setdefault(os.getpid(), MagicMock())
-        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        # Mock DB for Flask endpoint's _check_pswa_idempotency_key to return "processing" record
+        mock_conn_flask_processing_check = MagicMock(name="FlaskProcessingCheckConn")
+        cursor_mock_flask_processing_check = mock_conn_flask_processing_check.cursor.return_value.__enter__.return_value
+        mock_conn_flask_processing_check.autocommit = True # As in main.py
 
         processing_record = {
             'idempotency_key': idempotency_key,
-            'task_name': 'pswa.weave_script_task',
+            'task_name': service_name,
             'status': pswa_config['IDEMPOTENCY_STATUS_PROCESSING'],
             'result_payload': None,
             'locked_at': dt.now(timezone.utc) # Current time, so not timed out
         }
-        cursor_mock.fetchone.return_value = processing_record
+        cursor_mock_flask_processing_check.fetchone.return_value = processing_record
+
+        # Point the main mock getter to return this Flask-specific mock
+        mock_db_conn_fn_getter.side_effect = [mock_conn_flask_processing_check]
 
         # Make the POST request
         response = self.app.post('/v1/weave_script', json=payload, headers=headers)
 
-        # The Celery task itself will see the "PROCESSING_CONFLICT" and return it.
-        # The endpoint then packages this. The HTTP status for the *task status endpoint* might be 200
-        # but the result payload would indicate the conflict.
-        # The initial POST to /v1/weave_script should still be 202 as the task is dispatched.
-        self.assertEqual(response.status_code, 202)
-        task_id = response.get_json()["task_id"]
+        # Expect 409 Conflict directly from the endpoint
+        self.assertEqual(response.status_code, 409)
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "PSWA_IDEMPOTENCY_CONFLICT")
+        self.assertIn("currently processing", json_response.get("message"))
 
-        # Check the task's result
-        status_response = self.app.get(f'/tasks/{task_id}')
-        self.assertEqual(status_response.status_code, 200) # Task itself completed (by returning conflict)
-        json_result = status_response.get_json()
-
-        self.assertEqual(json_result["status"], "SUCCESS") # Celery task finished
-        self.assertIsNotNone(json_result["result"])
-        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
-        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
-
-        # Verify DB interactions:
-        # _check_pswa_idempotency_key was called and returned the processing_record.
-        # _store_pswa_idempotency_result should NOT have been called again.
-        execute_calls = cursor_mock.execute.call_args_list
+        # Verify DB interactions for this Flask pre-check:
+        # _check_idempotency_key was called and returned the processing_record.
+        # _store_idempotency_record should NOT have been called by this pre-check path.
+        execute_calls = cursor_mock_flask_processing_check.execute.call_args_list
         self.assertEqual(len(execute_calls), 1) # Only the SELECT call
         self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, service_name))
 
-        # No new commits
-        self.assertEqual(mock_conn.commit.call_count, 0) # Or 1 if autocommit is false and rollback happens
-        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT if autocommit is off for the connection
+        self.assertEqual(mock_conn_flask_processing_check.commit.call_count, 0) # Autocommit=True
+        self.assertEqual(mock_conn_flask_processing_check.rollback.call_count, 0) # No failure, no rollback
 
     @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
     def test_repeated_key_for_processing_task_lock_timeout_flask_endpoint(self, mock_db_conn_fn_getter):

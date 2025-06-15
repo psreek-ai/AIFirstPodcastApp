@@ -308,9 +308,10 @@ def _put_cpoa_db_connection(conn):
 
 
 # --- CPOA State Management DB Status Constants (New) ---
-IDEMPOTENCY_STATUS_PROCESSING = "processing"
-IDEMPOTENCY_STATUS_COMPLETED = "completed"
-IDEMPOTENCY_STATUS_FAILED = "failed"
+# Idempotency status strings (e.g., "processing", "completed", "failed") for CPOA's
+# own orchestration task are now loaded directly from CPOA-specific environment variables
+# within the orchestrate_podcast_generation function.
+# Other services (PSWA, VFA, etc.) load their own status strings from their respective configs.
 
 WORKFLOW_STATUS_PENDING = "pending"
 WORKFLOW_STATUS_IN_PROGRESS = "in_progress"

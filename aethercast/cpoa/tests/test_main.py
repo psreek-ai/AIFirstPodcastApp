@@ -1871,3 +1871,240 @@ class TestOrchestrateSearchResultsGeneration(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+# --- Base Class for CPOA Idempotency Tests ---
+class BaseCpoaIdempotencyTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if hasattr(cpoa_main, 'celery_app'):
+            cpoa_main.celery_app.conf.update(
+                task_always_eager=True,
+                task_eager_propagates=True
+            )
+        # Assuming cpoa_main.load_config() or similar might exist and be called
+        # For now, critical configs are patched in setUp.
+
+    def setUp(self):
+        self.mock_env_vars_cpoa_idem = {
+            "IDEMPOTENCY_STATUS_PROCESSING": "processing_cpoa_test",
+            "IDEMPOTENCY_STATUS_COMPLETED": "completed_cpoa_test",
+            "IDEMPOTENCY_STATUS_FAILED": "failed_cpoa_test",
+            "IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": "60",
+            "POSTGRES_HOST": "mock_pg_host_cpoa_idem",
+            "POSTGRES_PORT": "5432",
+            "POSTGRES_USER": "mock_pg_user_cpoa_idem",
+            "POSTGRES_PASSWORD": "mock_pg_pass_cpoa_idem",
+            "POSTGRES_DB": "mock_pg_db_cpoa_idem",
+            "DB_POOL_MIN_CONN": "1", # For init_cpoa_db_pool if called
+            "DB_POOL_MAX_CONN": "2",
+            "PSWA_SERVICE_URL": "http://mockpswa.test/api/v1/weave_script_async",
+            "VFA_SERVICE_URL": "http://mockvfa.test/api/v1/forge_voice_async",
+            "ASF_NOTIFICATION_URL": "http://mockasf.test/asf/internal/notify_new_audio",
+            "ASF_WEBSOCKET_BASE_URL": "ws://mockasf.test/ws", # Added for completeness
+            "WCHA_SERVICE_BASE_URL": "http://mockwcha.test",
+            "SCA_SERVICE_URL": "http://mocksca.test/api/v1/craft_snippet_async", # Assuming async
+            "IGA_SERVICE_URL": "http://mockiga.test/api/v1/generate_image_async", # Assuming async
+            "TDA_SERVICE_URL": "http://mocktda.test/api/v1/discover_topics_async", # Assuming async
+            "CPOA_ASF_SEND_UI_UPDATE_URL": "http://mockasf.test/asf/internal/send_ui_update",
+            "CPOA_SERVICE_RETRY_COUNT": "1",
+            "CPOA_SERVICE_RETRY_BACKOFF_FACTOR": "0.01"
+        }
+        self.env_patcher_cpoa_idem = patch.dict(os.environ, self.mock_env_vars_cpoa_idem)
+        self.env_patcher_cpoa_idem.start()
+
+        # Patch module-level constants in cpoa_main that are set from os.getenv at load time
+        self.idem_status_proc_patch = patch.object(cpoa_main, 'IDEMPOTENCY_STATUS_PROCESSING', "processing_cpoa_test")
+        self.idem_status_comp_patch = patch.object(cpoa_main, 'IDEMPOTENCY_STATUS_COMPLETED', "completed_cpoa_test")
+        self.idem_status_fail_patch = patch.object(cpoa_main, 'IDEMPOTENCY_STATUS_FAILED', "failed_cpoa_test")
+        self.idem_lock_timeout_patch = patch.object(cpoa_main, 'IDEMPOTENCY_LOCK_TIMEOUT_SECONDS', 60)
+
+        self.mock_idem_status_proc = self.idem_status_proc_patch.start()
+        self.mock_idem_status_comp = self.idem_status_comp_patch.start()
+        self.mock_idem_status_fail = self.idem_status_fail_patch.start()
+        self.mock_idem_lock_timeout = self.idem_lock_timeout_patch.start()
+
+        # Mock for _get_cpoa_db_connection
+        self.mock_db_conn = MagicMock(name="MockCpoaDbConnectionForIdempotency")
+        self.mock_db_cursor = MagicMock(name="MockCpoaDbCursorForIdempotency")
+        self.mock_db_conn.cursor.return_value.__enter__.return_value = self.mock_db_cursor
+
+        self.get_db_conn_patcher = patch('aethercast.cpoa.main._get_cpoa_db_connection', return_value=self.mock_db_conn)
+        self.mock_get_db_conn = self.get_db_conn_patcher.start()
+
+        # Mock downstream services & helpers
+        self.requests_retry_patcher = patch('aethercast.cpoa.main.requests_with_retry')
+        self.mock_requests_retry = self.requests_retry_patcher.start()
+
+        self.wcha_import_patch = patch.object(cpoa_main, 'WCHA_IMPORT_SUCCESSFUL', True)
+        self.mock_wcha_import = self.wcha_import_patch.start()
+
+        self.send_ui_update_patcher = patch('aethercast.cpoa.main._send_ui_update')
+        self.mock_send_ui_update = self.send_ui_update_patcher.start()
+
+        # Mock CPOA DB state management helpers
+        self.mock_workflow_id = f"wf-test-{uuid.uuid4().hex[:6]}"
+        self.create_workflow_patcher = patch('aethercast.cpoa.main._create_workflow_instance', return_value=self.mock_workflow_id)
+        self.mock_create_workflow = self.create_workflow_patcher.start()
+
+        self.update_workflow_patcher = patch('aethercast.cpoa.main._update_workflow_instance_status')
+        self.mock_update_workflow = self.update_workflow_patcher.start()
+
+        self.create_task_patcher = patch('aethercast.cpoa.main._create_task_instance', side_effect=lambda db, wf_id, name, order, params, initial_status: f"task-{name}-{uuid.uuid4().hex[:4]}")
+        self.mock_create_task = self.create_task_patcher.start()
+
+        self.update_task_patcher = patch('aethercast.cpoa.main._update_task_instance_status')
+        self.mock_update_task = self.update_task_patcher.start()
+
+        self.legacy_update_db_patcher = patch('aethercast.cpoa.main._update_task_status_in_db')
+        self.mock_legacy_update_db = self.legacy_update_db_patcher.start()
+
+        # Default side effects for successful async service calls
+        mock_wcha_submit_resp = MagicMock(status_code=202); mock_wcha_submit_resp.json.return_value = {"task_id": "wcha_async_task_123", "status_url": "/wcha_status/wcha_async_task_123"}
+        mock_wcha_poll_resp = MagicMock(status_code=200); mock_wcha_poll_resp.json.return_value = {"status": "SUCCESS", "result": {"status":"success", "content": "Mocked WCHA content", "source_urls": []}}
+
+        mock_pswa_submit_resp = MagicMock(status_code=202); mock_pswa_submit_resp.json.return_value = {"task_id": "pswa_async_task_123", "status_url": "/pswa_status/pswa_async_task_123"}
+        mock_pswa_poll_resp = MagicMock(status_code=200); mock_pswa_poll_resp.json.return_value = {"status": "SUCCESS", "result": {"script_data": {"script_id": "s1", "title": "Test Script", "segments": [{"segment_title": "Intro", "content": "Test intro"}]}}}
+
+        mock_vfa_submit_resp = MagicMock(status_code=202); mock_vfa_submit_resp.json.return_value = {"task_id": "vfa_async_task_123", "status_url": "/vfa_status/vfa_async_task_123"}
+        mock_vfa_poll_resp = MagicMock(status_code=200); mock_vfa_poll_resp.json.return_value = {"status": "SUCCESS", "result": {"status": "success", "audio_filepath": "/mock/audio.mp3", "stream_id": "mock_stream_123", "tts_settings_used": {}}}
+
+        mock_asf_resp = MagicMock(status_code=200); mock_asf_resp.json.return_value = {"message": "ASF Notified Successfully"}
+
+        # Define a more robust side_effect for requests_with_retry
+        self.service_call_mocks = {
+            "WCHA_SUBMIT": mock_wcha_submit_resp, "WCHA_POLL": mock_wcha_poll_resp,
+            "PSWA_SUBMIT": mock_pswa_submit_resp, "PSWA_POLL": mock_pswa_poll_resp,
+            "VFA_SUBMIT": mock_vfa_submit_resp, "VFA_POLL": mock_vfa_poll_resp,
+            "ASF_NOTIFY": mock_asf_resp
+        }
+
+        def requests_retry_side_effect(method, url, **kwargs):
+            # Determine which service is being called based on URL
+            if cpoa_main.WCHA_SERVICE_BASE_URL in url:
+                return self.service_call_mocks["WCHA_POLL"] if method.lower() == "get" else self.service_call_mocks["WCHA_SUBMIT"]
+            elif cpoa_main.PSWA_SERVICE_URL in url: # Assuming PSWA_SERVICE_URL is the submit URL
+                return self.service_call_mocks["PSWA_POLL"] if method.lower() == "get" and "/pswa_status/" in url else self.service_call_mocks["PSWA_SUBMIT"]
+            elif cpoa_main.VFA_SERVICE_URL in url: # Assuming VFA_SERVICE_URL is the submit URL
+                return self.service_call_mocks["VFA_POLL"] if method.lower() == "get" and "/vfa_status/" in url else self.service_call_mocks["VFA_SUBMIT"]
+            elif cpoa_main.ASF_NOTIFICATION_URL in url:
+                return self.service_call_mocks["ASF_NOTIFY"]
+
+            # Fallback for unexpected calls during a specific test, can be overridden in the test itself
+            print(f"WARNING: Unhandled mock URL in BaseCpoaIdempotencyTest requests_retry: {method} {url}")
+            fallback_resp = MagicMock(status_code=404, text=f"Unhandled mock URL: {url}")
+            fallback_resp.json.side_effect = json.JSONDecodeError("No JSON for 404", "", 0)
+            return fallback_resp
+
+        self.mock_requests_retry.side_effect = requests_retry_side_effect
+
+    def tearDown(self):
+        self.env_patcher_cpoa_idem.stop()
+        self.get_db_conn_patcher.stop()
+        self.requests_retry_patcher.stop()
+        self.wcha_import_patch.stop()
+        self.send_ui_update_patcher.stop()
+        self.create_workflow_patcher.stop()
+        self.update_workflow_patcher.stop()
+        self.create_task_patcher.stop()
+        self.update_task_patcher.stop()
+        self.legacy_update_db_patcher.stop()
+        self.idem_status_proc_patch.stop()
+        self.idem_status_comp_patch.stop()
+        self.idem_status_fail_patch.stop()
+        self.idem_lock_timeout_patch.stop()
+
+
+class TestCpoaTaskSelfIdempotency(BaseCpoaIdempotencyTest):
+
+    @patch('aethercast.cpoa.main._check_idempotency_key')
+    @patch('aethercast.cpoa.main._store_idempotency_record')
+    def test_new_key_full_success(self, mock_store_idempotency_record, mock_check_idempotency_key):
+        """Test CPOA main task with a new idempotency key, expecting full successful podcast generation."""
+
+        idempotency_key_for_cpoa_task = f"cpoa-task-idem-{uuid.uuid4().hex}"
+        test_topic = "The Future of Idempotent Podcasting"
+        cpoa_task_name_for_idempotency_check = "cpoa_orchestrate_podcast_task" # As used in orchestrate_podcast_generation
+
+        # 1. Mock _check_idempotency_key to return None (new key)
+        mock_check_idempotency_key.return_value = None
+
+        # Call the Celery task.
+        # The `task_id` kwarg to apply() sets `self.request.id` for eager tasks.
+        # `orchestrate_podcast_generation` uses this `self.request.id` (passed as `original_task_id`)
+        # as the `cpoa_orchestration_idempotency_key`.
+        task_result = cpoa_main.cpoa_orchestrate_podcast_task.apply(
+            kwargs={
+                'topic': test_topic,
+                'original_task_id_from_caller': "caller_provided_id_which_is_not_used_for_idem_key_here",
+                'user_id': "test_user_cpoa_new_key",
+                'client_id': "test_client_cpoa_new_key"
+                # voice_params_input, user_preferences, test_scenarios default to None
+            },
+            task_id=idempotency_key_for_cpoa_task
+        ).get()
+
+        # --- Assertions ---
+        self.assertIsNotNone(task_result, "Task result should not be None")
+        self.assertEqual(task_result.get('status'), cpoa_main.CPOA_STATUS_COMPLETED, f"Task status should be COMPLETED. Got: {task_result.get('status')}, Error: {task_result.get('error_message')}")
+        self.assertEqual(task_result.get('workflow_id'), self.mock_workflow_id, "Workflow ID in result should match mock")
+        self.assertIsNotNone(task_result.get('final_audio_details'), "Final audio details should be present")
+        self.assertIsNotNone(task_result['final_audio_details'].get('audio_filepath'), "Audio filepath should be present")
+        self.assertIsNotNone(task_result['final_audio_details'].get('stream_id'), "Stream ID should be present")
+
+        # Verify _check_idempotency_key call
+        mock_check_idempotency_key.assert_called_once_with(
+            self.mock_db_conn,
+            idempotency_key_for_cpoa_task,
+            cpoa_task_name_for_idempotency_check,
+            workflow_id_for_log=None
+        )
+
+        # Verify _store_idempotency_record calls
+        # First call: Storing "PROCESSING"
+        call_args_processing = mock_store_idempotency_record.call_args_list[0]
+        self.assertEqual(call_args_processing[0][0], self.mock_db_conn) # db_conn
+        self.assertEqual(call_args_processing[0][1], idempotency_key_for_cpoa_task) # idempotency_key
+        self.assertEqual(call_args_processing[0][2], cpoa_task_name_for_idempotency_check) # task_name
+        self.assertEqual(call_args_processing[0][3], self.mock_idem_status_proc) # status (patched global)
+        self.assertEqual(call_args_processing[1]['cpoa_workflow_id'], self.mock_workflow_id) # cpoa_workflow_id
+        self.assertTrue(call_args_processing[1]['is_new_key']) # is_new_key=True
+
+        # Second call: Storing "COMPLETED"
+        call_args_completed = mock_store_idempotency_record.call_args_list[1]
+        self.assertEqual(call_args_completed[0][0], self.mock_db_conn)
+        self.assertEqual(call_args_completed[0][1], idempotency_key_for_cpoa_task)
+        self.assertEqual(call_args_completed[0][2], cpoa_task_name_for_idempotency_check)
+        self.assertEqual(call_args_completed[0][3], self.mock_idem_status_comp) # status (patched global)
+        self.assertEqual(call_args_completed[1]['cpoa_workflow_id'], self.mock_workflow_id)
+        self.assertEqual(call_args_completed[1]['result_payload'], task_result) # Full task result stored
+        self.assertFalse(call_args_completed[1]['is_new_key']) # is_new_key=False
+
+        self.assertEqual(mock_store_idempotency_record.call_count, 2)
+
+        # Verify downstream service calls (at least one call for each submit)
+        # Exact number of calls to mock_requests_retry depends on polling strategy.
+        # Submit calls: WCHA, PSWA, VFA, ASF = 4 distinct service calls for success path.
+        # With async polling, each might have a submit (POST) and one or more poll (GET) calls.
+        # Our default side_effect mocks submit + one successful poll for async services.
+        # WCHA (submit+poll), PSWA (submit+poll), VFA (submit+poll), ASF (submit) = 2+2+2+1 = 7 calls
+        self.assertGreaterEqual(self.mock_requests_retry.call_count, 7)
+
+        # Check commits on the main DB connection mock
+        # 1. Commit after initial 'PROCESSING' idempotency store.
+        # 2. Commit in the `finally` block for final workflow status updates.
+        self.assertEqual(self.mock_db_conn.commit.call_count, 2)
+        self.mock_db_conn.rollback.assert_not_called()
+
+        # Verify new state management calls
+        self.mock_create_workflow.assert_called_once()
+        self.mock_update_workflow.assert_any_call(self.mock_db_conn, self.mock_workflow_id, cpoa_main.WORKFLOW_STATUS_IN_PROGRESS)
+        self.mock_update_workflow.assert_any_call(self.mock_db_conn, self.mock_workflow_id, cpoa_main.WORKFLOW_STATUS_COMPLETED, context_data=unittest.mock.ANY, error_message=None)
+        self.assertGreaterEqual(self.mock_create_task.call_count, 4) # WCHA, PSWA, VFA, ASF
+        self.assertGreaterEqual(self.mock_update_task.call_count, 4) # For each task's updates
+
+        self.mock_send_ui_update.assert_any_call(
+            "test_client_cpoa_new_key",
+            cpoa_main.UI_EVENT_GENERATION_STATUS,
+            {"message": "Podcast generation complete!", "final_status": cpoa_main.WORKFLOW_STATUS_COMPLETED, "is_terminal": True},
+            workflow_id_for_log=self.mock_workflow_id
+        )
