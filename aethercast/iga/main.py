@@ -416,8 +416,64 @@ def generate_image_async_endpoint():
         app.logger.warning(f"IGA Request {request_id}: Missing X-Idempotency-Key header.")
         return jsonify({"error_code": "IGA_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
 
+    # --- Idempotency Pre-check at Endpoint Level ---
+    # Task name should match the Celery task name for consistency in the idempotency_keys table
+    idem_task_name_for_db = 'generate_image_vertex_ai_task' # Should match celery_app.task name
+    db_conn_http = None
+    if PSYCOPG2_AVAILABLE:
+        try:
+            db_conn_http = _get_iga_db_connection()
+            # For read or single write operations not needing rollback for this pre-check.
+            # If we write 'processing', we commit it.
+            db_conn_http.autocommit = False
+
+            existing_record = _check_idempotency_key(db_conn_http, idempotency_key, idem_task_name_for_db)
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record.get('locked_at')
+                lock_timeout = iga_config['IGA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+
+                if status == iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED']:
+                    app.logger.info(f"IGA Request {request_id}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra={'workflow_id': workflow_id})
+                    db_conn_http.rollback() # No changes needed
+                    return jsonify(existing_record['result_payload']), 200 # OK
+                elif status == iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING']:
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
+                        app.logger.warning(f"IGA Request {request_id}: Idempotency key '{idempotency_key}' is PROCESSING. Returning conflict.", extra={'workflow_id': workflow_id})
+                        db_conn_http.rollback() # No changes needed
+                        return jsonify({"error_code": "IGA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409 # Conflict
+                    else: # Lock expired or null
+                        app.logger.info(f"IGA Request {request_id}: Idempotency key '{idempotency_key}' was PROCESSING but lock expired/null. Will re-process.", extra={'workflow_id': workflow_id})
+                        _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                        db_conn_http.commit()
+                elif status == iga_config['IGA_IDEMPOTENCY_STATUS_FAILED']:
+                    app.logger.info(f"IGA Request {request_id}: Idempotency key '{idempotency_key}' previously FAILED. Will re-process.", extra={'workflow_id': workflow_id})
+                    _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                    db_conn_http.commit()
+            else: # No existing record, so store a new one as "processing"
+                app.logger.info(f"IGA Request {request_id}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra={'workflow_id': workflow_id})
+                _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+                db_conn_http.commit()
+        except psycopg2.Error as db_err_http:
+            app.logger.error(f"IGA Request {request_id}: Database error during HTTP idempotency pre-check for key '{idempotency_key}': {db_err_http}", exc_info=True, extra={'workflow_id': workflow_id})
+            if db_conn_http: db_conn_http.rollback()
+            # Allow to proceed, Celery task will handle idempotency. Or, could return 503.
+            app.logger.warning(f"IGA Request {request_id}: Proceeding to Celery dispatch despite DB error in pre-check. Celery task will manage idempotency.")
+        except Exception as e_idem_http:
+            app.logger.error(f"IGA Request {request_id}: Unexpected error during HTTP idempotency pre-check for key '{idempotency_key}': {e_idem_http}", exc_info=True, extra={'workflow_id': workflow_id})
+            if db_conn_http: db_conn_http.rollback()
+            # Allow Celery task to handle it to ensure task submission if DB issue is transient.
+            app.logger.warning(f"IGA Request {request_id}: Proceeding to Celery dispatch despite unexpected error in pre-check. Celery task will manage idempotency.")
+        finally:
+            if db_conn_http and not db_conn_http.closed:
+                db_conn_http.close()
+    else: # psycopg2 not available at endpoint
+        app.logger.warning(f"IGA Request {request_id}: psycopg2 not available. Skipping HTTP endpoint idempotency pre-check for key '{idempotency_key}'. Celery task will handle.", extra={'workflow_id': workflow_id})
+
     if not iga_config.get("GCS_BUCKET_NAME"):
         app.logger.error(f"IGA Request {request_id}: GCS_BUCKET_NAME not configured.")
+        # This is a critical configuration error, should be caught before dispatching task.
+        # If idempotency key was set to "processing", this might leave it in that state until timeout.
         return jsonify({"error_code": "IGA_CONFIG_ERROR_GCS_BUCKET", "message": "IGA service GCS bucket not configured."}), 503
 
     try:
@@ -464,8 +520,13 @@ def get_task_status(task_id: str):
     response_data = {"task_id": task_id, "status": task_result.status, "result": None}
 
     if task_result.successful():
-        response_data["result"] = task_result.result
-        return jsonify(response_data), 200
+        task_output = task_result.result
+        response_data["result"] = task_output
+        http_status = 200
+        # Check if the task result itself indicates a business logic conflict for idempotency
+        if isinstance(task_output, dict) and task_output.get("status") == "PROCESSING_CONFLICT":
+            http_status = 409 # Conflict
+        return jsonify(response_data), http_status
     elif task_result.failed():
         error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
         response_data["result"] = error_info

@@ -609,6 +609,55 @@ def craft_snippet_async_endpoint():
         app.logger.warning(f"Request {request_id}: Missing X-Idempotency-Key header.")
         return flask.jsonify({"error_code": "SCA_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
 
+    # --- Idempotency Pre-check at Endpoint Level ---
+    idem_task_name_for_db = 'craft_snippet_task' # Matches Celery task name
+    db_conn_http = None
+    if PSYCOPG2_AVAILABLE:
+        try:
+            db_conn_http = _get_sca_db_connection()
+            db_conn_http.autocommit = False # Manage transaction for pre-check
+
+            existing_record = _check_idempotency_key(db_conn_http, idempotency_key, idem_task_name_for_db)
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record.get('locked_at')
+                lock_timeout = sca_config['SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+
+                if status == sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED']:
+                    app.logger.info(f"SCA Request {request_id}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra={'workflow_id': workflow_id})
+                    db_conn_http.rollback()
+                    return flask.jsonify(existing_record['result_payload']), 200
+                elif status == sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING']:
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
+                        app.logger.warning(f"SCA Request {request_id}: Idempotency key '{idempotency_key}' is PROCESSING. Returning conflict.", extra={'workflow_id': workflow_id})
+                        db_conn_http.rollback()
+                        return flask.jsonify({"error_code": "SCA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409
+                    else: # Lock expired
+                        app.logger.info(f"SCA Request {request_id}: Idempotency key '{idempotency_key}' was PROCESSING but lock expired. Re-processing.", extra={'workflow_id': workflow_id})
+                        _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                        db_conn_http.commit()
+                elif status == sca_config['SCA_IDEMPOTENCY_STATUS_FAILED']:
+                    app.logger.info(f"SCA Request {request_id}: Idempotency key '{idempotency_key}' previously FAILED. Re-processing.", extra={'workflow_id': workflow_id})
+                    _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                    db_conn_http.commit()
+            else: # No existing record
+                app.logger.info(f"SCA Request {request_id}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra={'workflow_id': workflow_id})
+                _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+                db_conn_http.commit()
+        except psycopg2.Error as db_err_http:
+            app.logger.error(f"SCA Request {request_id}: Database error during HTTP idempotency pre-check: {db_err_http}", exc_info=True, extra={'workflow_id': workflow_id})
+            if db_conn_http: db_conn_http.rollback()
+            app.logger.warning(f"SCA Request {request_id}: Proceeding to Celery dispatch despite DB error in pre-check.")
+        except Exception as e_idem_http:
+            app.logger.error(f"SCA Request {request_id}: Unexpected error during HTTP idempotency pre-check: {e_idem_http}", exc_info=True, extra={'workflow_id': workflow_id})
+            if db_conn_http: db_conn_http.rollback()
+            app.logger.warning(f"SCA Request {request_id}: Proceeding to Celery dispatch despite unexpected error in pre-check.")
+        finally:
+            if db_conn_http and not db_conn_http.closed:
+                db_conn_http.close()
+    else: # psycopg2 not available at endpoint
+        app.logger.warning(f"SCA Request {request_id}: psycopg2 not available. Skipping HTTP pre-check for key '{idempotency_key}'. Celery task will handle idempotency.", extra={'workflow_id': workflow_id})
+
     try:
         request_data = flask.request.get_json()
         if not request_data:

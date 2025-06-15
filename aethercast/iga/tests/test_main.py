@@ -134,25 +134,41 @@ class TestIgaIdempotencyFlask(BaseIgaServiceTest):
         self.assertIn("image_url", status_json["result"])
         self.assertTrue(status_json["result"]["image_url"].startswith("gs://test-iga-bucket/"))
 
-        # Verify DB interactions (SELECT, INSERT PROCESSING, UPDATE COMPLETED)
+        # Verify DB interactions
         mock_conn = mock_db_connection_registry_iga[os.getpid()]
         self.assertTrue(mock_db_conn_getter.called)
-        execute_calls = mock_conn.cursor.return_value.__enter__.return_value.execute.call_args_list
+        cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
+        execute_calls = cursor_mock.execute.call_args_list
 
+        # Endpoint pre-check: SELECT, INSERT (PROCESSING)
+        # Celery task: SELECT, UPDATE (COMPLETED)
+        # Total can be 3 or 4 depending on whether Celery task's SELECT finds the PROCESSING record updated by endpoint.
         self.assertGreaterEqual(len(execute_calls), 3)
-        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
-        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0])
-        self.assertEqual(execute_calls[1][0][1][4], iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING'])
-        self.assertIn("UPDATE idempotency_keys SET status = %s", execute_calls[2][0][0])
-        self.assertEqual(execute_calls[2][0][1][0], iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'])
-        self.assertEqual(mock_conn.commit.call_count, 2)
+
+        # Endpoint pre-check INSERT PROCESSING
+        self.assertIn("SELECT idempotency_key", execute_calls[0][0][0]) # First call in endpoint pre-check
+        self.assertIn("INSERT INTO idempotency_keys", execute_calls[1][0][0]) # Second call in endpoint pre-check
+        self.assertEqual(execute_calls[1][0][1][4], iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING']) # status
+        self.assertIsNotNone(execute_calls[1][0][1][3]) # locked_at for processing
+
+        # Celery task final UPDATE COMPLETED
+        found_completed_update = any(
+            "UPDATE idempotency_keys SET status = %s" in str(call[0][0]) and
+            call[0][1][0] == iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED']
+            for call in execute_calls
+        )
+        self.assertTrue(found_completed_update, "Update to COMPLETED not found in DB calls.")
+
+        # Commits: 1 from endpoint pre-check (for PROCESSING), 1 from Celery task (for COMPLETED)
+        self.assertGreaterEqual(mock_conn.commit.call_count, 2)
 
 
     def test_completed_idempotency_key_returns_stored_result(self, mock_db_conn_getter):
-        """Test IGA Flask endpoint returns stored result for a COMPLETED idempotency key."""
+        """Test IGA Flask endpoint returns stored result for a COMPLETED idempotency key due to pre-check."""
         idempotency_key = f"iga-test-completed-{uuid.uuid4()}"
+        workflow_id = f"wf-iga-test-completed-{uuid.uuid4()}"
         payload = {"prompt": "A prompt for a completed task"}
-        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, "X-Workflow-ID": workflow_id}
 
         stored_result = {"image_url": f"gs://test-iga-bucket/images/iga/completed_{uuid.uuid4()}.png", "prompt_used": payload["prompt"]}
 
@@ -161,66 +177,57 @@ class TestIgaIdempotencyFlask(BaseIgaServiceTest):
         completed_record = {
             'idempotency_key': idempotency_key, 'task_name': 'generate_image_vertex_ai_task',
             'status': iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'],
-            'result_payload': stored_result, # Already a dict
+            'result_payload': stored_result,
+            'workflow_id': workflow_id,
             'locked_at': None
         }
         cursor_mock.fetchone.return_value = completed_record
 
         response = self.app.post('/generate_image', json=payload, headers=headers)
-        self.assertEqual(response.status_code, 202) # Task is dispatched
+        self.assertEqual(response.status_code, 200) # Endpoint pre-check returns 200
+        json_response = response.get_json()
+        self.assertEqual(json_response, stored_result) # Should be the stored result directly
 
-        task_id = response.get_json()["task_id"]
-        status_response = self.app.get(f'/v1/tasks/{task_id}') # Use correct status URL
-        self.assertEqual(status_response.status_code, 200)
-        json_result = status_response.get_json()
-
-        self.assertEqual(json_result["status"], "SUCCESS")
-        self.assertEqual(json_result["result"], stored_result) # Should be the stored result
-
-        # Verify DB: Only one SELECT call. No new INSERTs or UPDATEs.
+        # Verify DB: Only one SELECT call from endpoint pre-check.
         execute_calls = cursor_mock.execute.call_args_list
         self.assertEqual(len(execute_calls), 1)
         self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
-        self.assertEqual(mock_conn.commit.call_count, 0) # No new commits
-        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, 'generate_image_vertex_ai_task')) # Check params
+        self.assertEqual(mock_conn.commit.call_count, 0)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT by endpoint
 
     def test_processing_idempotency_key_conflict(self, mock_db_conn_getter):
-        """Test IGA Flask endpoint returns 409 for a 'processing' and not timed out key."""
+        """Test IGA Flask endpoint returns 409 for a 'processing' and not timed out key due to pre-check."""
         idempotency_key = f"iga-test-processing-{uuid.uuid4()}"
+        workflow_id = f"wf-iga-test-processing-{uuid.uuid4()}"
         payload = {"prompt": "A prompt for a processing task"}
-        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, "X-Workflow-ID": workflow_id}
 
         mock_conn = mock_db_connection_registry_iga.setdefault(os.getpid(), MagicMock())
         cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
         processing_record = {
             'idempotency_key': idempotency_key, 'task_name': 'generate_image_vertex_ai_task',
             'status': iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING'],
-            'locked_at': datetime.now(timezone.utc) # Not timed out
+            'workflow_id': workflow_id,
+            'locked_at': datetime.now(timezone.utc)
         }
         cursor_mock.fetchone.return_value = processing_record
 
         response = self.app.post('/generate_image', json=payload, headers=headers)
-        self.assertEqual(response.status_code, 202) # Task is dispatched
+        self.assertEqual(response.status_code, 409) # Endpoint pre-check returns 409
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "IGA_IDEMPOTENCY_CONFLICT")
 
-        task_id = response.get_json()["task_id"]
-        status_response = self.app.get(f'/v1/tasks/{task_id}')
-        self.assertEqual(status_response.status_code, 409) # Expecting 409 Conflict from task status
-        json_result = status_response.get_json()
-
-        self.assertEqual(json_result["status"], "SUCCESS") # Celery task itself completed by returning the conflict info
-        self.assertIsNotNone(json_result["result"])
-        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
-        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
-
-        # Verify DB: Only one SELECT. No new INSERT/UPDATE.
+        # Verify DB: Only one SELECT from endpoint pre-check.
         execute_calls = cursor_mock.execute.call_args_list
         self.assertEqual(len(execute_calls), 1)
         self.assertEqual(mock_conn.commit.call_count, 0)
-        self.assertEqual(mock_conn.rollback.call_count, 1)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT by endpoint
 
     def test_processing_key_lock_timeout(self, mock_db_conn_getter):
         """Test IGA Flask endpoint re-processes if 'processing' lock has timed out."""
         idempotency_key = f"iga-test-lock-timeout-{uuid.uuid4()}"
+        workflow_id = f"wf-iga-test-lock-timeout-{uuid.uuid4()}"
         payload = {"prompt": "A prompt for a lock timeout task"}
         headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
 

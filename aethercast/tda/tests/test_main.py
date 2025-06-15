@@ -174,54 +174,45 @@ class TestTdaIdempotencyFlask(BaseTdaServiceTest):
         cursor_mock.fetchone.return_value = completed_record
 
         response = self.app.post('/discover_topics', json=payload, headers=headers)
-        self.assertEqual(response.status_code, 202)
-        
-        task_id = response.get_json()["task_id"]
-        status_response = self.app.get(f'/v1/tasks/{task_id}')
-        self.assertEqual(status_response.status_code, 200)
-        json_result = status_response.get_json()
+        self.assertEqual(response.status_code, 200) # Now expects 200 due to pre-check
+        json_response = response.get_json()
+        self.assertEqual(json_response, stored_task_result) # Should be the stored result directly
 
-        self.assertEqual(json_result["status"], "SUCCESS")
-        self.assertEqual(json_result["result"], stored_task_result)
-
+        # Verify DB: Only one SELECT call from endpoint pre-check.
         execute_calls = cursor_mock.execute.call_args_list
         self.assertEqual(len(execute_calls), 1)
         self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, 'discover_topics_task'))
         self.assertEqual(mock_conn.commit.call_count, 0)
-        self.assertEqual(mock_conn.rollback.call_count, 1)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT by endpoint
 
     def test_processing_idempotency_key_conflict(self, mock_db_conn_getter):
-        """Test TDA Flask endpoint returns 409 for a 'processing' and not timed out key."""
+        """Test TDA Flask endpoint returns 409 for a 'processing' and not timed out key due to pre-check."""
         idempotency_key = f"tda-test-processing-{uuid.uuid4()}"
+        workflow_id = f"wf-tda-test-processing-{uuid.uuid4()}" # Added for completeness
         payload = {"query": "processing query"}
-        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, "X-Workflow-ID": workflow_id}
 
         mock_conn = mock_db_connection_registry_tda.setdefault(os.getpid(), MagicMock())
         cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
         processing_record = {
             'idempotency_key': idempotency_key, 'task_name': 'discover_topics_task',
             'status': tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'],
-            'locked_at': datetime.now(timezone.utc) # Not timed out
+            'workflow_id': workflow_id,
+            'locked_at': datetime.now(timezone.utc)
         }
         cursor_mock.fetchone.return_value = processing_record
 
         response = self.app.post('/discover_topics', json=payload, headers=headers)
-        self.assertEqual(response.status_code, 202) # Task dispatched
-
-        task_id = response.get_json()["task_id"]
-        status_response = self.app.get(f'/v1/tasks/{task_id}')
-        self.assertEqual(status_response.status_code, 409) # Expecting 409 Conflict
-        json_result = status_response.get_json()
+        self.assertEqual(response.status_code, 409) # Endpoint pre-check returns 409
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "TDA_IDEMPOTENCY_CONFLICT")
         
-        self.assertEqual(json_result["status"], "SUCCESS")
-        self.assertIsNotNone(json_result["result"])
-        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
-        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
-
+        # Verify DB: Only one SELECT from endpoint pre-check.
         execute_calls = cursor_mock.execute.call_args_list
-        self.assertEqual(len(execute_calls), 1) # Only SELECT
+        self.assertEqual(len(execute_calls), 1)
         self.assertEqual(mock_conn.commit.call_count, 0)
-        self.assertEqual(mock_conn.rollback.call_count, 1)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT by endpoint
 
     def test_processing_key_lock_timeout(self, mock_db_conn_getter):
         """Test TDA Flask endpoint re-processes if 'processing' lock has timed out."""

@@ -447,12 +447,14 @@ def _create_task_instance(db_conn, workflow_id: str, agent_name: str, task_order
         pass # Connection managed by the caller, cursor closed by 'with'
 
 # --- Idempotency DB Helpers ---
-def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
+def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str, workflow_id_for_log: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """
-    Checks for an existing idempotency key.
+    Checks for an existing idempotency key for a given task_name.
     Returns the key's record if found, None otherwise.
+    task_name: Specific identifier for the operation associated with the key (e.g., "cpoa_orchestrate_podcast_task").
+    workflow_id_for_log: The CPOA workflow_id, used for logging context only.
     """
-    log_extra = {'workflow_id': 'N/A', 'task_id': 'IdempotencyCheck'} # Generic task_id for this check
+    log_extra = {'workflow_id': workflow_id_for_log or 'N/A', 'idempotency_key': idempotency_key, 'task_name_checked': task_name}
     try:
         with db_conn.cursor() as cur:
             cur.execute(
@@ -461,76 +463,69 @@ def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Opt
             )
             record = cur.fetchone()
             if record:
-                logger.info(f"Idempotency key '{idempotency_key}' for task '{task_name}' found with status '{record['status']}'.", extra=log_extra)
+                logger.info(f"Idempotency key found.", extra=log_extra)
                 return dict(record)
-            logger.info(f"No existing idempotency key '{idempotency_key}' found for task '{task_name}'.", extra=log_extra)
+            logger.info(f"No existing idempotency key found.", extra=log_extra)
             return None
     except psycopg2.Error as e:
-        logger.error(f"DB error checking idempotency key '{idempotency_key}' for task '{task_name}': {e}", exc_info=True, extra=log_extra)
-        raise # Re-raise to be handled by caller, potentially rolling back transaction
+        logger.error(f"DB error checking idempotency key: {e}", exc_info=True, extra=log_extra)
+        raise
     except Exception as e_unexp:
-        logger.error(f"Unexpected error checking idempotency key '{idempotency_key}' for task '{task_name}': {e_unexp}", exc_info=True, extra=log_extra)
+        logger.error(f"Unexpected error checking idempotency key: {e_unexp}", exc_info=True, extra=log_extra)
         raise
 
-def _store_idempotency_result(db_conn, idempotency_key: str, task_name: str, status: str, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None, workflow_id: Optional[str] = None, is_new_key: bool = True):
+def _store_idempotency_record(db_conn, idempotency_key: str, task_name: str, status: str, cpoa_workflow_id: Optional[str] = None, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None, is_new_key: bool = True):
     """
     Stores or updates an idempotency key record.
-    If is_new_key is True, it performs an INSERT.
-    If is_new_key is False, it performs an UPDATE to set status, result/error payload.
-    Manages locked_at updates based on status.
+    task_name: Specific identifier for the operation (e.g., "cpoa_orchestrate_podcast_task").
+    cpoa_workflow_id: The CPOA's internal workflow_id to associate with this idempotency record.
     """
-    log_extra = {'workflow_id': workflow_id or 'N/A', 'task_id': 'IdempotencyStore'}
+    log_extra = {'workflow_id': cpoa_workflow_id or 'N/A', 'idempotency_key': idempotency_key, 'task_name_stored': task_name, 'new_status': status}
     try:
         with db_conn.cursor() as cur:
+            current_time_utc = datetime.now(timezone.utc)
             if is_new_key:
-                # For a new key, status should typically be 'processing'
-                logger.info(f"Storing new idempotency key '{idempotency_key}' for task '{task_name}' with status '{status}'.", extra=log_extra)
+                logger.info(f"Attempting to store new idempotency key.", extra=log_extra)
                 cur.execute(
                     """
-                    INSERT INTO idempotency_keys (idempotency_key, task_name, workflow_id, locked_at, status, result_payload, error_payload)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO idempotency_keys (idempotency_key, task_name, workflow_id, created_at, locked_at, status, result_payload, error_payload)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (idempotency_key) DO UPDATE SET
-                        task_name = EXCLUDED.task_name, -- Should not change but required by ON CONFLICT
+                        task_name = EXCLUDED.task_name,
                         workflow_id = EXCLUDED.workflow_id,
                         locked_at = EXCLUDED.locked_at,
                         status = EXCLUDED.status,
                         result_payload = EXCLUDED.result_payload,
                         error_payload = EXCLUDED.error_payload,
-                        created_at = idempotency_keys.created_at; -- Keep original created_at
+                        created_at = idempotency_keys.created_at;
                     """,
-                    (idempotency_key, task_name, workflow_id,
-                     datetime.now(timezone.utc) if status == IDEMPOTENCY_STATUS_PROCESSING else None, # Set locked_at only if processing
+                    (idempotency_key, task_name, cpoa_workflow_id,
+                     current_time_utc, # created_at
+                     current_time_utc if status == IDEMPOTENCY_STATUS_PROCESSING else None, # locked_at
                      status, json.dumps(result_payload) if result_payload else None,
                      json.dumps(error_payload) if error_payload else None)
                 )
+                logger.info(f"Successfully inserted new idempotency key (or updated on conflict).", extra=log_extra)
             else: # Update existing key
-                logger.info(f"Updating idempotency key '{idempotency_key}' for task '{task_name}' to status '{status}'.", extra=log_extra)
-                locked_at_update_sql = ""
-                params = [status, json.dumps(result_payload) if result_payload else None, json.dumps(error_payload) if error_payload else None]
+                logger.info(f"Attempting to update existing idempotency key.", extra=log_extra)
+                set_clauses = ["status = %s", "result_payload = %s", "error_payload = %s", "workflow_id = %s"] # Always include workflow_id in update
+                params = [status, json.dumps(result_payload) if result_payload else None, json.dumps(error_payload) if error_payload else None, cpoa_workflow_id]
 
                 if status == IDEMPOTENCY_STATUS_PROCESSING:
-                    locked_at_update_sql = ", locked_at = %s"
-                    params.append(datetime.now(timezone.utc))
+                    set_clauses.append("locked_at = %s")
+                    params.append(current_time_utc)
                 elif status in [IDEMPOTENCY_STATUS_COMPLETED, IDEMPOTENCY_STATUS_FAILED]:
-                    locked_at_update_sql = ", locked_at = NULL" # Unlock on completion or failure
+                    set_clauses.append("locked_at = NULL")
 
                 params.extend([idempotency_key, task_name])
-
-                cur.execute(
-                    f"""
-                    UPDATE idempotency_keys
-                    SET status = %s, result_payload = %s, error_payload = %s {locked_at_update_sql}
-                    WHERE idempotency_key = %s AND task_name = %s;
-                    """,
-                    tuple(params)
-                )
-            logger.info(f"Successfully stored/updated idempotency key '{idempotency_key}' for task '{task_name}'.", extra=log_extra)
-
+                update_sql = f"UPDATE idempotency_keys SET {', '.join(set_clauses)} WHERE idempotency_key = %s AND task_name = %s;"
+                cur.execute(update_sql, tuple(params))
+                logger.info(f"Successfully updated existing idempotency key.", extra=log_extra)
     except psycopg2.Error as e:
-        logger.error(f"DB error storing idempotency key '{idempotency_key}' for task '{task_name}': {e}", exc_info=True, extra=log_extra)
+        logger.error(f"DB error storing idempotency key: {e}", exc_info=True, extra=log_extra)
         raise
     except Exception as e_unexp:
-        logger.error(f"Unexpected error storing idempotency key '{idempotency_key}' for task '{task_name}': {e_unexp}", exc_info=True, extra=log_extra)
+        logger.error(f"Unexpected error storing idempotency key: {e_unexp}", exc_info=True, extra=log_extra)
         raise
 
 def _update_task_instance_status(db_conn, task_id: str, status: str, output_summary: Optional[dict] = None, error_details: Optional[dict] = None, retry_count: Optional[int] = None, workflow_id_for_log: Optional[str] = None):
@@ -742,31 +737,21 @@ def _send_ui_update(client_id: Optional[str], event_name: str, data: Dict[str, A
 
 def orchestrate_podcast_generation(
     topic: str,
-    original_task_id: str, # ID from API Gateway, used for logging & correlation
+    original_task_id: str, # This is now used as the idempotency_key for the CPOA orchestration itself
     user_id: Optional[str] = None,
     voice_params_input: Optional[dict] = None,
     client_id: Optional[str] = None,
     user_preferences: Optional[dict] = None,
     test_scenarios: Optional[dict] = None,
-    # Add Celery task context if needed, e.g., self for bind=True
+    idempotency_key: Optional[str] = None # This is the client-provided key, now maps to original_task_id
 ) -> Dict[str, Any]:
-    # This is the core logic, to be run by the Celery task.
-    # The 'original_task_id' here is the Celery task's own ID if bind=True, or a passed-in ID.
-    # For simplicity, let's assume original_task_id is passed in if this function is called directly,
-    # or can be derived from self.request.id if this becomes the task body itself.
-    # For now, keeping it as a parameter.
-
-    # If this function is directly decorated as a task, 'original_task_id' might be self.request.id
-    # For now, let's assume it's a distinct ID for the conceptual podcast operation.
-
-    # Idempotency key for the CPOA task itself will be passed in as `original_task_id` if generated by trigger,
-    # or can be self.request.id if this task is the first point of idempotency.
-    # For now, let's assume original_task_id serves as the idempotency_key for cpoa_orchestrate_podcast_task.
-    cpoa_task_idempotency_key = original_task_id
-    task_name_cpoa_orchestration = "cpoa_orchestrate_podcast_task"
+        # The `idempotency_key` (originally `original_task_id` if called from Celery task, or client-provided if from direct trigger)
+        # is the primary key for CPOA's own orchestration task in the `idempotency_keys` table.
+        cpoa_orchestration_idempotency_key = idempotency_key or original_task_id # Use client-provided key if available, else Celery task ID
+        cpoa_task_name_for_idempotency = "cpoa_orchestrate_podcast_task" # Specific name for this CPOA operation type
 
     db_conn = None
-    workflow_id = None # Initialize workflow_id
+        cpoa_internal_workflow_id = None # This is the CPOA-managed workflow_id (UUID)
     final_cpoa_status_legacy = CPOA_STATUS_PENDING # Initialize legacy status
     final_error_message = None # Initialize error message
     final_workflow_status = WORKFLOW_STATUS_PENDING # Initialize workflow status
@@ -780,68 +765,80 @@ def orchestrate_podcast_generation(
                     "error_message": "DB connection acquisition failed for CPOA task.",
                     "orchestration_log": [], "final_audio_details": {}}
 
-        db_conn.autocommit = False # Ensure transaction control for idempotency
+        db_conn.autocommit = False
 
-        # Idempotency Check
-        existing_key_record = _check_idempotency_key(db_conn, cpoa_task_idempotency_key, task_name_cpoa_orchestration)
+        # Idempotency Check for the CPOA orchestration task itself
+        # The workflow_id for THIS idempotency record will be the CPOA's own generated workflow_id.
+        # This means we need to create the CPOA workflow_instance first to get its ID.
+
+        # Check idempotency using cpoa_orchestration_idempotency_key and cpoa_task_name_for_idempotency
+        # This check happens *before* creating the CPOA internal workflow instance.
+        # The workflow_id stored in the idempotency_keys table for this CPOA task will be
+        # the CPOA-managed cpoa_internal_workflow_id, created if the key is new or being re-processed.
+        existing_key_record = _check_idempotency_key(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, workflow_id_for_log=None) # workflow_id not known yet for log
+
         if existing_key_record:
             status = existing_key_record['status']
             locked_at = existing_key_record['locked_at']
+            # Use the cpoa_internal_workflow_id from the *existing* idempotency record
+            cpoa_internal_workflow_id = existing_key_record.get('workflow_id')
+            log_extra_cpoa_task = {'workflow_id': cpoa_internal_workflow_id, 'idempotency_key': cpoa_orchestration_idempotency_key, 'task_name': cpoa_task_name_for_idempotency}
+
             if status == IDEMPOTENCY_STATUS_COMPLETED:
-                logger.info(f"CPOA Task {cpoa_task_idempotency_key}: Found completed record. Returning stored result.", extra={'workflow_id': existing_key_record.get('workflow_id')})
-                db_conn.rollback() # Release connection without changes
-                return existing_key_record['result_payload'] # This should be the full CPOA final result dict
+                logger.info(f"CPOA Orchestration Task: Found completed record. Returning stored result.", extra=log_extra_cpoa_task)
+                db_conn.rollback()
+                return existing_key_record['result_payload']
             elif status == IDEMPOTENCY_STATUS_PROCESSING:
                 if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < IDEMPOTENCY_LOCK_TIMEOUT_SECONDS:
-                    logger.warning(f"CPOA Task {cpoa_task_idempotency_key}: Record is already processing and lock is active. Returning conflict.", extra={'workflow_id': existing_key_record.get('workflow_id')})
+                    logger.warning(f"CPOA Orchestration Task: Record is already processing and lock is active. Returning conflict.", extra=log_extra_cpoa_task)
                     db_conn.rollback()
-                    # This return structure should match what API Gateway expects for an "already processing" scenario.
-                    # For now, returning a simplified error an orchestrator would understand or a specific HTTP-like status.
-                    # This isn't a full HTTP response, but an indicator.
-                    return {"task_id": original_task_id, "workflow_id": existing_key_record.get('workflow_id'),
-                            "status": "CONFLICT_PROCESSING", # Custom status
-                            "error_message": "Task is already being processed.", "idempotency_key": cpoa_task_idempotency_key}
-                else:
-                    logger.warning(f"CPOA Task {cpoa_task_idempotency_key}: Record was 'processing' but lock timed out. Proceeding with new execution.", extra={'workflow_id': existing_key_record.get('workflow_id')})
-                    # Treat as new: update locked_at and status, then proceed. This is handled by _store_idempotency_result with is_new_key=False.
-                    _store_idempotency_result(db_conn, cpoa_task_idempotency_key, task_name_cpoa_orchestration, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=existing_key_record.get('workflow_id'), is_new_key=False)
-            elif status == IDEMPOTENCY_STATUS_FAILED: # If previous attempt failed, allow retry by treating as new.
-                 logger.info(f"CPOA Task {cpoa_task_idempotency_key}: Found 'failed' record. Allowing new execution attempt.", extra={'workflow_id': existing_key_record.get('workflow_id')})
-                 _store_idempotency_result(db_conn, cpoa_task_idempotency_key, task_name_cpoa_orchestration, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=existing_key_record.get('workflow_id'), is_new_key=False)
-
+                    return {"task_id": original_task_id, "workflow_id": cpoa_internal_workflow_id, # CPOA's internal workflow_id
+                            "status": "CONFLICT_PROCESSING",
+                            "error_message": "Task is already being processed.", "idempotency_key": cpoa_orchestration_idempotency_key}
+                else: # Lock timed out
+                    logger.warning(f"CPOA Orchestration Task: Record was 'processing' but lock timed out. Proceeding with new execution.", extra=log_extra_cpoa_task)
+                    # cpoa_internal_workflow_id should exist from the stale record.
+                    _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, IDEMPOTENCY_STATUS_PROCESSING, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False)
+            elif status == IDEMPOTENCY_STATUS_FAILED:
+                 logger.info(f"CPOA Orchestration Task: Found 'failed' record. Allowing new execution attempt.", extra=log_extra_cpoa_task)
+                 # cpoa_internal_workflow_id should exist.
+                 _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, IDEMPOTENCY_STATUS_PROCESSING, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False)
         else: # No existing key, this is a new request
-            _store_idempotency_result(db_conn, cpoa_task_idempotency_key, task_name_cpoa_orchestration, IDEMPOTENCY_STATUS_PROCESSING, is_new_key=True)
+            # Create the CPOA workflow instance *now* to get the definitive cpoa_internal_workflow_id
+            cpoa_internal_workflow_id = _create_workflow_instance(
+                db_conn,
+                trigger_event_type="podcast_generation_celery_task", # Or more specific if known
+                trigger_event_details={
+                    "topic": topic, "original_task_id": original_task_id,
+                    "client_idempotency_key": cpoa_orchestration_idempotency_key,
+                    "voice_params_input": voice_params_input, "client_id": client_id,
+                    "user_preferences": user_preferences, "test_scenarios": test_scenarios
+                },
+                user_id=user_id
+            )
+            if not cpoa_internal_workflow_id:
+                logger.error(f"Failed to create CPOA workflow instance for idempotency key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra) # Use initial_log_extra as cpoa_internal_workflow_id is None
+                db_conn.rollback()
+                return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
+                        "error_message": "Critical: Workflow instance creation failed before idempotency record.",
+                        "orchestration_log": [], "final_audio_details": {}}
 
-        db_conn.commit() # Commit the idempotency key creation/update before starting main logic.
+            _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, IDEMPOTENCY_STATUS_PROCESSING, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=True)
 
-        # --- Main Orchestration Logic (from original try block) ---
-        workflow_id = _create_workflow_instance( # This workflow_id is internal to CPOA's state tracking
-            db_conn,
-            trigger_event_type="podcast_generation_celery_task",
-            trigger_event_details={
-                "topic": topic, "original_task_id": original_task_id, # original_task_id is the idempotency key here
-            "voice_params_input": voice_params_input, "client_id": client_id,
-            "user_preferences": user_preferences, "test_scenarios": test_scenarios
-        },
-            user_id=user_id
-        )
+        db_conn.commit() # Commit the idempotency status update (processing or new record)
 
-        if not workflow_id:
-            # Log with initial_log_extra as workflow_id is None
-            # This path might be less likely if _create_workflow_instance raises on DB error and db_conn is valid.
-            logger.error(f"Failed to create workflow instance for podcast_generation (topic: {topic}) even with a DB connection. Aborting.", extra=initial_log_extra)
-            # Attempt to commit or rollback if workflow_id is None but db_conn was used.
-            # However, _create_workflow_instance should handle its own transaction part or raise to be handled here.
-            # Assuming _create_workflow_instance raises on error, this specific check might not be hit often if db_conn is good.
-            if db_conn: db_conn.rollback() # Rollback if creation failed but conn was active
+        # --- Main Orchestration Logic ---
+        # cpoa_internal_workflow_id is now definitively set.
+        if not cpoa_internal_workflow_id: # Should be caught by the creation logic above
+            logger.error(f"Critical: CPOA internal workflow ID is not set after idempotency checks for key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra)
+            if db_conn: db_conn.rollback()
             return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
-                    "error_message": "Workflow creation failed in CPOA state manager (DB error or unexpected).",
+                    "error_message": "Critical: CPOA internal workflow ID missing post-idempotency.",
                     "orchestration_log": [], "final_audio_details": {}}
 
-        # Use a logging adapter for this workflow, injecting workflow_id into all logs
-        wf_logger = logging.LoggerAdapter(logger, {'workflow_id': workflow_id, 'task_id': None})
-
-        _update_workflow_instance_status(db_conn, workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
+        # Use a logging adapter for this workflow
+        wf_logger = logging.LoggerAdapter(logger, {'workflow_id': cpoa_internal_workflow_id, 'task_id': None})
+        _update_workflow_instance_status(db_conn, cpoa_internal_workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
 
     # This is the CPOA internal step log, distinct from the DB task_instances table
     orchestration_log_cpoa: List[Dict[str, Any]] = []
@@ -869,23 +866,17 @@ def orchestrate_podcast_generation(
     wf_logger.info(f"Podcast generation workflow started for topic: {topic}. Original Task ID: {original_task_id}")
         log_step_cpoa("Orchestration process started.", data={"original_task_id": original_task_id, "topic": topic, "voice_params_input": voice_params_input, "client_id": client_id, "user_preferences": user_preferences, "test_scenarios": test_scenarios})
 
-        # Update legacy 'podcasts' table (this should eventually be phased out or integrated with workflow status)
-        # Note: original_task_id is the idempotency key for the CPOA task.
-        # If the legacy 'podcasts' table uses this ID as its primary key, this is fine.
-        _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, workflow_id_for_log=workflow_id)
+        # Update legacy 'podcasts' table (if original_task_id is its key)
+        _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, workflow_id_for_log=cpoa_internal_workflow_id)
 
         # --- WCHA Stage ---
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_WCHA
         current_task_order += 1
-        # Idempotency key for WCHA call
-        wcha_idempotency_key = str(uuid.uuid4())
-        # Note: WCHA service itself is not yet modified for idempotency in this subtask.
-        # This key would be passed to WCHA if it supported it.
-        # For now, CPOA generates it but it's not used by WCHA.
-        wcha_task_id = _create_task_instance(db_conn, workflow_id, "WCHA", current_task_order, {"topic": topic, "idempotency_key_for_wcha": wcha_idempotency_key}, initial_status=TASK_STATUS_DISPATCHED)
+        wcha_idempotency_key = f"{cpoa_orchestration_idempotency_key}_wcha" # Derived key
+        wcha_task_id = _create_task_instance(db_conn, cpoa_internal_workflow_id, "WCHA", current_task_order, {"topic": topic, "idempotency_key_for_wcha": wcha_idempotency_key}, initial_status=TASK_STATUS_DISPATCHED)
         
-        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Fetching web content...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
-        log_step_cpoa("Calling WCHA Service (async)...", data={"topic": topic, "wcha_idempotency_key": wcha_idempotency_key}) # Log the key
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Fetching web content...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=cpoa_internal_workflow_id)
+        log_step_cpoa("Calling WCHA Service (async)...", data={"topic": topic, "wcha_idempotency_key": wcha_idempotency_key})
         
         wcha_content = None
         wcha_error_details = None
@@ -990,69 +981,12 @@ def orchestrate_podcast_generation(
 
         if wcha_task_id:
             _update_task_instance_status(db_conn, wcha_task_id, TASK_STATUS_COMPLETED if not wcha_error_details and wcha_content else TASK_STATUS_FAILED,
-                                         output_summary=wcha_output_summary, error_details=wcha_error_details, workflow_id_for_log=workflow_id)
+                                         output_summary=wcha_output_summary, error_details=wcha_error_details, workflow_id_for_log=cpoa_internal_workflow_id)
 
-        if wcha_error_details or not wcha_content: # If any error occurred or content is still None
+        if wcha_error_details or not wcha_content:
             final_error_message = (wcha_error_details.get("message") if wcha_error_details else None) or "WCHA critical failure: No content after polling."
             final_cpoa_status_legacy = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
             raise Exception(final_error_message)
-
-
-        # --- PSWA Stage ---
-        current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
-                raise Exception(wcha_error_details["message"])
-
-            # This block was part of the original polling logic, keep it for when wcha_internal_task_id is valid (got 202)
-            # The SEARCH block above duplicated it, so this is the correct placement.
-            # if wcha_internal_task_id: # This check is now done before starting the loop.
-            #    polling_start_time = time.time()
-            #    while True:
-            #        if time.time() - polling_start_time > CPOA_WCHA_POLLING_TIMEOUT_SECONDS:
-            #            wcha_error_details = {"message": f"Polling WCHA task {wcha_internal_task_id} timed out."}
-            #            raise Exception(wcha_error_details["message"])
-            #        try:
-            #            poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
-            #            poll_response_wcha.raise_for_status()
-            #            wcha_task_status_data = poll_response_wcha.json()
-            #            wcha_task_state = wcha_task_status_data.get("status")
-            #            log_step_cpoa(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", data=wcha_task_status_data)
-            #            wf_logger.info(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", extra={'task_id': wcha_task_id})
-
-            #            if wcha_task_state == "SUCCESS":
-            #                wcha_result_dict = wcha_task_status_data.get("result")
-            #                if not wcha_result_dict or wcha_result_dict.get("status") != "success":
-            #                     wcha_error_details = {"message": "WCHA task succeeded but reported internal failure or invalid result.", "wcha_response": wcha_result_dict}
-            #                else: # Success
-            #                    wcha_content = wcha_result_dict.get("content")
-            #                    source_urls = wcha_result_dict.get("source_urls", [])
-            #                    context_data_for_workflow["wcha_source_urls"] = source_urls
-            #                    wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": wcha_result_dict.get("message", "WCHA success.")}
-            #                    log_step_cpoa("WCHA task polling successful, content received.", data=wcha_output_summary)
-            #                    if not wcha_content: wcha_error_details = {"message": wcha_output_summary.get("message") or "WCHA success but no content."}
-            #                break
-            #            elif wcha_task_state == "FAILURE":
-            #                wcha_error_details = {"message": "WCHA task execution failed.", "wcha_celery_response": wcha_task_status_data.get("result")}
-            #                log_step_cpoa(wcha_error_details["message"], data=wcha_error_details, is_error_payload=True)
-            #                break
-            #            time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
-            #        except requests.exceptions.RequestException as e_poll_wcha:
-            #            log_step_cpoa(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", is_error_payload=True)
-            #            wf_logger.warning(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", extra={'task_id': wcha_task_id})
-            #            time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
-
-        except Exception as e_wcha: # Catch errors from initial dispatch or polling logic
-            wcha_error_details = wcha_error_details or {"message": f"WCHA stage error: {str(e_wcha)}", "exception_type": type(e_wcha).__name__}
-            wf_logger.error(f"WCHA stage error: {wcha_error_details['message']}", exc_info=True, extra={'task_id': wcha_task_id})
-
-        if wcha_task_id:
-            _update_task_instance_status(wcha_task_id, TASK_STATUS_COMPLETED if not wcha_error_details and wcha_content else TASK_STATUS_FAILED,
-                                         output_summary=wcha_output_summary, error_details=wcha_error_details, workflow_id_for_log=workflow_id)
-
-        if wcha_error_details or not wcha_content: # If any error occurred or content is still None
-            final_error_message = (wcha_error_details.get("message") if wcha_error_details else None) or "WCHA critical failure: No content after polling."
-            final_cpoa_status_legacy = CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST
-            raise Exception(final_error_message)
-
 
         # --- PSWA Stage ---
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
@@ -1105,23 +1039,21 @@ def orchestrate_podcast_generation(
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
         current_task_order += 1
         pswa_input_params = {"topic": topic, "content_input_length": len(wcha_content)}
-            # Idempotency key for PSWA call
-            pswa_idempotency_key = str(uuid.uuid4())
-            pswa_task_id = _create_task_instance(db_conn, workflow_id, "PSWA", current_task_order, {**pswa_input_params, "idempotency_key_for_pswa": pswa_idempotency_key}, initial_status=TASK_STATUS_DISPATCHED)
+            pswa_idempotency_key = f"{cpoa_orchestration_idempotency_key}_pswa" # Derived key
+            pswa_task_id = _create_task_instance(db_conn, cpoa_internal_workflow_id, "PSWA", current_task_order, {**pswa_input_params, "idempotency_key_for_pswa": pswa_idempotency_key}, initial_status=TASK_STATUS_DISPATCHED)
 
-        _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, workflow_id_for_log=workflow_id) # Legacy
-        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting script...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
+        _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, workflow_id_for_log=cpoa_internal_workflow_id)
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting script...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=cpoa_internal_workflow_id)
             log_step_cpoa("Calling PSWA Service (async)...", data={"url": PSWA_SERVICE_URL, **pswa_input_params, "pswa_idempotency_key": pswa_idempotency_key})
 
         structured_script_from_pswa = None
         pswa_error_details = None
         pswa_output_summary = {}
         try:
-            if pswa_task_id: _update_task_instance_status(db_conn, pswa_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
+            if pswa_task_id: _update_task_instance_status(db_conn, pswa_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=cpoa_internal_workflow_id)
 
             pswa_payload = {"content": wcha_content, "topic": topic}
-            # Add idempotency key to PSWA headers (PSWA service not yet modified to use this)
-            pswa_headers = {'X-Idempotency-Key': pswa_idempotency_key}
+            pswa_headers = {'X-Idempotency-Key': pswa_idempotency_key, 'X-Workflow-ID': cpoa_internal_workflow_id} # Pass CPOA's internal workflow_id
             if test_scenarios and test_scenarios.get("pswa"):
                 pswa_headers['X-Test-Scenario'] = test_scenarios["pswa"]
 
@@ -1129,10 +1061,25 @@ def orchestrate_podcast_generation(
             # Initial call to PSWA to dispatch task
             response_pswa_initial = requests_with_retry("post", PSWA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
                                                       json=pswa_payload, timeout=30, headers=pswa_headers,
-                                                      workflow_id_for_log=workflow_id, task_id_for_log=pswa_task_id)
+                                                      workflow_id_for_log=cpoa_internal_workflow_id, task_id_for_log=pswa_task_id)
 
-            if response_pswa_initial.status_code != 202:
-                pswa_error_details = {"message": f"PSWA service did not accept the task. Status: {response_pswa_initial.status_code}", "response_text": response_pswa_initial.text[:200]}
+            if response_pswa_initial.status_code != 202: # PSWA now does pre-check and might return 200 or 409
+                if response_pswa_initial.status_code == 200: # PSWA found completed result via idempotency
+                    wf_logger.info(f"PSWA returned 200 for idempotency key {pswa_idempotency_key}, using existing result.", extra={'task_id': pswa_task_id})
+                    pswa_task_status_data = response_pswa_initial.json() # This is the final result
+                    # Simulate successful polling outcome directly
+                    structured_script_from_pswa = pswa_task_status_data.get("script_data") # Assuming PSWA returns it this way for 200
+                    if not structured_script_from_pswa:
+                        pswa_error_details = {"message": "PSWA 200 OK but script_data missing.", "pswa_response": pswa_task_status_data}
+                    else:
+                        pswa_output_summary = {"script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title"), "segment_count": len(structured_script_from_pswa.get("segments", []))}
+                    # Skip polling logic by breaking the outer loop effectively or by not setting pswa_internal_task_id
+                    pswa_internal_task_id = None # This will prevent polling loop
+                elif response_pswa_initial.status_code == 409: # PSWA reports conflict
+                    pswa_error_details = {"message": f"PSWA service reported conflict (409) for idempotency key {pswa_idempotency_key}.", "response_text": response_pswa_initial.text[:200]}
+                    # This is a specific type of failure; CPOA might decide to wait and retry the CPOA task, or fail. For now, fail.
+                else:
+                    pswa_error_details = {"message": f"PSWA service did not accept the task. Status: {response_pswa_initial.status_code}", "response_text": response_pswa_initial.text[:200]}
                 raise Exception(pswa_error_details["message"])
 
             pswa_task_init_data = response_pswa_initial.json()
@@ -1140,90 +1087,86 @@ def orchestrate_podcast_generation(
             pswa_status_url_suffix = pswa_task_init_data.get("status_url")
 
             if not pswa_internal_task_id or not pswa_status_url_suffix:
-                pswa_error_details = {"message": "PSWA task submission response missing task_id or status_url.", "response_data": pswa_task_init_data}
-                raise Exception(pswa_error_details["message"])
+                    raise Exception(pswa_error_details["message"]) # Raise if error details were set by non-202/non-200/non-409 initial response
 
-            pswa_base_url = '/'.join(PSWA_SERVICE_URL.split('/')[:-1]) # e.g., http://pswa:5004
+            # Only proceed to polling if pswa_internal_task_id was set (i.e., initial response was 202)
+            if pswa_internal_task_id:
+                pswa_task_init_data = response_pswa_initial.json() # This is safe now
+                pswa_status_url_suffix = pswa_task_init_data.get("status_url") # Should be present for 202
+
+                pswa_base_url = '/'.join(PSWA_SERVICE_URL.split('/')[:-1])
             pswa_poll_url = f"{pswa_base_url}{pswa_status_url_suffix}"
             log_step_cpoa(f"PSWA task {pswa_internal_task_id} submitted. Polling at {pswa_poll_url}", data=pswa_task_init_data)
             wf_logger.info(f"PSWA task {pswa_internal_task_id} submitted. Polling status at {pswa_poll_url}", extra={'task_id': pswa_task_id})
 
+                polling_start_time = time.time()
+                while True: # Polling loop
+                    if time.time() - polling_start_time > CPOA_PSWA_POLLING_TIMEOUT_SECONDS:
+                        pswa_error_details = {"message": f"Polling PSWA task {pswa_internal_task_id} timed out after {CPOA_PSWA_POLLING_TIMEOUT_SECONDS}s."}
+                        raise Exception(pswa_error_details["message"])
+                    try:
+                        poll_response = requests.get(pswa_poll_url, timeout=15)
+                        poll_response.raise_for_status()
+                        pswa_task_status_data = poll_response.json()
+                        pswa_task_state = pswa_task_status_data.get("status")
+                        log_step_cpoa(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", data=pswa_task_status_data)
+                        wf_logger.info(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", extra={'task_id': pswa_task_id})
 
-            polling_start_time = time.time()
-            while True:
-                if time.time() - polling_start_time > CPOA_PSWA_POLLING_TIMEOUT_SECONDS:
-                    pswa_error_details = {"message": f"Polling PSWA task {pswa_internal_task_id} timed out after {CPOA_PSWA_POLLING_TIMEOUT_SECONDS}s."}
-                    raise Exception(pswa_error_details["message"])
+                        if pswa_task_state == "SUCCESS":
+                            structured_script_from_pswa = pswa_task_status_data.get("result", {}).get("script_data")
+                            if not structured_script_from_pswa:
+                                 pswa_error_details = {"message": "PSWA task succeeded but script_data missing.", "pswa_response": pswa_task_status_data}
+                            elif not (isinstance(structured_script_from_pswa, dict) and structured_script_from_pswa.get("script_id") and structured_script_from_pswa.get("title")):
+                                pswa_error_details = {"message": "PSWA task result is invalid or malformed.", "received_script_preview": structured_script_from_pswa}
+                            else:
+                                pswa_output_summary = {"script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title"), "segment_count": len(structured_script_from_pswa.get("segments", []))}
+                            break
+                        elif pswa_task_state == "FAILURE":
+                            pswa_error_details = {"message": "PSWA task execution failed.", "pswa_response": pswa_task_status_data.get("result")}
+                            break
+                        time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
+                    except requests.exceptions.RequestException as e_poll_pswa:
+                        log_step_cpoa(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", is_error_payload=True)
+                        wf_logger.warning(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", extra={'task_id': pswa_task_id})
+                        time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
+            # End of polling logic block (if pswa_internal_task_id was set)
 
-                try:
-                    poll_response = requests.get(pswa_poll_url, timeout=15)
-                    poll_response.raise_for_status()
-                    pswa_task_status_data = poll_response.json()
-                    pswa_task_state = pswa_task_status_data.get("status")
-                    log_step_cpoa(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", data=pswa_task_status_data)
-                    wf_logger.info(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", extra={'task_id': pswa_task_id})
-
-                    if pswa_task_state == "SUCCESS":
-                        structured_script_from_pswa = pswa_task_status_data.get("result", {}).get("script_data") # PSWA task returns dict with script_data or error_data
-                        if not structured_script_from_pswa: # Check if script_data is present
-                             pswa_error_details = {"message": "PSWA task succeeded but script_data missing.", "pswa_response": pswa_task_status_data}
-                             log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
-                        elif not (isinstance(structured_script_from_pswa, dict) and structured_script_from_pswa.get("script_id") and structured_script_from_pswa.get("title")):
-                            pswa_error_details = {"message": "PSWA task result is invalid or malformed.", "received_script_preview": structured_script_from_pswa}
-                            log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
-                        else:
-                            pswa_output_summary = {"script_id": structured_script_from_pswa.get("script_id"), "title": structured_script_from_pswa.get("title"), "segment_count": len(structured_script_from_pswa.get("segments", []))}
-                            log_step_cpoa("PSWA Task polling successful, script received.", data=pswa_output_summary)
-                        break
-                    elif pswa_task_state == "FAILURE":
-                        pswa_error_details = {"message": "PSWA task execution failed.", "pswa_response": pswa_task_status_data.get("result")}
-                        log_step_cpoa(pswa_error_details["message"], data=pswa_error_details, is_error_payload=True)
-                        break
-
-                    time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
-                except requests.exceptions.RequestException as e_poll_pswa:
-                    log_step_cpoa(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", is_error_payload=True)
-                    wf_logger.warning(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", extra={'task_id': pswa_task_id})
-                    time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
-
-        except requests.exceptions.RequestException as e_req_pswa: # For initial PSWA call
+        except requests.exceptions.RequestException as e_req_pswa:
             status_code = e_req_pswa.response.status_code if e_req_pswa.response is not None else "N/A"
             pswa_error_details = {"message": f"PSWA service initial call failed (HTTP status: {status_code}, type: {type(e_req_pswa).__name__}): {str(e_req_pswa)}." , "response_payload_preview": e_req_pswa.response.text[:200] if e_req_pswa.response is not None else "N/A"}
-            log_step_cpoa("PSWA service request exception.", data=pswa_error_details, is_error_payload=True)
-        except json.JSONDecodeError as e_json_pswa: # For initial PSWA call
+        except json.JSONDecodeError as e_json_pswa:
             pswa_error_details = {"message": f"PSWA service initial response was not valid JSON: {str(e_json_pswa)}", "response_text_preview": response_pswa_initial.text[:200] if 'response_pswa_initial' in locals() else "N/A"}
-            log_step_cpoa("PSWA service JSON decode error on initial call.", data=pswa_error_details, is_error_payload=True)
-        except Exception as e_pswa_unexp:
+        except Exception as e_pswa_unexp: # Catch other errors during dispatch or polling
             pswa_error_details = pswa_error_details or {"message": f"PSWA stage unexpected error: {str(e_pswa_unexp)}", "exception_type": type(e_pswa_unexp).__name__}
-            wf_logger.error(f"PSWA stage unexpected error: {pswa_error_details['message']}", exc_info=True, extra={'task_id': pswa_task_id})
+            # wf_logger might not be initialized if error is very early.
+            logger_to_use_pswa_exc = wf_logger if 'wf_logger' in locals() and wf_logger else logger
+            logger_to_use_pswa_exc.error(f"PSWA stage unexpected error: {pswa_error_details['message']}", exc_info=True, extra={'task_id': pswa_task_id or 'N/A', 'workflow_id': cpoa_internal_workflow_id or 'N/A'})
+
 
         if pswa_task_id:
-            _update_task_instance_status(db_conn, pswa_task_id, TASK_STATUS_COMPLETED if not pswa_error_details else TASK_STATUS_FAILED,
-                                         output_summary=pswa_output_summary, error_details=pswa_error_details, workflow_id_for_log=workflow_id)
+            _update_task_instance_status(db_conn, pswa_task_id, TASK_STATUS_COMPLETED if not pswa_error_details and structured_script_from_pswa else TASK_STATUS_FAILED,
+                                         output_summary=pswa_output_summary, error_details=pswa_error_details, workflow_id_for_log=cpoa_internal_workflow_id)
 
-        if pswa_error_details or not structured_script_from_pswa: # Check if error occurred or script is still None
-            final_error_message = (pswa_error_details.get("message") if pswa_error_details else None) or "PSWA critical failure: No script after polling."
+        if pswa_error_details or not structured_script_from_pswa:
+            final_error_message = (pswa_error_details.get("message") if pswa_error_details else None) or "PSWA critical failure: No script."
             final_cpoa_status_legacy = CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION
             raise Exception(final_error_message)
 
         context_data_for_workflow["script_title"] = structured_script_from_pswa.get("title")
         context_data_for_workflow["script_id"] = structured_script_from_pswa.get("script_id")
 
-
         # --- VFA Stage ---
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_VFA
         current_task_order += 1
         effective_voice_params = voice_params_input.copy() if voice_params_input else {}
-        if user_preferences: # Apply preferences
-            # ... (preference application logic as before) ...
+        if user_preferences:
             pass
-        # Idempotency key for VFA call
-        vfa_idempotency_key = str(uuid.uuid4())
+        vfa_idempotency_key = f"{cpoa_orchestration_idempotency_key}_vfa" # Derived key
         vfa_input_params = {"script_id": context_data_for_workflow["script_id"], "title": context_data_for_workflow["script_title"], "voice_params_input": effective_voice_params, "idempotency_key_for_vfa": vfa_idempotency_key}
-        vfa_task_id = _create_task_instance(db_conn, workflow_id, "VFA", current_task_order, vfa_input_params, initial_status=TASK_STATUS_DISPATCHED)
+        vfa_task_id = _create_task_instance(db_conn, cpoa_internal_workflow_id, "VFA", current_task_order, vfa_input_params, initial_status=TASK_STATUS_DISPATCHED)
 
-        _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_VFA_AUDIO_GENERATION, workflow_id_for_log=workflow_id) # Legacy
-        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Synthesizing audio...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=workflow_id)
+        _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_VFA_AUDIO_GENERATION, workflow_id_for_log=cpoa_internal_workflow_id) # Legacy
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Synthesizing audio...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=cpoa_internal_workflow_id)
         log_step_cpoa("Calling VFA Service (async)...", data={**vfa_input_params, "vfa_idempotency_key": vfa_idempotency_key})
 
         vfa_error_details = None
@@ -1490,21 +1433,20 @@ def orchestrate_podcast_generation(
             if idempotency_conn_final_store: _put_cpoa_db_connection(idempotency_conn_final_store)
 
     log_step_cpoa(f"Orchestration process ended with status {final_workflow_status}.", data={"final_cpoa_status_legacy": final_cpoa_status_legacy, "final_error_message": final_error_message})
-    # Ensure wf_logger is available if initialization failed before it was set
-    logger_to_use_final = wf_logger if 'wf_logger' in locals() and wf_logger else logger
-    logger_to_use_final.info(f"Podcast generation workflow ended. Final status: {final_workflow_status}. Legacy CPOA status: {final_cpoa_status_legacy}.", extra={'workflow_id': workflow_id or 'N/A'})
+        logger_to_use_final = wf_logger if 'wf_logger' in locals() and wf_logger else logger # Ensure wf_logger availability
+        logger_to_use_final.info(f"Podcast generation workflow ended. Final status: {final_workflow_status}. Legacy CPOA status: {final_cpoa_status_legacy}.", extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
 
     # Send final UI update based on the new workflow_status
     if final_workflow_status == WORKFLOW_STATUS_FAILED or final_workflow_status == WORKFLOW_STATUS_COMPLETED_WITH_ERRORS :
-        _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message or f"Task ended with status: {final_workflow_status}", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=workflow_id)
+            _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message or f"Task ended with status: {final_workflow_status}", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
     elif final_workflow_status == WORKFLOW_STATUS_COMPLETED:
-         _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=workflow_id)
+             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
 
-    asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow['stream_id']}" if context_data_for_workflow.get("stream_id") else None
+        asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow['stream_id']}" if context_data_for_workflow.get("stream_id") else None # Use context_data_for_workflow
 
-    cpoa_final_result = {
-        "task_id": original_task_id,
-        "workflow_id": workflow_id,
+    cpoa_final_result_payload = { # Renamed for clarity
+        "task_id": original_task_id, # This is the client's original task_id or the cpoa_orchestration_idempotency_key
+        "workflow_id": cpoa_internal_workflow_id, # This is CPOA's internal workflow UUID
         "topic": topic,
         "status": final_cpoa_status_legacy, # Return legacy status for now for API GW compatibility
         "error_message": final_error_message,
@@ -1725,12 +1667,17 @@ def _get_topic_details_from_db(db_conn, topic_id: str) -> Optional[Dict[str, Any
         # Connection managed by the caller
 
 
-def orchestrate_snippet_generation(topic_info: dict, db_conn_param = None, workflow_id_for_log: Optional[str] = None) -> Dict[str, Any]: # Added workflow_id_for_log
+def orchestrate_snippet_generation(
+    topic_info: dict,
+    db_conn_param = None,
+    workflow_id_for_log: Optional[str] = None, # This is the CPOA workflow_id
+    base_idempotency_key: Optional[str] = None # Key from the parent CPOA orchestration
+) -> Dict[str, Any]:
     """
-    Orchestrates snippet generation by calling the SnippetCraftAgent (SCA) service.
+    Orchestrates snippet generation by calling SCA and IGA.
+    Uses base_idempotency_key to derive keys for SCA & IGA calls.
     """
     function_name = "orchestrate_snippet_generation"
-    # Use provided workflow_id_for_log for logger, or default to 'N/A'
     log_extra_snippet_wf = {'workflow_id': workflow_id_for_log or 'N/A', 'task_id': None}
     current_logger = logging.LoggerAdapter(logger, log_extra_snippet_wf)
 
@@ -1780,15 +1727,20 @@ def orchestrate_snippet_generation(topic_info: dict, db_conn_param = None, workf
 
     try:
         # 1. Initiate SCA Task
-        sca_idempotency_key = str(uuid.uuid4())
-        sca_headers = {'X-Idempotency-Key': sca_idempotency_key}
-        current_logger.info(f"Generated idempotency key for SCA call: {sca_idempotency_key}", extra=log_extra_snippet_wf)
+        sca_idempotency_key_suffix = topic_info.get("topic_id", str(uuid.uuid4().hex[:6]))
+        sca_idempotency_key = f"{base_idempotency_key}_sca_{sca_idempotency_key_suffix}" if base_idempotency_key else str(uuid.uuid4())
+
+        sca_headers = {
+            'X-Idempotency-Key': sca_idempotency_key,
+            'X-Workflow-ID': workflow_id_for_log # Pass CPOA's own workflow_id
+        }
+        current_logger.info(f"Generated idempotency key for SCA call: {sca_idempotency_key} (base: {base_idempotency_key})", extra=log_extra_snippet_wf)
         initial_sca_response = requests_with_retry(
             "post", SCA_SERVICE_URL,
             max_retries=CPOA_SERVICE_RETRY_COUNT,
             backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
             json=sca_payload, headers=sca_headers, timeout=30,
-            workflow_id_for_log=workflow_id_for_log, task_id_for_log=topic_id # Pass context
+            workflow_id_for_log=workflow_id_for_log, task_id_for_log=topic_id
         )
 
         if initial_sca_response.status_code != 202:
@@ -1847,16 +1799,21 @@ def orchestrate_snippet_generation(topic_info: dict, db_conn_param = None, workf
 
             if cover_art_prompt and IGA_SERVICE_URL:
                 current_logger.info(f"Orchestrating image generation for snippet '{snippet_id_for_iga_log}' with prompt: '{cover_art_prompt}' (async IGA call)")
-                iga_idempotency_key = str(uuid.uuid4())
+                iga_idempotency_key_suffix = snippet_data.get("snippet_id", str(uuid.uuid4().hex[:6]))
+                iga_idempotency_key = f"{base_idempotency_key}_iga_{iga_idempotency_key_suffix}" if base_idempotency_key else str(uuid.uuid4())
+
                 iga_payload = {"prompt": cover_art_prompt}
-                iga_headers = {'X-Idempotency-Key': iga_idempotency_key}
-                current_logger.info(f"Generated idempotency key for IGA call: {iga_idempotency_key}", extra=log_extra_snippet_wf)
+                iga_headers = {
+                    'X-Idempotency-Key': iga_idempotency_key,
+                    'X-Workflow-ID': workflow_id_for_log # Pass CPOA's own workflow_id
+                }
+                current_logger.info(f"Generated idempotency key for IGA call: {iga_idempotency_key} (base: {base_idempotency_key})", extra=log_extra_snippet_wf)
                 iga_submit_url = f"{IGA_SERVICE_URL.rstrip('/')}/generate_image"
 
                 try:
                     initial_iga_response = requests_with_retry("post", iga_submit_url, max_retries=CPOA_SERVICE_RETRY_COUNT,
                                                               backoff_factor=CPOA_SERVICE_RETRY_BACKOFF_FACTOR, json=iga_payload, headers=iga_headers, timeout=30,
-                                                              workflow_id_for_log=workflow_id_for_log, task_id_for_log=snippet_id_for_iga_log) # Pass context
+                                                              workflow_id_for_log=workflow_id_for_log, task_id_for_log=snippet_id_for_iga_log)
 
                     if initial_iga_response.status_code != 202:
                         current_logger.warning(f"IGA service did not accept task for snippet '{snippet_id_for_iga_log}'. Status: {initial_iga_response.status_code}, Response: {initial_iga_response.text[:200]}")
@@ -2311,7 +2268,14 @@ def orchestrate_topic_exploration(
         logger.info(f"Generating exploration snippet for: {topic_info_for_sca['title_suggestion']}")
         try:
             # client_id is not passed here, as these are "background" generations for exploration results
-            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca)
+            # Derive a base_idempotency_key for this specific snippet generation chain
+            explore_base_idempotency_key = f"{workflow_id}_explore_{topic_info_for_sca.get('topic_id', uuid.uuid4().hex[:6])}"
+            snippet_result = orchestrate_snippet_generation(
+                topic_info=topic_info_for_sca,
+                db_conn_param=db_conn, # Pass the existing DB connection
+                workflow_id_for_log=workflow_id,
+                base_idempotency_key=explore_base_idempotency_key
+            )
             if snippet_result and "error" not in snippet_result:
                 explored_snippets.append(snippet_result)
             else:
@@ -2466,8 +2430,15 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
         snippet_result = None
         snippet_output_summary = {}
         try:
-            if sg_task_id: _update_task_instance_status(sg_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id)
-            snippet_result = orchestrate_snippet_generation(topic_info=topic_info_for_sca, workflow_id_for_log=workflow_id)
+            if sg_task_id: _update_task_instance_status(db_conn, sg_task_id, TASK_STATUS_IN_PROGRESS, workflow_id_for_log=workflow_id) # Pass db_conn
+            # Derive a base_idempotency_key for this specific snippet generation chain
+            search_base_idempotency_key = f"{workflow_id}_search_{topic_info_for_sca.get('topic_id', uuid.uuid4().hex[:6])}"
+            snippet_result = orchestrate_snippet_generation(
+                topic_info=topic_info_for_sca,
+                db_conn_param=db_conn, # Pass the existing DB connection
+                workflow_id_for_log=workflow_id,
+                base_idempotency_key=search_base_idempotency_key
+            )
 
             if snippet_result and "error" not in snippet_result:
                 if "snippet_id" not in snippet_result and "id" in snippet_result: snippet_result["snippet_id"] = snippet_result["id"]

@@ -541,138 +541,6 @@ def calculate_relevance_score(article: dict, query: str = None) -> float:
             if qk in article.get("title", "").lower(): score = min(1.0, score + 0.1)
     return round(score, 2)
 
-@celery_app.task(bind=True, name='discover_topics_task')
-def discover_topics_task(self, request_id_main: str, query: Optional[str], limit: int, use_real_news_api: bool, error_trigger: Optional[str] = None):
-    """
-    Celery task to discover topics, potentially calling another Celery task for NewsAPI.
-    Now with Idempotency.
-    """
-    task_log_id = self.request.id
-    log_extra_base = {"orig_req_id": request_id_main, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "query": query}
-    app.logger.info(f"TDA Celery Task {task_log_id}: Starting. Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}", extra=log_extra_base)
-
-    if not idempotency_key:
-        app.logger.error(f"TDA Task {task_log_id}: Idempotency key not provided. This is required.", extra=log_extra_base)
-        raise ValueError("Idempotency key is required for TDA task execution.")
-
-    # Assuming PSYCOPG2_AVAILABLE is checked globally or by _get_tda_db_connection
-    # For simplicity here, directly proceed; _get_tda_db_connection will raise if not available.
-
-    db_conn = None
-    try:
-        db_conn = _get_tda_db_connection()
-        db_conn.autocommit = False # Explicit transaction management
-
-        existing_record = _check_idempotency_key(db_conn, idempotency_key, self.name)
-        if existing_record:
-            status = existing_record['status']
-            locked_at = existing_record.get('locked_at')
-
-            if status == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED']:
-                app.logger.info(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra=log_extra_base)
-                db_conn.rollback()
-                return existing_record['result_payload']
-
-            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']:
-                timeout_seconds = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
-                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < timeout_seconds:
-                    app.logger.warning(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' is already PROCESSING (lock not timed out). Conflict.", extra=log_extra_base)
-                    db_conn.rollback()
-                    return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
-                else:
-                    app.logger.warning(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' was PROCESSING but lock timed out/missing. Re-processing.", extra=log_extra_base)
-                    _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-
-            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED']:
-                app.logger.info(f"TDA Task {task_log_id}: Idempotency key '{idempotency_key}' previously FAILED. Retrying.", extra=log_extra_base)
-                _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-        else: # No existing record
-            app.logger.info(f"TDA Task {task_log_id}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra=log_extra_base)
-            _store_idempotency_record(db_conn, idempotency_key, self.name, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
-
-        db_conn.commit() # Commit the PROCESSING state change
-
-        if error_trigger == "tda_error": # For testing celery task failure
-            app.logger.info(f"TDA Task {task_log_id}: Simulated TDA error triggered in task for key '{idempotency_key}'.", extra=log_extra_base)
-            raise Exception("Simulated TDA error in Celery task.")
-
-        # --- Main Task Logic ---
-        app.logger.info(f"TDA Task {task_log_id}: Proceeding with topic discovery for key '{idempotency_key}'.", extra=log_extra_base)
-        discovered_topics = []
-    if use_real_news_api:
-        request_keywords = [k.strip() for k in query.split(',')] if query else None
-        logger.info(f"Celery Task {self.request.id}: Dispatching NewsAPI sub-task. Keywords: {request_keywords}")
-
-        news_task = fetch_news_from_newsapi_task.delay(
-            request_id_celery=self.request.id, # Correlate sub-task with this parent task
-            keywords=request_keywords,
-            language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE"),
-            max_results=limit
-        )
-        logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} dispatched. Polling for results...")
-
-        # Polling logic for the NewsAPI sub-task
-        # This worker will block here until the sub-task completes or polling times out.
-        # A more advanced pattern would use Celery chains/callbacks to avoid worker blocking.
-        polling_start_time = time.time()
-        # Use specific polling config or reuse general ones if suitable
-        news_polling_interval = int(os.getenv("TDA_NEWSAPI_POLLING_INTERVAL_SECONDS", "5"))
-        news_polling_timeout = int(os.getenv("TDA_NEWSAPI_POLLING_TIMEOUT_SECONDS", "120")) # E.g., 2 minutes for news API call
-
-        while True:
-            if time.time() - polling_start_time > news_polling_timeout:
-                logger.error(f"Celery Task {self.request.id}: Polling NewsAPI sub-task {news_task.id} timed out.")
-                raise Exception(f"Polling NewsAPI sub-task {news_task.id} timed out.")
-
-            news_task_result = AsyncResult(news_task.id, app=celery_app)
-            logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} status: {news_task_result.status}")
-
-            if news_task_result.successful():
-                sub_task_output = news_task_result.result
-                if sub_task_output.get("status") == "success":
-                    discovered_topics = sub_task_output.get("discovered_topics", [])
-                    logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} successful. Found {len(discovered_topics)} topics.")
-                else: # NewsAPI task itself reported an issue in its result
-                    logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} reported failure: {sub_task_output.get('message')}")
-                    raise Exception(f"NewsAPI sub-task failed: {sub_task_output.get('message', 'Unknown error from NewsAPI task')}")
-                break
-            elif news_task_result.failed():
-                logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} failed with Celery status FAILED. Info: {news_task_result.info}")
-                raise Exception(f"NewsAPI sub-task failed: {str(news_task_result.info)}")
-
-            time.sleep(news_polling_interval)
-    else:
-        # Simulated data path
-        logger.info(f"Celery Task {self.request.id}: Using simulated data sources. Query: '{query}', Limit: {limit}")
-        discovered_topics = identify_topics_from_sources(query=query, limit=limit)
-        logger.info(f"Celery Task {self.request.id}: Simulated data discovery found {len(discovered_topics)} topics.")
-
-    # Return the final list of topics (or an error structure if preferred)
-    task_result_payload = {}
-    if not discovered_topics:
-        task_result_payload = {"status": "success_no_topics", "message": "No topics discovered.", "topics": []}
-    else:
-        task_result_payload = {"status": "success", "discovered_topics": discovered_topics, "message": f"Successfully discovered {len(discovered_topics)} topics."}
-
-    _store_idempotency_record(db_conn, idempotency_key, self.name,
-                              tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'],
-                              workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
-    db_conn.commit()
-    app.logger.info(f"TDA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'.", extra=log_extra_base)
-    return task_result_payload
-
-    # Exception handling for the main task logic (idempotency part is above)
-    except Exception as e:
-        app.logger.error(f"TDA Task {task_log_id}: Error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
-        # on_failure handler will be invoked by Celery
-        raise # Re-raise to trigger on_failure and standard Celery error handling.
-    finally:
-        if db_conn:
-            if not db_conn.closed:
-                db_conn.close()
-                app.logger.debug(f"TDA Task {task_log_id}: Closed DB connection for key '{idempotency_key}'.", extra=log_extra_base)
-
-
 # --- Custom Celery Task Class for TDA with Idempotency ---
 class TdaCeleryTask(Task):
     def on_failure(self, exc, task_id, args, kwargs, einfo):
@@ -759,6 +627,11 @@ def discover_topics_task(self, request_id_main: str, query: Optional[str], limit
         if use_real_news_api_flag:
             request_keywords = [k.strip() for k in query.split(',')] if query else None
             app.logger.info(f"Celery Task {self.request.id}: Dispatching NewsAPI sub-task. Keywords: {request_keywords}", extra=log_extra_base)
+            # TODO: Implement Idempotency for fetch_news_from_newsapi_task
+            # This sub-task should accept a derived idempotency key from discover_topics_task
+            # and implement its own idempotency checks against the idempotency_keys table
+            # to prevent re-fetching from NewsAPI if the parent task retries.
+            # Example derived key: derived_news_key = f"{idempotency_key}_newsapi"
             news_task = fetch_news_from_newsapi_task.delay(request_id_celery=self.request.id, keywords=request_keywords, language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")) # Removed max_results, not a param
             app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} dispatched. Polling...", extra=log_extra_base)
 
@@ -824,6 +697,57 @@ def discover_topics_async_endpoint():
     if not idempotency_key:
         app.logger.warning(f"Request {request_id_main}: Missing X-Idempotency-Key header.")
         return flask.jsonify({"error_code": "TDA_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
+
+    # --- Idempotency Pre-check at Endpoint Level ---
+    idem_task_name_for_db = 'discover_topics_task' # Matches Celery task name
+    db_conn_http = None
+    # Assuming PSYCOPG2_AVAILABLE is defined and True if psycopg2 is imported
+    # For TDA, psycopg2 is imported directly, so we can assume it's available if no import error.
+    # A more robust check would be `if 'psycopg2' in sys.modules:` or the PSYCOPG2_AVAILABLE flag if set.
+    # For now, let's assume it's available if the service starts.
+    try:
+        db_conn_http = _get_tda_db_connection()
+        db_conn_http.autocommit = False # Manage transaction for pre-check
+
+        existing_record = _check_idempotency_key(db_conn_http, idempotency_key, idem_task_name_for_db)
+        if existing_record:
+            status = existing_record['status']
+            locked_at = existing_record.get('locked_at')
+            lock_timeout = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+
+            if status == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED']:
+                app.logger.info(f"TDA Request {request_id_main}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra={'workflow_id': workflow_id})
+                db_conn_http.rollback()
+                return flask.jsonify(existing_record['result_payload']), 200
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']:
+                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
+                    app.logger.warning(f"TDA Request {request_id_main}: Idempotency key '{idempotency_key}' is PROCESSING. Returning conflict.", extra={'workflow_id': workflow_id})
+                    db_conn_http.rollback()
+                    return flask.jsonify({"error_code": "TDA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409
+                else: # Lock expired
+                    app.logger.info(f"TDA Request {request_id_main}: Idempotency key '{idempotency_key}' was PROCESSING but lock expired. Re-processing.", extra={'workflow_id': workflow_id})
+                    _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                    db_conn_http.commit()
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED']:
+                app.logger.info(f"TDA Request {request_id_main}: Idempotency key '{idempotency_key}' previously FAILED. Re-processing.", extra={'workflow_id': workflow_id})
+                _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                db_conn_http.commit()
+        else: # No existing record
+            app.logger.info(f"TDA Request {request_id_main}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra={'workflow_id': workflow_id})
+            _store_idempotency_record(db_conn_http, idempotency_key, idem_task_name_for_db, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+            db_conn_http.commit()
+    except psycopg2.Error as db_err_http:
+        app.logger.error(f"TDA Request {request_id_main}: Database error during HTTP idempotency pre-check: {db_err_http}", exc_info=True, extra={'workflow_id': workflow_id})
+        if db_conn_http: db_conn_http.rollback()
+        app.logger.warning(f"TDA Request {request_id_main}: Proceeding to Celery dispatch despite DB error in pre-check.")
+    except Exception as e_idem_http: # Catch any other error during pre-check
+        app.logger.error(f"TDA Request {request_id_main}: Unexpected error during HTTP idempotency pre-check: {e_idem_http}", exc_info=True, extra={'workflow_id': workflow_id})
+        if db_conn_http: db_conn_http.rollback()
+        app.logger.warning(f"TDA Request {request_id_main}: Proceeding to Celery dispatch despite unexpected error in pre-check.")
+    finally:
+        if db_conn_http and not db_conn_http.closed:
+            db_conn_http.close()
+    # Continue to payload validation and task dispatch even if DB pre-check had issues (logged warning)
 
     try:
         request_data = flask.request.get_json() if flask.request.content_length else {}

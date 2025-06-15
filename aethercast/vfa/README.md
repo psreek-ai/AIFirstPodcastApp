@@ -72,17 +72,29 @@ VFA operates asynchronously using Celery.
         "voice_params": { /* ... Optional voice parameters ... */ }
     }
     ```
--   **Success Response (202 Accepted - JSON):**
-    ```json
-    {
-        "task_id": "celery_task_uuid_string",
-        "status_url": "/v1/tasks/celery_task_uuid_string",
-        "message": "Voice forging task accepted.",
-        "idempotency_key_processed": "client_provided_idempotency_key"
-    }
-    ```
--   **Error Responses (JSON):**
-    -   **400 Bad Request**: If `X-Idempotency-Key` is missing, or for payload validation errors.
+-   **Responses (JSON):**
+    -   **200 OK**: If the request is successfully processed and the result is available synchronously (e.g., idempotency pre-check found a completed task). The body will contain the final result from the `forge_voice_task`.
+        ```json
+        { /* Result from forge_voice_task, e.g., audio_filepath, stream_id */ }
+        ```
+    -   **202 Accepted**: If the task is accepted for asynchronous processing (Celery task dispatched).
+        ```json
+        {
+            "task_id": "celery_task_uuid_string",
+            "status_url": "/v1/tasks/celery_task_uuid_string",
+            "message": "Voice forging task accepted.",
+            "idempotency_key_processed": "client_provided_idempotency_key"
+        }
+        ```
+    -   **400 Bad Request**: If `X-Idempotency-Key` header is missing, or for payload validation errors.
+    -   **409 Conflict**: If the `X-Idempotency-Key` refers to a task that is currently processing and not timed out (detected by endpoint pre-check).
+        ```json
+        {
+            "error_code": "VFA_IDEMPOTENCY_CONFLICT",
+            "message": "Request with this idempotency key is currently processing."
+        }
+        ```
+    -   **500 Internal Server Error / 503 Service Unavailable**: For other server-side issues (e.g., database error during pre-check).
 
 ### 2. Get Task Status / Result
 

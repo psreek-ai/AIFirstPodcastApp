@@ -809,6 +809,11 @@ def get_dynamic_snippets():
     app.logger.info("Request received for /api/v1/snippets (dynamic generation)")
     if not cpoa_landing_snippets_func_imported:
         return jsonify({"error_code": "API_GW_CPOA_SNIPPET_SERVICE_UNAVAILABLE", "message": "Snippet service unavailable."}), 503
+
+    # Optionally get X-Idempotency-Key. For a GET, it's less common but CPOA might use it.
+    idempotency_key = request.headers.get("X-Idempotency-Key")
+    # X-Workflow-ID is not typically client-provided for this type of GET, CPOA generates its own.
+
     try:
         limit_str = request.args.get('limit', default="6")
         try: limit = int(limit_str); limit = 6 if not (1 <= limit <= 20) else limit
@@ -826,9 +831,15 @@ def get_dynamic_snippets():
                         app.logger.info(f"Optional user_id {user_id_for_cpoa} obtained for get_dynamic_snippets via token.")
                     else:
                         app.logger.info(f"User {decoded_data['user_id']} from optional token not found in DB for get_dynamic_snippets.")
-                elif decoded_data is None:
+                elif decoded_data is None: # Token was present but invalid (expired or malformed)
                      app.logger.info("Optional token provided for get_dynamic_snippets was invalid or expired.")
-        cpoa_response_dict = orchestrate_landing_page_snippets(limit=limit, user_id=user_id_for_cpoa)
+
+        cpoa_kwargs_for_landing = {"limit": limit, "user_id": user_id_for_cpoa}
+        if idempotency_key: # Pass to CPOA if client provided it
+            cpoa_kwargs_for_landing["idempotency_key"] = idempotency_key
+            app.logger.info(f"Passing X-Idempotency-Key: {idempotency_key} to CPOA for landing page snippets.")
+
+        cpoa_response_dict = orchestrate_landing_page_snippets(**cpoa_kwargs_for_landing)
         workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
         if cpoa_response_dict.get("error"):
             error_code = str(cpoa_response_dict.get("error", "CPOA_ERROR")).upper()
@@ -877,13 +888,19 @@ def explore_topic():
     app.logger.info(f"Authenticated user for explore: {g.current_user['user_id']}. (client_id from payload: {request.get_json(silent=True).get('client_id') if request.is_json else 'N/A'})")
     if not cpoa_exploration_func_imported:
         return jsonify({"error_code": "API_GW_CPOA_EXPLORE_SERVICE_UNAVAILABLE", "message": "Exploration service unavailable."}), 503
+
+    idempotency_key = request.headers.get("X-Idempotency-Key")
+    if not idempotency_key:
+        app.logger.warning(f"Request to /api/v1/topics/explore missing X-Idempotency-Key header.")
+        return jsonify({"error_code": "API_GW_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
+
     try: data = request.get_json()
     except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
     if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
     current_topic_id = data.get("current_topic_id")
     keywords = data.get("keywords")
     depth_mode = data.get("depth_mode", "deeper")
-    client_id = data.get("client_id") # client_id for fetching preferences, not necessarily for auth here
+    client_id = data.get("client_id")
     if not current_topic_id and not keywords: return jsonify({"error_code": "API_GW_EXPLORE_INPUT_REQUIRED", "message": "current_topic_id or keywords required."}), 400
 
     user_preferences = None
@@ -906,10 +923,11 @@ def explore_topic():
             if conn_prefs: conn_prefs.close()
 
     try:
-        current_user_id = g.current_user['user_id'] # From @token_required
+        current_user_id = g.current_user['user_id']
         cpoa_response_dict = orchestrate_topic_exploration(
             current_topic_id=current_topic_id, keywords=keywords, depth_mode=depth_mode,
-            user_preferences=user_preferences, user_id=current_user_id
+            user_preferences=user_preferences, user_id=current_user_id,
+            idempotency_key=idempotency_key # Pass to CPOA
         )
         workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
         if cpoa_response_dict.get("error"):
@@ -940,6 +958,12 @@ def search_podcasts_endpoint():
     app.logger.info(f"Authenticated user for search: {g.current_user['user_id']}. (client_id from payload: {request.get_json(silent=True).get('client_id') if request.is_json else 'N/A'})")
     if not cpoa_search_func_imported:
         return jsonify({"error_code": "API_GW_CPOA_SEARCH_SERVICE_UNAVAILABLE", "message": "Search service unavailable."}), 503
+
+    idempotency_key = request.headers.get("X-Idempotency-Key")
+    if not idempotency_key:
+        app.logger.warning(f"Request to /api/v1/search/podcasts missing X-Idempotency-Key header.")
+        return jsonify({"error_code": "API_GW_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
+
     try: data = request.get_json()
     except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
     if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
@@ -948,7 +972,7 @@ def search_podcasts_endpoint():
     if not query or not isinstance(query, str) or not query.strip():
         return jsonify({"error_code": "API_GW_SEARCH_QUERY_INVALID", "message": "Query required."}), 400
 
-    client_id = data.get("client_id") # For fetching preferences
+    client_id = data.get("client_id")
     user_preferences = None
     if client_id:
         conn_prefs = None
@@ -965,9 +989,10 @@ def search_podcasts_endpoint():
             if conn_prefs: conn_prefs.close()
 
     try:
-        current_user_id = g.current_user['user_id'] # From @token_required
+        current_user_id = g.current_user['user_id']
         cpoa_response_dict = orchestrate_search_results_generation(
-            query=query, user_preferences=user_preferences, user_id=current_user_id
+            query=query, user_preferences=user_preferences, user_id=current_user_id,
+            idempotency_key=idempotency_key # Pass to CPOA
         )
         workflow_id_from_cpoa = cpoa_response_dict.get("workflow_id")
 
@@ -1000,6 +1025,12 @@ def create_podcast_generation_task():
     app.logger.info(f"Authenticated user for podcast creation: {g.current_user['user_id']}. (client_id: {request.get_json(silent=True).get('client_id') if request.is_json else 'N/A'})")
     if not cpoa_podcast_func_imported:
         return jsonify({"error_code": "API_GW_CPOA_PODCAST_SERVICE_UNAVAILABLE", "message": "Podcast service unavailable."}), 503
+
+    idempotency_key = request.headers.get("X-Idempotency-Key")
+    if not idempotency_key:
+        app.logger.warning(f"Request to /api/v1/podcasts missing X-Idempotency-Key header.")
+        return jsonify({"error_code": "API_GW_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
+
     try: data = request.get_json()
     except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
     if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
@@ -1008,8 +1039,8 @@ def create_podcast_generation_task():
     if not topic or not isinstance(topic, str) or not topic.strip(): return jsonify({"error_code": "API_GW_PODCAST_TOPIC_INVALID", "message": "Topic required."}), 400
 
     voice_params_from_request = data.get('voice_params')
-    client_id_from_request = data.get('client_id') # For fetching preferences and UI updates
-    test_scenarios_from_request = data.get('test_scenarios') # For testing specific error paths
+    client_id_from_request = data.get('client_id')
+    test_scenarios_from_request = data.get('test_scenarios')
 
     user_preferences = None
     if client_id_from_request: # If client_id (session_id) is provided, try to fetch its preferences
@@ -1058,7 +1089,8 @@ def create_podcast_generation_task():
         cpoa_kwargs = {
             "topic": topic, "original_task_id": podcast_id, "user_id": current_user_id,
             "voice_params_input": voice_params_from_request, "user_preferences": user_preferences,
-            "test_scenarios": test_scenarios_from_request
+            "test_scenarios": test_scenarios_from_request,
+            "idempotency_key": idempotency_key # Pass to CPOA
         }
         if client_id_from_request: cpoa_kwargs["client_id"] = client_id_from_request
 

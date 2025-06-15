@@ -166,54 +166,45 @@ class TestScaIdempotencyFlask(BaseScaServiceTest):
         cursor_mock.fetchone.return_value = completed_record
 
         response = self.app.post('/craft_snippet', json=payload, headers=headers)
-        self.assertEqual(response.status_code, 202)
+        self.assertEqual(response.status_code, 200) # Now expects 200 due to pre-check
+        json_response = response.get_json()
+        self.assertEqual(json_response, stored_snippet_data) # Should be the stored result directly
 
-        task_id = response.get_json()["task_id"]
-        status_response = self.app.get(f'/v1/tasks/{task_id}')
-        self.assertEqual(status_response.status_code, 200)
-        json_result = status_response.get_json()
-
-        self.assertEqual(json_result["status"], "SUCCESS")
-        self.assertEqual(json_result["result"], stored_snippet_data)
-
+        # Verify DB: Only one SELECT call from endpoint pre-check.
         execute_calls = cursor_mock.execute.call_args_list
         self.assertEqual(len(execute_calls), 1)
         self.assertIn("SELECT idempotency_key", execute_calls[0][0][0])
+        self.assertEqual(execute_calls[0][0][1], (idempotency_key, 'craft_snippet_task'))
         self.assertEqual(mock_conn.commit.call_count, 0)
-        self.assertEqual(mock_conn.rollback.call_count, 1)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT by endpoint
 
     def test_processing_idempotency_key_conflict(self, mock_db_conn_getter):
-        """Test SCA Flask endpoint returns 409 for a 'processing' and not timed out key."""
+        """Test SCA Flask endpoint returns 409 for a 'processing' and not timed out key due to pre-check."""
         idempotency_key = f"sca-test-processing-{uuid.uuid4()}"
+        workflow_id = f"wf-sca-test-processing-{uuid.uuid4()}" # Added for completeness
         payload = {"topic_id": "t_proc", "content_brief": "processing brief", "topic_info": {}}
-        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key}
+        headers = {IDEMPOTENCY_KEY_HEADER: idempotency_key, "X-Workflow-ID": workflow_id}
 
         mock_conn = mock_db_connection_registry_sca.setdefault(os.getpid(), MagicMock())
         cursor_mock = mock_conn.cursor.return_value.__enter__.return_value
         processing_record = {
             'idempotency_key': idempotency_key, 'task_name': 'craft_snippet_task',
             'status': sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'],
-            'locked_at': datetime.now(timezone.utc) # Not timed out
+            'workflow_id': workflow_id,
+            'locked_at': datetime.now(timezone.utc)
         }
         cursor_mock.fetchone.return_value = processing_record
 
         response = self.app.post('/craft_snippet', json=payload, headers=headers)
-        self.assertEqual(response.status_code, 202) # Task dispatched
+        self.assertEqual(response.status_code, 409) # Endpoint pre-check returns 409
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "SCA_IDEMPOTENCY_CONFLICT")
 
-        task_id = response.get_json()["task_id"]
-        status_response = self.app.get(f'/v1/tasks/{task_id}')
-        self.assertEqual(status_response.status_code, 409) # Expecting 409 Conflict
-        json_result = status_response.get_json()
-
-        self.assertEqual(json_result["status"], "SUCCESS") # Celery task completed by returning conflict info
-        self.assertIsNotNone(json_result["result"])
-        self.assertEqual(json_result["result"]["status"], "PROCESSING_CONFLICT")
-        self.assertEqual(json_result["result"]["idempotency_key"], idempotency_key)
-
+        # Verify DB: Only one SELECT from endpoint pre-check.
         execute_calls = cursor_mock.execute.call_args_list
-        self.assertEqual(len(execute_calls), 1) # Only SELECT
+        self.assertEqual(len(execute_calls), 1)
         self.assertEqual(mock_conn.commit.call_count, 0)
-        self.assertEqual(mock_conn.rollback.call_count, 1)
+        self.assertEqual(mock_conn.rollback.call_count, 1) # Rollback after SELECT by endpoint
 
     def test_processing_key_lock_timeout(self, mock_db_conn_getter):
         """Test SCA Flask endpoint re-processes if 'processing' lock has timed out."""
