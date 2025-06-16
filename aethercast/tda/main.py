@@ -103,7 +103,7 @@ tda_config = {
 
     "TDA_HOST": os.getenv("TDA_HOST", os.getenv("FLASK_RUN_HOST", "0.0.0.0")),
     "TDA_PORT": int(os.getenv("TDA_PORT", os.getenv("FLASK_RUN_PORT", "5000"))),
-    "TDA_DEBUG_MODE": os.getenv("TDA_DEBUG_MODE", "True").lower() == "true",
+    # "TDA_DEBUG_MODE": os.getenv("TDA_DEBUG_MODE", "True").lower() == "true", # To be replaced by FLASK_DEBUG
 
     # Idempotency related configurations
     "TDA_IDEMPOTENCY_STATUS_PROCESSING": os.getenv('TDA_IDEMPOTENCY_STATUS_PROCESSING', 'processing'),
@@ -860,7 +860,8 @@ if __name__ == "__main__":
 
     host = tda_config.get("TDA_HOST")
     port = tda_config.get("TDA_PORT")
-    debug_mode = tda_config.get("TDA_DEBUG_MODE")
+    # Read FLASK_DEBUG directly for running the app
+    flask_debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
     # The initial "JSON logging configured..." message is now part of setup_json_logging
-    app.logger.info(f"--- TDA Service starting on {host}:{port} (Debug: {debug_mode}, DB: PostgreSQL) ---")
-    app.run(host=host, port=port, debug=debug_mode)
+    app.logger.info(f"--- TDA Service starting on {host}:{port} (Debug: {flask_debug_mode}, DB: PostgreSQL) ---")
+    app.run(host=host, port=port, debug=flask_debug_mode)

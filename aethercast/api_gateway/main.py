@@ -1341,4 +1341,6 @@ def handle_subscribe():
 if __name__ == '__main__':
     app.logger.info("Starting API Gateway service directly for development.")
     init_db()
-    app.run(debug=True, host=os.getenv("API_GATEWAY_HOST", "0.0.0.0"), port=int(os.getenv("API_GATEWAY_PORT", "5001")))
+    # Debug mode for direct execution should respect FLASK_DEBUG environment variable
+    debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
+    app.run(debug=debug_mode, host=os.getenv("API_GATEWAY_HOST", "0.0.0.0"), port=int(os.getenv("API_GATEWAY_PORT", "5001")))

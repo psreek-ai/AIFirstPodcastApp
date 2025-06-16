@@ -69,10 +69,11 @@ def load_asf_configuration():
 
     asf_config['ASF_HOST'] = os.getenv("ASF_HOST", '0.0.0.0')
     asf_config['ASF_PORT'] = int(os.getenv("ASF_PORT", 5006))
-    asf_config['ASF_DEBUG_MODE'] = os.getenv("ASF_DEBUG_MODE", "True").lower() == "true"
+    # ASF_DEBUG_MODE is removed, FLASK_DEBUG will be read directly where needed.
 
-    # Adjust logger level based on debug mode
-    logger.setLevel(logging.DEBUG if asf_config['ASF_DEBUG_MODE'] else logging.INFO)
+    # Adjust logger level based on FLASK_DEBUG mode
+    flask_debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
+    logger.setLevel(logging.DEBUG if flask_debug_mode else logging.INFO)
 
 
     logger.info("--- ASF Configuration ---")
@@ -413,12 +414,13 @@ if __name__ == '__main__':
 
     asf_host = asf_config.get('ASF_HOST')
     asf_port = asf_config.get('ASF_PORT')
-    asf_debug_mode = asf_config.get('ASF_DEBUG_MODE')
+    # Read FLASK_DEBUG directly for running the app
+    flask_debug_mode_run = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
 
-    logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {asf_host}:{asf_port} (Debug: {asf_debug_mode}).")
+    logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {asf_host}:{asf_port} (Debug: {flask_debug_mode_run}).")
     # allow_unsafe_werkzeug=True is needed for Werkzeug dev server if debug is True and reloader is on.
     # Gunicorn with eventlet/gevent worker is preferred for production.
-    socketio.run(app, host=asf_host, port=asf_port, debug=asf_debug_mode,
-                 allow_unsafe_werkzeug=True if asf_debug_mode else False,
+    socketio.run(app, host=asf_host, port=asf_port, debug=flask_debug_mode_run,
+                 allow_unsafe_werkzeug=True if flask_debug_mode_run else False,
                  # Consider use_reloader=False if issues with background threads or state
                  )

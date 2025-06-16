@@ -79,7 +79,7 @@ def load_vfa_configuration():
     vfa_config['VFA_TEST_MODE_ENABLED'] = os.getenv("VFA_TEST_MODE_ENABLED", "False").lower() == 'true'
     vfa_config['VFA_HOST'] = os.getenv("VFA_HOST", "0.0.0.0")
     vfa_config['VFA_PORT'] = int(os.getenv("VFA_PORT", 5005))
-    vfa_config['VFA_DEBUG_MODE'] = os.getenv("VFA_DEBUG_MODE", "True").lower() == "true"
+    # vfa_config['VFA_DEBUG_MODE'] will be replaced by direct use of FLASK_DEBUG
 
     # Database Configuration (for Idempotency)
     vfa_config['POSTGRES_HOST'] = os.getenv("POSTGRES_HOST")
@@ -563,8 +563,9 @@ def get_vfa_task_status(task_id: str):
 if __name__ == '__main__':
     host = vfa_config.get("VFA_HOST", "0.0.0.0")
     port = vfa_config.get("VFA_PORT", 5005)
-    debug_mode = vfa_config.get("VFA_DEBUG_MODE", True)
-    logger.info(f"--- VFA Service (AIMS_TTS Client & Celery Producer) starting on {host}:{port} (Debug: {debug_mode}) ---")
+    # Read FLASK_DEBUG directly for running the app
+    flask_debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
+    logger.info(f"--- VFA Service (AIMS_TTS Client & Celery Producer) starting on {host}:{port} (Debug: {flask_debug_mode}) ---")
     if not vfa_config.get("AIMS_TTS_SERVICE_URL") and not vfa_config.get("VFA_TEST_MODE_ENABLED"):
         logger.critical("CRITICAL ERROR: AIMS_TTS_SERVICE_URL is not set and VFA is not in test mode. VFA will not function correctly.")
-    app.run(host=host, port=port, debug=debug_mode)
+    app.run(host=host, port=port, debug=flask_debug_mode)

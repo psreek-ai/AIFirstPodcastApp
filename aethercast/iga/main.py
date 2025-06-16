@@ -84,7 +84,7 @@ def load_iga_configuration():
     global iga_config
     iga_config['IGA_HOST'] = os.getenv("IGA_HOST", "0.0.0.0")
     iga_config['IGA_PORT'] = int(os.getenv("IGA_PORT", 5007))
-    iga_config['IGA_DEBUG_MODE'] = os.getenv("IGA_DEBUG_MODE", "True").lower() == "true"
+    # iga_config['IGA_DEBUG_MODE'] will be replaced by direct use of FLASK_DEBUG
 
     # Vertex AI Configurations
     iga_config['IGA_VERTEXAI_PROJECT_ID'] = os.getenv("IGA_VERTEXAI_PROJECT_ID", os.getenv("GCP_PROJECT_ID"))
@@ -566,9 +566,10 @@ if __name__ == "__main__":
 
     host = iga_config.get("IGA_HOST")
     port = iga_config.get("IGA_PORT")
-    is_debug_mode = iga_config.get("IGA_DEBUG_MODE")
+    # Read FLASK_DEBUG directly for running the app
+    flask_debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
 
-    app.logger.info(f"--- IGA Service (Vertex AI & GCS) starting on {host}:{port} (Debug: {is_debug_mode}) ---")
-    app.run(host=host, port=port, debug=is_debug_mode)
+    app.logger.info(f"--- IGA Service (Vertex AI & GCS) starting on {host}:{port} (Debug: {flask_debug_mode}) ---")
+    app.run(host=host, port=port, debug=flask_debug_mode)
 
 [end of aethercast/iga/main.py]
