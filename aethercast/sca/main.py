@@ -104,6 +104,8 @@ def load_sca_configuration():
     sca_config['POSTGRES_USER'] = os.getenv('POSTGRES_USER')
     sca_config['POSTGRES_PASSWORD'] = os.getenv('POSTGRES_PASSWORD')
     sca_config['POSTGRES_DB'] = os.getenv('POSTGRES_DB')
+    # Load the consolidated DB URL for SCA
+    sca_config['SCA_POSTGRES_DB_URL'] = os.getenv('SCA_POSTGRES_DB_URL')
 
     sca_config['SCA_IDEMPOTENCY_STATUS_PROCESSING'] = os.getenv('SCA_IDEMPOTENCY_STATUS_PROCESSING', 'processing')
     sca_config['SCA_IDEMPOTENCY_STATUS_COMPLETED'] = os.getenv('SCA_IDEMPOTENCY_STATUS_COMPLETED', 'completed')
@@ -338,13 +340,26 @@ def call_real_llm_service(prompt: str, topic_info: dict) -> dict:
 def _get_sca_db_connection():
     """Establishes a connection to the PostgreSQL database for SCA idempotency."""
     if not PSYCOPG2_AVAILABLE:
-        app.logger.error("SCA Idempotency: psycopg2-binary is not available.")
+        app.logger.error("SCA Idempotency: psycopg2-binary is not available. Cannot connect to PostgreSQL.")
         raise ConnectionError("SCA Idempotency: Missing psycopg2-binary library.")
 
+    sca_db_url = sca_config.get('SCA_POSTGRES_DB_URL')
+
+    if sca_db_url:
+        try:
+            conn = psycopg2.connect(dsn=sca_db_url, cursor_factory=RealDictCursor)
+            app.logger.info("SCA Idempotency: Successfully connected to PostgreSQL using SCA_POSTGRES_DB_URL.")
+            return conn
+        except psycopg2.Error as e:
+            app.logger.error(f"SCA Idempotency: Failed to connect using SCA_POSTGRES_DB_URL ('{sca_db_url}'): {e}. Falling back to individual components if configured.", exc_info=True)
+            # Fallback logic will be hit if URL connection fails
+
+    # Fallback to individual components
+    app.logger.info("SCA Idempotency: SCA_POSTGRES_DB_URL not used or failed. Attempting connection with individual PostgreSQL components.")
     required_pg_vars = ['POSTGRES_HOST', 'POSTGRES_USER', 'POSTGRES_PASSWORD', 'POSTGRES_DB']
     if not all(sca_config.get(var) for var in required_pg_vars):
-        app.logger.error("SCA Idempotency: PostgreSQL connection variables not fully configured.")
-        raise ConnectionError("SCA Idempotency: PostgreSQL environment variables not fully configured.")
+        app.logger.error("SCA Idempotency: PostgreSQL individual connection variables not fully configured for fallback.")
+        raise ConnectionError("SCA Idempotency: PostgreSQL individual environment variables not fully configured for fallback.")
 
     try:
         conn = psycopg2.connect(
@@ -352,11 +367,11 @@ def _get_sca_db_connection():
             user=sca_config['POSTGRES_USER'], password=sca_config['POSTGRES_PASSWORD'],
             dbname=sca_config['POSTGRES_DB'], cursor_factory=RealDictCursor
         )
-        app.logger.info("SCA Idempotency: Successfully connected to PostgreSQL.")
+        app.logger.info("SCA Idempotency: Successfully connected to PostgreSQL using individual components as fallback.")
         return conn
     except psycopg2.Error as e:
-        app.logger.error(f"SCA Idempotency: Unable to connect to PostgreSQL: {e}", exc_info=True)
-        raise ConnectionError(f"SCA Idempotency: PostgreSQL connection failed: {e}") from e
+        app.logger.error(f"SCA Idempotency: Unable to connect to PostgreSQL using individual components: {e}", exc_info=True)
+        raise ConnectionError(f"SCA Idempotency: PostgreSQL connection failed (individual components): {e}") from e
 
 def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
     """Checks for an existing idempotency key record."""

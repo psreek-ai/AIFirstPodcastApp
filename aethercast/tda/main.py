@@ -110,6 +110,8 @@ tda_config = {
     "TDA_IDEMPOTENCY_STATUS_COMPLETED": os.getenv('TDA_IDEMPOTENCY_STATUS_COMPLETED', 'completed'),
     "TDA_IDEMPOTENCY_STATUS_FAILED": os.getenv('TDA_IDEMPOTENCY_STATUS_FAILED', 'failed'),
     "TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": int(os.getenv('TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS', '1800')),
+    # Load the consolidated DB URL for TDA
+    "TDA_POSTGRES_DB_URL": os.getenv("TDA_POSTGRES_DB_URL"),
 }
 
 
@@ -168,8 +170,26 @@ NEWS_API_STATUS_OK = "ok"
 # Flask app is initialized earlier now for logging setup
 
 # --- Database Helper Functions (TDA General + Idempotency) ---
-def _get_tda_db_connection(): # Renamed for clarity and specific idempotency use
-    """Establishes a PostgreSQL database connection with RealDictCursor."""
+def _get_tda_db_connection():
+    """Establishes a PostgreSQL database connection with RealDictCursor, prioritizing TDA_POSTGRES_DB_URL."""
+    tda_db_url = tda_config.get('TDA_POSTGRES_DB_URL')
+
+    if tda_db_url:
+        try:
+            conn = psycopg2.connect(dsn=tda_db_url, cursor_factory=RealDictCursor)
+            app.logger.info("TDA DB: Successfully connected to PostgreSQL using TDA_POSTGRES_DB_URL.")
+            return conn
+        except psycopg2.Error as e:
+            app.logger.error(f"TDA DB: Failed to connect using TDA_POSTGRES_DB_URL ('{tda_db_url}'): {e}. Falling back to individual components.", exc_info=True)
+            # Fallback logic continues below
+
+    # Fallback to individual components
+    app.logger.info("TDA DB: TDA_POSTGRES_DB_URL not used or failed. Attempting connection with individual PostgreSQL components.")
+    required_pg_vars_fallback = ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"] # Port is optional with default
+    if not all(tda_config.get(var) for var in required_pg_vars_fallback):
+        app.logger.error("TDA DB: PostgreSQL individual connection variables not fully configured for fallback.")
+        raise ConnectionError("TDA DB: PostgreSQL individual environment variables not fully configured for fallback.")
+
     try:
         conn = psycopg2.connect(
             host=tda_config["POSTGRES_HOST"],
@@ -177,13 +197,13 @@ def _get_tda_db_connection(): # Renamed for clarity and specific idempotency use
             user=tda_config["POSTGRES_USER"],
             password=tda_config["POSTGRES_PASSWORD"],
             dbname=tda_config["POSTGRES_DB"],
-            cursor_factory=RealDictCursor # Ensures dictionary-like row access
+            cursor_factory=RealDictCursor
         )
-        app.logger.debug("TDA DB: Successfully connected to PostgreSQL with RealDictCursor.")
+        app.logger.info("TDA DB: Successfully connected to PostgreSQL using individual components as fallback.")
         return conn
     except psycopg2.Error as e:
-        app.logger.error(f"TDA DB: Error connecting to PostgreSQL database: {e}", exc_info=True)
-        raise # Re-raise to be handled by caller
+        app.logger.error(f"TDA DB: Error connecting to PostgreSQL database using individual components: {e}", exc_info=True)
+        raise ConnectionError(f"TDA DB: PostgreSQL connection failed (individual components): {e}") from e
 
 def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
     """Checks for an existing idempotency key record."""

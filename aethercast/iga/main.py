@@ -109,6 +109,8 @@ def load_iga_configuration():
     iga_config['POSTGRES_USER'] = os.getenv('POSTGRES_USER')
     iga_config['POSTGRES_PASSWORD'] = os.getenv('POSTGRES_PASSWORD')
     iga_config['POSTGRES_DB'] = os.getenv('POSTGRES_DB')
+    # Load the consolidated DB URL for IGA
+    iga_config['IGA_POSTGRES_DB_URL'] = os.getenv('IGA_POSTGRES_DB_URL')
 
     iga_config['IGA_IDEMPOTENCY_STATUS_PROCESSING'] = os.getenv('IGA_IDEMPOTENCY_STATUS_PROCESSING', 'processing')
     iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'] = os.getenv('IGA_IDEMPOTENCY_STATUS_COMPLETED', 'completed')
@@ -157,10 +159,25 @@ def _get_iga_db_connection():
         app.logger.error("IGA Idempotency: psycopg2-binary is not available. Cannot connect to PostgreSQL.")
         raise ConnectionError("IGA Idempotency: Missing psycopg2-binary library.")
 
+    iga_db_url = iga_config.get('IGA_POSTGRES_DB_URL')
+
+    if iga_db_url:
+        try:
+            conn = psycopg2.connect(dsn=iga_db_url, cursor_factory=RealDictCursor)
+            app.logger.info("IGA Idempotency: Successfully connected to PostgreSQL using IGA_POSTGRES_DB_URL.")
+            return conn
+        except psycopg2.Error as e:
+            app.logger.error(f"IGA Idempotency: Failed to connect using IGA_POSTGRES_DB_URL ('{iga_db_url}'): {e}. Falling back to individual components if configured.", exc_info=True)
+            # Fallback to individual components only if the URL connection failed, and they are all present.
+            # This behavior could be debated: if a specific URL is given and fails, should it always hard-fail?
+            # For now, allowing fallback as per subtask instructions.
+
+    # Fallback to individual components if IGA_POSTGRES_DB_URL is not set or connection with it failed (and we decided to allow fallback)
+    app.logger.info("IGA Idempotency: IGA_POSTGRES_DB_URL not used or failed. Attempting connection with individual PostgreSQL components.")
     required_pg_vars = ['POSTGRES_HOST', 'POSTGRES_USER', 'POSTGRES_PASSWORD', 'POSTGRES_DB']
     if not all(iga_config.get(var) for var in required_pg_vars):
-        app.logger.error("IGA Idempotency: PostgreSQL connection variables not fully configured.")
-        raise ConnectionError("IGA Idempotency: PostgreSQL environment variables not fully configured.")
+        app.logger.error("IGA Idempotency: PostgreSQL individual connection variables not fully configured for fallback.")
+        raise ConnectionError("IGA Idempotency: PostgreSQL individual environment variables not fully configured for fallback.")
 
     try:
         conn = psycopg2.connect(
@@ -171,11 +188,11 @@ def _get_iga_db_connection():
             dbname=iga_config['POSTGRES_DB'],
             cursor_factory=RealDictCursor
         )
-        app.logger.info("IGA Idempotency: Successfully connected to PostgreSQL.")
+        app.logger.info("IGA Idempotency: Successfully connected to PostgreSQL using individual components as fallback.")
         return conn
     except psycopg2.Error as e:
-        app.logger.error(f"IGA Idempotency: Unable to connect to PostgreSQL: {e}", exc_info=True)
-        raise ConnectionError(f"IGA Idempotency: PostgreSQL connection failed: {e}") from e
+        app.logger.error(f"IGA Idempotency: Unable to connect to PostgreSQL using individual components: {e}", exc_info=True)
+        raise ConnectionError(f"IGA Idempotency: PostgreSQL connection failed (individual components): {e}") from e
 
 def _check_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
     """Checks for an existing idempotency key record."""

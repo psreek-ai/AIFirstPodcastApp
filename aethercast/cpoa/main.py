@@ -90,13 +90,13 @@ DB_TYPE_SNIPPET = "snippet"
 
 
 # --- Celery Configuration ---
-CPOA_CELERY_BROKER_URL = os.getenv('CPOA_CELERY_BROKER_URL', 'redis://redis:6379/0')
-CPOA_CELERY_RESULT_BACKEND = os.getenv('CPOA_CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
+CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
 
 celery_app = Celery(
     'cpoa_tasks',
-    broker=CPOA_CELERY_BROKER_URL,
-    backend=CPOA_CELERY_RESULT_BACKEND,
+    broker=CELERY_BROKER_URL,
+    backend=CELERY_RESULT_BACKEND,
     include=['aethercast.cpoa.main'] # Ensure tasks are discoverable
 )
 celery_app.conf.update(
@@ -758,9 +758,15 @@ def orchestrate_podcast_generation(
     final_workflow_status = WORKFLOW_STATUS_PENDING # Initialize workflow status
 
     try:
+        # Define CPOA-specific idempotency config values at the start of the function
+        cpoa_idem_status_processing = os.getenv("CPOA_IDEMPOTENCY_STATUS_PROCESSING", "processing")
+        cpoa_idem_status_completed = os.getenv("CPOA_IDEMPOTENCY_STATUS_COMPLETED", "completed")
+        cpoa_idem_status_failed = os.getenv("CPOA_IDEMPOTENCY_STATUS_FAILED", "failed")
+        cpoa_idem_lock_timeout_seconds = int(os.getenv("CPOA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS", "3600"))
+
         db_conn = _get_cpoa_db_connection()
         if not db_conn:
-            logger.error(f"Failed to acquire DB connection for CPOA task (idempotency_key: {cpoa_task_idempotency_key}). Aborting.", extra=initial_log_extra)
+            logger.error(f"Failed to acquire DB connection for CPOA task (idempotency_key: {cpoa_orchestration_idempotency_key}). Aborting.", extra=initial_log_extra)
             # Cannot store idempotency failure if DB is down.
             return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
                     "error_message": "DB connection acquisition failed for CPOA task.",
@@ -769,43 +775,32 @@ def orchestrate_podcast_generation(
         db_conn.autocommit = False
 
         # Idempotency Check for the CPOA orchestration task itself
-        # The workflow_id for THIS idempotency record will be the CPOA's own generated workflow_id.
-        # This means we need to create the CPOA workflow_instance first to get its ID.
-
-        # Check idempotency using cpoa_orchestration_idempotency_key and cpoa_task_name_for_idempotency
-        # This check happens *before* creating the CPOA internal workflow instance.
-        # The workflow_id stored in the idempotency_keys table for this CPOA task will be
-        # the CPOA-managed cpoa_internal_workflow_id, created if the key is new or being re-processed.
-        existing_key_record = _check_idempotency_key(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, workflow_id_for_log=None) # workflow_id not known yet for log
+        existing_key_record = _check_idempotency_key(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, workflow_id_for_log=None)
 
         if existing_key_record:
             status = existing_key_record['status']
             locked_at = existing_key_record['locked_at']
-            # Use the cpoa_internal_workflow_id from the *existing* idempotency record
             cpoa_internal_workflow_id = existing_key_record.get('workflow_id')
             log_extra_cpoa_task = {'workflow_id': cpoa_internal_workflow_id, 'idempotency_key': cpoa_orchestration_idempotency_key, 'task_name': cpoa_task_name_for_idempotency}
 
-            if status == IDEMPOTENCY_STATUS_COMPLETED:
+            if status == cpoa_idem_status_completed: # Use CPOA specific
                 logger.info(f"CPOA Orchestration Task: Found completed record. Returning stored result.", extra=log_extra_cpoa_task)
                 db_conn.rollback()
                 return existing_key_record['result_payload']
-            elif status == IDEMPOTENCY_STATUS_PROCESSING:
-                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < IDEMPOTENCY_LOCK_TIMEOUT_SECONDS:
+            elif status == cpoa_idem_status_processing: # Use CPOA specific
+                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < cpoa_idem_lock_timeout_seconds: # Use CPOA specific timeout
                     logger.warning(f"CPOA Orchestration Task: Record is already processing and lock is active. Returning conflict.", extra=log_extra_cpoa_task)
                     db_conn.rollback()
-                    return {"task_id": original_task_id, "workflow_id": cpoa_internal_workflow_id, # CPOA's internal workflow_id
+                    return {"task_id": original_task_id, "workflow_id": cpoa_internal_workflow_id,
                             "status": "CONFLICT_PROCESSING",
                             "error_message": "Task is already being processed.", "idempotency_key": cpoa_orchestration_idempotency_key}
-                else: # Lock timed out
+                else:
                     logger.warning(f"CPOA Orchestration Task: Record was 'processing' but lock timed out. Proceeding with new execution.", extra=log_extra_cpoa_task)
-                    # cpoa_internal_workflow_id should exist from the stale record.
-                    _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, IDEMPOTENCY_STATUS_PROCESSING, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False)
-            elif status == IDEMPOTENCY_STATUS_FAILED:
+                    _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_processing, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False) # Use CPOA specific
+            elif status == cpoa_idem_status_failed: # Use CPOA specific
                  logger.info(f"CPOA Orchestration Task: Found 'failed' record. Allowing new execution attempt.", extra=log_extra_cpoa_task)
-                 # cpoa_internal_workflow_id should exist.
-                 _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, IDEMPOTENCY_STATUS_PROCESSING, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False)
-        else: # No existing key, this is a new request
-            # Create the CPOA workflow instance *now* to get the definitive cpoa_internal_workflow_id
+                 _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_processing, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False) # Use CPOA specific
+        else:
             cpoa_internal_workflow_id = _create_workflow_instance(
                 db_conn,
                 trigger_event_type="podcast_generation_celery_task", # Or more specific if known
@@ -818,15 +813,15 @@ def orchestrate_podcast_generation(
                 user_id=user_id
             )
             if not cpoa_internal_workflow_id:
-                logger.error(f"Failed to create CPOA workflow instance for idempotency key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra) # Use initial_log_extra as cpoa_internal_workflow_id is None
+                logger.error(f"Failed to create CPOA workflow instance for idempotency key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra)
                 db_conn.rollback()
                 return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
                         "error_message": "Critical: Workflow instance creation failed before idempotency record.",
                         "orchestration_log": [], "final_audio_details": {}}
 
-            _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, IDEMPOTENCY_STATUS_PROCESSING, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=True)
+            _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_processing, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=True) # Use CPOA specific
 
-        db_conn.commit() # Commit the idempotency status update (processing or new record)
+        db_conn.commit()
 
         # --- Main Orchestration Logic ---
         # cpoa_internal_workflow_id is now definitively set.
@@ -1346,10 +1341,10 @@ def orchestrate_podcast_generation(
                 # Use workflow_id if available, otherwise it's 'N/A' by default in helper.
                 # The result_payload for a failed CPOA task is essentially the error information.
                 error_payload_for_idempotency = {"error_message": final_error_message, "legacy_status": final_cpoa_status_legacy, "stage": current_orchestration_stage_legacy}
-                _store_idempotency_result(db_conn, cpoa_task_idempotency_key, task_name_cpoa_orchestration, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload_for_idempotency, workflow_id=workflow_id, is_new_key=False)
+                _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_failed, error_payload=error_payload_for_idempotency, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False) # Use CPOA specific, cpoa_internal_workflow_id
                 db_conn.commit() # Commit idempotency failure status
             except Exception as e_idem_fail_store:
-                wf_logger.error(f"Failed to store idempotency failure status for key {cpoa_task_idempotency_key}: {e_idem_fail_store}", exc_info=True)
+                wf_logger.error(f"Failed to store idempotency failure status for key {cpoa_orchestration_idempotency_key}: {e_idem_fail_store}", exc_info=True) # Use cpoa_orchestration_idempotency_key
                 if db_conn: db_conn.rollback() # Rollback if storing idempotency key itself failed
 
         _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message, "stage": current_orchestration_stage_legacy, "final_status": final_cpoa_status_legacy}, workflow_id_for_log=workflow_id)
@@ -1419,16 +1414,16 @@ def orchestrate_podcast_generation(
             idempotency_conn_final_store = _get_cpoa_db_connection()
             if idempotency_conn_final_store:
                 idempotency_conn_final_store.autocommit = False
-                _store_idempotency_result(idempotency_conn_final_store, cpoa_task_idempotency_key, task_name_cpoa_orchestration,
-                                          IDEMPOTENCY_STATUS_COMPLETED, result_payload=cpoa_final_result_payload,
-                                          workflow_id=workflow_id, is_new_key=False)
+                _store_idempotency_record(idempotency_conn_final_store, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, # Use cpoa_orchestration_idempotency_key and cpoa_task_name_for_idempotency
+                                          cpoa_idem_status_completed, result_payload=cpoa_final_result_payload, # Use CPOA specific
+                                          cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False) # Use cpoa_internal_workflow_id
                 idempotency_conn_final_store.commit()
             else:
                 logger_to_use = wf_logger if wf_logger else logger
-                logger_to_use.error(f"Could not get DB connection to store final idempotency result for {cpoa_task_idempotency_key}.", extra={'workflow_id': workflow_id or 'N/A'})
+                logger_to_use.error(f"Could not get DB connection to store final idempotency result for {cpoa_orchestration_idempotency_key}.", extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
         except Exception as e_idem_final:
             logger_to_use = wf_logger if wf_logger else logger
-            logger_to_use.error(f"Failed to store final idempotency result for key {cpoa_task_idempotency_key}: {e_idem_final}", exc_info=True, extra={'workflow_id': workflow_id or 'N/A'})
+            logger_to_use.error(f"Failed to store final idempotency result for key {cpoa_orchestration_idempotency_key}: {e_idem_final}", exc_info=True, extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
             if idempotency_conn_final_store: idempotency_conn_final_store.rollback()
         finally:
             if idempotency_conn_final_store: _put_cpoa_db_connection(idempotency_conn_final_store)
