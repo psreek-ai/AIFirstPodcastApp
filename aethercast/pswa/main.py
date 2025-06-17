@@ -647,62 +647,138 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
         # --- Prepare for AIMS call (if not cached or cache disabled) ---
         current_persona = persona or pswa_config.get('PSWA_DEFAULT_PERSONA')
         persona_system_message_addition = pswa_config.get('PSWA_PERSONA_PROMPTS_MAP_PARSED', {}).get(current_persona, "")
-        final_system_message = f"{persona_specific_system_message.strip()} {pswa_config.get('PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION', '')}".strip()
+        # Corrected variable name below
+        final_system_message = f"{persona_system_message_addition.strip()} {pswa_config.get('PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION', '')}".strip()
         user_prompt_narrative_guidance = narrative_guidance or pswa_config.get('PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION', '')
         final_user_message = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE', '').format(topic=topic, content=content, narrative_guidance=user_prompt_narrative_guidance)
         aims_payload = {"model_id": pswa_config.get('PSWA_LLM_MODEL'), "system_message": final_system_message, "user_message": final_user_message, "temperature": pswa_config.get('PSWA_LLM_TEMPERATURE'), "max_tokens": pswa_config.get('PSWA_LLM_MAX_TOKENS'), "json_mode": pswa_config.get('PSWA_LLM_JSON_MODE')}
         aims_request_id_header = {"X-Request-ID": f"pswa_to_aims_{task_id_for_logging}"}
 
-        self.update_state(state='PROGRESS', meta={'current_step': 'Calling AIMS service', 'progress_percent': 30})
-        logger.info(f"Celery Task {task_id_for_logging}: Calling AIMS service for script generation.", extra={"aims_model": aims_payload["model_id"], "orig_req_id": request_id_celery})
+        self.update_state(state='PROGRESS', meta={'current_step': 'Calling AIMS service', 'progress_percent': 30, **log_ctx})
+        logger.info(f"Celery Task {task_id_for_logging}: Calling AIMS service for script generation.", extra={"aims_model": aims_payload["model_id"], "orig_req_id": request_id_celery, **log_ctx})
 
-        aims_response_data = _call_aims_service_for_script(aims_payload, aims_request_id_header)
+        # --- Integrated _call_aims_service_for_script logic starts ---
+        aims_response_data = {} # Initialize to ensure it's always defined
+        task_id_from_aims_initial = None # Initialize
+        status_url = None # Initialize
 
-        if "error" in aims_response_data: # AIMS returned a logical error
-            logger.error(f"Celery Task {task_id_for_logging}: AIMS service returned an error: {aims_response_data}", extra={**log_ctx, "aims_response": aims_response_data})
+        try:
+            response_aims = requests.post(pswa_config['AIMS_SERVICE_URL'], json=aims_payload, headers=aims_request_id_header, timeout=pswa_config['AIMS_REQUEST_TIMEOUT_SECONDS'])
+            response_aims.raise_for_status()
+            aims_initial_response_data = response_aims.json() # Could raise JSONDecodeError
+            task_id_from_aims_initial = aims_initial_response_data.get("task_id")
+            status_url = aims_initial_response_data.get("status_url")
+
+            if not task_id_from_aims_initial or not status_url:
+                logger.error(f"Celery Task {task_id_for_logging}: AIMS service response missing task_id or status_url. Response: {aims_initial_response_data}", extra=log_ctx)
+                aims_response_data = {"error": "PSWA_AIMS_BAD_TASK_RESPONSE", "message": "AIMS service task submission response invalid."}
+            else:
+                logger.info(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} submitted. Polling at {status_url}", extra=log_ctx)
+                self.update_state(state='PROGRESS', meta={'current_step': 'Polling AIMS for script', 'progress_percent': 40, 'aims_task_id': task_id_from_aims_initial, **log_ctx})
+
+                polling_start_time = time.time()
+                aims_final_result = None # To store the final result from AIMS task
+
+                while True:
+                    if time.time() - polling_start_time > pswa_config['AIMS_POLLING_TIMEOUT_SECONDS']:
+                        logger.error(f"Celery Task {task_id_for_logging}: Polling AIMS task {task_id_from_aims_initial} timed out.", extra=log_ctx)
+                        aims_response_data = {"error": "PSWA_AIMS_TIMEOUT", "message": "Polling AIMS task timed out."}
+                        break
+                    try:
+                        logger.info(f"Celery Task {task_id_for_logging}: Polling AIMS task {task_id_from_aims_initial} at {status_url}", extra=log_ctx)
+                        poll_response = requests.get(status_url, timeout=10)
+                        poll_response.raise_for_status()
+                        try:
+                            task_status_data = poll_response.json()
+                        except json.JSONDecodeError as e_json_poll:
+                            logger.error(f"Celery Task {task_id_for_logging}: Failed to decode JSON from AIMS status poll for AIMS task {task_id_from_aims_initial}. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}", exc_info=True, extra=log_ctx)
+                            aims_response_data = {"error": "PSWA_AIMS_BAD_JSON_RESPONSE", "message": "AIMS service status response not valid JSON.", "details": str(e_json_poll), "response_preview": poll_response.text[:200]}
+                            break
+
+                        current_aims_status = task_status_data.get("status")
+                        logger.info(f"Celery Task {task_id_for_logging}: Polled AIMS task {task_id_from_aims_initial}. Status: {current_aims_status}", extra=log_ctx)
+
+                        if current_aims_status == "SUCCESS":
+                            aims_final_result = task_status_data.get("result", {})
+                            logger.info(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} completed successfully.", extra=log_ctx)
+                            break
+                        elif current_aims_status == "FAILURE":
+                            logger.error(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} failed. Full response: {task_status_data}", extra=log_ctx)
+                            aims_response_data = {"error": "PSWA_AIMS_TASK_FAILED", "message": "AIMS task reported failure.", "details": task_status_data.get("result")}
+                            break
+
+                        self.update_state(state='PROGRESS', meta={'current_step': f'AIMS task ongoing ({current_aims_status})', 'progress_percent': 40 + int(60 * (time.time() - polling_start_time) / pswa_config['AIMS_POLLING_TIMEOUT_SECONDS']), 'aims_task_id': task_id_from_aims_initial, 'aims_status': current_aims_status, **log_ctx})
+                        time.sleep(pswa_config['AIMS_POLLING_INTERVAL_SECONDS'])
+
+                    except requests.exceptions.RequestException as e_poll:
+                        logger.warning(f"Celery Task {task_id_for_logging}: Polling AIMS task {task_id_from_aims_initial} failed: {e_poll}. Retrying poll.", extra=log_ctx)
+                        time.sleep(pswa_config['AIMS_POLLING_INTERVAL_SECONDS']) # Wait before retrying poll
+
+                if aims_final_result: # If polling loop completed with SUCCESS
+                    raw_script_text = aims_final_result.get("choices", [{}])[0].get("text", "")
+                    if not raw_script_text:
+                        logger.error(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} result missing text.", extra={**log_ctx, "aims_result": aims_final_result})
+                        aims_response_data = {"error": "PSWA_AIMS_EMPTY_RESPONSE", "message": "AIMS task result was empty."}
+                    else:
+                        parsed_script = parse_llm_script_output(raw_script_text, topic)
+                        parsed_script["llm_model_used"] = aims_final_result.get("model_id", pswa_config.get('PSWA_LLM_MODEL'))
+                        parsed_script["aims_request_id"] = task_id_from_aims_initial # AIMS task ID
+                        parsed_script["aims_usage"] = aims_final_result.get("usage")
+                        aims_response_data = parsed_script # This is the successful script data
+
+        except requests.exceptions.RequestException as e_aims_initial:
+            logger.error(f"Celery Task {task_id_for_logging}: Initial AIMS service call failed: {e_aims_initial}", exc_info=True, extra=log_ctx)
+            aims_response_data = {"error": "PSWA_AIMS_HTTP_ERROR", "message": "AIMS service request failed.", "details": str(e_aims_initial)}
+        except json.JSONDecodeError as e_json_initial:
+            logger.error(f"Celery Task {task_id_for_logging}: Failed to decode initial AIMS response: {e_json_initial}. Response: {response_aims.text[:200]}", exc_info=True, extra=log_ctx)
+            aims_response_data = {"error": "PSWA_AIMS_BAD_INITIAL_JSON", "message": "AIMS service initial response not valid JSON.", "details": str(e_json_initial), "response_preview": response_aims.text[:200] if 'response_aims' in locals() else "N/A"}
+        except Exception as e_aims_logic: # Catch any other unexpected error in AIMS interaction logic
+            logger.error(f"Celery Task {task_id_for_logging}: Unexpected error during AIMS interaction: {e_aims_logic}", exc_info=True, extra=log_ctx)
+            aims_response_data = {"error": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected error during AIMS interaction.", "details": str(e_aims_logic)}
+        # --- Integrated _call_aims_service_for_script logic ends ---
+
+
+        if "error" in aims_response_data: # AIMS returned a logical error or polling failed
+            logger.error(f"Celery Task {task_id_for_logging}: AIMS interaction resulted in an error: {aims_response_data}", extra={**log_ctx, "aims_response": aims_response_data})
             _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=aims_response_data, is_new_key=False)
             db_conn_idem.commit()
-            return aims_response_data
+            return aims_response_data # Return the error payload from AIMS interaction
 
+        # If aims_response_data is the structured script (i.e., success)
         structured_script = aims_response_data
         if not (isinstance(structured_script, dict) and all(k in structured_script for k in ["title", "intro", "segments", "outro"])):
-            logger.error(f"Celery Task {task_id_for_logging}: LLM (AIMS) response malformed. Preview: {json.dumps(structured_script)[:500]}", extra={**log_ctx, "raw_response_preview": json.dumps(structured_script)[:500]})
-            malformed_error_payload = {"error": "PSWA_MALFORMED_SCRIPT_FROM_AIMS", "message": "AIMS returned a malformed script structure.", "details_preview": json.dumps(structured_script)[:200]}
+            logger.error(f"Celery Task {task_id_for_logging}: LLM (AIMS) response malformed after successful poll. Preview: {json.dumps(structured_script)[:500]}", extra={**log_ctx, "raw_response_preview": json.dumps(structured_script)[:500]})
+            malformed_error_payload = {"error": "PSWA_MALFORMED_SCRIPT_FROM_AIMS", "message": "AIMS returned a malformed script structure after successful poll.", "details_preview": json.dumps(structured_script)[:200]}
             _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=malformed_error_payload, is_new_key=False)
             db_conn_idem.commit()
             return malformed_error_payload
 
-        script_id = f"pswa_script_{uuid.uuid4().hex[:12]}"
-        structured_script["script_id"] = script_id
-        structured_script["llm_model_used"] = aims_response_data.get("model_id_used", pswa_config.get('PSWA_LLM_MODEL'))
-        structured_script["persona_used"] = current_persona
-        structured_script["source"] = "aims_generation_async"
+        script_id = structured_script.get("script_id", f"pswa_script_{uuid.uuid4().hex[:12]}")
+        if "script_id" not in structured_script: structured_script["script_id"] = script_id # Ensure it has one
+        # model_id_used and persona_used should have been added by parse_llm_script_output or from AIMS result
+        structured_script["source"] = "aims_generation_async_polled"
 
         if pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED') and not (structured_script.get("segments") and any(s.get("segment_title") == "ERROR" for s in structured_script["segments"])):
-             _save_script_to_cache(script_id, topic_hash, structured_script, structured_script["llm_model_used"])
+             _save_script_to_cache(script_id, topic_hash, structured_script, structured_script.get("llm_model_used", "unknown"))
 
-        final_success_payload = {"script_data": structured_script, "status_for_metric": "success_generation_async", "aims_total_duration_ms": aims_response_data.get("aims_total_duration_ms", -1)}
+        final_success_payload = {"script_data": structured_script, "status_for_metric": "success_generation_async_polled"}
         _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_COMPLETED'], workflow_id=workflow_id, result_payload=final_success_payload, is_new_key=False)
         db_conn_idem.commit()
-        self.update_state(state='SUCCESS', meta={'current_step': 'Script generated successfully', 'progress_percent': 100, 'result_summary': {"script_id": script_id, "title": structured_script.get("title")}, **log_ctx})
-        logger.info(f"Celery Task {task_id_for_logging}: Script generation successful. Script ID: {script_id}", extra={**log_ctx, "script_title": structured_script.get("title")})
+        self.update_state(state='SUCCESS', meta={'current_step': 'Script generated successfully via polling', 'progress_percent': 100, 'result_summary': {"script_id": script_id, "title": structured_script.get("title")}, **log_ctx})
+        logger.info(f"Celery Task {task_id_for_logging}: Script generation successful via polling. Script ID: {script_id}", extra={**log_ctx, "script_title": structured_script.get("title")})
         return final_success_payload
 
     except Exception as e:
         logger.error(f"Celery Task {task_id_for_logging}: Unhandled exception in main task logic: {e}", exc_info=True, extra=log_ctx)
-        if db_conn_idem and idempotency_key and PSYCOPG2_AVAILABLE: # Check if db_conn_idem was initialized
+        if db_conn_idem and idempotency_key and PSYCOPG2_AVAILABLE:
             try:
-                # Ensure not to overwrite an already committed state by re-checking.
-                # However, on_failure will be called by Celery, which should handle this.
-                # For safety, we can try to mark FAILED if not already.
-                # This specific block might be redundant if on_failure is robust.
                 current_status_check = _check_idempotency_key(db_conn_idem, idempotency_key)
                 if not current_status_check or current_status_check['status'] == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']:
                     error_payload_for_idempotency = {"error": "PSWA_TASK_UNHANDLED_EXCEPTION", "message": f"PSWA task failed: {type(e).__name__} - {str(e)}"}
                     _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=error_payload_for_idempotency, is_new_key=False)
                     db_conn_idem.commit()
                 else:
-                    db_conn_idem.rollback() # Rollback if status was already completed/failed by another path
+                    db_conn_idem.rollback()
             except Exception as db_e:
                 logger.error(f"Celery Task {task_id_for_logging}: CRITICAL - Failed to store idempotency FAILED status after main task error: {db_e}", exc_info=True, extra=log_ctx)
                 if db_conn_idem and not db_conn_idem.closed: db_conn_idem.rollback()
