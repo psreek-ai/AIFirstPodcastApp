@@ -10,10 +10,17 @@ from google.cloud import texttospeech
 from google.cloud import storage # Added for GCS
 from google.api_core import exceptions as google_exceptions
 
+# --- Database and Idempotency specific imports ---
+import psycopg2
+from psycopg2 import pool as psycopg2_pool
+from psycopg2 import extras as psycopg2_extras # For DictCursor
+# time is already imported below, json needs to be imported
+import json # For serializing/deserializing JSON payloads for DB
+
 # --- Load Environment Variables ---
 load_dotenv()
 
-import time # Added for metric logging
+import time # Added for metric logging & idempotency stale check
 
 # --- Celery Configuration ---
 CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0') # Matches AIMS
@@ -64,6 +71,118 @@ setup_json_logging(app)
 
 # Make the global logger use the configured app.logger
 logger = app.logger
+
+# --- Idempotency Configuration & DB Connection Pool for AIMS_TTS ---
+IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = 300 # 5 minutes (adjust as needed for TTS tasks)
+db_connection_pool_tts = None
+
+def get_db_connection_tts():
+    """Establishes and returns a database connection from the AIMS_TTS pool."""
+    global db_connection_pool_tts
+    if db_connection_pool_tts is None:
+        try:
+            db_connection_pool_tts = psycopg2_pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=int(os.getenv("DB_POOL_MAX_CONNECTIONS_TTS", 3)), # Separate pool size
+                user=os.getenv("POSTGRES_USER"),
+                password=os.getenv("POSTGRES_PASSWORD"),
+                host=os.getenv("POSTGRES_HOST"),
+                port=os.getenv("POSTGRES_PORT", "5432"),
+                database=os.getenv("POSTGRES_DB")
+            )
+            logger.info("Database connection pool created successfully for AIMS_TTS.")
+        except (Exception, psycopg2.Error) as error:
+            logger.error(f"Error while creating PostgreSQL connection pool for AIMS_TTS: {error}", exc_info=True)
+            raise
+    try:
+        return db_connection_pool_tts.getconn()
+    except Exception as error:
+        logger.error(f"Error getting connection from AIMS_TTS pool: {error}", exc_info=True)
+        raise
+
+def release_db_connection_tts(conn):
+    """Releases a database connection back to the AIMS_TTS pool."""
+    global db_connection_pool_tts
+    if db_connection_pool_tts and conn:
+        db_connection_pool_tts.putconn(conn)
+
+def check_idempotency_tts(db_conn, idempotency_key: str, task_name: str):
+    log_extra_idem = {'idempotency_key': idempotency_key, 'task_name': task_name, 'service_name': 'aims-tts-service'}
+    try:
+        with db_conn.cursor(cursor_factory=psycopg2_extras.DictCursor) as cursor:
+            cursor.execute(
+                "SELECT status, result_payload, locked_at, error_payload FROM idempotency_keys WHERE key = %s AND task_name = %s",
+                (idempotency_key, task_name)
+            )
+            record = cursor.fetchone()
+            if record:
+                logger.info(f"Idempotency record found: Status - {record['status']}", extra=log_extra_idem)
+                if record['status'] == 'completed':
+                    return {'status': 'completed', 'result': record['result_payload'] if isinstance(record['result_payload'], dict) else json.loads(record['result_payload'])}
+                elif record['status'] == 'processing':
+                    if record['locked_at'] and (time.time() - record['locked_at'].timestamp()) < IDEMPOTENCY_LOCK_TIMEOUT_SECONDS:
+                        logger.warning("Task is already processing (lock not expired).", extra=log_extra_idem)
+                        return {'status': 'conflict', 'message': 'Task already processing'}
+                    else:
+                        logger.warning("Task was 'processing' but lock expired. Will attempt to re-acquire.", extra=log_extra_idem)
+                        return None # Stale lock
+                elif record['status'] == 'failed':
+                    logger.warning("Previous attempt for this task failed. Will attempt to re-run.", extra=log_extra_idem)
+                    return None # Failed, proceed
+            return None
+    except (Exception, psycopg2.Error) as error:
+        logger.error(f"Error checking idempotency in AIMS-TTS: {error}", exc_info=True, extra=log_extra_idem)
+        raise
+
+def acquire_idempotency_lock_tts(db_conn, idempotency_key: str, task_name: str, workflow_id: Optional[str] = None):
+    log_extra_idem = {'idempotency_key': idempotency_key, 'task_name': task_name, 'workflow_id': workflow_id or "N/A", 'service_name': 'aims-tts-service'}
+    try:
+        with db_conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO idempotency_keys (key, task_name, workflow_id, status, locked_at, created_at, updated_at)
+                VALUES (%s, %s, %s, 'processing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                ON CONFLICT (key, task_name) DO UPDATE SET
+                    status = 'processing',
+                    locked_at = CURRENT_TIMESTAMP,
+                    workflow_id = EXCLUDED.workflow_id,
+                    updated_at = CURRENT_TIMESTAMP
+                RETURNING id;
+                """,
+                (idempotency_key, task_name, workflow_id)
+            )
+            lock_id = cursor.fetchone()
+            db_conn.commit()
+            if lock_id:
+                logger.info("Idempotency lock acquired in AIMS-TTS.", extra=log_extra_idem)
+                return True
+            logger.error("Failed to acquire idempotency lock in AIMS-TTS (no id returned).", extra=log_extra_idem)
+            return False
+    except (Exception, psycopg2.Error) as error:
+        db_conn.rollback()
+        logger.error(f"Error acquiring idempotency lock in AIMS-TTS: {error}", exc_info=True, extra=log_extra_idem)
+        raise
+
+def update_idempotency_record_tts(db_conn, idempotency_key: str, task_name: str, final_status: str, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None):
+    log_extra_idem = {'idempotency_key': idempotency_key, 'task_name': task_name, 'final_status': final_status, 'service_name': 'aims-tts-service'}
+    try:
+        with db_conn.cursor() as cursor:
+            result_payload_db = json.dumps(result_payload) if result_payload is not None else None
+            error_payload_db = json.dumps(error_payload) if error_payload is not None else None
+            cursor.execute(
+                """
+                UPDATE idempotency_keys
+                SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE key = %s AND task_name = %s
+                """,
+                (final_status, result_payload_db, error_payload_db, idempotency_key, task_name)
+            )
+            db_conn.commit()
+            logger.info("Idempotency record updated in AIMS-TTS.", extra=log_extra_idem)
+    except (Exception, psycopg2.Error) as error:
+        db_conn.rollback()
+        logger.error(f"Error updating idempotency record in AIMS-TTS: {error}", exc_info=True, extra=log_extra_idem)
+        raise
 
 # --- AIMS_TTS Configuration ---
 AIMS_TTS_HOST = os.getenv('AIMS_TTS_HOST', '0.0.0.0')
@@ -129,10 +248,40 @@ def invoke_tts_google_task(self, request_id: str, text_to_synthesize: str, voice
     Celery task to invoke Google TTS and upload to GCS.
     'self' is the task instance.
     """
-    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting TTS synthesis. Voice: {voice_id}")
+    celery_task_internal_id = self.request.id or f"sync_tts_{uuid.uuid4().hex[:8]}"
+    log_extra = {
+        'request_id': request_id,
+        'celery_task_id': celery_task_internal_id,
+        'workflow_id': "N/A", # workflow_id is not explicitly passed here yet
+        'voice_id_used': voice_id, # Renamed for clarity from 'voice_id' in original log
+        'language_code_used': language_code, # Renamed for clarity
+        'service_name': 'aims-tts-service'
+    }
+    logger.info(f"AIMS-TTS Task {celery_task_internal_id}: Starting TTS synthesis for user request {request_id}. Voice: {voice_id}", extra=log_extra)
+
+    idempotency_key_str = request_id # Use user-provided request_id
+    task_name_str = "aims_invoke_tts_google_task" # Explicit task name for idempotency table
+    db_conn = None
+    task_final_result = None
 
     try:
-        client = texttospeech.TextToSpeechClient()
+        db_conn = get_db_connection_tts()
+        idempotency_check = check_idempotency_tts(db_conn, idempotency_key_str, task_name_str)
+
+        if idempotency_check:
+            if idempotency_check['status'] == 'completed':
+                logger.info(f"Task '{task_name_str}' (req: {request_id}) already completed. Returning stored result.", extra=log_extra)
+                return idempotency_check['result']
+            elif idempotency_check['status'] == 'conflict':
+                logger.warning(f"Task '{task_name_str}' (req: {request_id}) conflict: {idempotency_check['message']}.", extra=log_extra)
+                return {"error": {"type": "idempotency_conflict", "message": idempotency_check['message']}, "request_id": request_id}
+
+        if not acquire_idempotency_lock_tts(db_conn, idempotency_key_str, task_name_str, log_extra['workflow_id']):
+            logger.error(f"Failed to acquire idempotency lock for task '{task_name_str}' (req: {request_id}). Aborting.", extra=log_extra)
+            return {"error": {"type": "lock_acquisition_failed", "message": "Failed to acquire idempotency lock."}, "request_id": request_id}
+
+        # Core TTS and GCS Upload Logic
+        client = texttospeech.TextToSpeechClient() # Consider initializing client once if worker reuses context
         synthesis_input = texttospeech.SynthesisInput(text=text_to_synthesize)
         voice_params = texttospeech.VoiceSelectionParams(language_code=language_code, name=voice_id)
         audio_config = texttospeech.AudioConfig(
@@ -144,38 +293,51 @@ def invoke_tts_google_task(self, request_id: str, text_to_synthesize: str, voice
         gcp_tts_call_start_time = time.time()
         tts_response = client.synthesize_speech(request={"input": synthesis_input, "voice": voice_params, "audio_config": audio_config})
         gcp_tts_call_duration_ms = (time.time() - gcp_tts_call_start_time) * 1000
-        logger.info("AIMS_TTS GCP TTS call processed (async)", extra=dict(metric_name="aims_tts_gcp_tts_call_latency_ms", value=round(gcp_tts_call_duration_ms, 2), tags={"voice_id_used": voice_id}))
+        logger.info("AIMS_TTS GCP TTS call processed (async)", extra={**log_extra, "metric_name":"aims_tts_gcp_tts_call_latency_ms", "value":round(gcp_tts_call_duration_ms, 2)})
 
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(GCS_BUCKET_NAME)
+        storage_client_instance = storage.Client() # Ensure client is instantiated if not global or passed
+        bucket = storage_client_instance.bucket(GCS_BUCKET_NAME)
         gcs_object_name = f"{AIMS_TTS_GCS_AUDIO_PREFIX}{request_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
         blob = bucket.blob(gcs_object_name)
         gcs_content_type = selected_audio_encoding_details["mimetype"]
-        if output_format_str == "LINEAR16" and "rate=" not in gcs_content_type:
-             sample_rate = tts_response.audio_config.sample_rate_hertz if hasattr(tts_response, 'audio_config') and tts_response.audio_config.sample_rate_hertz else 24000
-             gcs_content_type = f"audio/L16; rate={sample_rate}"
+        if output_format_str == "LINEAR16" and "rate=" not in gcs_content_type: # Adjust content type for LINEAR16 if needed
+             sample_rate_hz = tts_response.audio_config.sample_rate_hertz if hasattr(tts_response, 'audio_config') and tts_response.audio_config.sample_rate_hertz else 24000
+             gcs_content_type = f"audio/L16; rate={sample_rate_hz}"
 
         gcs_upload_start_time = time.time()
         blob.upload_from_string(tts_response.audio_content, content_type=gcs_content_type)
         gcs_upload_duration_ms = (time.time() - gcs_upload_start_time) * 1000
-        logger.info("AIMS_TTS GCS upload processed (async)", extra=dict(metric_name="aims_tts_gcs_upload_latency_ms", value=round(gcs_upload_duration_ms, 2)))
+        logger.info("AIMS_TTS GCS upload processed (async)", extra={**log_extra, "metric_name":"aims_tts_gcs_upload_latency_ms", "value":round(gcs_upload_duration_ms, 2)})
 
         audio_gcs_uri = f"gs://{GCS_BUCKET_NAME}/{gcs_object_name}"
         estimated_duration = estimate_audio_duration(len(text_to_synthesize), speech_rate)
-        logger.info("AIMS_TTS characters synthesized (async)", extra=dict(metric_name="aims_tts_synthesized_chars_count", value=len(text_to_synthesize), tags={"voice_id_used": voice_id}))
+        logger.info("AIMS_TTS characters synthesized (async)", extra={**log_extra, "metric_name":"aims_tts_synthesized_chars_count", "value":len(text_to_synthesize)})
 
-        return {
+        task_final_result = {
             "request_id": request_id, "voice_id": voice_id, "audio_url": audio_gcs_uri,
             "audio_duration_seconds": estimated_duration, "audio_format": file_extension
         }
+        update_idempotency_record_tts(db_conn, idempotency_key_str, task_name_str, 'completed', result_payload=task_final_result)
+        return task_final_result
+
     except google_exceptions.GoogleAPIError as e:
-        logger.error(f"Celery Task {self.request.id}: Google Cloud API Error: {e}", exc_info=True)
-        logger.error("AIMS_TTS GCP API error (async)", extra=dict(metric_name="aims_tts_gcp_error_count", value=1, tags={"error_type": "gcp_api_error"}))
-        raise self.retry(exc=e, countdown=5, max_retries=3)
+        logger.error(f"AIMS-TTS Task {celery_task_internal_id}: Google Cloud API Error for req {request_id}: {e}", exc_info=True, extra=log_extra)
+        logger.error("AIMS_TTS GCP API error (async)", extra={**log_extra, "metric_name":"aims_tts_gcp_error_count", "value":1, "tags_metric":{"error_type": "gcp_api_error"}})
+        error_payload_db = {"error_type": type(e).__name__, "message": str(e), "details": e.args[0] if e.args else "N/A"}
+        if db_conn:
+            update_idempotency_record_tts(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
+        raise self.retry(exc=e, countdown=10, max_retries=2) # Adjusted retry
+
     except Exception as e:
-        logger.error(f"Celery Task {self.request.id}: Unexpected error in TTS task: {e}", exc_info=True)
-        logger.error(f"Celery Task {self.request.id}: Non-GoogleAPIError in TTS, will retry: {e}", exc_info=True)
-        raise self.retry(exc=e, countdown=5, max_retries=3)
+        logger.error(f"AIMS-TTS Task {celery_task_internal_id}: Unexpected error for req {request_id}: {e}", exc_info=True, extra=log_extra)
+        error_payload_db = {"error_type": type(e).__name__, "message": str(e)}
+        if db_conn:
+             update_idempotency_record_tts(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
+        raise self.retry(exc=e, countdown=5, max_retries=1) # Adjusted retry
+
+    finally:
+        if db_conn:
+            release_db_connection_tts(db_conn)
 
 
 @app.route('/v1/synthesize', methods=['POST'])
@@ -262,6 +424,15 @@ if __name__ == '__main__':
     #     logger.error(f"Could not create shared audio directory {SHARED_AUDIO_DIR_CONTAINER} on startup: {e}")
 
     logger.info(f"--- AIMS_TTS Service starting on {AIMS_TTS_HOST}:{AIMS_TTS_PORT} (Debug: {FLASK_DEBUG}) ---")
+    # Initialize DB pool at startup (best effort)
+    try:
+        conn_main_init = get_db_connection_tts()
+        if conn_main_init:
+            release_db_connection_tts(conn_main_init)
+            logger.info("AIMS_TTS DB connection pool initialized successfully from main.")
+    except Exception as e_main_db_init:
+        logger.error(f"AIMS_TTS failed to initialize DB pool from main: {e_main_db_init}", exc_info=True)
+
     app.run(host=AIMS_TTS_HOST, port=AIMS_TTS_PORT, debug=FLASK_DEBUG)
 
 [end of aethercast/aims_tts_service/main.py]

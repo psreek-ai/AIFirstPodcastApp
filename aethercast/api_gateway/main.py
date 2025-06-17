@@ -10,6 +10,7 @@ import requests
 from typing import Optional, Dict, Any, List # Added List
 from functools import wraps
 import jwt
+from pydantic import BaseModel, EmailStr, ValidationError, field_validator, constr
 import re # For email validation in /subscribe
 from werkzeug.security import generate_password_hash, check_password_hash
 from google.cloud import storage # Added for GCS
@@ -29,7 +30,7 @@ load_dotenv()
 
 # --- Logging Setup ---
 # Custom filter to add service_name to log records
-class ServiceNameFilter(logging.Filter):
+class ServiceNameFilter(logging.Filter): # noqa E501
     def __init__(self, service_name="api-gateway"):
         super().__init__()
         self.service_name = service_name
@@ -70,6 +71,64 @@ def setup_json_logging():
 
 setup_json_logging() # Call early to configure logging
 
+
+# --- Pydantic Models for Request Validation ---
+
+class SessionInitPayload(BaseModel):
+    client_id: Optional[str] = None
+    initial_preferences: Optional[Dict[str, Any]] = None
+
+class SessionPreferencesUpdatePayload(BaseModel):
+    client_id: str
+    preferences: Dict[str, Any]
+
+class UserRegisterPayload(BaseModel):
+    username: constr(min_length=3)
+    email: EmailStr
+    password: constr(min_length=8)
+
+class UserLoginPayload(BaseModel):
+    identifier: str # Can be username or email
+    password: str
+
+class TopicExplorePayload(BaseModel):
+    current_topic_id: Optional[str] = None
+    keywords: Optional[List[str]] = None
+    depth_mode: Optional[str] = "deeper"
+    client_id: Optional[str] = None # session identifier
+
+    @field_validator('keywords')
+    def keywords_must_be_list_of_str(cls, v):
+        if v is not None and (not isinstance(v, list) or not all(isinstance(s, str) for s in v)):
+            raise ValueError('keywords must be a list of strings')
+        return v
+
+    # Using model_validator in Pydantic v2 style, or root_validator for Pydantic v1
+    # For this environment, let's assume a style that can be manually invoked or adapted.
+    def check_either_current_topic_id_or_keywords(self): # Renamed for clarity
+        if self.current_topic_id is None and (self.keywords is None or not self.keywords):
+            # This kind of validation is typically done with a model_validator (Pydantic v2)
+            # or root_validator (Pydantic v1). Here we'll simulate it or do it in the route.
+            # Raising ValueError here would be caught by the route's ValidationError handler
+            # if model construction itself calls this.
+            # However, Pydantic calls field validators first.
+            # This check is better placed in the route after initial model validation.
+            pass # Will be handled in the route for now
+
+class SearchPodcastsPayload(BaseModel):
+    query: constr(min_length=1)
+    client_id: Optional[str] = None
+
+class CreatePodcastPayload(BaseModel):
+    topic: constr(min_length=1)
+    voice_params: Optional[Dict[str, Any]] = None
+    client_id: Optional[str] = None
+    test_scenarios: Optional[Dict[str, Any]] = None
+
+class SubscribePayload(BaseModel):
+    email: EmailStr
+
+
 # --- Service URLs ---
 TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME") # Added for signed URLs
@@ -83,16 +142,62 @@ POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 POSTGRES_USER = os.getenv("POSTGRES_USER")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 POSTGRES_DB = os.getenv("POSTGRES_DB")
+API_GW_DB_POOL_MIN_CONN = int(os.getenv("API_GW_DB_POOL_MIN_CONN", 1))
+API_GW_DB_POOL_MAX_CONN = int(os.getenv("API_GW_DB_POOL_MAX_CONN", 5))
+
 
 # Conditional import for psycopg2
 if DATABASE_TYPE == "postgres":
     try:
         import psycopg2
         from psycopg2.extras import RealDictCursor
+        from psycopg2.pool import SimpleConnectionPool # Added for connection pooling
     except ImportError:
         _pre_init_logger = print # Use print before app.logger is available
-        _pre_init_logger("ERROR: DATABASE_TYPE is 'postgres' but psycopg2 is not installed. Please install it.")
+        _pre_init_logger("ERROR: DATABASE_TYPE is 'postgres' but psycopg2 and/or its pool module is not installed. Please install it.")
         # sys.exit(1) # Or handle more gracefully depending on desired behavior
+
+# Global variable for the connection pool
+api_gw_db_pool = None
+
+# --- DB Pool Initializer ---
+def init_api_gw_db_pool():
+    """Initializes the PostgreSQL connection pool for API Gateway."""
+    global api_gw_db_pool
+    # Use app.logger if available, otherwise print for early stage logging
+    log_func = app.logger.info if hasattr(app, 'logger') and app.logger else print
+
+    if DATABASE_TYPE == "postgres":
+        try:
+            log_func("Initializing API Gateway database connection pool...")
+            if not all([POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB]):
+                err_msg = "PostgreSQL connection parameters not fully configured for API Gateway pool."
+                # Use app.logger.error if available, otherwise print
+                log_func_err = app.logger.error if hasattr(app, 'logger') and app.logger else print
+                log_func_err(err_msg)
+                api_gw_db_pool = None # Ensure pool is None if config is missing
+                return # Do not proceed if config is missing
+
+            api_gw_db_pool = SimpleConnectionPool(
+                minconn=API_GW_DB_POOL_MIN_CONN,
+                maxconn=API_GW_DB_POOL_MAX_CONN,
+                host=POSTGRES_HOST,
+                port=POSTGRES_PORT,
+                user=POSTGRES_USER,
+                password=POSTGRES_PASSWORD,
+                dbname=POSTGRES_DB,
+                cursor_factory=RealDictCursor # Ensure connections from pool use RealDictCursor
+            )
+            log_func(f"API Gateway database connection pool initialized successfully (min: {API_GW_DB_POOL_MIN_CONN}, max: {API_GW_DB_POOL_MAX_CONN}).")
+        except (Exception, psycopg2.Error) as error:
+            log_func_err = app.logger.error if hasattr(app, 'logger') and app.logger else print
+            log_func_err(f"Failed to initialize API Gateway database connection pool: {error}", exc_info=True)
+            api_gw_db_pool = None # Ensure pool is None on error
+            # Depending on requirements, might raise an error to halt startup if DB is critical
+            # raise ConnectionError(f"Failed to initialize API Gateway DB pool: {error}") from error
+    else:
+        log_func("API Gateway is not configured to use PostgreSQL. Skipping pool initialization.")
+
 
 # --- DB Schema (PostgreSQL compatible) ---
 DB_SCHEMA_SQL = """
@@ -204,34 +309,68 @@ API_GW_SNIPPET_CACHE_MAX_AGE_HOURS = int(os.getenv("API_GW_SNIPPET_CACHE_MAX_AGE
 
 # --- Database Helper Functions (Updated for PostgreSQL) ---
 def get_db_connection():
+    log_func_info = app.logger.info if hasattr(app, 'logger') and app.logger else print
+    log_func_error = app.logger.error if hasattr(app, 'logger') and app.logger else print
+
     if DATABASE_TYPE == "postgres":
-        if not all([POSTGRES_HOST, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DB]):
-            log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
-            log_func("PostgreSQL connection variables not fully set.")
-            raise ConnectionError("PostgreSQL environment variables not fully configured.")
+        if not api_gw_db_pool:
+            log_func_error("API Gateway PostgreSQL connection pool is not initialized.")
+            raise ConnectionError("API Gateway PostgreSQL connection pool not initialized.")
         try:
-            conn = psycopg2.connect(
-                host=POSTGRES_HOST,
-                port=POSTGRES_PORT,
-                user=POSTGRES_USER,
-                password=POSTGRES_PASSWORD,
-                dbname=POSTGRES_DB,
-                cursor_factory=RealDictCursor
-            )
-            return conn
-        except psycopg2.Error as e:
-            log_func = app.logger.error if hasattr(app, 'logger') and app.logger else print
-            log_func(f"Unable to connect to PostgreSQL: {e}")
-            raise ConnectionError(f"PostgreSQL connection failed: {e}") from e
-    else:
+            # TODO: Implement retry logic for getconn() if needed, similar to CPOA.
+            # For now, direct getconn() assuming pool handles initial waits/retries internally to some extent.
+            conn = api_gw_db_pool.getconn()
+            if conn:
+                log_func_info("Retrieved DB connection from API Gateway pool.")
+                return conn
+            else: # Should not happen if pool is initialized and has connections
+                log_func_error("api_gw_db_pool.getconn() returned None unexpectedly.")
+                raise ConnectionError("Failed to get connection from pool (returned None).")
+        except (Exception, psycopg2.Error) as e:
+            log_func_error(f"Error getting connection from API Gateway pool: {e}", exc_info=True)
+            raise ConnectionError(f"Failed to get PostgreSQL connection from pool: {e}") from e
+    else: # SQLite
+        log_func_info("Using SQLite database connection for API Gateway.")
         conn = sqlite3.connect(DATABASE_FILE)
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = sqlite3.Row # Keep this for SQLite for dict-like access
         return conn
+
+def release_db_connection(conn):
+    """Releases a database connection."""
+    log_func_info = app.logger.info if hasattr(app, 'logger') and app.logger else print
+    log_func_error = app.logger.error if hasattr(app, 'logger') and app.logger else print
+
+    if conn: # Ensure conn is not None
+        if DATABASE_TYPE == "postgres":
+            if api_gw_db_pool:
+                try:
+                    api_gw_db_pool.putconn(conn)
+                    log_func_info("Returned DB connection to API Gateway PostgreSQL pool.")
+                except (Exception, psycopg2.Error) as e:
+                    log_func_error(f"Error returning connection to API Gateway PostgreSQL pool: {e}", exc_info=True)
+                    # If putconn fails, the connection might be broken. Try to close it.
+                    try:
+                        conn.close()
+                        log_func_warning = app.logger.warning if hasattr(app, 'logger') and app.logger else print
+                        log_func_warning("Closed PostgreSQL connection after error during putconn.")
+                    except Exception as e_close:
+                        log_func_error(f"Error closing PostgreSQL connection after putconn failure: {e_close}", exc_info=True)
+            else:
+                log_func_error("API Gateway PostgreSQL pool not initialized, cannot return connection. Attempting to close.")
+                try: conn.close() # Fallback close
+                except Exception: pass # Ignore errors during this fallback close
+        else: # SQLite
+            try:
+                conn.close()
+                log_func_info("Closed SQLite database connection for API Gateway.")
+            except Exception as e_sqlite_close:
+                 log_func_error(f"Error closing SQLite connection: {e_sqlite_close}", exc_info=True)
+
 
 def init_db():
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Will use pool if postgres, or direct sqlite
         cursor = conn.cursor()
         current_tables_to_check = ["podcasts", "topics_snippets", "generated_scripts", "user_sessions", "users", "workflow_instances", "task_instances", "subscribers"]
 
@@ -266,7 +405,7 @@ def init_db():
         log_func(f"Unexpected error during DB initialization ({DATABASE_TYPE}): {e_unexp}")
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn) # Use new release function
 
 # --- GCS Signed URL Helper ---
 def generate_gcs_signed_url(gcs_uri: str, expiration_minutes: int = 15) -> Optional[str]:
@@ -381,7 +520,7 @@ def _get_user_by_id(user_id_str: str) -> Optional[Dict[str, Any]]:
         app.logger.error(f"Database error fetching user by ID {user_id_str} ({DATABASE_TYPE}): {e}", exc_info=True)
         return None
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 # --- CPOA Import ---
 # ... (CPOA import logic as before) ...
@@ -529,12 +668,30 @@ def health_check_endpoint():
 # --- Session Management Endpoints ---
 @app.route('/api/v1/session/init', methods=['POST'])
 def session_init():
-    data = request.get_json()
-    client_id_from_request = data.get('client_id') if data else None
+    request_internal_id = str(uuid.uuid4()) # For tracing this specific request processing
+    logger.info(f"Request {request_internal_id} - /api/v1/session/init called.")
+
+    try:
+        data = request.get_json()
+        if data is None: # Handles empty body or non-JSON body
+            logger.warning(f"Request {request_internal_id}: Empty or non-JSON payload for session init.")
+            return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
+    except Exception as e_json: # Catch error during get_json() itself
+        logger.warning(f"Request {request_internal_id}: Malformed JSON payload for session init: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON payload: {e_json}"}), 400
+
+    try:
+        payload = SessionInitPayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"Request {request_internal_id}: Validation failed for session init. Details: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
+
+    client_id_from_request = payload.client_id
+    initial_preferences = payload.initial_preferences if payload.initial_preferences is not None else {}
     session_id_to_use = None
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         if client_id_from_request:
             try:
                 uuid.UUID(client_id_from_request) # Validate format
@@ -585,7 +742,7 @@ def session_init():
         return jsonify({"error_code": "API_GW_SESSION_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn) # Use new release function
 
 
 @app.route('/api/v1/session/preferences', methods=['GET'])
@@ -598,7 +755,7 @@ def get_session_preferences():
 
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         session_data = _get_session(conn, session_id_from_token)
         if not session_data:
             return jsonify({"error_code": "API_GW_SESSION_NOT_FOUND", "message": "Session not found."}), 404
@@ -618,7 +775,7 @@ def get_session_preferences():
         return jsonify({"error_code": "API_GW_SESSION_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn) # Use new release function
 
 @app.route('/api/v1/session/preferences', methods=['PUT'])
 @token_required # Activate token requirement
@@ -637,6 +794,16 @@ def update_session_preferences_endpoint():
 
     session_id_from_token = g.current_user.get('session_id')
 
+    # Pydantic validation for payload
+    try:
+        payload = SessionPreferencesUpdatePayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"Request {request.url}: Validation failed for session preferences update. Details: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
+
+    target_client_id = payload.client_id
+    preferences = payload.preferences
+
     if not session_id_from_token:
         app.logger.warning("Update session preferences: No session_id claim found in JWT token.")
         return jsonify({"error_code": "API_GW_INVALID_TOKEN_CLAIMS", "message": "Token does not contain required session information."}), 401
@@ -648,7 +815,7 @@ def update_session_preferences_endpoint():
 
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         session_exists = _get_session(conn, target_client_id)
 
         if not session_exists:
@@ -670,30 +837,30 @@ def update_session_preferences_endpoint():
         return jsonify({"error_code": "API_GW_SESSION_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn) # Use new release function
 
 # --- Auth Endpoints ---
 @app.route('/api/v1/auth/register', methods=['POST'])
 def register_user():
     try:
         data = request.get_json()
-        if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
-    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+        if data is None: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
+    except Exception as e_json:
+         return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
 
-    username = data.get('username')
-    email = data.get('email')
-    password = data.get('password')
+    try:
+        payload = UserRegisterPayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"User registration validation failed: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
 
-    if not username or not isinstance(username, str) or len(username) < 3:
-        return jsonify({"error_code": "API_GW_INVALID_USERNAME", "message": "Username must be at least 3 characters."}), 400
-    if not email or not isinstance(email, str) or not re.fullmatch(EMAIL_REGEX, email): # Using EMAIL_REGEX from subscribe
-        return jsonify({"error_code": "API_GW_INVALID_EMAIL", "message": "Invalid email format."}), 400
-    if not password or not isinstance(password, str) or len(password) < 8:
-        return jsonify({"error_code": "API_GW_INVALID_PASSWORD", "message": "Password must be at least 8 characters."}), 400
+    username = payload.username
+    email = payload.email
+    password = payload.password
 
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         cursor = conn.cursor()
         # Check if username or email already exists
         check_sql = "SELECT user_id FROM users WHERE username = %s OR email = %s;" if DATABASE_TYPE == "postgres" else "SELECT user_id FROM users WHERE username = ? OR email = ?;"
@@ -722,24 +889,28 @@ def register_user():
         if conn and DATABASE_TYPE == "postgres": conn.rollback()
         return jsonify({"error_code": "API_GW_REGISTER_UNEXPECTED_ERROR", "message": "An unexpected error occurred during registration."}), 500
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 @app.route('/api/v1/auth/login', methods=['POST'])
 def login_user():
     try:
         data = request.get_json()
-        if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
-    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
+        if data is None: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
+    except Exception as e_json:
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
 
-    identifier = data.get('identifier') # Can be username or email
-    password = data.get('password')
+    try:
+        payload = UserLoginPayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"User login validation failed: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
 
-    if not identifier or not password:
-        return jsonify({"error_code": "API_GW_LOGIN_CREDS_REQUIRED", "message": "Username/email and password required."}), 400
+    identifier = payload.identifier
+    password = payload.password
 
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         cursor = conn.cursor()
 
         # Allow login with username or email
@@ -793,7 +964,7 @@ def login_user():
         app.logger.error(f"Login user: Unexpected error for {identifier}: {e_unexp}", exc_info=True)
         return jsonify({"error_code": "API_GW_LOGIN_UNEXPECTED_ERROR", "message": "An unexpected error occurred during login."}), 500
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 
 # --- Helper to process snippets for signed URLs ---
@@ -901,17 +1072,31 @@ def explore_topic():
         app.logger.warning(f"Request to /api/v1/topics/explore missing X-Idempotency-Key header.")
         return jsonify({"error_code": "API_GW_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
 
-    try: data = request.get_json()
-    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
-    if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
-    current_topic_id = data.get("current_topic_id")
-    keywords = data.get("keywords")
-    depth_mode = data.get("depth_mode", "deeper")
-    client_id = data.get("client_id")
-    if not current_topic_id and not keywords: return jsonify({"error_code": "API_GW_EXPLORE_INPUT_REQUIRED", "message": "current_topic_id or keywords required."}), 400
+    try:
+        data = request.get_json()
+        if data is None: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
+    except Exception as e_json:
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
+
+    try:
+        payload = TopicExplorePayload.model_validate(data)
+        # Perform the interdependent check for current_topic_id and keywords
+        if payload.current_topic_id is None and (payload.keywords is None or not payload.keywords):
+            # Manually create a ValidationError-like structure for this specific check
+            custom_error = [{'loc': ('__root__',), 'msg': 'Either current_topic_id or a non-empty list of keywords must be provided.', 'type': 'value_error'}]
+            logger.warning(f"Topic exploration validation failed: {custom_error}", extra={'validation_errors': custom_error})
+            return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": custom_error}), 422
+    except ValidationError as e:
+        logger.warning(f"Topic exploration validation failed: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
+
+    current_topic_id = payload.current_topic_id
+    keywords = payload.keywords
+    depth_mode = payload.depth_mode
+    client_id = payload.client_id
 
     user_preferences = None
-    if client_id: # If client_id (session_id) is provided, try to fetch its preferences
+    if client_id:
         conn_prefs = None
         try:
             conn_prefs = get_db_connection()
@@ -971,15 +1156,20 @@ def search_podcasts_endpoint():
         app.logger.warning(f"Request to /api/v1/search/podcasts missing X-Idempotency-Key header.")
         return jsonify({"error_code": "API_GW_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
 
-    try: data = request.get_json()
-    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
-    if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+    try:
+        data = request.get_json()
+        if data is None: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
+    except Exception as e_json:
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
 
-    query = data.get("query")
-    if not query or not isinstance(query, str) or not query.strip():
-        return jsonify({"error_code": "API_GW_SEARCH_QUERY_INVALID", "message": "Query required."}), 400
+    try:
+        payload = SearchPodcastsPayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"Podcast search validation failed: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
 
-    client_id = data.get("client_id")
+    query = payload.query
+    client_id = payload.client_id
     user_preferences = None
     if client_id:
         conn_prefs = None
@@ -1038,19 +1228,25 @@ def create_podcast_generation_task():
         app.logger.warning(f"Request to /api/v1/podcasts missing X-Idempotency-Key header.")
         return jsonify({"error_code": "API_GW_MISSING_IDEMPOTENCY_KEY", "message": "X-Idempotency-Key header is required."}), 400
 
-    try: data = request.get_json()
-    except Exception: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed JSON."}), 400
-    if not data: return jsonify({"error_code": "API_GW_PAYLOAD_REQUIRED", "message": "Payload required."}), 400
+    try:
+        data = request.get_json()
+        if data is None: return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
+    except Exception as e_json:
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
 
-    topic = data.get('topic')
-    if not topic or not isinstance(topic, str) or not topic.strip(): return jsonify({"error_code": "API_GW_PODCAST_TOPIC_INVALID", "message": "Topic required."}), 400
+    try:
+        payload = CreatePodcastPayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"Podcast creation validation failed: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
 
-    voice_params_from_request = data.get('voice_params')
-    client_id_from_request = data.get('client_id')
-    test_scenarios_from_request = data.get('test_scenarios')
+    topic = payload.topic
+    voice_params_from_request = payload.voice_params
+    client_id_from_request = payload.client_id
+    test_scenarios_from_request = payload.test_scenarios
 
     user_preferences = None
-    if client_id_from_request: # If client_id (session_id) is provided, try to fetch its preferences
+    if client_id_from_request:
         conn_prefs = None
         try:
             conn_prefs = get_db_connection()
@@ -1144,7 +1340,7 @@ def list_podcasts():
     # ... (implementation as before) ...
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         cursor = conn.cursor()
         # Fetch relevant fields, including GCS URI for audio
         cursor.execute("SELECT podcast_id, topic, cpoa_status, final_audio_filepath, task_created_timestamp, last_updated_timestamp FROM podcasts ORDER BY task_created_timestamp DESC LIMIT 100;")
@@ -1167,7 +1363,7 @@ def list_podcasts():
         app.logger.error(f"List podcasts: Unexpected error: {e}", exc_info=True)
         return jsonify({"error_code": "API_GW_UNEXPECTED_ERROR_LIST_PODCASTS", "message": "Unexpected error listing podcasts."}), 500
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 
 @app.route('/api/v1/podcasts/<uuid:podcast_id_from_path>', methods=['GET'])
@@ -1176,7 +1372,7 @@ def get_podcast_details(podcast_id_from_path: uuid.UUID):
     podcast_id_str = str(podcast_id_from_path)
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         cursor = conn.cursor()
 
         sql = "SELECT * FROM podcasts WHERE podcast_id = %s;" if DATABASE_TYPE == "postgres" else "SELECT * FROM podcasts WHERE podcast_id = ?;"
@@ -1207,7 +1403,7 @@ def get_podcast_details(podcast_id_from_path: uuid.UUID):
         app.logger.error(f"Get podcast details: Unexpected error for {podcast_id_str}: {e}", exc_info=True)
         return jsonify({"error_code": "API_GW_UNEXPECTED_ERROR_PODCAST_DETAILS", "message": "Unexpected error fetching podcast details."}), 500
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 
 # --- Serve Podcast Audio Endpoint ---
@@ -1217,7 +1413,7 @@ def serve_podcast_audio(podcast_id_from_path: uuid.UUID):
     podcast_id_str = str(podcast_id_from_path)
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         cursor = conn.cursor()
         sql = "SELECT final_audio_filepath FROM podcasts WHERE podcast_id = %s;" if DATABASE_TYPE == "postgres" else "SELECT final_audio_filepath FROM podcasts WHERE podcast_id = ?;"
         cursor.execute(sql, (podcast_id_str,))
@@ -1262,7 +1458,7 @@ def serve_podcast_audio(podcast_id_from_path: uuid.UUID):
         app.logger.error(f"Serve audio: Unexpected error for {podcast_id_str}: {e}", exc_info=True)
         return jsonify({"error_code": "API_GW_UNEXPECTED_ERROR_SERVE_AUDIO", "message": "Unexpected error serving audio."}), 500
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 # --- Internal Endpoints ---
 @app.route('/api/v1/internal/media_access_url', methods=['GET'])
@@ -1297,23 +1493,22 @@ EMAIL_REGEX = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
 def handle_subscribe():
     try:
         data = request.get_json()
-        if not data:
-            return jsonify({"error_code": "SUBSCRIBE_PAYLOAD_REQUIRED", "message": "JSON payload is required."}), 400
+        if data is None:
+            return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
     except Exception as e_json:
-        app.logger.warning(f"Malformed JSON in /subscribe: {e_json}")
-        return jsonify({"error_code": "SUBSCRIBE_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
+        app.logger.warning(f"Malformed JSON in /subscribe: {e_json}", exc_info=True)
+        return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON: {e_json}"}), 400
 
-    email = data.get('email')
+    try:
+        payload = SubscribePayload.model_validate(data)
+    except ValidationError as e:
+        logger.warning(f"Subscription validation failed: {e.errors()}", extra={'validation_errors': e.errors()})
+        return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
 
-    if not email or not isinstance(email, str) or not email.strip():
-        return jsonify({"error_code": "SUBSCRIBE_EMAIL_REQUIRED", "message": "Email is required."}), 400
-
-    if not re.fullmatch(EMAIL_REGEX, email):
-        return jsonify({"error_code": "SUBSCRIBE_INVALID_EMAIL_FORMAT", "message": "Invalid email format."}), 400
-
+    email = payload.email
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection() # Uses pool if postgres
         cursor = conn.cursor()
 
         # Check if email exists
@@ -1342,7 +1537,7 @@ def handle_subscribe():
         if conn and DATABASE_TYPE == "postgres": conn.rollback()
         return jsonify({"error_code": "SUBSCRIBE_UNEXPECTED_ERROR", "message": "An unexpected error occurred."}), 500
     finally:
-        if conn: conn.close()
+        if conn: release_db_connection(conn) # Use new release function
 
 # --- Main Block ---
 if __name__ == '__main__':
@@ -1350,4 +1545,18 @@ if __name__ == '__main__':
     init_db()
     # Debug mode for direct execution should respect FLASK_DEBUG environment variable
     debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
+
+    # Initialize the DB pool at startup if using PostgreSQL
+    if DATABASE_TYPE == "postgres":
+        init_api_gw_db_pool()
+        # Optionally, test the pool by getting and putting a connection
+        # test_conn = None
+        # try:
+        #     test_conn = get_db_connection()
+        #     if test_conn: app.logger.info("Successfully tested DB pool connection from main.")
+        # except Exception as e_pool_test:
+        #     app.logger.error(f"Failed to test DB pool connection from main: {e_pool_test}", exc_info=True)
+        # finally:
+        #     if test_conn: release_db_connection(test_conn)
+
     app.run(debug=debug_mode, host=os.getenv("API_GATEWAY_HOST", "0.0.0.0"), port=int(os.getenv("API_GATEWAY_PORT", "5001")))

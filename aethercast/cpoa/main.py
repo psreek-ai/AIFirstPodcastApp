@@ -937,43 +937,69 @@ def orchestrate_podcast_generation(
                         try:
                             wcha_task_status_data = poll_response_wcha.json()
                         except json.JSONDecodeError as e_json_poll:
-                            wf_logger.error(f"Polling WCHA task {wcha_internal_task_id}: Failed to decode JSON. Status: {poll_response_wcha.status_code}. Response: {poll_response_wcha.text[:200]}", exc_info=True, extra={'task_id': wcha_task_id})
+                            wf_logger.error(
+                                f"Polling WCHA task {wcha_internal_task_id}: Failed to decode JSON from {wcha_poll_url}. Status: {poll_response_wcha.status_code}. Response: {poll_response_wcha.text[:200]}",
+                                exc_info=True,
+                                extra={'task_id': wcha_task_id, 'polled_service_task_id': wcha_internal_task_id, 'poll_url': wcha_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                            )
                             wcha_error_details = {"message": "WCHA status poll response not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_wcha.text[:200]}
                             break # Exit polling loop
                         wcha_task_state = wcha_task_status_data.get("status")
                         log_step_cpoa(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", data=wcha_task_status_data)
                         wf_logger.info(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", extra={'task_id': wcha_task_id})
 
-                        if wcha_task_state == "SUCCESS":
+                        if wcha_task_state == "SUCCESS": # WCHA uses "SUCCESS"
                             wcha_result_dict = wcha_task_status_data.get("result")
-                            # WCHA's harvest_url_content_task returns: {"url": url, "content": extracted_text, "error_type": None, "error_message": None}
-                            # WCHA's fetch_news_articles_task returns: {"status": "success", "articles": articles, "message": ...}
-                            # The new conceptual 'get_content_for_topic_task' (if WCHA were updated) should return something like:
-                            # {"status": "success", "content": "...", "source_urls": [...]}
-                            # For now, let's assume the result from WCHA task (if successful) will have a 'content' field.
-                            # This might need adjustment based on what task WCHA's /harvest actually triggers for topics.
-                            if wcha_result_dict and wcha_result_dict.get("content"): # Assuming direct content
-                                wcha_content = wcha_result_dict.get("content")
-                                source_urls = wcha_result_dict.get("source_urls", []) # If WCHA returns this
+                            if not wcha_result_dict or (isinstance(wcha_result_dict, dict) and wcha_result_dict.get("status") != "success" and not wcha_result_dict.get("content") and not wcha_result_dict.get("articles")): # check for WCHA's internal success status or content
+                                 wcha_error_details = {"message": "WCHA task succeeded but reported internal failure or invalid result.", "wcha_response": wcha_result_dict}
+                            else: # Success
+                                wcha_content = wcha_result_dict.get("content") # This is for DDGS/direct harvest path
+                                if not wcha_content and wcha_result_dict.get("articles"): # NewsAPI path
+                                    # This indicates WCHA returned articles which CPOA needs to process further.
+                                    # For now, this is treated as an intermediate step, not direct content.
+                                    # A more robust CPOA would handle this by dispatching individual URL harvests from these articles.
+                                    # For this subtask, we'll assume if 'articles' are present, 'content' might be missing, and we log this.
+                                    wf_logger.info(f"WCHA task {wcha_internal_task_id} returned articles; further processing would be needed.", extra={'task_id': wcha_task_id})
+                                    # If CPOA is expected to directly use 'content', and it's missing even if articles are present, it could be an error or a different flow.
+                                    # For now, let's assume 'content' is primary. If it's missing, it's an issue unless 'articles' are handled.
+                                    # This logic might need to be refined based on how WCHA structures its "SUCCESS" with "articles".
+                                    # If 'content' is expected, and it's not there, it's an issue.
+                                    if not wcha_content:
+                                        wcha_error_details = {"message": "WCHA task succeeded (NewsAPI path) but expected 'content' field is missing.", "wcha_response": wcha_result_dict}
+
+                                source_urls = wcha_result_dict.get("source_urls", [])
                                 context_data_for_workflow["wcha_source_urls"] = source_urls
-                                wcha_output_summary = {"content_length": len(wcha_content), "source_urls": source_urls, "message": "WCHA task content received."}
+                                wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": "WCHA task content received."}
                                 log_step_cpoa("WCHA task polling successful, content received.", data=wcha_output_summary)
-                            # If WCHA returned articles (from NewsAPI path), CPOA would need to harvest each one.
-                            # This part is simplified for now, assuming direct content or a single content blob.
-                            elif wcha_result_dict and wcha_result_dict.get("articles"): # NewsAPI path
-                                 wcha_error_details = {"message": "WCHA returned articles, but CPOA expected aggregated content. Further processing needed.", "wcha_response": wcha_result_dict}
-                                 # For now, this is an error. A more robust CPOA would handle this by dispatching individual URL harvests.
-                            else:
-                                 wcha_error_details = {"message": "WCHA task succeeded but result format unexpected or content missing.", "wcha_response": wcha_result_dict}
+                                if not wcha_content and not wcha_result_dict.get("articles"): # If neither content nor articles, it's an issue
+                                    wcha_error_details = {"message": wcha_output_summary.get("message") or "WCHA success but no content or articles."}
                             break # Exit polling loop on SUCCESS
-                        elif wcha_task_state == "FAILURE":
+                        elif wcha_task_state == "FAILURE": # WCHA uses "FAILURE"
                             wcha_error_details = {"message": "WCHA task execution failed.", "wcha_celery_response": wcha_task_status_data.get("result")}
+                            wf_logger.error(
+                                f"WCHA task {wcha_internal_task_id} reported FAILURE. Service Response: {wcha_task_status_data.get('result')}",
+                                extra={'task_id': wcha_task_id, 'polled_service_task_id': wcha_internal_task_id, 'poll_url': wcha_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id, 'service_response': wcha_task_status_data.get('result')}
+                            )
                             log_step_cpoa(wcha_error_details["message"], data=wcha_error_details, is_error_payload=True)
                             break # Exit polling loop on FAILURE
                         time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
-                    except requests.exceptions.RequestException as e_poll_wcha:
+                    except requests.exceptions.HTTPError as e_poll_wcha_http:
+                        wf_logger.error(
+                            f"Polling WCHA task {wcha_internal_task_id}: Status endpoint call failed with HTTP {e_poll_wcha_http.response.status_code}. Response: {e_poll_wcha_http.response.text[:200]}",
+                            exc_info=True,
+                            extra={'task_id': wcha_task_id, 'polled_service_task_id': wcha_internal_task_id, 'poll_url': wcha_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                        )
+                        # Unlike generic RequestException, HTTPError from polling usually means the service is up but found an issue.
+                        # We might break here or retry a few times depending on the status code. For now, log and let retry or timeout handle.
+                        # For this subtask, if the status endpoint itself fails, it's a polling failure.
+                        wcha_error_details = {"message": f"WCHA status endpoint failed with {e_poll_wcha_http.response.status_code}", "details": e_poll_wcha_http.response.text[:200]}
+                        break # Exit polling loop
+                    except requests.exceptions.RequestException as e_poll_wcha: # Other network errors during poll
                         log_step_cpoa(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", is_error_payload=True)
-                        wf_logger.warning(f"Polling WCHA task {wcha_internal_task_id} failed: {e_poll_wcha}. Retrying.", extra={'task_id': wcha_task_id})
+                        wf_logger.warning(
+                            f"Polling WCHA task {wcha_internal_task_id} failed with {type(e_poll_wcha).__name__}: {e_poll_wcha}. Retrying.",
+                            extra={'task_id': wcha_task_id, 'polled_service_task_id': wcha_internal_task_id, 'poll_url': wcha_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                        )
                         time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
             # End of polling loop / synchronous handling block
         except Exception as e_wcha: # Catch errors from initial dispatch or polling logic
@@ -1107,11 +1133,15 @@ def orchestrate_podcast_generation(
                         raise Exception(pswa_error_details["message"])
                     try:
                         poll_response = requests.get(pswa_poll_url, timeout=15)
-                        poll_response.raise_for_status()
+                        poll_response.raise_for_status() # Handles 4xx/5xx from status endpoint
                         try:
                             pswa_task_status_data = poll_response.json()
                         except json.JSONDecodeError as e_json_poll:
-                            wf_logger.error(f"Polling PSWA task {pswa_internal_task_id}: Failed to decode JSON. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}", exc_info=True, extra={'task_id': pswa_task_id})
+                            wf_logger.error(
+                                f"Polling PSWA task {pswa_internal_task_id}: Failed to decode JSON from {pswa_poll_url}. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}",
+                                exc_info=True,
+                                extra={'task_id': pswa_task_id, 'polled_service_task_id': pswa_internal_task_id, 'poll_url': pswa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                            )
                             pswa_error_details = {"message": "PSWA status poll response not valid JSON", "details": str(e_json_poll), "response_preview": poll_response.text[:200]}
                             break # Exit polling loop
                         pswa_task_state = pswa_task_status_data.get("status")
@@ -1129,11 +1159,26 @@ def orchestrate_podcast_generation(
                             break
                         elif pswa_task_state == "FAILURE":
                             pswa_error_details = {"message": "PSWA task execution failed.", "pswa_response": pswa_task_status_data.get("result")}
+                            wf_logger.error(
+                                f"PSWA task {pswa_internal_task_id} reported FAILURE. Service Response: {pswa_task_status_data.get('result')}",
+                                extra={'task_id': pswa_task_id, 'polled_service_task_id': pswa_internal_task_id, 'poll_url': pswa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id, 'service_response': pswa_task_status_data.get('result')}
+                            )
                             break
                         time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
-                    except requests.exceptions.RequestException as e_poll_pswa:
+                    except requests.exceptions.HTTPError as e_poll_pswa_http:
+                        wf_logger.error(
+                            f"Polling PSWA task {pswa_internal_task_id}: Status endpoint call failed with HTTP {e_poll_pswa_http.response.status_code}. Response: {e_poll_pswa_http.response.text[:200]}",
+                            exc_info=True,
+                            extra={'task_id': pswa_task_id, 'polled_service_task_id': pswa_internal_task_id, 'poll_url': pswa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                        )
+                        pswa_error_details = {"message": f"PSWA status endpoint failed with {e_poll_pswa_http.response.status_code}", "details": e_poll_pswa_http.response.text[:200]}
+                        break # Exit polling loop
+                    except requests.exceptions.RequestException as e_poll_pswa: # Other network errors during poll
                         log_step_cpoa(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", is_error_payload=True)
-                        wf_logger.warning(f"Polling PSWA task {pswa_internal_task_id} failed: {e_poll_pswa}. Retrying.", extra={'task_id': pswa_task_id})
+                        wf_logger.warning(
+                            f"Polling PSWA task {pswa_internal_task_id} failed with {type(e_poll_pswa).__name__}: {e_poll_pswa}. Retrying.",
+                            extra={'task_id': pswa_task_id, 'polled_service_task_id': pswa_internal_task_id, 'poll_url': pswa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                        )
                         time.sleep(CPOA_PSWA_POLLING_INTERVAL_SECONDS)
             # End of polling logic block (if pswa_internal_task_id was set)
 
@@ -1216,36 +1261,55 @@ def orchestrate_podcast_generation(
 
                 try:
                     poll_response_vfa = requests.get(vfa_poll_url, timeout=15)
-                    poll_response_vfa.raise_for_status()
+                        poll_response_vfa.raise_for_status() # Handles 4xx/5xx from status endpoint
                     try:
                         vfa_task_status_data = poll_response_vfa.json()
                     except json.JSONDecodeError as e_json_poll:
-                        wf_logger.error(f"Polling VFA task {vfa_internal_task_id}: Failed to decode JSON. Status: {poll_response_vfa.status_code}. Response: {poll_response_vfa.text[:200]}", exc_info=True, extra={'task_id': vfa_task_id})
+                            wf_logger.error(
+                                f"Polling VFA task {vfa_internal_task_id}: Failed to decode JSON from {vfa_poll_url}. Status: {poll_response_vfa.status_code}. Response: {poll_response_vfa.text[:200]}",
+                                exc_info=True,
+                                extra={'task_id': vfa_task_id, 'polled_service_task_id': vfa_internal_task_id, 'poll_url': vfa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                            )
                         vfa_error_details = {"message": "VFA status poll response not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_vfa.text[:200]}
                         break # Exit polling loop
                     vfa_task_state = vfa_task_status_data.get("status")
                     log_step_cpoa(f"VFA task {vfa_internal_task_id} status: {vfa_task_state}", data=vfa_task_status_data)
                     wf_logger.info(f"VFA task {vfa_internal_task_id} status: {vfa_task_state}", extra={'task_id': vfa_task_id})
 
-                    if vfa_task_state == "SUCCESS":
-                        vfa_result_dict = vfa_task_status_data.get("result") # This is the original VFA success/error dict
+                        if vfa_task_state == "SUCCESS": # VFA Celery task uses "SUCCESS"
+                            vfa_result_dict = vfa_task_status_data.get("result") # This is the VFA task's actual return value
                         if not vfa_result_dict or not isinstance(vfa_result_dict, dict):
                             vfa_error_details = {"message": "VFA task succeeded but result is missing or invalid.", "vfa_response": vfa_task_status_data}
-                        elif vfa_result_dict.get("status") != VFA_STATUS_SUCCESS: # VFA task's own internal status
+                            elif vfa_result_dict.get("status") != VFA_STATUS_SUCCESS: # VFA task's internal logical status
                              vfa_error_details = {"message": vfa_result_dict.get("message", "VFA task reported non-success status in result."), "vfa_response": vfa_result_dict}
                         else: # VFA task logic succeeded
                             vfa_output_summary = {"status": vfa_result_dict.get("status"), "audio_gcs_uri": vfa_result_dict.get("audio_filepath"), "stream_id": vfa_result_dict.get("stream_id"), "tts_settings_used": vfa_result_dict.get("tts_settings_used")}
                             log_step_cpoa("VFA Task polling successful, audio metadata received.", data=vfa_output_summary)
                         break
-                    elif vfa_task_state == "FAILURE":
+                        elif vfa_task_state == "FAILURE": # VFA Celery task uses "FAILURE"
                         vfa_error_details = {"message": "VFA Celery task execution failed.", "vfa_celery_response": vfa_task_status_data.get("result")}
+                            wf_logger.error(
+                                f"VFA task {vfa_internal_task_id} reported FAILURE. Service Response: {vfa_task_status_data.get('result')}",
+                                extra={'task_id': vfa_task_id, 'polled_service_task_id': vfa_internal_task_id, 'poll_url': vfa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id, 'service_response': vfa_task_status_data.get('result')}
+                            )
                         log_step_cpoa(vfa_error_details["message"], data=vfa_error_details, is_error_payload=True)
                         break
 
                     time.sleep(CPOA_VFA_POLLING_INTERVAL_SECONDS)
-                except requests.exceptions.RequestException as e_poll_vfa:
+                    except requests.exceptions.HTTPError as e_poll_vfa_http:
+                        wf_logger.error(
+                            f"Polling VFA task {vfa_internal_task_id}: Status endpoint call failed with HTTP {e_poll_vfa_http.response.status_code}. Response: {e_poll_vfa_http.response.text[:200]}",
+                            exc_info=True,
+                            extra={'task_id': vfa_task_id, 'polled_service_task_id': vfa_internal_task_id, 'poll_url': vfa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                        )
+                        vfa_error_details = {"message": f"VFA status endpoint failed with {e_poll_vfa_http.response.status_code}", "details": e_poll_vfa_http.response.text[:200]}
+                        break # Exit polling loop
+                    except requests.exceptions.RequestException as e_poll_vfa: # Other network errors during poll
                     log_step_cpoa(f"Polling VFA task {vfa_internal_task_id} failed: {e_poll_vfa}. Retrying.", is_error_payload=True)
-                    wf_logger.warning(f"Polling VFA task {vfa_internal_task_id} failed: {e_poll_vfa}. Retrying.", extra={'task_id': vfa_task_id})
+                        wf_logger.warning(
+                            f"Polling VFA task {vfa_internal_task_id} failed with {type(e_poll_vfa).__name__}: {e_poll_vfa}. Retrying.",
+                            extra={'task_id': vfa_task_id, 'polled_service_task_id': vfa_internal_task_id, 'poll_url': vfa_poll_url, 'cpoa_workflow_id': cpoa_internal_workflow_id}
+                        )
                     time.sleep(CPOA_VFA_POLLING_INTERVAL_SECONDS)
 
         except requests.exceptions.RequestException as e_req_vfa: # For initial VFA call
@@ -1867,23 +1931,21 @@ def orchestrate_snippet_generation(
                                     break
                                 try:
                                     poll_response_iga = requests.get(iga_poll_url, timeout=10)
-                                    poll_response_iga.raise_for_status()
+                                        poll_response_iga.raise_for_status() # Handles 4xx/5xx from status endpoint
                                     try:
                                         iga_task_status_data = poll_response_iga.json()
                                     except json.JSONDecodeError as e_json_poll:
-                                        current_logger.error(f"Polling IGA task {iga_internal_task_id}: Failed to decode JSON. Status: {poll_response_iga.status_code}. Response: {poll_response_iga.text[:200]}", exc_info=True)
-                                        # This error means we can't get the image URL. Mark as None and break.
-                                        snippet_data["image_url"] = None # Ensure image_url is None
-                                        # To break out of IGA polling and continue without image:
-                                        # We can set a flag or directly break if the structure allows.
-                                        # Here, we'll log and let the IGA task be marked as failed for image part.
-                                        # The snippet will be saved without an image_url.
-                                        # This break is for the IGA polling.
+                                            current_logger.error(
+                                                f"Polling IGA task {iga_internal_task_id}: Failed to decode JSON from {iga_poll_url}. Status: {poll_response_iga.status_code}. Response: {poll_response_iga.text[:200]}",
+                                                exc_info=True,
+                                                extra={'polled_service_task_id': iga_internal_task_id, 'poll_url': iga_poll_url, 'cpoa_workflow_id': workflow_id_for_log}
+                                            )
+                                            snippet_data["image_url"] = None
                                         break # Exit IGA polling loop
                                     iga_task_state = iga_task_status_data.get("status")
                                     current_logger.info(f"IGA task {iga_internal_task_id} status: {iga_task_state} for snippet '{snippet_id_for_iga_log}'")
 
-                                    if iga_task_state == "SUCCESS":
+                                        if iga_task_state == "SUCCESS": # IGA uses "SUCCESS"
                                         iga_result = iga_task_status_data.get("result")
                                         if iga_result and iga_result.get("image_url"):
                                             snippet_data["image_url"] = iga_result["image_url"]
@@ -1892,13 +1954,27 @@ def orchestrate_snippet_generation(
                                             current_logger.warning(f"IGA task {iga_internal_task_id} succeeded but result or image_url missing for snippet '{snippet_id_for_iga_log}'. Data: {iga_task_status_data}")
                                             snippet_data["image_url"] = None
                                         break
-                                    elif iga_task_state == "FAILURE":
-                                        current_logger.error(f"IGA task {iga_internal_task_id} for snippet '{snippet_id_for_iga_log}' reported FAILURE. Full IGA response: {iga_task_status_data}")
+                                        elif iga_task_state == "FAILURE": # IGA uses "FAILURE"
+                                            current_logger.error(
+                                                f"IGA task {iga_internal_task_id} for snippet '{snippet_id_for_iga_log}' reported FAILURE. Service Response: {iga_task_status_data.get('result')}",
+                                                extra={'polled_service_task_id': iga_internal_task_id, 'poll_url': iga_poll_url, 'cpoa_workflow_id': workflow_id_for_log, 'service_response': iga_task_status_data.get('result')}
+                                            )
                                         snippet_data["image_url"] = None
                                         break
                                     time.sleep(CPOA_IGA_POLLING_INTERVAL_SECONDS)
-                                except requests.exceptions.RequestException as e_poll_iga:
-                                    current_logger.warning(f"Polling IGA task {iga_internal_task_id} for snippet '{snippet_id_for_iga_log}' failed: {e_poll_iga}. Retrying.")
+                                    except requests.exceptions.HTTPError as e_poll_iga_http:
+                                        current_logger.error(
+                                            f"Polling IGA task {iga_internal_task_id}: Status endpoint call failed with HTTP {e_poll_iga_http.response.status_code}. Response: {e_poll_iga_http.response.text[:200]}",
+                                            exc_info=True,
+                                            extra={'polled_service_task_id': iga_internal_task_id, 'poll_url': iga_poll_url, 'cpoa_workflow_id': workflow_id_for_log}
+                                        )
+                                        snippet_data["image_url"] = None
+                                        break # Exit IGA polling loop
+                                    except requests.exceptions.RequestException as e_poll_iga: # Other network errors during poll
+                                        current_logger.warning(
+                                            f"Polling IGA task {iga_internal_task_id} for snippet '{snippet_id_for_iga_log}' failed with {type(e_poll_iga).__name__}: {e_poll_iga}. Retrying.",
+                                            extra={'polled_service_task_id': iga_internal_task_id, 'poll_url': iga_poll_url, 'cpoa_workflow_id': workflow_id_for_log}
+                                        )
                                     time.sleep(CPOA_IGA_POLLING_INTERVAL_SECONDS)
                 except requests.exceptions.RequestException as e_iga_req_initial:
                     current_logger.warning(f"IGA service initial call failed for snippet '{snippet_id_for_iga_log}': {e_iga_req_initial}", exc_info=True)
@@ -2248,31 +2324,50 @@ def orchestrate_topic_exploration(
                     raise Exception(tda_error_details["message"])
                 try:
                     poll_response_tda = requests.get(tda_poll_url, timeout=10)
-                    poll_response_tda.raise_for_status()
+                        poll_response_tda.raise_for_status() # Handles 4xx/5xx from status endpoint
                     try:
                         tda_task_status_data = poll_response_tda.json()
                     except json.JSONDecodeError as e_json_poll:
-                        wf_logger.error(f"Polling TDA task (Search) {tda_task_id_from_service}: Failed to decode JSON. Status: {poll_response_tda.status_code}. Response: {poll_response_tda.text[:200]}", exc_info=True, extra={'task_id': tda_task_id})
+                            wf_logger.error(
+                                f"Polling TDA task (Search) {tda_task_id_from_service}: Failed to decode JSON from {tda_poll_url}. Status: {poll_response_tda.status_code}. Response: {poll_response_tda.text[:200]}",
+                                exc_info=True,
+                                extra={'task_id': tda_task_id, 'polled_service_task_id': tda_task_id_from_service, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id}
+                            )
                         tda_error_details = {"message": "TDA status poll response (Search) not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_tda.text[:200]}
                         break # Exit polling loop
                     tda_task_state = tda_task_status_data.get("status")
                     wf_logger.info(f"TDA task {tda_task_id_from_service} status: {tda_task_state}", extra={'task_id': tda_task_id})
 
-                    if tda_task_state == "SUCCESS":
+                        if tda_task_state == "SUCCESS": # TDA uses "SUCCESS"
                         tda_result = tda_task_status_data.get("result", {})
-                        if tda_result.get("status") == "success": # Check internal status from TDA task
+                            if tda_result.get("status") == "success": # Check internal status from TDA task logic
                             tda_topics = tda_result.get("discovered_topics", [])
                             tda_output_summary = {"topic_count": len(tda_topics), "query_used": query_for_tda}
                             wf_logger.info(f"TDA task {tda_task_id_from_service} successful. Found {len(tda_topics)} topics.", extra={'task_id': tda_task_id})
-                        else:
+                            else: # TDA task logic reported failure
                             tda_error_details = {"message": "TDA task succeeded but reported internal failure.", "tda_response": tda_result}
                         break
-                    elif tda_task_state == "FAILURE":
+                        elif tda_task_state == "FAILURE": # TDA uses "FAILURE"
                         tda_error_details = {"message": "TDA task execution failed.", "tda_celery_response": tda_task_status_data.get("result")}
+                            wf_logger.error(
+                                f"TDA task {tda_task_id_from_service} reported FAILURE. Service Response: {tda_task_status_data.get('result')}",
+                                extra={'task_id': tda_task_id, 'polled_service_task_id': tda_task_id_from_service, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id, 'service_response': tda_task_status_data.get('result')}
+                            )
                         break
                     time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
-                except requests.exceptions.RequestException as e_poll_tda:
-                    wf_logger.warning(f"Polling TDA task {tda_task_id_from_service} failed: {e_poll_tda}. Retrying.", extra={'task_id': tda_task_id})
+                    except requests.exceptions.HTTPError as e_poll_tda_http:
+                        wf_logger.error(
+                            f"Polling TDA task {tda_task_id_from_service}: Status endpoint call failed with HTTP {e_poll_tda_http.response.status_code}. Response: {e_poll_tda_http.response.text[:200]}",
+                            exc_info=True,
+                            extra={'task_id': tda_task_id, 'polled_service_task_id': tda_task_id_from_service, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id}
+                        )
+                        tda_error_details = {"message": f"TDA status endpoint failed with {e_poll_tda_http.response.status_code}", "details": e_poll_tda_http.response.text[:200]}
+                        break # Exit polling loop
+                    except requests.exceptions.RequestException as e_poll_tda: # Other network errors during poll
+                        wf_logger.warning(
+                            f"Polling TDA task {tda_task_id_from_service} failed with {type(e_poll_tda).__name__}: {e_poll_tda}. Retrying.",
+                            extra={'task_id': tda_task_id, 'polled_service_task_id': tda_task_id_from_service, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id}
+                        )
                     time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
 
         except requests.exceptions.RequestException as e_req:
@@ -2875,31 +2970,50 @@ def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional
                         raise Exception(tda_error_details["message"])
                     try:
                         poll_response_tda = requests.get(tda_poll_url, timeout=10)
-                        poll_response_tda.raise_for_status()
+                        poll_response_tda.raise_for_status() # Handles 4xx/5xx from status endpoint
                         try:
                             tda_task_status_data = poll_response_tda.json()
                         except json.JSONDecodeError as e_json_poll:
-                            wf_logger.error(f"Polling TDA task (Landing Page) {tda_internal_task_id}: Failed to decode JSON. Status: {poll_response_tda.status_code}. Response: {poll_response_tda.text[:200]}", exc_info=True, extra={'task_id': tda_task_id})
+                            wf_logger.error(
+                                f"Polling TDA task (Landing Page) {tda_internal_task_id}: Failed to decode JSON from {tda_poll_url}. Status: {poll_response_tda.status_code}. Response: {poll_response_tda.text[:200]}",
+                                exc_info=True,
+                                extra={'task_id': tda_task_id, 'polled_service_task_id': tda_internal_task_id, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id}
+                            )
                             tda_error_details = {"message": "TDA status poll response (Landing Page) not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_tda.text[:200]}
                             break # Exit polling loop
                         tda_task_state = tda_task_status_data.get("status")
                         wf_logger.info(f"TDA task {tda_internal_task_id} status: {tda_task_state}", extra={'task_id': tda_task_id})
 
-                        if tda_task_state == "SUCCESS":
+                        if tda_task_state == "SUCCESS": # TDA uses "SUCCESS"
                             tda_result = tda_task_status_data.get("result", {})
-                            if tda_result.get("status") == "success":
+                            if tda_result.get("status") == "success": # Check internal status from TDA task logic
                                 tda_topics = tda_result.get("discovered_topics", [])
                                 tda_output_summary = {"topic_count": len(tda_topics), "query_used": query_for_tda}
                                 wf_logger.info(f"TDA task {tda_internal_task_id} successful. Found {len(tda_topics)} topics.", extra={'task_id': tda_task_id})
-                            else:
+                            else: # TDA task logic reported failure
                                 tda_error_details = {"message": "TDA task succeeded but reported internal failure.", "tda_response": tda_result}
                             break
-                        elif tda_task_state == "FAILURE":
+                        elif tda_task_state == "FAILURE": # TDA uses "FAILURE"
                             tda_error_details = {"message": "TDA task execution failed.", "tda_celery_response": tda_task_status_data.get("result")}
+                            wf_logger.error(
+                                f"TDA task {tda_internal_task_id} reported FAILURE. Service Response: {tda_task_status_data.get('result')}",
+                                extra={'task_id': tda_task_id, 'polled_service_task_id': tda_internal_task_id, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id, 'service_response': tda_task_status_data.get('result')}
+                            )
                             break
                         time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
-                    except requests.exceptions.RequestException as e_poll_tda:
-                        wf_logger.warning(f"Polling TDA task {tda_internal_task_id} failed: {e_poll_tda}. Retrying.", extra={'task_id': tda_task_id})
+                    except requests.exceptions.HTTPError as e_poll_tda_http:
+                        wf_logger.error(
+                            f"Polling TDA task {tda_internal_task_id}: Status endpoint call failed with HTTP {e_poll_tda_http.response.status_code}. Response: {e_poll_tda_http.response.text[:200]}",
+                            exc_info=True,
+                            extra={'task_id': tda_task_id, 'polled_service_task_id': tda_internal_task_id, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id}
+                        )
+                        tda_error_details = {"message": f"TDA status endpoint failed with {e_poll_tda_http.response.status_code}", "details": e_poll_tda_http.response.text[:200]}
+                        break # Exit polling loop
+                    except requests.exceptions.RequestException as e_poll_tda: # Other network errors during poll
+                        wf_logger.warning(
+                            f"Polling TDA task {tda_internal_task_id} failed with {type(e_poll_tda).__name__}: {e_poll_tda}. Retrying.",
+                            extra={'task_id': tda_task_id, 'polled_service_task_id': tda_internal_task_id, 'poll_url': tda_poll_url, 'cpoa_workflow_id': workflow_id}
+                        )
                         time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
 
             except requests.exceptions.RequestException as e_req: # For initial TDA call
