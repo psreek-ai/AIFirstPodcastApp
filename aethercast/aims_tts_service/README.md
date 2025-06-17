@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts into audible speech. This version of AIMS TTS utilizes **Google Cloud Text-to-Speech** to provide high-quality voice synthesis. It is primarily used by the Voice Forge Agent (VFA) to generate audio for podcasts. The service saves generated audio to a shared volume accessible by other services.
+The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts into audible speech. This version of AIMS TTS utilizes **Google Cloud Text-to-Speech** to provide high-quality voice synthesis. It is primarily used by the Voice Forge Agent (VFA) to generate audio for podcasts. The service saves generated audio to Google Cloud Storage (GCS). Operations are performed asynchronously using Celery.
 
 ## API Endpoints
 
@@ -10,114 +10,153 @@ The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/v1/synthesize`
--   **Description:** Receives text and synthesis parameters, calls the Google Cloud Text-to-Speech API, saves the resulting audio to a shared file path, and returns metadata about the audio.
+-   **Description:** Accepts text and synthesis parameters, then dispatches an asynchronous Celery task (`invoke_tts_google_task`) to invoke the Google Cloud Text-to-Speech API and upload the resulting audio to GCS. Returns immediately with a task ID for status polling.
 -   **Request Payload (JSON):**
-    *   `text` (string, required): The text content to be synthesized. Must be a non-empty string. Max length approx. 5000 characters. Invalid input results in a 400 error.
-    *   `voice_id` (string, optional): The specific Google Cloud TTS voice name (e.g., "en-US-Wavenet-D"). Defaults to `AIMS_TTS_DEFAULT_VOICE_ID`. If provided, must be a string, otherwise results in a 400 error.
-    *   `language_code` (string, optional): The language code (e.g., "en-US"). Defaults to `AIMS_TTS_DEFAULT_LANGUAGE_CODE`. If provided, must be a non-empty string, otherwise results in a 400 error.
-    *   `audio_format` (string, optional): Desired audio encoding (e.g., "MP3", "LINEAR16", "OGG_OPUS"). Defaults to `AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR`. Must be one of the supported formats ("MP3", "LINEAR16", "OGG_OPUS"), otherwise results in a 400 error.
-    *   `speech_rate` (float, optional): Speaking rate (0.25 to 4.0). Defaults to `AIMS_TTS_DEFAULT_SPEAKING_RATE`. Values outside this range are clamped. Non-float values result in a 400 error.
-    *   `pitch` (float, optional): Speaking pitch (-20.0 to 20.0). Defaults to `AIMS_TTS_DEFAULT_PITCH`. Values outside this range are clamped. Non-float values result in a 400 error.
--   **Success Response (JSON):**
-    *   `request_id` (string): A unique identifier for this synthesis request.
-    *   `voice_id` (string): The voice ID that was used for the synthesis.
-    *   `audio_url` (string): The GCS URI of the generated audio file (e.g., `gs://your-bucket-name/audio/aims_tts/aims-tts-req-xxxx_yyyy.mp3`). This URI is used by other services (like VFA and CPOA) to access the audio.
-    *   `audio_duration_seconds` (float): An estimated duration of the generated audio in seconds.
-    *   `audio_format` (string): The actual audio format (file extension) of the saved audio file (e.g., "mp3"), which also influences the GCS object name.
--   **Error Responses (JSON):**
-    *   **400 Bad Request:** Returned for invalid request payloads, such as:
-        *   Missing or empty `text`.
-        *   `text` exceeding maximum length.
-        *   Invalid type for `voice_id` (if provided).
-        *   Invalid type or empty `language_code` (if provided).
-        *   Unsupported `audio_format`.
-        *   Non-float `speech_rate` or `pitch`.
+    *   `text` (string, required): The text content to be synthesized. Must be a non-empty string. Max length approx. 5000 characters.
+    *   `voice_id` (string, optional): The specific Google Cloud TTS voice name (e.g., "en-US-Wavenet-D"). Defaults to `AIMS_TTS_DEFAULT_VOICE_ID`.
+    *   `language_code` (string, optional): The language code (e.g., "en-US"). Defaults to `AIMS_TTS_DEFAULT_LANGUAGE_CODE`.
+    *   `audio_format` (string, optional): Desired audio encoding (e.g., "MP3", "LINEAR16", "OGG_OPUS"). Defaults to `AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR`.
+    *   `speech_rate` (float, optional): Speaking rate (0.25 to 4.0). Defaults to `AIMS_TTS_DEFAULT_SPEAKING_RATE`.
+    *   `pitch` (float, optional): Speaking pitch (-20.0 to 20.0). Defaults to `AIMS_TTS_DEFAULT_PITCH`.
+-   **Success Response (202 Accepted - Task Dispatched):**
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status_url": "/v1/tasks/some_celery_task_id"
+    }
+    ```
+-   **Error Responses (JSON - Before Task Dispatch):**
+    *   **400 Bad Request:** For invalid request payloads (missing `text`, invalid parameters, etc.).
         *   Example: `{"request_id": "...", "error": {"type": "invalid_request_error", "message": "Validation failed: <specific_reason>"}}`
-    *   **500 Internal Server Error:** For unexpected errors during TTS synthesis or file system I/O errors.
-        *   Example: `{"request_id": "...", "error": {"type": "tts_failure", "message": "Google TTS API error: Details..."}}`
-        *   Example: `{"request_id": "...", "error": {"type": "file_system_error", "message": "Could not save audio file: Details..."}}`
-    *   **503 Service Unavailable:** If the service is not configured correctly (e.g., missing `GOOGLE_APPLICATION_CREDENTIALS`).
+    *   **503 Service Unavailable:** If the service is not configured correctly (e.g., missing `GOOGLE_APPLICATION_CREDENTIALS` or `GCS_BUCKET_NAME`).
 
-*For the conceptual API contract that AIMS TTS aims to fulfill, including potential future features like direct audio streaming, refer to `aethercast/aims_tts/tts_api_placeholder.md`. The current implementation focuses on file-based generation via Google TTS.*
+### Get Task Status
+
+-   **URL Path:** `/v1/tasks/<task_id>`
+-   **HTTP Method:** `GET`
+-   **Description:** Retrieves the status and result of an asynchronous TTS synthesis task dispatched by `/v1/synthesize`.
+-   **Success Response (200 OK - Task Completed Successfully):**
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status": "SUCCESS",
+        "result": {
+            "request_id": "aims-tts-req-...",
+            "voice_id": "en-US-Wavenet-D",
+            "audio_url": "gs://your-bucket-name/audio/aims_tts/aims-tts-req-xxxx_yyyy.mp3",
+            "audio_duration_seconds": 15.7,
+            "audio_format": "mp3"
+        }
+    }
+    ```
+-   **Pending Response (202 Accepted - Task Still Processing):**
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status": "PENDING",
+        "result": null
+    }
+    ```
+-   **Failed Response (200 OK or 500 - Task Failed in Celery):**
+    *(HTTP status might be 200 if the API successfully retrieved the failure state from Celery, or 500 if the status endpoint itself has an issue.)*
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status": "FAILURE",
+        "result": {
+            "error": {"type": "task_failed", "message": "Google Cloud TTS API error: ..."}
+        }
+    }
+    ```
+
+## Idempotency
+
+The `/v1/synthesize` endpoint, through its underlying Celery task `invoke_tts_google_task`, is designed to be idempotent. This prevents redundant processing for identical synthesis requests and allows for safe retries.
+
+-   **Mechanism:** Idempotency is managed using a shared `idempotency_keys` table in a PostgreSQL database.
+-   **Idempotency Key:** The `request_id` (generated by the AIMS_TTS service for each incoming `/v1/synthesize` request and subsequently passed to the Celery task) serves as the idempotency key.
+-   **Pattern:** A two-phase pattern is employed:
+    1.  **Check/Lock:** Before executing the core TTS synthesis, the Celery task checks the `idempotency_keys` table.
+        -   If a record with the `request_id` and task name (`aims_invoke_tts_google_task`) exists with a 'completed' status, the stored result (containing GCS URI, duration, etc.) is returned immediately.
+        -   If the record indicates 'processing' and the lock is not stale (within `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`), a conflict is signaled.
+        -   Otherwise, the task attempts to acquire a lock by setting the status to 'processing' and updating a `locked_at` timestamp.
+    2.  **Execute & Update:**
+        -   The core TTS synthesis and GCS upload logic is executed.
+        -   Upon successful completion, the idempotency record is updated to 'completed', and the synthesis metadata is stored in `result_payload`.
+        -   If an error occurs, the record is updated to 'failed', and error details are stored in `error_payload`.
+        -   The `locked_at` timestamp is cleared once the task reaches a terminal state.
 
 ## Configuration
 
-Configuration is managed via environment variables, typically set in an `.env` file (created from `.env.example`) located in the `aethercast/aims_tts_service/` directory.
+Configuration is managed via environment variables, typically set in an `.env` file.
 
-Key environment variables:
+### Core Service Configuration:
+-   `AIMS_TTS_HOST`: Host for the Flask server. Default: `0.0.0.0`.
+-   `AIMS_TTS_PORT`: Port for the service. Default: `9000`.
+-   `FLASK_DEBUG`: Enable Flask debug mode. Default: `False`.
+-   `CELERY_BROKER_URL`: Celery message broker URL. Default: `redis://redis:6379/0`.
+-   `CELERY_RESULT_BACKEND`: Celery result backend URL. Default: `redis://redis:6379/0`.
 
-This service requires Google Cloud Platform credentials and configuration for both Google Cloud Text-to-Speech and Google Cloud Storage (for saving the generated audio files). Please refer to the main project README's section on **'## GCP Prerequisites and Setup for Local Development'** for comprehensive instructions. This includes setting up your GCP project, enabling necessary APIs (Text-to-Speech API and Cloud Storage API), creating a GCS bucket, and configuring a service account. You will need to download the service account's JSON key, name it `gcp-credentials.json`, and place it in the `aethercast/aims_tts_service/` directory. Ensure `GCP_PROJECT_ID`, `GCP_LOCATION` (for API regional endpoints if applicable), and `GCS_BUCKET_NAME` are set in your `common.env` file (or in this service's `.env` file if you need to override). The `GOOGLE_APPLICATION_CREDENTIALS` variable in the `.env` file for this service must be set to `/app/gcp-credentials.json`, which is the path where the key will be mounted inside the Docker container.
+### Google Cloud Configuration:
+Refer to the main project README for GCP setup.
+-   `GOOGLE_APPLICATION_CREDENTIALS`: Path to GCP service account key (e.g., `/app/gcp-credentials.json` in Docker).
+-   `GCS_BUCKET_NAME`: **Required.** Name of the Google Cloud Storage bucket for audio uploads.
+-   `AIMS_TTS_GCS_AUDIO_PREFIX`: Prefix within the GCS bucket for AIMS_TTS files. Default: `audio/aims_tts/`.
 
--   `AIMS_TTS_HOST`: Host address for the Flask server to bind to.
-    -   *Default:* `0.0.0.0`
--   `AIMS_TTS_PORT`: Port on which the AIMS TTS service will listen.
-    -   *Default:* `9000`
--   `FLASK_DEBUG`: Enables or disables Flask's debug mode.
-    -   *Default:* `False` (as per `main.py`, but `Dockerfile` sets to `True`; `main.py` value takes precedence if `.env` is used)
--   `AIMS_TTS_DEFAULT_VOICE_ID`: Default Google TTS voice name if not specified in the request.
-    -   *Default:* `en-US-Wavenet-D`
--   `AIMS_TTS_DEFAULT_LANGUAGE_CODE`: Default language code if not specified in the request.
-    -   *Default:* `en-US`
--   `AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR`: Default audio format if not specified (e.g., "MP3", "LINEAR16").
-    -   *Default:* `MP3`
--   `AIMS_TTS_DEFAULT_SPEAKING_RATE`: Default speaking rate if not specified.
-    -   *Default:* `1.0`
--   `AIMS_TTS_DEFAULT_PITCH`: Default speaking pitch if not specified.
-    -   *Default:* `0.0`
--   `SHARED_AUDIO_DIR_CONTAINER`: Path for temporary local audio file storage before upload to Google Cloud Storage. Primary storage for generated audio is GCS. This directory might be used for intermediate files or if local fallback is ever implemented.
-    -   *Default:* `/shared_audio/aims_tts` (its role is now primarily for temporary files).
--   `AIMS_TTS_GCS_AUDIO_PREFIX`: **Required.** The prefix (folder path) within the GCS bucket where AIMS_TTS audio files will be stored.
-    -   *Default:* `audio/aims_tts/` (Ensure it ends with a `/`).
-    Details for `GOOGLE_APPLICATION_CREDENTIALS` and `GCS_BUCKET_NAME` are covered in the paragraph above and the main project README.
+### TTS Defaults:
+-   `AIMS_TTS_DEFAULT_VOICE_ID`: Default voice. Default: `en-US-Wavenet-D`.
+-   `AIMS_TTS_DEFAULT_LANGUAGE_CODE`: Default language. Default: `en-US`.
+-   `AIMS_TTS_DEFAULT_AUDIO_ENCODING_STR`: Default audio format. Default: `MP3`.
+-   `AIMS_TTS_DEFAULT_SPEAKING_RATE`: Default speaking rate. Default: `1.0`.
+-   `AIMS_TTS_DEFAULT_PITCH`: Default pitch. Default: `0.0`.
+
+### PostgreSQL Database Configuration (for Idempotency):
+-   `POSTGRES_HOST`: Hostname of the PostgreSQL server.
+-   `POSTGRES_PORT`: Port for PostgreSQL. Default: `5432`.
+-   `POSTGRES_USER`: PostgreSQL username.
+-   `POSTGRES_PASSWORD`: PostgreSQL password.
+-   `POSTGRES_DB`: Name of the PostgreSQL database.
+-   `AIMS_TTS_DB_POOL_MIN_CONN`: Min connections for DB pool. Default: `1`.
+-   `AIMS_TTS_DB_POOL_MAX_CONN`: Max connections for DB pool. Default: `3` (can be smaller for TTS).
+-   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Timeout for idempotency lock. Default: `300`.
 
 ## Dependencies
 
 Service dependencies are listed in `requirements.txt`:
--   `Flask`: Web framework.
--   `python-dotenv`: For loading environment variables from `.env` files.
--   `google-cloud-texttospeech`: The Google Cloud Text-to-Speech client library.
--   `google-cloud-storage`: The Google Cloud Storage client library (for uploading audio to GCS).
+-   `Flask`
+-   `python-dotenv`
+-   `google-cloud-texttospeech`
+-   `google-cloud-storage`
+-   `celery`
+-   `redis`
+-   `python-json-logger`
+-   `psycopg2-binary` (for PostgreSQL idempotency)
 
-Install dependencies using:
-```bash
-pip install -r requirements.txt
-```
+Install using: `pip install -r requirements.txt`
 
 ## Running Standalone
 
-To run the AIMS TTS service directly for development or testing:
-
-    1.  Ensure all required environment variables are set (e.g., in an `.env` file in this directory). Crucially, `GOOGLE_APPLICATION_CREDENTIALS` must point to a valid GCP key file, and `GCS_BUCKET_NAME` must be set to your target bucket.
-    2.  Execute the main script:
+1.  Set required environment variables (GCP credentials, GCS bucket, PostgreSQL, Celery broker).
+2.  Start the Flask application:
     ```bash
     python aethercast/aims_tts_service/main.py
     ```
-    The service will typically start on `http://0.0.0.0:9000` (or as configured). Audio files will be uploaded to GCS.
+3.  Start a Celery worker:
+    ```bash
+    celery -A aethercast.aims_tts_service.main.celery_app worker -l info
+    ```
 
 ## Docker
 
-The AIMS TTS service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
-
--   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build aims_tts_service`.
--   **Credentials and Configuration in Docker:** The `docker-compose.yml` file is configured to mount your GCP service account key (`gcp-credentials.json` located in `aethercast/aims_tts_service/`) into the container at `/app/gcp-credentials.json`. Ensure your `aethercast/aims_tts_service/.env` file has `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` set. Also, `GCS_BUCKET_NAME` (usually from `common.env`) and `AIMS_TTS_GCS_AUDIO_PREFIX` must be correctly configured in the environment for GCS uploads. For detailed steps on creating and placing the `gcp-credentials.json` file and setting up GCS, see the main project README's section '## GCP Prerequisites and Setup for Local Development'.
--   **Shared Volume for Audio:** The shared volume `aethercast_audio_data` (mounted to `/shared_audio`) is no longer the primary storage for AIMS_TTS outputs. Audio is uploaded to GCS. The volume might still be used for temporary files or by other services that haven't fully migrated.
--   **Running with Docker Compose:**
-    ```bash
-    docker-compose up -d aims_tts_service
-    ```
-    Or, to run all services:
-    ```bash
-    docker-compose up -d
-    ```
-
-The service will then be accessible to other Dockerized services (like VFA) via its service name and internal port (e.g., `http://aims_tts_service:9000`).
+AIMS TTS is included in `docker-compose.yml`.
+-   **Build:** `docker-compose build aims_tts_service`
+-   **Run:** `docker-compose up -d aims_tts_service`
+-   Ensure GCP credentials and GCS bucket are correctly configured in the environment for the Docker container. Celery workers may need a separate service definition in `docker-compose.yml` or to be run as separate containers/processes configured to connect to the shared Celery broker.
 
 ## Monitoring and Logging
 
-This service outputs logs in a structured JSON format. Key operational metrics, such as request latency, counts, Google Cloud TTS call performance, and GCS upload times, are also logged as part of these structured logs.
-
-For details on the general logging format, specific metrics defined for this service, and how to view logs (e.g., using `docker-compose logs aims_tts_service`), please refer to the main [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md) in the project's `docs/operational/` directory.
+This service uses structured JSON logging. Metrics related to TTS generation, GCS uploads, and task processing are logged. Refer to the main project's [Logging Guide](../../../docs/operational/Logging_Guide.md) and [Metrics Definition](../../../docs/operational/Metrics_Definition.md).
 
 ---
 
-*For information on the overarching Aethercast project architecture, advanced setup including database migrations for shared resources like idempotency tables, and how services interact, please refer to the main [README.md](../../../README.md) at the root of the Aethercast project.*
+*For overarching Aethercast project details, see the main [README.md](../../../README.md).*

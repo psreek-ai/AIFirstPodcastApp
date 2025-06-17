@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The AIMS (AI Model Service) acts as a centralized gateway for interacting with Large Language Models (LLMs). This version of AIMS utilizes **Google Cloud Vertex AI** (specifically models like Gemini) to provide generative AI capabilities to other services within the Aethercast system (e.g., PSWA, SCA). It abstracts the direct LLM calls, offering a single point of configuration and a consistent API endpoint.
+The AIMS (AI Model Service) acts as a centralized gateway for interacting with Large Language Models (LLMs). This version of AIMS utilizes **Google Cloud Vertex AI** (specifically models like Gemini) to provide generative AI capabilities to other services within the Aethercast system (e.g., PSWA, SCA). It abstracts the direct LLM calls, offering a single point of configuration and a consistent API endpoint. Operations are asynchronous, leveraging Celery for task management.
 
 ## API Endpoints
 
@@ -10,7 +10,7 @@ The AIMS (AI Model Service) acts as a centralized gateway for interacting with L
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/v1/generate`
--   **Description:** Receives a prompt and other parameters, calls the configured Google Cloud Vertex AI LLM (e.g., a Gemini model), and returns the generated text along with metadata.
+-   **Description:** Accepts a prompt and other parameters, then dispatches an asynchronous Celery task (`invoke_llm_vertex_ai_task`) to invoke the configured Google Cloud Vertex AI LLM. Returns immediately with a task ID for status polling.
 -   **Request Payload (JSON):**
     *   `prompt` (string, required): The textual prompt for the LLM. Must be a non-empty string.
     *   `model_id_override` (string, optional): Specify a Google LLM model ID (e.g., "gemini-1.5-pro-preview-0409") to use instead of the service's default. Also accepts `model`. If provided, must be a string.
@@ -18,51 +18,113 @@ The AIMS (AI Model Service) acts as a centralized gateway for interacting with L
     *   `temperature` (float, optional): Sampling temperature. Must be a float between 0.0 and 2.0 (inclusive) if provided. Defaults to a service/model default (e.g., 0.7). Invalid values result in a 400 error.
     *   `response_format` (object, optional): Specify desired output format. Must be an object if provided. For JSON output from compatible models, use `{"type": "json_object"}`. The `type` field, if present, must be a string. Invalid structures result in a 400 error.
     *   *(For more details on the API contract, refer to `aethercast/aims/llm_api_placeholder.md` which defines the intended stable interface AIMS provides.)*
--   **Success Response (JSON):**
-    *   `request_id` (string): Unique ID for the request.
-    *   `model_id` (string): The actual Google LLM model ID used for generation (as reported by Vertex AI or the configured model).
-    *   `choices` (array of objects):
-        *   `text` (string): The LLM-generated text.
-        *   `finish_reason` (string): Reason generation stopped (e.g., "STOP", "MAX_TOKENS", "SAFETY").
-    *   `usage` (object):
-        *   `prompt_tokens` (integer): Tokens in the input prompt.
-        *   `completion_tokens` (integer): Tokens in the generated output.
-        *   `total_tokens` (integer): Total tokens processed.
-    *   *(Refer to `aethercast/aims/llm_api_placeholder.md` for the detailed response structure.)*
--   **Error Responses (JSON):**
-    *   Structured JSON errors are returned for issues like configuration problems, invalid requests, or errors from the Vertex AI service.
-    *   **400 Bad Request:** Returned for issues like missing `prompt`, invalid types for parameters (e.g., `max_tokens` not an integer, `temperature` not a float), or values out of allowed range (e.g., `max_tokens` not positive, `temperature` outside 0.0-2.0). The error response will typically look like: `{"request_id": "...", "error": {"type": "invalid_request_error", "message": "Validation failed: <specific_reason>"}}`.
-    *   **403 Forbidden:** May be returned by Vertex AI for permission issues.
-    *   **429 Too Many Requests:** May be returned by Vertex AI if rate limits are exceeded.
-    *   **500 Internal Server Error:** For unexpected errors within AIMS or non-specific errors from Vertex AI.
-    *   **503 Service Unavailable:** If Vertex AI is unavailable or if AIMS is not configured correctly.
-    *   Specific error types also exist for `configuration_error`, `generation_blocked_safety`, and various `google_vertex_ai_*` errors.
+-   **Success Response (202 Accepted - Task Dispatched):**
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status_url": "/v1/tasks/some_celery_task_id"
+    }
+    ```
+-   **Error Responses (JSON - Before Task Dispatch):**
+    *   Structured JSON errors are returned for issues like configuration problems or invalid requests.
+    *   **400 Bad Request:** Returned for issues like missing `prompt`, invalid types for parameters (e.g., `max_tokens` not an integer, `temperature` not a float), or values out of allowed range. Example: `{"request_id": "...", "error": {"type": "invalid_request_error", "message": "Validation failed: <specific_reason>"}}`.
+    *   **503 Service Unavailable:** If AIMS is not configured correctly (e.g., missing GCP credentials).
+
+### Get Task Status
+
+-   **URL Path:** `/v1/tasks/<task_id>`
+-   **HTTP Method:** `GET`
+-   **Description:** Retrieves the status and result of an asynchronous LLM generation task dispatched by `/v1/generate`.
+-   **Success Response (200 OK - Task Completed Successfully):**
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status": "SUCCESS",
+        "result": {
+            "request_id": "aims_req_...",
+            "model_id": "gemini-1.0-pro",
+            "choices": [{"text": "Generated text...", "finish_reason": "STOP"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 50, "total_tokens": 60}
+        }
+    }
+    ```
+    *(Note: If the LLM task itself resulted in an error (e.g., content blocked by safety filters), this will be reflected within the `result.result` structure, e.g., `result: {"status": "error", "error_code": "AIMS_SAFETY_BLOCK", ...}`)*
+-   **Pending Response (202 Accepted - Task Still Processing):**
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status": "PENDING",
+        "result": null
+    }
+    ```
+-   **Failed Response (200 OK or 500 - Task Failed in Celery):**
+    *(HTTP status might be 200 if the API successfully retrieved the failure state from Celery, or 500 if the status endpoint itself has an issue.)*
+    ```json
+    {
+        "task_id": "some_celery_task_id",
+        "status": "FAILURE",
+        "result": {
+            "error": {"type": "task_failed", "message": "Vertex AI API Error: ..."}
+        }
+    }
+    ```
+
+## Idempotency
+
+The `/v1/generate` endpoint, through its underlying Celery task `invoke_llm_vertex_ai_task`, is designed to be idempotent. This prevents redundant processing for identical requests and allows for safe retries.
+
+-   **Mechanism:** Idempotency is managed using a shared `idempotency_keys` table in a PostgreSQL database.
+-   **Idempotency Key:** The `request_id` generated by the AIMS service for each incoming `/v1/generate` request (and subsequently passed to the Celery task) serves as the idempotency key.
+-   **Pattern:** A two-phase pattern is employed:
+    1.  **Check/Lock:** Before executing the core LLM call, the Celery task checks the `idempotency_keys` table.
+        -   If a record with the `request_id` and task name (`aims_invoke_llm_vertex_ai_task`) exists with a 'completed' status, the stored result is returned immediately.
+        -   If the record indicates 'processing' and the lock is not stale (within `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`), a conflict is signaled, and the task may be retried or gracefully fail.
+        -   Otherwise (no record, stale lock, or previous 'failed' status), the task attempts to acquire a lock by inserting/updating the record to 'processing' status with a current `locked_at` timestamp.
+    2.  **Execute & Update:**
+        -   The core LLM invocation logic is executed.
+        -   Upon successful completion, the idempotency record is updated to 'completed', and the LLM response is stored in `result_payload`.
+        -   If an error occurs during LLM invocation, the record is updated to 'failed', and error details are stored in `error_payload`.
+        -   The `locked_at` timestamp is cleared (set to NULL) once the task reaches a terminal state ('completed' or 'failed').
 
 ## Configuration
 
 Configuration is managed via environment variables, typically set in an `.env` file created from `.env.example` located in the `aethercast/aims_service/` directory.
 
-Key environment variables:
+### Core Service Configuration:
+-   `AIMS_HOST`: Host address for the Flask server. Default: `0.0.0.0`.
+-   `AIMS_PORT`: Port for the AIMS service. Default: `8000`.
+-   `FLASK_DEBUG`: Enable/disable Flask debug mode. Default: `True`.
+-   `CELERY_BROKER_URL`: URL for Celery message broker. Default: `redis://redis:6379/0`.
+-   `CELERY_RESULT_BACKEND`: URL for Celery result backend. Default: `redis://redis:6379/0`.
 
-This service requires Google Cloud Platform credentials and configuration to interact with Vertex AI. Please refer to the main project README's section on **'## GCP Prerequisites and Setup for Local Development'** for comprehensive instructions. This includes setting up your GCP project, enabling necessary APIs (especially Vertex AI API), and configuring a service account. You will need to download the service account's JSON key, name it `gcp-credentials.json`, and place it in the `aethercast/aims_service/` directory. Ensure `GCP_PROJECT_ID` and `GCP_LOCATION` are set in your `common.env` file (or in this service's `.env` file if you need to override). The `GOOGLE_APPLICATION_CREDENTIALS` variable in the `.env` file for this service must be set to `/app/gcp-credentials.json`, which is the path where the key will be mounted inside the Docker container.
+### Google Cloud Vertex AI Configuration:
+This service requires Google Cloud Platform credentials and configuration. Refer to the main project README's section on **'## GCP Prerequisites and Setup for Local Development'** for comprehensive instructions.
+-   `AIMS_GOOGLE_LLM_MODEL_ID`: Default Google LLM model ID. Default: `gemini-1.0-pro`.
+-   `GOOGLE_APPLICATION_CREDENTIALS`: Path to GCP service account key file (e.g., `/app/gcp-credentials.json` in Docker).
+-   `GCP_PROJECT_ID`: Your Google Cloud Project ID.
+-   `GCP_LOCATION`: Your Google Cloud Project Location (e.g., `us-central1`).
 
--   `AIMS_HOST`: Host address for the Flask server to bind to.
-    -   *Default:* `0.0.0.0`
--   `AIMS_PORT`: Port on which the AIMS service will listen.
-    -   *Default:* `8000`
--   `FLASK_DEBUG`: Enables or disables Flask's debug mode.
-    -   *Default:* `True` (for development)
--   `AIMS_GOOGLE_LLM_MODEL_ID`: The default Google LLM model ID to be used if not specified in the request.
-    -   *Default:* `gemini-1.0-pro`
-    -   *Examples:* `gemini-1.5-pro-preview-0409`, `text-bison@001` (though Gemini is preferred for chat-like completions)
-    Details for `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_PROJECT_ID`, and `GCP_LOCATION` are covered in the paragraph above and the main project README.
+### PostgreSQL Database Configuration (for Idempotency):
+-   `POSTGRES_HOST`: Hostname of the PostgreSQL server.
+-   `POSTGRES_PORT`: Port for PostgreSQL. Default: `5432`.
+-   `POSTGRES_USER`: PostgreSQL username.
+-   `POSTGRES_PASSWORD`: PostgreSQL password.
+-   `POSTGRES_DB`: Name of the PostgreSQL database.
+-   `AIMS_DB_POOL_MIN_CONN`: Minimum connections for the database pool. Default: `1`.
+-   `AIMS_DB_POOL_MAX_CONN`: Maximum connections for the database pool. Default: `5`.
+-   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Timeout for considering an idempotency lock stale. Default: `300`.
+
 
 ## Dependencies
 
 Service dependencies are listed in `requirements.txt`:
 -   `Flask`: Web framework.
--   `python-dotenv`: For loading environment variables from `.env` files.
--   `google-cloud-aiplatform`: The Google Cloud Vertex AI SDK.
+-   `python-dotenv`: For loading environment variables.
+-   `google-cloud-aiplatform`: Google Cloud Vertex AI SDK.
+-   `celery`: For asynchronous task processing.
+-   `redis`: For Celery broker and backend.
+-   `python-json-logger`: For structured JSON logging.
+-   `psycopg2-binary`: PostgreSQL adapter for Python (for idempotency).
 
 Install dependencies using:
 ```bash
@@ -73,29 +135,29 @@ pip install -r requirements.txt
 
 To run the AIMS service directly for development or testing:
 
-1.  Ensure all required environment variables are set (e.g., in an `.env` file in this directory). Specifically, `GOOGLE_APPLICATION_CREDENTIALS`, `GCP_PROJECT_ID`, and `GCP_LOCATION` must be correctly configured.
-2.  Execute the main script:
+1.  Ensure all required environment variables are set (e.g., in an `.env` file). This includes GCP credentials, PostgreSQL details, and Celery broker URLs.
+2.  Start the Flask application:
     ```bash
     python aethercast/aims_service/main.py
     ```
-    The service will typically start on `http://0.0.0.0:8000` (or as configured by `AIMS_HOST`/`AIMS_PORT`).
+    The service will typically start on `http://0.0.0.0:8000`.
+3.  Start a Celery worker to process tasks:
+    ```bash
+    celery -A aethercast.aims_service.main.celery_app worker -l info
+    ```
+    Ensure your Python path allows Celery to find the `aethercast.aims_service.main.celery_app` instance.
 
 ## Docker
 
 The AIMS service is designed to be run as a Docker container and is included in the project's `docker-compose.yml` file.
 
--   **Building the Image:** If changes are made, you might need to rebuild the service's image: `docker-compose build aims_service`.
--   **Credentials in Docker:** The `docker-compose.yml` file is configured to mount your GCP service account key (`gcp-credentials.json` located in `aethercast/aims_service/`) into the container at `/app/gcp-credentials.json`. Ensure your `aethercast/aims_service/.env` file has `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` set. For detailed steps on creating and placing the `gcp-credentials.json` file, see the main project README's section '## GCP Prerequisites and Setup for Local Development'.
+-   **Building the Image:** If changes are made: `docker-compose build aims_service`.
+-   **Credentials in Docker:** Mount your GCP service account key as described in the main project README. Ensure `GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-credentials.json` is set in the `.env` file for this service.
 -   **Running with Docker Compose:**
     ```bash
     docker-compose up -d aims_service
     ```
-    Or, to run all services:
-    ```bash
-    docker-compose up -d
-    ```
-
-The service will then be accessible to other Dockerized services (like PSWA and SCA) via its service name and internal port (e.g., `http://aims_service:8000`).
+    This will also start dependent services like Redis if they are part of the compose file. Celery workers are typically run as separate containers or processes pointing to the same broker. The provided `docker-compose.yml` might need a separate service definition for AIMS Celery workers.
 
 ## Monitoring and Logging
 
