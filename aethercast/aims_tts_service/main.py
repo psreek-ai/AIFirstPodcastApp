@@ -174,6 +174,7 @@ def invoke_tts_google_task(self, request_id: str, text_to_synthesize: str, voice
         raise self.retry(exc=e, countdown=5, max_retries=3)
     except Exception as e:
         logger.error(f"Celery Task {self.request.id}: Unexpected error in TTS task: {e}", exc_info=True)
+        logger.error(f"Celery Task {self.request.id}: Non-GoogleAPIError in TTS, will retry: {e}", exc_info=True)
         raise self.retry(exc=e, countdown=5, max_retries=3)
 
 

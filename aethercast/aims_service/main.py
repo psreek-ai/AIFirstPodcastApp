@@ -183,6 +183,7 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
         raise self.retry(exc=e, countdown=5, max_retries=3) # Example retry
     except Exception as e:
         logger.error(f"Celery Task {self.request.id}: Unexpected error during LLM call: {e}", exc_info=True)
+        logger.error(f"Celery Task {self.request.id}: Non-GoogleAPIError, will retry: {e}", exc_info=True)
         raise self.retry(exc=e, countdown=5, max_retries=3) # Example retry
 
 

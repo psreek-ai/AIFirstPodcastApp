@@ -13,6 +13,7 @@ import jwt
 import re # For email validation in /subscribe
 from werkzeug.security import generate_password_hash, check_password_hash
 from google.cloud import storage # Added for GCS
+from google.api_core import exceptions as google_api_exceptions # For GCS error handling
 # from google.oauth2 import service_account # Not strictly needed if using ADC
 import logging # Added for JSON logging
 
@@ -292,8 +293,11 @@ def generate_gcs_signed_url(gcs_uri: str, expiration_minutes: int = 15) -> Optio
         )
         app.logger.info(f"Generated signed URL for {gcs_uri} expiring in {expiration_minutes} minutes.")
         return signed_url
-    except Exception as e:
-        app.logger.error(f"Error generating signed URL for {gcs_uri}: {e}", exc_info=True)
+    except google.api_core.exceptions.GoogleAPIError as e_gcs_api:
+        app.logger.error(f"Google Cloud API Error generating signed URL for {gcs_uri}: {e_gcs_api}", exc_info=True)
+        return None
+    except Exception as e_other:
+        app.logger.error(f"Unexpected error generating signed URL for {gcs_uri}: {e_other}", exc_info=True)
         return None
 
 # --- Session Helper Functions ---
@@ -370,6 +374,9 @@ def _get_user_by_id(user_id_str: str) -> Optional[Dict[str, Any]]:
         if user_row and not isinstance(user_row, dict) and hasattr(user_row, 'keys'):
              user_row = dict(zip(user_row.keys(), user_row))
         return user_row
+    except ConnectionError as e_conn:
+        app.logger.error(f"Database connection error fetching user by ID {user_id_str}: {e_conn}", exc_info=True)
+        return None
     except (sqlite3.Error, psycopg2.Error if DATABASE_TYPE == "postgres" else sqlite3.Error) as e:
         app.logger.error(f"Database error fetching user by ID {user_id_str} ({DATABASE_TYPE}): {e}", exc_info=True)
         return None

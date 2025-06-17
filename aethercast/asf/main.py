@@ -242,6 +242,13 @@ def handle_join_stream(data):
         logger.info(f"ASF: Sent {AUDIO_EVENT_START_OF_STREAM} for stream_id: {stream_id}")
 
         if gcs_uri.startswith("gs://"): # Streaming from GCS signed URL
+            if not signed_url_from_api_gw: # This will be true if the API GW call was commented out or failed
+                logger.error(f"ASF: Critical error - signed URL was not obtained before attempting GCS stream for stream_id: {stream_id}. The API GW call might be commented out or failed.")
+                emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Internal error preparing audio stream (failed to get secure URL).'}, room=stream_id)
+                return
+
+            # The original safeguard check below is now somewhat redundant if the above check is comprehensive,
+            # but it doesn't hurt to keep it as a final defense if signed_url_from_api_gw was manipulated unexpectedly post-check.
             if not signed_url_from_api_gw: # Should have been caught above, but as a safeguard
                 logger.error(f"ASF: Critical error - signed URL is None before attempting GCS stream for {stream_id}.")
                 emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Internal error preparing stream.'}, room=stream_id)
@@ -313,10 +320,16 @@ def health_check():
                 api_gw_status = f"Connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}, but got HTTP {response.status_code}."
         except requests.exceptions.ConnectionError:
             api_gw_status = f"Failed to connect to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']} (Connection Error)."
+            logger.warning(f"ASF Health Check: Connection error while checking API Gateway health at {health_url}.")
         except requests.exceptions.Timeout:
             api_gw_status = f"Timed out connecting to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}."
+            logger.warning(f"ASF Health Check: Timeout while checking API Gateway health at {health_url}.")
+        except requests.exceptions.HTTPError as e_http:
+            api_gw_status = f"Connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}, but received HTTP error: {e_http.response.status_code} - {e_http.response.reason}."
+            logger.warning(f"ASF Health Check: API Gateway at {health_url} returned HTTP {e_http.response.status_code} - {e_http.response.reason}.")
         except Exception as e_gw_health:
              api_gw_status = f"Error checking API Gateway health: {str(e_gw_health)}"
+             logger.error(f"ASF Health Check: Unexpected error while checking API Gateway health at {health_url}: {e_gw_health}", exc_info=True)
 
 
     return flask.jsonify({

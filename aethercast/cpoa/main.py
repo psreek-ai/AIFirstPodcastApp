@@ -934,7 +934,12 @@ def orchestrate_podcast_generation(
                     try:
                         poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
                         poll_response_wcha.raise_for_status()
-                        wcha_task_status_data = poll_response_wcha.json()
+                        try:
+                            wcha_task_status_data = poll_response_wcha.json()
+                        except json.JSONDecodeError as e_json_poll:
+                            wf_logger.error(f"Polling WCHA task {wcha_internal_task_id}: Failed to decode JSON. Status: {poll_response_wcha.status_code}. Response: {poll_response_wcha.text[:200]}", exc_info=True, extra={'task_id': wcha_task_id})
+                            wcha_error_details = {"message": "WCHA status poll response not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_wcha.text[:200]}
+                            break # Exit polling loop
                         wcha_task_state = wcha_task_status_data.get("status")
                         log_step_cpoa(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", data=wcha_task_status_data)
                         wf_logger.info(f"WCHA task {wcha_internal_task_id} status: {wcha_task_state}", extra={'task_id': wcha_task_id})
@@ -1103,7 +1108,12 @@ def orchestrate_podcast_generation(
                     try:
                         poll_response = requests.get(pswa_poll_url, timeout=15)
                         poll_response.raise_for_status()
-                        pswa_task_status_data = poll_response.json()
+                        try:
+                            pswa_task_status_data = poll_response.json()
+                        except json.JSONDecodeError as e_json_poll:
+                            wf_logger.error(f"Polling PSWA task {pswa_internal_task_id}: Failed to decode JSON. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}", exc_info=True, extra={'task_id': pswa_task_id})
+                            pswa_error_details = {"message": "PSWA status poll response not valid JSON", "details": str(e_json_poll), "response_preview": poll_response.text[:200]}
+                            break # Exit polling loop
                         pswa_task_state = pswa_task_status_data.get("status")
                         log_step_cpoa(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", data=pswa_task_status_data)
                         wf_logger.info(f"PSWA task {pswa_internal_task_id} status: {pswa_task_state}", extra={'task_id': pswa_task_id})
@@ -1207,7 +1217,12 @@ def orchestrate_podcast_generation(
                 try:
                     poll_response_vfa = requests.get(vfa_poll_url, timeout=15)
                     poll_response_vfa.raise_for_status()
-                    vfa_task_status_data = poll_response_vfa.json()
+                    try:
+                        vfa_task_status_data = poll_response_vfa.json()
+                    except json.JSONDecodeError as e_json_poll:
+                        wf_logger.error(f"Polling VFA task {vfa_internal_task_id}: Failed to decode JSON. Status: {poll_response_vfa.status_code}. Response: {poll_response_vfa.text[:200]}", exc_info=True, extra={'task_id': vfa_task_id})
+                        vfa_error_details = {"message": "VFA status poll response not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_vfa.text[:200]}
+                        break # Exit polling loop
                     vfa_task_state = vfa_task_status_data.get("status")
                     log_step_cpoa(f"VFA task {vfa_internal_task_id} status: {vfa_task_state}", data=vfa_task_status_data)
                     wf_logger.info(f"VFA task {vfa_internal_task_id} status: {vfa_task_state}", extra={'task_id': vfa_task_id})
@@ -1766,7 +1781,24 @@ def orchestrate_snippet_generation(
             try:
                 poll_response = requests.get(sca_poll_url, timeout=10)
                 poll_response.raise_for_status()
-                sca_task_status_data = poll_response.json()
+                try:
+                    sca_task_status_data = poll_response.json()
+                except json.JSONDecodeError as e_json_poll:
+                    current_logger.error(f"{function_name} - Polling SCA task {sca_task_id_from_service}: Failed to decode JSON. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}", exc_info=True)
+                    # Cannot set sca_error_details directly here as it's not in this function's scope for return.
+                    # This error will effectively lead to SCA_POLLING_TIMEOUT or be caught by general RequestException if not handled by raise_for_status.
+                    # For now, this specific error means we can't process the response, so it's a failure for this poll attempt.
+                    # The main function will return an error if snippet_data is not populated.
+                    # To make it more explicit, we can raise an exception here or return a specific error structure if the function supported it.
+                    # Given the existing structure, logging and then letting the timeout or next poll attempt handle it is one way.
+                    # However, the requirement is to break and mark as failed.
+                    # This requires returning an error structure from orchestrate_snippet_generation.
+                    # Let's assume for now this function is expected to return a dict with "error" on failure.
+                    # We'll need to adjust the calling code or the function's return if this error is to be propagated specifically.
+                    # For this subtask, if JSON fails, we'll log and then the outer logic will eventually timeout or fail.
+                    # To meet the "break" requirement, we'd need to propagate an error that the caller handles or this function returns an error dict.
+                    # Re-evaluating: The function already returns error dicts. So, we can return one here.
+                    return {"error": "SCA_POLL_JSON_DECODE_ERROR", "details": f"Polling SCA task {sca_task_id_from_service}: Failed to decode JSON. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}"}
                 sca_task_state = sca_task_status_data.get("status")
                 current_logger.info(f"{function_name} - SCA task {sca_task_id_from_service} for topic_id {topic_id} status: {sca_task_state}")
 
@@ -1836,7 +1868,18 @@ def orchestrate_snippet_generation(
                                 try:
                                     poll_response_iga = requests.get(iga_poll_url, timeout=10)
                                     poll_response_iga.raise_for_status()
-                                    iga_task_status_data = poll_response_iga.json()
+                                    try:
+                                        iga_task_status_data = poll_response_iga.json()
+                                    except json.JSONDecodeError as e_json_poll:
+                                        current_logger.error(f"Polling IGA task {iga_internal_task_id}: Failed to decode JSON. Status: {poll_response_iga.status_code}. Response: {poll_response_iga.text[:200]}", exc_info=True)
+                                        # This error means we can't get the image URL. Mark as None and break.
+                                        snippet_data["image_url"] = None # Ensure image_url is None
+                                        # To break out of IGA polling and continue without image:
+                                        # We can set a flag or directly break if the structure allows.
+                                        # Here, we'll log and let the IGA task be marked as failed for image part.
+                                        # The snippet will be saved without an image_url.
+                                        # This break is for the IGA polling.
+                                        break # Exit IGA polling loop
                                     iga_task_state = iga_task_status_data.get("status")
                                     current_logger.info(f"IGA task {iga_internal_task_id} status: {iga_task_state} for snippet '{snippet_id_for_iga_log}'")
 
@@ -1850,7 +1893,7 @@ def orchestrate_snippet_generation(
                                             snippet_data["image_url"] = None
                                         break
                                     elif iga_task_state == "FAILURE":
-                                        current_logger.error(f"IGA task {iga_internal_task_id} failed for snippet '{snippet_id_for_iga_log}'. Data: {iga_task_status_data}")
+                                        current_logger.error(f"IGA task {iga_internal_task_id} for snippet '{snippet_id_for_iga_log}' reported FAILURE. Full IGA response: {iga_task_status_data}")
                                         snippet_data["image_url"] = None
                                         break
                                     time.sleep(CPOA_IGA_POLLING_INTERVAL_SECONDS)
@@ -2206,7 +2249,12 @@ def orchestrate_topic_exploration(
                 try:
                     poll_response_tda = requests.get(tda_poll_url, timeout=10)
                     poll_response_tda.raise_for_status()
-                    tda_task_status_data = poll_response_tda.json()
+                    try:
+                        tda_task_status_data = poll_response_tda.json()
+                    except json.JSONDecodeError as e_json_poll:
+                        wf_logger.error(f"Polling TDA task (Search) {tda_task_id_from_service}: Failed to decode JSON. Status: {poll_response_tda.status_code}. Response: {poll_response_tda.text[:200]}", exc_info=True, extra={'task_id': tda_task_id})
+                        tda_error_details = {"message": "TDA status poll response (Search) not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_tda.text[:200]}
+                        break # Exit polling loop
                     tda_task_state = tda_task_status_data.get("status")
                     wf_logger.info(f"TDA task {tda_task_id_from_service} status: {tda_task_state}", extra={'task_id': tda_task_id})
 
@@ -2585,10 +2633,17 @@ def orchestrate_topic_exploration(
                 response = requests_with_retry("post", TDA_SERVICE_URL, CPOA_SERVICE_RETRY_COUNT, CPOA_SERVICE_RETRY_BACKOFF_FACTOR,
                                            json=tda_input_params, headers=tda_headers, timeout=30,
                                                workflow_id_for_log=workflow_id, task_id_for_log=tda_task_id)
-                tda_data = response.json() # Assuming TDA is synchronous for now, adjust if it becomes async like others
+                try:
+                    tda_data = response.json()
+                except json.JSONDecodeError as e_json:
+                    wf_logger.error(f"TDA response for exploration (query: '{query_for_tda}') was not valid JSON. Status: {response.status_code}. Response: {response.text[:200]}", exc_info=True, extra={'task_id': tda_task_id})
+                    tda_error_details = {"message": "TDA response not valid JSON", "details": str(e_json), "response_preview": response.text[:200]}
+                    # This will cause tda_topics to remain empty, and the function will handle it as a TDA failure.
+                    tda_data = {} # Ensure tda_data is a dict to avoid errors in .get calls later
                 tda_topics = tda_data.get("topics", tda_data.get("discovered_topics", [])) # Adapt based on actual TDA response
                 tda_output_summary = {"topic_count": len(tda_topics), "query_used": query_for_tda}
-                wf_logger.info(f"TDA returned {len(tda_topics)} topics for exploration based on '{original_topic_title}'.", extra={'task_id': tda_task_id})
+                if not tda_error_details: # Log success only if no JSON decode error
+                    wf_logger.info(f"TDA returned {len(tda_topics)} topics for exploration based on '{original_topic_title}'.", extra={'task_id': tda_task_id})
                 if not tda_topics:
                     tda_error_details = {"message": "TDA returned no topics for exploration.", "tda_response": tda_data}
             except requests.exceptions.RequestException as e_req:
@@ -2821,7 +2876,12 @@ def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional
                     try:
                         poll_response_tda = requests.get(tda_poll_url, timeout=10)
                         poll_response_tda.raise_for_status()
-                        tda_task_status_data = poll_response_tda.json()
+                        try:
+                            tda_task_status_data = poll_response_tda.json()
+                        except json.JSONDecodeError as e_json_poll:
+                            wf_logger.error(f"Polling TDA task (Landing Page) {tda_internal_task_id}: Failed to decode JSON. Status: {poll_response_tda.status_code}. Response: {poll_response_tda.text[:200]}", exc_info=True, extra={'task_id': tda_task_id})
+                            tda_error_details = {"message": "TDA status poll response (Landing Page) not valid JSON", "details": str(e_json_poll), "response_preview": poll_response_tda.text[:200]}
+                            break # Exit polling loop
                         tda_task_state = tda_task_status_data.get("status")
                         wf_logger.info(f"TDA task {tda_internal_task_id} status: {tda_task_state}", extra={'task_id': tda_task_id})
 
