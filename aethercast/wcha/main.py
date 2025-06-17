@@ -326,6 +326,12 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
     """
     logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting content harvest for URL: {url_to_harvest}")
 
+    # --- URL Safety Check ---
+    is_safe, reason = is_url_safe(url_to_harvest)
+    if not is_safe:
+        logger.warning(f"Celery Task {self.request.id}: URL '{url_to_harvest}' is not safe: {reason}. Skipping harvest.")
+        return {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
+
     # Configuration for the task execution (could be passed or accessed if worker has access to wcha_config)
     request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
     headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}

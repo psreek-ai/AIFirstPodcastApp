@@ -481,31 +481,94 @@ def call_real_news_api(keywords: list[str] = None, categories: list[str] = None,
         raise # Re-raise
 
 
-@celery_app.task(bind=True, name='fetch_news_from_newsapi_task')
-def fetch_news_from_newsapi_task(self, request_id_celery: str, keywords: list[str] = None, categories: list[str] = None, language: str = None, country: str = None):
+@celery_app.task(bind=True, base=TdaNewsApiCeleryTask, name='fetch_news_from_newsapi_task')
+def fetch_news_from_newsapi_task(self, request_id_celery: str, keywords: list[str] = None, categories: list[str] = None, language: str = None, country: str = None, idempotency_key: Optional[str] = None, workflow_id: Optional[str] = None):
     """
-    Celery task to fetch articles from NewsAPI.org.
+    Celery task to fetch articles from NewsAPI.org with idempotency.
     request_id_celery is for logging correlation with the dispatching request.
     """
-    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id_celery}): Fetching news. Keywords: {keywords}, Categories: {categories}")
+    task_log_id = self.request.id
+    task_name_for_idempotency = self.name # "fetch_news_from_newsapi_task"
+    log_extra_base = {"orig_req_id": request_id_celery, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "workflow_id": workflow_id, "keywords": keywords}
+    app.logger.info(f"TDA NewsAPI Task {task_log_id}: Starting. Keywords: {keywords}", extra=log_extra_base)
 
-    # The actual NewsAPI call logic is now within call_real_news_api
-    # We pass the parameters to it.
-    # Note: _save_topic_to_db is called inside call_real_news_api.
-    # If saving to DB should also be part of the async task's success criteria, this is fine.
-    # If DB save fails, call_real_news_api currently logs it and continues, returning successfully fetched articles.
-    # For a Celery task, you might want more explicit error propagation if DB save is critical.
+    if not idempotency_key:
+        app.logger.error(f"TDA NewsAPI Task {task_log_id}: Idempotency key not provided. This is required.", extra=log_extra_base)
+        # Not raising ValueError here to allow on_failure to handle if it's invoked by Celery due to other reasons
+        # before this check. Instead, return an error payload.
+        # The task will be marked as FAILED by Celery if it raises an exception not caught by self.retry.
+        # If we want to ensure on_failure is called, we'd raise an unhandled exception.
+        # For now, let's assume the caller (discover_topics_task) ensures it's passed.
+        # If it's absolutely critical to stop and record failure via on_failure, raise unhandled error.
+        raise ValueError("Idempotency key is required for fetch_news_from_newsapi_task.")
+
+
+    db_conn = None
     try:
-        # Pass page_size or other specific params if needed, or rely on defaults in call_real_news_api
+        db_conn = _get_tda_db_connection()
+        db_conn.autocommit = False
+
+        existing_record = _check_idempotency_key(db_conn, idempotency_key, task_name_for_idempotency)
+        if existing_record:
+            status = existing_record['status']
+            locked_at = existing_record.get('locked_at')
+            if status == tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED']:
+                app.logger.info(f"TDA NewsAPI Task {task_log_id}: Idempotency key '{idempotency_key}' already COMPLETED. Returning stored result.", extra=log_extra_base)
+                db_conn.rollback() # Release transaction
+                return existing_record['result_payload']
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING']:
+                timeout_seconds = tda_config['TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+                # Check if locked_at is timezone-aware; if not, make it so for comparison
+                if locked_at and locked_at.tzinfo is None:
+                    locked_at = locked_at.replace(tzinfo=datetime.now(timezone.utc).tzinfo)
+
+                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < timeout_seconds:
+                    app.logger.warning(f"TDA NewsAPI Task {task_log_id}: Idempotency key '{idempotency_key}' is already PROCESSING. Conflict.", extra=log_extra_base)
+                    db_conn.rollback() # Release transaction
+                    # This specific return structure indicates to the parent task that it's a conflict.
+                    return {"status": "PROCESSING_CONFLICT", "message": "Sub-task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                else: # Lock expired
+                    app.logger.warning(f"TDA NewsAPI Task {task_log_id}: Idempotency key '{idempotency_key}' was PROCESSING but lock timed out. Re-processing.", extra=log_extra_base)
+                    _store_idempotency_record(db_conn, idempotency_key, task_name_for_idempotency, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+            elif status == tda_config['TDA_IDEMPOTENCY_STATUS_FAILED']:
+                app.logger.info(f"TDA NewsAPI Task {task_log_id}: Idempotency key '{idempotency_key}' previously FAILED. Retrying.", extra=log_extra_base)
+                _store_idempotency_record(db_conn, idempotency_key, task_name_for_idempotency, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+        else: # No existing record
+            app.logger.info(f"TDA NewsAPI Task {task_log_id}: New idempotency key '{idempotency_key}'. Storing as PROCESSING.", extra=log_extra_base)
+            _store_idempotency_record(db_conn, idempotency_key, task_name_for_idempotency, tda_config['TDA_IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+
+        db_conn.commit() # Commit the PROCESSING status update
+
+        # --- Main Task Logic ---
+        app.logger.info(f"TDA NewsAPI Task {task_log_id}: Proceeding with NewsAPI call for key '{idempotency_key}'.", extra=log_extra_base)
         articles = call_real_news_api(keywords=keywords, categories=categories, language=language, country=country)
-        # The 'articles' returned by call_real_news_api are already transformed TopicObjects and saved.
-        return {"status": "success", "discovered_topics": articles, "message": f"Fetched {len(articles)} topics."}
+
+        task_result_payload_to_store = {"status": "success", "discovered_topics": articles, "message": f"Fetched {len(articles)} topics."}
+
+        _store_idempotency_record(db_conn, idempotency_key, task_name_for_idempotency, tda_config['TDA_IDEMPOTENCY_STATUS_COMPLETED'], workflow_id=workflow_id, result_payload=task_result_payload_to_store, is_new_key=False)
+        db_conn.commit() # Commit the COMPLETED status and result
+
+        app.logger.info(f"TDA NewsAPI Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'.", extra=log_extra_base)
+        return task_result_payload_to_store
+
     except requests.exceptions.RequestException as e_req:
-        logger.error(f"Celery Task {self.request.id}: NewsAPI request error in task: {e_req}", exc_info=True)
-        raise self.retry(exc=e_req, countdown=10, max_retries=2) # Celery retry for network issues
-    except Exception as e_task: # Catch other exceptions from call_real_news_api or within the task
-        logger.error(f"Celery Task {self.request.id}: Unexpected error: {e_task}", exc_info=True)
-        raise self.retry(exc=e_task, countdown=10, max_retries=2) # Generic retry
+        app.logger.error(f"TDA NewsAPI Task {task_log_id}: NewsAPI request error for key '{idempotency_key}': {e_req}", exc_info=True, extra=log_extra_base)
+        # self.retry will re-raise the exception if retries are exhausted, then on_failure in TdaNewsApiCeleryTask handles idempotency.
+        # No need to update idempotency record to FAILED here, as on_failure will do it.
+        if db_conn: db_conn.rollback() # Rollback any pending DB changes before retry/failure
+        raise self.retry(exc=e_req, countdown=10, max_retries=2, idempotency_key=idempotency_key, workflow_id=workflow_id) # Pass keys for on_failure
+    except Exception as e_task:
+        app.logger.error(f"TDA NewsAPI Task {task_log_id}: Unexpected error for key '{idempotency_key}': {e_task}", exc_info=True, extra=log_extra_base)
+        if db_conn: db_conn.rollback()
+        # For other errors, on_failure will also be triggered if this re-raises.
+        # Ensure idempotency_key and workflow_id are available to on_failure via kwargs.
+        # Celery's self.retry automatically passes original kwargs. If raising a new exception, ensure they are passed.
+        # For now, assume self.retry handles passing kwargs correctly or the exception is directly raised.
+        raise # Re-raise to trigger on_failure, which will mark idempotency as FAILED.
+    finally:
+        if db_conn and not db_conn.closed:
+            db_conn.close()
+            app.logger.debug(f"TDA NewsAPI Task {task_log_id}: Closed DB connection for key '{idempotency_key}'.", extra=log_extra_base)
 
 
 SIMULATED_DATA_SOURCES = [
@@ -548,6 +611,38 @@ def identify_topics_from_sources(query: str = None, limit: int = 5) -> list:
 # --- Other helper functions (generate_topic_id, generate_summary_from_title, calculate_relevance_score) ---
 # generate_topic_id is now just str(uuid.uuid4()) inline or within topic creation.
 # generate_summary_from_title and calculate_relevance_score are specific to simulated data.
+
+
+# --- Custom Celery Task Class for NewsAPI Task with Idempotency ---
+class TdaNewsApiCeleryTask(Task):
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        app.logger.error(f'Celery Task {task_id} (TDA NewsAPI Fetch) failed: {exc}', exc_info=einfo)
+        idempotency_key = kwargs.get('idempotency_key')
+        # task_name_for_idempotency should be passed in kwargs or use self.name if appropriate
+        # For this specific task, self.name (e.g., 'fetch_news_from_newsapi_task') is suitable
+        task_name = self.name # or kwargs.get('task_name_for_idempotency')
+        workflow_id = kwargs.get('workflow_id')
+
+        if idempotency_key:
+            db_conn_fail = None
+            try:
+                db_conn_fail = _get_tda_db_connection()
+                if db_conn_fail:
+                    db_conn_fail.autocommit = False
+                    error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo).strip()}
+                    _store_idempotency_record(db_conn_fail, idempotency_key, task_name,
+                                              tda_config['TDA_IDEMPOTENCY_STATUS_FAILED'],
+                                              workflow_id=workflow_id, # Pass workflow_id
+                                              error_payload=error_payload, is_new_key=False)
+                    db_conn_fail.commit()
+                    app.logger.info(f"Idempotency record for key {idempotency_key} (Task: {task_name}) marked as FAILED.")
+            except Exception as db_err:
+                app.logger.error(f"Failed to update idempotency record to FAILED for key {idempotency_key} (Task: {task_name}) after task failure: {db_err}", exc_info=True)
+                if db_conn_fail: db_conn_fail.rollback()
+            finally:
+                if db_conn_fail and not db_conn_fail.closed:
+                    try: db_conn_fail.close()
+                    except Exception: pass
 
 def generate_summary_from_title(title: str) -> str:
     return f"This topic explores {title.lower()}, focusing on its recent developments and potential impact."
@@ -647,13 +742,18 @@ def discover_topics_task(self, request_id_main: str, query: Optional[str], limit
         if use_real_news_api_flag:
             request_keywords = [k.strip() for k in query.split(',')] if query else None
             app.logger.info(f"Celery Task {self.request.id}: Dispatching NewsAPI sub-task. Keywords: {request_keywords}", extra=log_extra_base)
-            # TODO: Implement Idempotency for fetch_news_from_newsapi_task
-            # This sub-task should accept a derived idempotency key from discover_topics_task
-            # and implement its own idempotency checks against the idempotency_keys table
-            # to prevent re-fetching from NewsAPI if the parent task retries.
-            # Example derived key: derived_news_key = f"{idempotency_key}_newsapi"
-            news_task = fetch_news_from_newsapi_task.delay(request_id_celery=self.request.id, keywords=request_keywords, language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE")) # Removed max_results, not a param
-            app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} dispatched. Polling...", extra=log_extra_base)
+
+            derived_news_key = f"{idempotency_key}_newsapi_fetch"
+            app.logger.info(f"TDA Task {task_log_id}: Derived idempotency key for NewsAPI sub-task: {derived_news_key}", extra=log_extra_base)
+
+            news_task = fetch_news_from_newsapi_task.delay(
+                request_id_celery=self.request.id, # Correlation ID for logging
+                keywords=request_keywords,
+                language=tda_config.get("TDA_NEWS_DEFAULT_LANGUAGE"),
+                idempotency_key=derived_news_key,
+                workflow_id=workflow_id # Pass down the parent's workflow_id
+            )
+            app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} dispatched with idempotency key {derived_news_key}. Polling...", extra=log_extra_base)
 
             polling_start_time = time.time()
             news_polling_interval = int(os.getenv("TDA_NEWSAPI_POLLING_INTERVAL_SECONDS", "5"))
@@ -667,13 +767,21 @@ def discover_topics_task(self, request_id_main: str, query: Optional[str], limit
                 app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} status: {news_task_result.status}", extra=log_extra_base)
                 if news_task_result.successful():
                     sub_task_output = news_task_result.result
+                    # Handle PROCESSING_CONFLICT from sub-task
+                    if isinstance(sub_task_output, dict) and sub_task_output.get("status") == "PROCESSING_CONFLICT":
+                        app.logger.warning(f"TDA Task {task_log_id}: NewsAPI sub-task {news_task.id} for key '{derived_news_key}' is already processing. Will retry polling.", extra=log_extra_base)
+                        # Continue polling, do not break yet.
+                        # Add a small delay before next poll to avoid busy-waiting on conflict
+                        time.sleep(news_polling_interval) # Or a specific conflict_retry_interval
+                        continue # Skip to next iteration of while loop
+
                     if sub_task_output.get("status") == "success":
                         discovered_topics = sub_task_output.get("discovered_topics", [])
                         app.logger.info(f"Celery Task {self.request.id}: NewsAPI sub-task successful. Found {len(discovered_topics)} topics.", extra=log_extra_base)
-                    else:
-                        app.logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} reported failure: {sub_task_output.get('message')}", extra=log_extra_base)
+                    else: # Other non-success states from sub-task that are not PROCESSING_CONFLICT
+                        app.logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} reported business logic failure: {sub_task_output.get('message')}", extra=log_extra_base)
                         raise Exception(f"NewsAPI sub-task failed: {sub_task_output.get('message', 'Unknown error')}")
-                    break
+                    break # Break on actual success or non-conflict failure
                 elif news_task_result.failed():
                     app.logger.error(f"Celery Task {self.request.id}: NewsAPI sub-task {news_task.id} failed with Celery status FAILED. Info: {news_task_result.info}", extra=log_extra_base)
                     raise Exception(f"NewsAPI sub-task failed: {str(news_task_result.info)}")
