@@ -163,6 +163,7 @@ Below are descriptions of the major components depicted in the architecture diag
     * **Description:** Single entry point for all client requests to the backend. Handles request routing, authentication, authorization, rate limiting, and potentially request/response transformations.
     * **Key Responsibilities:**
         * Expose public endpoints for frontend interaction.
+        * Validate incoming request payloads (e.g., using Pydantic models) before further processing.
         * Route requests to the Central Podcast Orchestrator Agent.
         * Manage security and access control.
     * **Potential Technologies:** AWS API Gateway, Azure API Management, Google Cloud API Gateway, Kong, Tyk.
@@ -186,9 +187,9 @@ Below are descriptions of the major components depicted in the architecture diag
         * **Potential Technologies:** Python, Flask, Celery, Requests, PostgreSQL.
 
     * **`WebContentHarvesterAgent` (WCHA):**
-        * **Description:** (As before) Functions as a Python library called directly by CPOA for synchronous web content fetching and extraction. Does not have its own Celery task or direct idempotency handling (idempotency of its use would be covered by the calling CPOA workflow if CPOA's operation involving WCHA was idempotent).
-        * **Interaction:** Called as a library by CPOA. Accesses External Web.
-        * **Potential Technologies:** Python, `duckduckgo_search`, `trafilatura`.
+        * **Description:** Functions as a Python library called by CPOA for initial content requests. Internally, WCHA can dispatch asynchronous Celery tasks (e.g., for fetching news via NewsAPI or harvesting specific URLs) which are idempotent and use the shared `idempotency_keys` PostgreSQL table. For other operations like DDG search and immediate extraction, it may operate synchronously within the calling CPOA process.
+        * **Interaction:** Called as a library by CPOA. Can dispatch its own Celery tasks for specific harvesting operations, which then interact with the PostgreSQL DB (for idempotency) and the External Web/News APIs.
+        * **Potential Technologies:** Python, Flask (for task status endpoint), Celery, `duckduckgo_search`, `trafilatura`, `psycopg2-binary`, `python-json-logger`.
 
     * **`PodcastScriptWeaverAgent` (PSWA):**
         * **Description:** Asynchronously weaves scripts via `weave_script_task` (Celery). Calls AIMS. Supports script caching (SQLite or PostgreSQL).
@@ -234,6 +235,7 @@ Below are descriptions of the major components depicted in the architecture diag
 * **Modularity & Maintainability:** (As before) Microservice architecture with Celery tasks enhances this.
 * **Resilience & Fault Tolerance:** Celery's retry mechanisms, coupled with the implemented idempotency in backend agents, significantly improve resilience. CPOA manages overall workflow recovery.
 * **Security:** (As before) Secure Celery broker communication, database credentials.
+* **Standardized Logging:** All services, including the API Gateway and backend agents, implement structured JSON logging, often including contextual IDs like `workflow_id` and `task_id`, to facilitate centralized log analysis and debugging.
 
 This System Architecture document provides a foundational understanding. More detailed designs for each component and their interactions will be elaborated in subsequent architecture documents (e.g., `Agent_Orchestration.md`, `Data_Flows.md`).
 

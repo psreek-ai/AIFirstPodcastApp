@@ -373,6 +373,7 @@ Comprehensive observability is crucial.
 * **Centralized Logging:**
     * All agents, including CPOA (via API Gateway logging), should log to a centralized logging system.
     * Logs should include `workflow_id` (from CPOA), agent-specific `task_id` (Celery task ID for downstream services), `idempotency_key` where applicable, `user_session_id`, agent name, timestamp, log level, and detailed messages.
+    * Polling logs within CPOA are designed to be rich in context, including CPOA's internal task identifiers, the polled service's task ID, and specific error messages or response snippets from the downstream service to facilitate easier debugging of inter-agent communication issues.
 * **Distributed Tracing:** (As before - trace context should include these IDs).
 * **Metrics Monitoring:** (As before - include metrics related to idempotent operations, e.g., tasks created vs. completed, idempotency conflicts).
 * **Workflow Visualization (Advanced):** (As before - CPOA's PostgreSQL state is key).

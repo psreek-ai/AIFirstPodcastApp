@@ -2,6 +2,7 @@
 - User session state and preferences in the **PostgreSQL** `user_sessions` table (managed by API Gateway).
 - Podcast generation status tracking via CPOA's `workflow_instances` and `task_instances` tables in **PostgreSQL**.
 - Caching for topics and snippets relies on the `topics_snippets` table in **PostgreSQL** and PSWA's script cache (`generated_scripts` table, which can be PostgreSQL or SQLite).
+- Shared `idempotency_keys` table in **PostgreSQL** (used by WCHA, AIMS, AIMS_TTS, TDA, SCA, PSWA, IGA, and VFA for their Celery tasks).
 - Redis is primarily used as the **Celery message broker and results backend**.
 
 Refer to the main `aethercast/data_stores/README.md`, `docs/architecture/CPOA_State_Management.md`, and relevant service READMEs for details on the current PostgreSQL-based implementations. This document outlines potential future or auxiliary uses for a dedicated Key-Value store.
