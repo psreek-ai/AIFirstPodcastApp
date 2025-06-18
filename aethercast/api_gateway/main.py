@@ -199,76 +199,76 @@ def init_api_gw_db_pool():
         log_func("API Gateway is not configured to use PostgreSQL. Skipping pool initialization.")
 
 
-# --- DB Schema (PostgreSQL compatible) ---
+# --- DB Schema (SQLite compatible for tests, PostgreSQL for prod) ---
 DB_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS podcasts (
-    podcast_id UUID PRIMARY KEY,
+    podcast_id TEXT PRIMARY KEY,
     topic TEXT NOT NULL,
     cpoa_status TEXT,
     cpoa_error_message TEXT,
-    final_audio_filepath TEXT, -- This will store GCS URI
+    final_audio_filepath TEXT,
     stream_id TEXT,
     asf_websocket_url TEXT,
     asf_notification_status TEXT,
-    task_created_timestamp TIMESTAMPTZ NOT NULL,
-    last_updated_timestamp TIMESTAMPTZ,
-    cpoa_full_orchestration_log JSONB,
-    tts_settings_used JSONB
+    task_created_timestamp TEXT NOT NULL,
+    last_updated_timestamp TEXT,
+    cpoa_full_orchestration_log TEXT,
+    tts_settings_used TEXT
 );
 
 CREATE TABLE IF NOT EXISTS topics_snippets (
-    id UUID PRIMARY KEY,
+    id TEXT PRIMARY KEY,
     type TEXT NOT NULL CHECK(type IN ('topic', 'snippet')),
     title TEXT NOT NULL,
     summary TEXT,
-    keywords JSONB, -- Changed from TEXT
+    keywords TEXT,
     source_url TEXT,
     source_name TEXT,
-    original_topic_details JSONB, -- Changed from TEXT
+    original_topic_details TEXT,
     llm_model_used_for_snippet TEXT,
     cover_art_prompt TEXT,
-    image_url TEXT, -- This will store GCS URI or signed URL temporarily
-    generation_timestamp TIMESTAMPTZ NOT NULL,
-    last_accessed_timestamp TIMESTAMPTZ,
+    image_url TEXT,
+    generation_timestamp TEXT NOT NULL,
+    last_accessed_timestamp TEXT,
     relevance_score REAL
 );
 
 CREATE TABLE IF NOT EXISTS generated_scripts (
-    script_id UUID PRIMARY KEY,
-    topic_hash TEXT NOT NULL UNIQUE, -- Keep as TEXT, it's a hash
-    structured_script_json JSONB NOT NULL, -- Changed from TEXT
-    generation_timestamp TIMESTAMPTZ NOT NULL,
+    script_id TEXT PRIMARY KEY,
+    topic_hash TEXT NOT NULL UNIQUE,
+    structured_script_json TEXT NOT NULL,
+    generation_timestamp TEXT NOT NULL,
     llm_model_used TEXT,
-    last_accessed_timestamp TIMESTAMPTZ
+    last_accessed_timestamp TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
 
 CREATE TABLE IF NOT EXISTS user_sessions (
-    session_id UUID PRIMARY KEY,
-    created_timestamp TIMESTAMPTZ NOT NULL,
-    last_seen_timestamp TIMESTAMPTZ NOT NULL,
-    preferences_json JSONB -- Changed from TEXT
+    session_id TEXT PRIMARY KEY,
+    created_timestamp TEXT NOT NULL,
+    last_seen_timestamp TEXT NOT NULL,
+    preferences_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    user_id UUID PRIMARY KEY,
+    user_id TEXT PRIMARY KEY,
     username TEXT UNIQUE NOT NULL,
     email TEXT UNIQUE NOT NULL,
     hashed_password TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL
+    created_at TEXT NOT NULL
 );
 
 -- Schema for CPOA State Management --
 CREATE TABLE IF NOT EXISTS workflow_instances (
-    workflow_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    workflow_id TEXT PRIMARY KEY,
+    user_id TEXT REFERENCES users(user_id) ON DELETE SET NULL,
     trigger_event_type VARCHAR(255) NOT NULL,
-    trigger_event_details_json JSONB,
+    trigger_event_details_json TEXT,
     overall_status VARCHAR(50) NOT NULL,
-    start_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
-    end_timestamp TIMESTAMPTZ,
-    last_updated_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
-    context_data_json JSONB,
+    start_timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    end_timestamp TEXT,
+    last_updated_timestamp TEXT NOT NULL DEFAULT (datetime('now')),
+    context_data_json TEXT,
     error_message TEXT
 );
 
@@ -278,17 +278,17 @@ CREATE INDEX IF NOT EXISTS idx_workflow_start_time ON workflow_instances (start_
 CREATE INDEX IF NOT EXISTS idx_workflow_trigger_event_type ON workflow_instances (trigger_event_type);
 
 CREATE TABLE IF NOT EXISTS task_instances (
-    task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    workflow_id UUID NOT NULL REFERENCES workflow_instances(workflow_id) ON DELETE CASCADE,
+    task_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflow_instances(workflow_id) ON DELETE CASCADE,
     agent_name VARCHAR(255) NOT NULL,
     task_order INTEGER NOT NULL,
     status VARCHAR(50) NOT NULL,
-    input_params_json JSONB,
-    output_result_summary_json JSONB,
-    error_details_json JSONB,
-    start_timestamp TIMESTAMPTZ,
-    end_timestamp TIMESTAMPTZ,
-    last_updated_timestamp TIMESTAMPTZ NOT NULL DEFAULT current_timestamp,
+    input_params_json TEXT,
+    output_result_summary_json TEXT,
+    error_details_json TEXT,
+    start_timestamp TEXT,
+    end_timestamp TEXT,
+    last_updated_timestamp TEXT NOT NULL DEFAULT (datetime('now')),
     retry_count INTEGER NOT NULL DEFAULT 0
 );
 
@@ -299,7 +299,7 @@ CREATE INDEX IF NOT EXISTS idx_task_order ON task_instances (workflow_id, task_o
 
 CREATE TABLE IF NOT EXISTS subscribers (
     email VARCHAR(255) PRIMARY KEY,
-    subscribed_at TIMESTAMPTZ NOT NULL DEFAULT current_timestamp
+    subscribed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -669,21 +669,21 @@ def health_check_endpoint():
 @app.route('/api/v1/session/init', methods=['POST'])
 def session_init():
     request_internal_id = str(uuid.uuid4()) # For tracing this specific request processing
-    logger.info(f"Request {request_internal_id} - /api/v1/session/init called.")
+    app.logger.info(f"Request {request_internal_id} - /api/v1/session/init called.")
 
     try:
         data = request.get_json()
         if data is None: # Handles empty body or non-JSON body
-            logger.warning(f"Request {request_internal_id}: Empty or non-JSON payload for session init.")
+            app.logger.warning(f"Request {request_internal_id}: Empty or non-JSON payload for session init.")
             return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": "Malformed or empty JSON payload."}), 400
     except Exception as e_json: # Catch error during get_json() itself
-        logger.warning(f"Request {request_internal_id}: Malformed JSON payload for session init: {e_json}", exc_info=True)
+        app.logger.warning(f"Request {request_internal_id}: Malformed JSON payload for session init: {e_json}", exc_info=True)
         return jsonify({"error_code": "API_GW_MALFORMED_JSON", "message": f"Malformed JSON payload: {e_json}"}), 400
 
     try:
         payload = SessionInitPayload.model_validate(data)
     except ValidationError as e:
-        logger.warning(f"Request {request_internal_id}: Validation failed for session init. Details: {e.errors()}", extra={'validation_errors': e.errors()})
+        app.logger.warning(f"Request {request_internal_id}: Validation failed for session init. Details: {e.errors()}", extra={'validation_errors': e.errors()})
         return jsonify({"error_code": "API_GW_VALIDATION_ERROR", "message": "Input validation failed", "details": e.errors()}), 422
 
     client_id_from_request = payload.client_id

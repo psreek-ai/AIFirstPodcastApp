@@ -33,6 +33,7 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
 )
+celery_app.finalize() # Explicitly finalize the app
 
 # --- WCHA Configuration ---
 wcha_config = {}
@@ -479,27 +480,27 @@ def fetch_news_articles_task(self, request_id: str, topic: str, language: Option
 
         base_url = wcha_config.get("TDA_NEWS_API_BASE_URL", "https://newsapi.org/v2/")
         endpoint = wcha_config.get("TDA_NEWS_API_ENDPOINT", "everything")
-    api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}" # This was the line 482 with SyntaxError
 
-    params = {}
-    query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else wcha_config.get("TDA_NEWS_DEFAULT_KEYWORDS", [])
-    if query_keywords_list:
-        params["q"] = " OR ".join(query_keywords_list)
+        params = {}
+        query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else wcha_config.get("TDA_NEWS_DEFAULT_KEYWORDS", [])
+        if query_keywords_list:
+            params["q"] = " OR ".join(query_keywords_list)
 
-    current_language = language if language else wcha_config.get("TDA_NEWS_DEFAULT_LANGUAGE", "en")
-    if current_language:
-        params["language"] = current_language
+        current_language = language if language else wcha_config.get("TDA_NEWS_DEFAULT_LANGUAGE", "en")
+        if current_language:
+            params["language"] = current_language
 
-    params["pageSize"] = max_results if max_results else wcha_config.get("TDA_NEWS_PAGE_SIZE", 25)
+        params["pageSize"] = max_results if max_results else wcha_config.get("TDA_NEWS_PAGE_SIZE", 25)
 
-    headers = {
-        "X-Api-Key": wcha_config["TDA_NEWS_API_KEY"],
-        "User-Agent": wcha_config.get("WCHA_USER_AGENT", "AethercastContentHarvester/0.2")
-    }
-    request_timeout = wcha_config.get("WCHA_REQUEST_TIMEOUT", 15)
+        headers = {
+            "X-Api-Key": wcha_config["TDA_NEWS_API_KEY"],
+            "User-Agent": wcha_config.get("WCHA_USER_AGENT", "AethercastContentHarvester/0.2")
+        }
+        request_timeout = wcha_config.get("WCHA_REQUEST_TIMEOUT", 15)
 
-    logger.info(f"Celery Task {self.request.id}: Calling NewsAPI: URL={api_url}, Params={params}", extra=log_extra)
-        # Actual API call logic
+        logger.info(f"Celery Task {self.request.id}: Calling NewsAPI: URL={api_url}, Params={params}", extra=log_extra)
+        # Actual API call logic correctly indented under the main try
         response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
         response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
         response_json = response.json()
@@ -521,16 +522,16 @@ def fetch_news_articles_task(self, request_id: str, topic: str, language: Option
     except requests.exceptions.RequestException as e_req: # Covers connection errors, timeouts, HTTP errors
         error_msg = f"NewsAPI request error: {e_req}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        error_payload = {"error_type": type(e_req).__name__, "message": str(e_req)}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
-        # Celery's retry mechanism can be used here
-        raise self.retry(exc=e_req, countdown=60, max_retries=3) # Example retry parameters
+        if db_conn: # Ensure db_conn is available before trying to update
+            error_payload = {"error_type": type(e_req).__name__, "message": str(e_req)}
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+        raise self.retry(exc=e_req, countdown=60, max_retries=3)
     except Exception as e_unexp: # Catch any other unexpected errors
         error_msg = f"Unexpected error fetching news: {e_unexp}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        error_payload = {"error_type": type(e_unexp).__name__, "message": str(e_unexp)}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
-        # Decide if retry is appropriate for unexpected errors
+        if db_conn: # Ensure db_conn is available
+            error_payload = {"error_type": type(e_unexp).__name__, "message": str(e_unexp)}
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
         raise self.retry(exc=e_unexp, countdown=60, max_retries=1)
     finally:
         if db_conn:
@@ -544,7 +545,7 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
     Note: is_url_safe check should be done *before* dispatching this task.
     """
     log_extra = {'task_id': request_id, 'workflow_id': 'N/A'}
-    idempotency_key = request_id # Using request_id as idempotency key
+    idempotency_key = request_id
     task_name = "wcha_harvest_url_content_task"
     db_conn = None
 
@@ -567,17 +568,14 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
 
         logger.info(f"Celery Task {self.request.id}: Lock acquired. Starting content harvest for URL: {url_to_harvest}", extra=log_extra)
 
-        # --- URL Safety Check (already logged by is_url_safe) ---
         is_safe, reason = is_url_safe(url_to_harvest, task_id=request_id, workflow_id='N/A')
         if not is_safe:
             logger.warning(f"Celery Task {self.request.id}: URL '{url_to_harvest}' is not safe: {reason}. Skipping harvest.", extra=log_extra)
             result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result) # Consider this a "completed" attempt with a specific outcome
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result)
             return result
 
         request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
-    headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
-
         headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
 
         if not _IMPORTS_SUCCESSFUL_REQUESTS_BS4:
@@ -608,8 +606,6 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
         if extracted_text:
             if len(extracted_text) < min_length:
                 logger.warning(f"Celery Task {self.request.id}: Content from {url_to_harvest} is shorter ({len(extracted_text)}) than min_length ({min_length}).", extra=log_extra)
-                # Still consider this a "successful" harvest, but with short content.
-                # The consumer of this task can decide what to do with short content.
             logger.info(f"Celery Task {self.request.id}: Trafilatura successfully extracted {len(extracted_text)} characters from {url_to_harvest}.", extra=log_extra)
             result = {"url": url_to_harvest, "content": extracted_text, "error_type": None, "error_message": None}
         else:
@@ -622,37 +618,29 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
     except requests.exceptions.RequestException as e_req:
         error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url_to_harvest}': {e_req}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        error_payload = {"error_type": type(e_req).__name__, "message": str(e_req), "url": url_to_harvest}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+        if db_conn: # Ensure db_conn is available
+            error_payload = {"error_type": type(e_req).__name__, "message": str(e_req), "url": url_to_harvest}
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
         raise self.retry(exc=e_req, countdown=60, max_retries=3)
-    except Exception as e_gen: # Includes Trafilatura errors or other unexpected issues
+    except Exception as e_gen:
         error_msg = f"General error during harvest for '{url_to_harvest}': {type(e_gen).__name__} - {e_gen}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        error_payload = {"error_type": type(e_gen).__name__, "message": str(e_gen), "url": url_to_harvest}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
-        # Trafilatura errors might not be worth retrying, but other unexpected errors might.
-        # For now, retry once for any generic exception.
+        if db_conn: # Ensure db_conn is available
+            error_payload = {"error_type": type(e_gen).__name__, "message": str(e_gen), "url": url_to_harvest}
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
         raise self.retry(exc=e_gen, countdown=60, max_retries=1)
     finally:
         if db_conn:
             release_db_connection(db_conn)
 
-def harvest_from_url(url: str, min_length: int = 150) -> dict:
+def harvest_from_url(url: str, min_length: int = 150, **kwargs) -> dict: # Added **kwargs
     # This function remains for synchronous use (e.g., by get_content_for_topic)
     # or as a wrapper if needed. For Celery, the core logic is in harvest_url_content_task.
     # For now, it simply calls the old logic.
-    # If get_content_for_topic is also to be made async, this would need more refactoring.
 
-    # Create a task_id if not provided, for logging context within this function and calls it makes.
-    # This function might be called with a specific task_id if it's part of a larger operation.
-    # For now, let's assume it might generate its own if not provided, or use a passed one.
-    # However, current calls to harvest_from_url do not pass these.
-    # For consistency with the subtask, let's add them as optional params.
-    # Defaulting to "N/A" if not provided, aligning with ServiceNameFilter.
-    local_task_id = kwargs.pop('task_id', f"harvest_sync_{uuid.uuid4().hex[:8]}")
-    local_workflow_id = kwargs.pop('workflow_id', "N/A")
+    local_task_id = kwargs.pop('task_id', f"harvest_sync_{uuid.uuid4().hex[:8]}") # Use kwargs.pop
+    local_workflow_id = kwargs.pop('workflow_id', "N/A") # Use kwargs.pop
     log_extra_sync = {'task_id': local_task_id, 'workflow_id': local_workflow_id}
-
 
     # First, check if the URL is safe to fetch
     safe, reason = is_url_safe(url, task_id=local_task_id, workflow_id=local_workflow_id)
@@ -883,7 +871,8 @@ try:
                 elif result_dict_or_task["message"].startswith(ERROR_WCHA_SEARCH_FAILED): status_code = 502
                 return flask.jsonify(result_dict_or_task), status_code
 
-            elif url_to_harvest: # This part remains for direct URL async harvesting
+            # Start a new conditional block after handling 'use_search and topic'
+            if url_to_harvest: # This part remains for direct URL async harvesting
                 logger.info(f"[WCHA_API] Received API request for async direct URL harvest: '{url_to_harvest}'", extra=log_extra_api)
                 # Pass api_request_id as task_id to is_url_safe
                 safe, reason = is_url_safe(url_to_harvest, task_id=api_request_id, workflow_id='N/A')

@@ -1,5 +1,27 @@
+import sys
+print("--- WCHA Test sys.path START ---")
+for p_idx, p_val in enumerate(sys.path):
+    print(f"sys.path[{p_idx}]: {p_val}")
+print("--- WCHA Test sys.path END ---")
+
+print("--- WCHA Test Current Working Directory ---")
+import os
+print(f"CWD: {os.getcwd()}")
+print("--- WCHA Test CWD END ---")
+
+print("--- WCHA Test Attempting direct import of python_json_logger ---")
+try:
+    import python_json_logger
+    print(f"Successfully imported python_json_logger directly in test file. Version: {getattr(python_json_logger, '__version__', 'unknown')}")
+except ImportError as e:
+    print(f"Failed to import python_json_logger directly in test file: {e}")
+    print("This suggests python_json_logger is not installed correctly in the Python environment being used by the test runner, or there's a path issue.")
+except Exception as e_other:
+    print(f"An unexpected error occurred during direct import of python_json_logger: {e_other}")
+print("--- WCHA Test Direct import attempt END ---")
+
 import unittest
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock, call # mock_open, ANY removed as they were unused after edit. call added.
 import os
 import sys
 import logging
@@ -27,21 +49,8 @@ from aethercast.wcha import main as wcha_main # For other tests
 # Configure basic logging to avoid NoHandlerFoundError if wcha.main uses logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Mock DDGS and requests before they are used by wcha_main
-# This is to prevent real network calls during test loading or execution.
-mock_ddgs_instance = MagicMock()
-mock_ddgs_instance.text.return_value = [] # Default to no results
-
-mock_ddgs_context_manager = MagicMock()
-mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
-mock_ddgs_constructor = MagicMock(return_value=mock_ddgs_context_manager)
-
-# Mock requests.get
-mock_requests_get = MagicMock()
-
-# Mock trafilatura.extract
-mock_trafilatura_extract = MagicMock()
-
+# Removed module-level MagicMock instances previously used for patching.
+# Patching will now be done directly in test methods or setUp.
 
 class TestIsUrlSafe(unittest.TestCase):
     @patch('socket.getaddrinfo')
@@ -144,9 +153,6 @@ class TestIsUrlSafe(unittest.TestCase):
         self.assertTrue("is unspecified" in reason and "is not a public IP" in reason)
 
 
-@patch('aethercast.wcha.main.DDGS', mock_ddgs_constructor)
-@patch('aethercast.wcha.main.requests.get', mock_requests_get)
-@patch('aethercast.wcha.main.trafilatura.extract', mock_trafilatura_extract)
 class TestGetContentForTopic(unittest.TestCase):
     def setUp(self):
         self.maxDiff = None
@@ -154,21 +160,25 @@ class TestGetContentForTopic(unittest.TestCase):
             "WCHA_SEARCH_MAX_RESULTS": 3,
             "WCHA_REQUEST_TIMEOUT": 10,
             "WCHA_USER_AGENT": "TestAgent/1.0",
-            "WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION": 50
+            "WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION": 50,
+            # Ensure USE_REAL_NEWS_API is False to avoid NewsAPI specific paths unless intended
+            "USE_REAL_NEWS_API": False
         }
-        # Patch wcha_main.wcha_config directly
         self.config_patcher = patch.dict(wcha_main.wcha_config, self.mock_wcha_config_defaults, clear=True)
         self.mock_config = self.config_patcher.start()
+        self.addCleanup(self.config_patcher.stop)
 
-        mock_ddgs_instance.text.reset_mock(return_value=True, side_effect=True)
-        mock_requests_get.reset_mock(return_value=True, side_effect=True)
-        mock_trafilatura_extract.reset_mock(return_value=True, side_effect=True)
-
-    def tearDown(self):
-        self.config_patcher.stop()
-
-    def test_get_content_for_topic_success(self):
+    @patch('aethercast.wcha.main.trafilatura.extract')
+    @patch('aethercast.wcha.main.requests.get')
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_success(self, mock_ddgs_constructor, mock_requests_get, mock_trafilatura_extract):
+        # Configure mocks passed as arguments
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.return_value = [{'href': 'http://example.com/page1'}, {'href': 'http://example.com/page2'}]
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         mock_response1 = MagicMock(status_code=200, headers={'Content-Type': 'text/html'}, content=b"Page 1 HTML content")
         mock_response2 = MagicMock(status_code=200, headers={'Content-Type': 'text/html'}, content=b"Page 2 HTML content")
         mock_requests_get.side_effect = [mock_response1, mock_response2]
@@ -177,7 +187,6 @@ class TestGetContentForTopic(unittest.TestCase):
         page2_content = "Extracted content from page 2, also made sure it is long enough."
         mock_trafilatura_extract.side_effect = [page1_content, page2_content]
 
-        # Mock is_url_safe to always return True for this specific test
         with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
             result = wcha_main.get_content_for_topic("test topic")
 
@@ -192,8 +201,14 @@ class TestGetContentForTopic(unittest.TestCase):
         self.assertEqual(mock_requests_get.call_count, 2)
         self.assertEqual(mock_trafilatura_extract.call_count, 2)
 
-    def test_get_content_for_topic_no_search_results(self):
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_no_search_results(self, mock_ddgs_constructor):
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.return_value = []
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
             result = wcha_main.get_content_for_topic("obscure topic")
         self.assertEqual(result["status"], "failure")
@@ -201,24 +216,52 @@ class TestGetContentForTopic(unittest.TestCase):
         self.assertEqual(len(result["source_urls"]), 0)
         self.assertIn(wcha_main.ERROR_WCHA_NO_SEARCH_RESULTS, result["message"])
 
-    def test_get_content_for_topic_search_exception(self):
+        self.assertEqual(result["status"], "failure")
+        self.assertIsNone(result["content"])
+        self.assertEqual(len(result["source_urls"]), 0)
+        self.assertIn(wcha_main.ERROR_WCHA_NO_SEARCH_RESULTS, result["message"])
+
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_search_exception(self, mock_ddgs_constructor):
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.side_effect = Exception("DDG API Error")
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
             result = wcha_main.get_content_for_topic("search error topic")
         self.assertEqual(result["status"], "failure")
         self.assertIn(wcha_main.ERROR_WCHA_SEARCH_FAILED, result["message"])
 
-    def test_get_content_for_topic_harvest_all_urls_fail(self):
+    @patch('aethercast.wcha.main.trafilatura.extract')
+    @patch('aethercast.wcha.main.requests.get')
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_harvest_all_urls_fail(self, mock_ddgs_constructor, mock_requests_get, mock_trafilatura_extract):
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.return_value = [{'href': 'http://example.com/page1'}]
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         mock_requests_get.side_effect = requests.exceptions.Timeout("Simulated timeout")
+
         with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
             result = wcha_main.get_content_for_topic("harvest fail topic")
         self.assertEqual(result["status"], "failure")
         self.assertIn(wcha_main.ERROR_WCHA_HARVEST_ALL_FAILED, result["message"])
         self.assertIn("Timeout after 10 seconds", result["message"])
 
-    def test_get_content_for_topic_content_too_short_from_all_sources(self):
+    @patch('aethercast.wcha.main.trafilatura.extract')
+    @patch('aethercast.wcha.main.requests.get')
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_content_too_short_from_all_sources(self, mock_ddgs_constructor, mock_requests_get, mock_trafilatura_extract):
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.return_value = [{'href': 'http://example.com/short1'}]
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         mock_response = MagicMock(status_code=200, headers={'Content-Type': 'text/html'}, content=b"Short HTML")
         mock_requests_get.return_value = mock_response
         mock_trafilatura_extract.return_value = "Too short."
@@ -228,8 +271,16 @@ class TestGetContentForTopic(unittest.TestCase):
         self.assertIn(wcha_main.ERROR_WCHA_HARVEST_ALL_FAILED, result["message"])
         self.assertIn("Skipped (too short)", result["message"])
 
-    def test_get_content_for_topic_partial_success_one_url_good_one_fails(self):
+    @patch('aethercast.wcha.main.trafilatura.extract')
+    @patch('aethercast.wcha.main.requests.get')
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_partial_success_one_url_good_one_fails(self, mock_ddgs_constructor, mock_requests_get, mock_trafilatura_extract):
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.return_value = [{'href': 'http://good.com/page1'}, {'href': 'http://bad.com/page2'}]
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         mock_good_response = MagicMock(status_code=200, headers={'Content-Type': 'text/html'}, content=b"Good HTML")
         mock_requests_get.side_effect = [mock_good_response, requests.exceptions.Timeout("Simulated timeout on second URL")]
         mock_trafilatura_extract.return_value = "Good content that is definitely long enough for aggregation."
@@ -238,15 +289,21 @@ class TestGetContentForTopic(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertIn("Failures: URL: http://bad.com/page2", result["message"])
 
-    def test_get_content_for_topic_max_results_override(self):
+    @patch('aethercast.wcha.main.DDGS')
+    def test_get_content_for_topic_max_results_override(self, mock_ddgs_constructor):
+        mock_ddgs_instance = MagicMock()
         mock_ddgs_instance.text.return_value = []
+        mock_ddgs_context_manager = MagicMock()
+        mock_ddgs_context_manager.__enter__.return_value = mock_ddgs_instance
+        mock_ddgs_constructor.return_value = mock_ddgs_context_manager
+
         with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
             wcha_main.get_content_for_topic("test max results override", max_results_override=1)
         mock_ddgs_instance.text.assert_called_once_with(keywords="test max results override", region='wt-wt', safesearch='moderate', max_results=1)
 
-    @patch('aethercast.wcha.main.IMPORTS_SUCCESSFUL', False)
-    @patch('aethercast.wcha.main.MISSING_IMPORT_ERROR', "Simulated missing library")
-    def test_get_content_for_topic_imports_not_successful(self):
+    @patch('aethercast.wcha.main.IMPORTS_SUCCESSFUL', False) # Patch the flag directly
+    @patch('aethercast.wcha.main.MISSING_IMPORT_ERROR', "Simulated missing library") # Patch the error message
+    def test_get_content_for_topic_imports_not_successful(self): # No need for mock args if not used
         result = wcha_main.get_content_for_topic("any topic")
         self.assertEqual(result["status"], "failure_dependency") # Adjusted to match new status
         self.assertIn(wcha_main.ERROR_WCHA_LIB_MISSING, result["message"])

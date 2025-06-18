@@ -212,5 +212,6 @@ if __name__ == '__main__':
     # This part is just for local testing of the card structure, not a full UI schema
     # print("\n--- Single Card Structure (for reference based on template) ---")
     # print(json.dumps(single_snippet_card_template_example, indent=2))
+    pass # Ensure the block ends cleanly
 
-```
+# Ensure there's a newline at the end of the file if that was missing.

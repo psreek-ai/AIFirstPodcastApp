@@ -23,6 +23,7 @@ except ImportError:
 
 # Conditional import for sqlite3 (standard library, should always be available)
 import sqlite3 # For type hinting and explicit error handling
+import requests # Added for AIMS calls
 
 from dotenv import load_dotenv
 load_dotenv() # Load environment variables from .env file at the very start
@@ -67,10 +68,10 @@ def load_pswa_config():
         "PSWA_LLM_TEMPERATURE": float(os.getenv("PSWA_LLM_TEMPERATURE", "0.7")),
         "PSWA_LLM_MAX_TOKENS": int(os.getenv("PSWA_LLM_MAX_TOKENS", "2000")),
         "PSWA_LLM_JSON_MODE": os.getenv("PSWA_LLM_JSON_MODE", "true").lower() == "true",
-        "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE"),
+        "PSWA_DEFAULT_PROMPT_USER_TEMPLATE": os.getenv("PSWA_DEFAULT_PROMPT_USER_TEMPLATE", "Generate a podcast script about {topic} using the following content: {content}. Additional guidance: {narrative_guidance}"),
         "PSWA_PERSONA_PROMPTS_JSON": os.getenv("PSWA_PERSONA_PROMPTS_JSON", '{}'),
         "PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION": os.getenv("PSWA_BASE_SYSTEM_MESSAGE_JSON_SCHEMA_INSTRUCTION"),
-        "PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION": os.getenv("PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION"),
+        "PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION": os.getenv("PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION", ""),
         "PSWA_DEFAULT_PERSONA": os.getenv("PSWA_DEFAULT_PERSONA", "InformativeHost"),
         "CELERY_BROKER_URL": os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
         "CELERY_RESULT_BACKEND": os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/0"),
@@ -107,6 +108,7 @@ pswa_celery_app.conf.update(
     task_track_started=True,
     # Add other Celery configurations as needed
 )
+pswa_celery_app.finalize() # Explicitly finalize the app
 
 
 # --- Logging Setup ---

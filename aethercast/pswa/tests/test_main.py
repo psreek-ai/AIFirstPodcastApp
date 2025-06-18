@@ -67,7 +67,13 @@ class TestPswaIdempotency(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Configure Celery for testing (task_always_eager=True runs tasks synchronously)
-        pswa_celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        # Also explicitly set broker and backend to in-memory for tests
+        pswa_celery_app.conf.update(
+            task_always_eager=True,
+            task_eager_propagates=True,
+            broker_url="memory://",
+            result_backend="rpc://"
+        )
         flask_app.testing = True
 
         # Ensure pswa_config is loaded initially. Tests can override specific values.
@@ -93,8 +99,13 @@ class TestPswaIdempotency(unittest.TestCase):
             "IDEMPOTENCY_STATUS_COMPLETED": "completed",
             "IDEMPOTENCY_STATUS_FAILED": "failed",
             "IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": 60, # Short timeout for tests
-            "CELERY_BROKER_URL": "memory://", # Use in-memory broker for tests
-            "CELERY_RESULT_BACKEND": "rpc://" # Use RPC backend for results
+            "SERVICE_NAME_FOR_IDEMPOTENCY": "PSWA_Test", # Ensure this is a string
+            "PSWA_SCRIPT_CACHE_ENABLED": False, # Disable script caching for tests
+            # CELERY_BROKER_URL and CELERY_RESULT_BACKEND are now set directly in pswa_celery_app.conf
+            # in setUpClass, so they are not strictly needed in pswa_config for the app's broker/backend
+            # but other parts of the code might still read them from pswa_config.
+            "CELERY_BROKER_URL": "memory://",
+            "CELERY_RESULT_BACKEND": "rpc://"
         }
         self.config_patcher = patch.dict(pswa_config, self.test_config_overrides, clear=False)
         self.mocked_pswa_config = self.config_patcher.start()

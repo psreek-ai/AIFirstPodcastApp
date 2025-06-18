@@ -34,6 +34,7 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
 )
+celery_app.finalize() # Explicitly finalize the app
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -148,7 +149,7 @@ def _get_vfa_db_connection():
         raise ConnectionError(f"VFA: PostgreSQL connection for idempotency failed: {e}") from e
 
 # --- Custom Celery Task Class for VFA with Idempotency ---
-class VfaCeleryTask(Celery.Task): # Inherit from celery.Task
+class VfaCeleryTask(celery_app.Task): # Inherit from celery_app.Task
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         logger.error(f'Celery Task {task_id} (VFA ForgeVoice) failed: {exc}', exc_info=einfo)
         idempotency_key = kwargs.get('idempotency_key')

@@ -47,6 +47,7 @@ celery_app.conf.update(
     timezone='UTC',
     enable_utc=True,
 )
+celery_app.finalize() # Explicitly finalize the app
 
 # --- Logging Setup ---
 # Custom filter to add service_name to log records

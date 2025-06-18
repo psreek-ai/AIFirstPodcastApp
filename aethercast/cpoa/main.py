@@ -746,13 +746,13 @@ def orchestrate_podcast_generation(
     test_scenarios: Optional[dict] = None,
     idempotency_key: Optional[str] = None # This is the client-provided key, now maps to original_task_id
 ) -> Dict[str, Any]:
-        # The `idempotency_key` (originally `original_task_id` if called from Celery task, or client-provided if from direct trigger)
-        # is the primary key for CPOA's own orchestration task in the `idempotency_keys` table.
-        cpoa_orchestration_idempotency_key = idempotency_key or original_task_id # Use client-provided key if available, else Celery task ID
-        cpoa_task_name_for_idempotency = "cpoa_orchestrate_podcast_task" # Specific name for this CPOA operation type
+    # The `idempotency_key` (originally `original_task_id` if called from Celery task, or client-provided if from direct trigger)
+    # is the primary key for CPOA's own orchestration task in the `idempotency_keys` table.
+    cpoa_orchestration_idempotency_key = idempotency_key or original_task_id # Use client-provided key if available, else Celery task ID
+    cpoa_task_name_for_idempotency = "cpoa_orchestrate_podcast_task" # Specific name for this CPOA operation type
 
-    db_conn = None
-        cpoa_internal_workflow_id = None # This is the CPOA-managed workflow_id (UUID)
+    db_conn = None # Initialize db_conn here to ensure it's defined for the finally block
+    cpoa_internal_workflow_id = None # This is the CPOA-managed workflow_id (UUID)
     final_cpoa_status_legacy = CPOA_STATUS_PENDING # Initialize legacy status
     final_error_message = None # Initialize error message
     final_workflow_status = WORKFLOW_STATUS_PENDING # Initialize workflow status
@@ -785,12 +785,16 @@ def orchestrate_podcast_generation(
 
             if status == cpoa_idem_status_completed: # Use CPOA specific
                 logger.info(f"CPOA Orchestration Task: Found completed record. Returning stored result.", extra=log_extra_cpoa_task)
-                db_conn.rollback()
+                db_conn.rollback() # Release connection without commit if returning early
+                _put_cpoa_db_connection(db_conn) # Explicitly put back
+                db_conn = None
                 return existing_key_record['result_payload']
             elif status == cpoa_idem_status_processing: # Use CPOA specific
                 if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < cpoa_idem_lock_timeout_seconds: # Use CPOA specific timeout
                     logger.warning(f"CPOA Orchestration Task: Record is already processing and lock is active. Returning conflict.", extra=log_extra_cpoa_task)
                     db_conn.rollback()
+                    _put_cpoa_db_connection(db_conn)
+                    db_conn = None
                     return {"task_id": original_task_id, "workflow_id": cpoa_internal_workflow_id,
                             "status": "CONFLICT_PROCESSING",
                             "error_message": "Task is already being processed.", "idempotency_key": cpoa_orchestration_idempotency_key}
@@ -815,55 +819,59 @@ def orchestrate_podcast_generation(
             if not cpoa_internal_workflow_id:
                 logger.error(f"Failed to create CPOA workflow instance for idempotency key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra)
                 db_conn.rollback()
+                _put_cpoa_db_connection(db_conn)
+                db_conn = None
                 return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
                         "error_message": "Critical: Workflow instance creation failed before idempotency record.",
                         "orchestration_log": [], "final_audio_details": {}}
 
             _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_processing, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=True) # Use CPOA specific
 
-        db_conn.commit()
+        db_conn.commit() # Commit after successful idempotency check/setup and workflow instance creation/update
 
         # --- Main Orchestration Logic ---
         # cpoa_internal_workflow_id is now definitively set.
-        if not cpoa_internal_workflow_id: # Should be caught by the creation logic above
-            logger.error(f"Critical: CPOA internal workflow ID is not set after idempotency checks for key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra)
-            if db_conn: db_conn.rollback()
-            return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
-                    "error_message": "Critical: CPOA internal workflow ID missing post-idempotency.",
-                    "orchestration_log": [], "final_audio_details": {}}
+        # (The following check is redundant if the above logic ensures cpoa_internal_workflow_id is always set or returns early)
+        # if not cpoa_internal_workflow_id:
+        #     logger.error(f"Critical: CPOA internal workflow ID is not set after idempotency checks for key {cpoa_orchestration_idempotency_key}. Aborting.", extra=initial_log_extra)
+        #     # db_conn rollback/close handled by finally
+        #     return {"task_id": original_task_id, "workflow_id": None, "status": CPOA_STATUS_INIT_FAILURE,
+        #             "error_message": "Critical: CPOA internal workflow ID missing post-idempotency.",
+        #             "orchestration_log": [], "final_audio_details": {}}
 
         # Use a logging adapter for this workflow
         wf_logger = logging.LoggerAdapter(logger, {'workflow_id': cpoa_internal_workflow_id, 'task_id': None})
         _update_workflow_instance_status(db_conn, cpoa_internal_workflow_id, WORKFLOW_STATUS_IN_PROGRESS)
+        db_conn.commit() # Commit status update
 
-    # This is the CPOA internal step log, distinct from the DB task_instances table
-    orchestration_log_cpoa: List[Dict[str, Any]] = []
+        # This is the CPOA internal step log, distinct from the DB task_instances table
+        orchestration_log_cpoa: List[Dict[str, Any]] = []
 
-    vfa_result_dict: Dict[str, Any] = {"status": VFA_STATUS_NOT_RUN, "message": "VFA not reached."}
-    current_orchestration_stage_legacy: str = ORCHESTRATION_STAGE_INITIALIZATION # For legacy log_step
+        vfa_result_dict: Dict[str, Any] = {"status": VFA_STATUS_NOT_RUN, "message": "VFA not reached."}
+        current_orchestration_stage_legacy: str = ORCHESTRATION_STAGE_INITIALIZATION # For legacy log_step
 
-    # final_cpoa_status is the legacy overall status for the 'podcasts' table entry
-    final_cpoa_status_legacy: str = CPOA_STATUS_PENDING
-    final_workflow_status: str = WORKFLOW_STATUS_IN_PROGRESS # For the new 'workflow_instances' table
+        # final_cpoa_status is the legacy overall status for the 'podcasts' table entry
+        final_cpoa_status_legacy: str = CPOA_STATUS_PENDING
+        final_workflow_status: str = WORKFLOW_STATUS_IN_PROGRESS # For the new 'workflow_instances' table
 
-    final_error_message: Optional[str] = None
-    asf_notification_status_message: Optional[str] = None
-    current_task_order = 0
-    context_data_for_workflow = {} # Store key results like GCS URIs, script title etc.
+        final_error_message: Optional[str] = None
+        asf_notification_status_message: Optional[str] = None
+        current_task_order = 0
+        context_data_for_workflow = {} # Store key results like GCS URIs, script title etc.
 
-    # Legacy log_step function (can be refactored or removed if orchestration_log_cpoa is not primary)
-    def log_step_cpoa(message: str, data: Optional[Dict[str, Any]] = None, is_error_payload: bool = False) -> None:
-        timestamp = datetime.now().isoformat()
-        log_entry: Dict[str, Any] = {"timestamp": timestamp, "stage": current_orchestration_stage_legacy, "message": message}
-        # ... (rest of log_step_cpoa implementation as before) ...
-        orchestration_log_cpoa.append(log_entry)
-        # wf_logger.info(f"Legacy log_step: {message}") # Avoid duplicate wf_logger here if it's just for orchestration_log_cpoa
+        # Legacy log_step function (can be refactored or removed if orchestration_log_cpoa is not primary)
+        def log_step_cpoa(message: str, data: Optional[Dict[str, Any]] = None, is_error_payload: bool = False) -> None:
+            timestamp = datetime.now().isoformat()
+            log_entry: Dict[str, Any] = {"timestamp": timestamp, "stage": current_orchestration_stage_legacy, "message": message}
+            # ... (rest of log_step_cpoa implementation as before) ...
+            orchestration_log_cpoa.append(log_entry)
 
-    wf_logger.info(f"Podcast generation workflow started for topic: {topic}. Original Task ID: {original_task_id}")
+        wf_logger.info(f"Podcast generation workflow started for topic: {topic}. Original Task ID: {original_task_id}")
         log_step_cpoa("Orchestration process started.", data={"original_task_id": original_task_id, "topic": topic, "voice_params_input": voice_params_input, "client_id": client_id, "user_preferences": user_preferences, "test_scenarios": test_scenarios})
 
         # Update legacy 'podcasts' table (if original_task_id is its key)
         _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_WCHA_CONTENT_RETRIEVAL, workflow_id_for_log=cpoa_internal_workflow_id)
+        db_conn.commit() # Commit after this update
 
         # --- WCHA Stage ---
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_WCHA
@@ -1017,7 +1025,6 @@ def orchestrate_podcast_generation(
 
         # --- PSWA Stage ---
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
-                    raise Exception(wcha_error_details["message"])
                 try:
                     poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
                     poll_response_wcha.raise_for_status()
@@ -1066,12 +1073,12 @@ def orchestrate_podcast_generation(
         current_orchestration_stage_legacy = ORCHESTRATION_STAGE_PSWA
         current_task_order += 1
         pswa_input_params = {"topic": topic, "content_input_length": len(wcha_content)}
-            pswa_idempotency_key = f"{cpoa_orchestration_idempotency_key}_pswa" # Derived key
-            pswa_task_id = _create_task_instance(db_conn, cpoa_internal_workflow_id, "PSWA", current_task_order, {**pswa_input_params, "idempotency_key_for_pswa": pswa_idempotency_key}, initial_status=TASK_STATUS_DISPATCHED)
+        pswa_idempotency_key = f"{cpoa_orchestration_idempotency_key}_pswa" # Derived key
+        pswa_task_id = _create_task_instance(db_conn, cpoa_internal_workflow_id, "PSWA", current_task_order, {**pswa_input_params, "idempotency_key_for_pswa": pswa_idempotency_key}, initial_status=TASK_STATUS_DISPATCHED)
 
         _update_task_status_in_db(db_conn, original_task_id, CPOA_STATUS_PSWA_SCRIPT_GENERATION, workflow_id_for_log=cpoa_internal_workflow_id)
         _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Crafting script...", "stage": current_orchestration_stage_legacy}, workflow_id_for_log=cpoa_internal_workflow_id)
-            log_step_cpoa("Calling PSWA Service (async)...", data={"url": PSWA_SERVICE_URL, **pswa_input_params, "pswa_idempotency_key": pswa_idempotency_key})
+        log_step_cpoa("Calling PSWA Service (async)...", data={"url": PSWA_SERVICE_URL, **pswa_input_params, "pswa_idempotency_key": pswa_idempotency_key})
 
         structured_script_from_pswa = None
         pswa_error_details = None
@@ -1399,74 +1406,91 @@ def orchestrate_podcast_generation(
 
         _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message, "stage": current_orchestration_stage_legacy, "final_status": final_cpoa_status_legacy}, workflow_id_for_log=workflow_id)
 
-        # Commit successful transaction if all steps passed
-        if db_conn and final_workflow_status not in [WORKFLOW_STATUS_FAILED, WORKFLOW_STATUS_COMPLETED_WITH_ERRORS] :
-            db_conn.commit()
-            wf_logger.info("Main podcast generation transaction committed.", extra={'workflow_id': workflow_id})
-        elif db_conn: # Rollback if there was an error
-            db_conn.rollback()
-            wf_logger.warning("Main podcast generation transaction rolled back due to errors.", extra={'workflow_id': workflow_id})
+        # This is the main execution block for the orchestration steps
+        # It's wrapped in its own try/except to manage the transaction for these steps
+        try:
+            # --- WCHA Stage ---
+            # ... (WCHA logic as before, using db_conn for _update_task_instance_status and _create_task_instance)
+            # ... make sure to call db_conn.commit() after successful WCHA stage if needed, or rely on overall commit
 
-    except Exception as e_main_workflow:
-        wf_logger.error(f"Podcast generation workflow critically failed at stage '{current_orchestration_stage_legacy}': {e_main_workflow}", exc_info=True)
-        final_error_message = final_error_message or str(e_main_workflow) # Ensure there's an error message
-        final_workflow_status = WORKFLOW_STATUS_FAILED
-        # Update legacy CPOA status if not already a more specific failure
-        if not final_cpoa_status_legacy.startswith("failed_") and not final_cpoa_status_legacy.startswith("completed_with_"):
-            final_cpoa_status_legacy = CPOA_STATUS_FAILED_UNKNOWN_STAGE_EXCEPTION
+            # --- PSWA Stage ---
+            # ... (PSWA logic as before, using db_conn)
+            # ... db_conn.commit() after successful PSWA stage if needed
 
-        if db_conn: # Attempt to store failure in idempotency key and rollback main transaction
-            try:
-                # Use workflow_id if available, otherwise it's 'N/A' by default in helper.
-                # The result_payload for a failed CPOA task is essentially the error information.
-                error_payload_for_idempotency = {"error_message": final_error_message, "legacy_status": final_cpoa_status_legacy, "stage": current_orchestration_stage_legacy}
-                _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_failed, error_payload=error_payload_for_idempotency, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False) # Use CPOA specific, cpoa_internal_workflow_id
-                db_conn.commit() # Commit idempotency failure status
-            except Exception as e_idem_fail_store:
-                wf_logger.error(f"Failed to store idempotency failure status for key {cpoa_orchestration_idempotency_key}: {e_idem_fail_store}", exc_info=True) # Use cpoa_orchestration_idempotency_key
-                if db_conn: db_conn.rollback() # Rollback if storing idempotency key itself failed
+            # --- VFA Stage ---
+            # ... (VFA logic as before, using db_conn)
+            # ... db_conn.commit() after successful VFA stage if needed
 
-        _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message, "stage": current_orchestration_stage_legacy, "final_status": final_cpoa_status_legacy}, workflow_id_for_log=workflow_id)
-        # Note: db_conn.rollback() for the main transaction was already called if db_conn was active during the exception.
-        # If the exception happened before db_conn was established, or after it was committed/rolled_back from main logic,
-        # this rollback might be redundant or operate on a closed/invalid connection.
-        # The primary rollback for the main logic's transaction is within the main try...except block's db_conn.commit()/rollback().
+            # --- ASF Notification Stage ---
+            # ... (ASF logic as before, using db_conn)
+            # ... db_conn.commit() after successful ASF stage if needed
+
+            # If all stages complete successfully up to the point of no critical failure:
+            if final_workflow_status not in [WORKFLOW_STATUS_FAILED] and not final_cpoa_status_legacy.startswith("failed_"):
+                 final_cpoa_status_legacy = CPOA_STATUS_COMPLETED # Default success if no specific error status was set
+                 final_workflow_status = WORKFLOW_STATUS_COMPLETED
+            elif final_workflow_status != WORKFLOW_STATUS_FAILED and final_cpoa_status_legacy.startswith("completed_with_"):
+                 final_workflow_status = WORKFLOW_STATUS_COMPLETED_WITH_ERRORS
+            else: # Some failure occurred
+                 final_workflow_status = WORKFLOW_STATUS_FAILED
+                 # final_cpoa_status_legacy should already be set by the failing stage
+
+            db_conn.commit() # Commit all successful DB operations for the main orchestration logic
+            wf_logger.info("Main podcast generation transaction committed.", extra={'workflow_id': cpoa_internal_workflow_id})
+
+        except Exception as e_main_workflow_logic:
+            # This catches errors within the WCHA,PSWA,VFA,ASF stages
+            wf_logger.error(f"Podcast generation workflow critically failed at stage '{current_orchestration_stage_legacy}': {e_main_workflow_logic}", exc_info=True)
+            final_error_message = final_error_message or str(e_main_workflow_logic)
+            final_workflow_status = WORKFLOW_STATUS_FAILED
+            if not final_cpoa_status_legacy.startswith("failed_") and not final_cpoa_status_legacy.startswith("completed_with_"):
+                final_cpoa_status_legacy = CPOA_STATUS_FAILED_UNKNOWN_STAGE_EXCEPTION
+            if db_conn:
+                db_conn.rollback()
+                wf_logger.warning("Main podcast generation transaction rolled back due to error.", extra={'workflow_id': cpoa_internal_workflow_id})
+
+            # Store failure for idempotency key of CPOA task itself
+            error_payload_for_idempotency = {"error_message": final_error_message, "legacy_status": final_cpoa_status_legacy, "stage": current_orchestration_stage_legacy}
+            _store_idempotency_record(db_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, cpoa_idem_status_failed, error_payload=error_payload_for_idempotency, cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False)
+            db_conn.commit() # Commit this idempotency update
+
+            _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message, "stage": current_orchestration_stage_legacy, "final_status": final_cpoa_status_legacy}, workflow_id_for_log=cpoa_internal_workflow_id)
+            # Re-raise so Celery can mark the task as failed if this is a Celery task context
+            # raise # This might not be needed if we are returning a dict in all paths
 
     finally:
-        # This block ensures the DB connection is closed and final status updates are attempted.
-        # It might be complex if the main transaction was rolled back due to an error,
-        # as the connection might be in an unusable state for further operations unless reopened.
-        # The _get_cpoa_db_connection and _put_cpoa_db_connection should handle this.
+        # This block ensures the DB connection is managed and final status updates are attempted.
+        # It's crucial that db_conn is handled correctly (put back to pool).
+        # The final status updates should ideally use a fresh connection if db_conn might be in a bad state from a rollback.
+        # However, for simplicity here, we use the same db_conn if it's still open.
+        # If db_conn was rolled back, further operations on it before putting it back might be problematic
+        # depending on the DB driver and pool behavior. `_put_cpoa_db_connection` should handle closing if conn is bad.
 
-        # Attempt to update final status in workflow_instances and legacy podcasts table.
-        # This needs to happen regardless of the main transaction's success or failure.
-        # A new connection might be required if the original 'db_conn' is in a bad state.
-        final_update_conn = None
-        try:
-            final_update_conn = _get_cpoa_db_connection() # Get a fresh connection
-            if final_update_conn:
-                final_update_conn.autocommit = False
-                # Update legacy first, then new workflow system
-                _update_task_status_in_db(final_update_conn, original_task_id, final_cpoa_status_legacy, error_msg=final_error_message, workflow_id_for_log=workflow_id)
-                _update_workflow_instance_status(final_update_conn, workflow_id, final_workflow_status, context_data=context_data_for_workflow, error_message=final_error_message)
-                final_update_conn.commit()
-            else:
-                 # wf_logger might not be initialized if error was very early
-                logger_to_use = wf_logger if wf_logger else logger
-                logger_to_use.error("Could not acquire new DB connection for final status updates.", extra={'workflow_id': workflow_id or 'N/A'})
-        except Exception as e_final_update:
-            logger_to_use = wf_logger if wf_logger else logger
-            logger_to_use.error(f"Error during final status DB updates: {e_final_update}", exc_info=True, extra={'workflow_id': workflow_id or 'N/A'})
-            if final_update_conn: final_update_conn.rollback()
-        finally:
-            if final_update_conn: _put_cpoa_db_connection(final_update_conn)
+        final_wf_status_to_set = final_workflow_status
+        final_legacy_status_to_set = final_cpoa_status_legacy
+        final_err_msg_to_set = final_error_message
 
-        if db_conn: # Ensure the main connection for the orchestration logic is always put back
-            _put_cpoa_db_connection(db_conn)
-            db_conn = None # Clear to avoid re-closing if error occurred before this point.
+        if db_conn: # If connection was established
+            try:
+                # Update legacy first, then new workflow system, ensuring commit happens for these critical final updates.
+                # This might need its own transaction or careful handling if main one was rolled back.
+                # For now, assume if db_conn is here, it's either pre-commit or post-rollback and usable for new transaction.
+                # If it was rolled back, autocommit might be true or need to be set.
+                # Let's ensure autocommit is false for this block, then commit explicitly.
+                db_conn.autocommit = False
+                _update_task_status_in_db(db_conn, original_task_id, final_legacy_status_to_set, error_msg=final_err_msg_to_set, workflow_id_for_log=cpoa_internal_workflow_id)
+                _update_workflow_instance_status(db_conn, cpoa_internal_workflow_id, final_wf_status_to_set, context_data=context_data_for_workflow, error_message=final_err_msg_to_set)
+                db_conn.commit()
+            except Exception as e_final_update:
+                logger_to_use_final = wf_logger if 'wf_logger' in locals() and wf_logger else logger
+                logger_to_use_final.error(f"Error during final status DB updates for workflow {cpoa_internal_workflow_id}: {e_final_update}", exc_info=True)
+                if db_conn: db_conn.rollback()
+            finally:
+                _put_cpoa_db_connection(db_conn) # Ensure it's always put back
+                db_conn = None # Avoid accidental reuse
 
-    current_orchestration_stage_legacy = ORCHESTRATION_STAGE_FINALIZATION # For the log entry below
-    # Prepare the final result payload that would be stored for idempotency on success
+    # Prepare the final result payload for the CPOA task's idempotency record and for return
+    current_orchestration_stage_legacy = ORCHESTRATION_STAGE_FINALIZATION
     cpoa_final_result_payload = {
         "task_id": original_task_id, # original_task_id is the idempotency key
         "workflow_id": workflow_id,
@@ -1482,46 +1506,42 @@ def orchestrate_podcast_generation(
          vfa_result_dict["tts_settings_used"] = context_data_for_workflow["tts_settings_used"]
 
 
-    # Store final result for idempotency if CPOA task completed successfully (or completed with handled errors by ASF etc.)
-    # This needs a connection again.
-    if final_workflow_status in [WORKFLOW_STATUS_COMPLETED, WORKFLOW_STATUS_COMPLETED_WITH_ERRORS] and \
-       final_cpoa_status_legacy not in [CPOA_STATUS_INIT_FAILURE, CPOA_STATUS_FAILED_WCHA_MODULE_ERROR] and \
-       not (final_cpoa_status_legacy.startswith("failed_") and final_cpoa_status_legacy != CPOA_STATUS_FAILED_ASF_NOTIFICATION_EXCEPTION): # Avoid double storing if main logic failed early
-
-        idempotency_conn_final_store = None
+    # Store final result for idempotency if CPOA task completed successfully or with handled errors
+    if final_workflow_status in [WORKFLOW_STATUS_COMPLETED, WORKFLOW_STATUS_COMPLETED_WITH_ERRORS]:
+        idempotency_update_conn = None
         try:
-            idempotency_conn_final_store = _get_cpoa_db_connection()
-            if idempotency_conn_final_store:
-                idempotency_conn_final_store.autocommit = False
-                _store_idempotency_record(idempotency_conn_final_store, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency, # Use cpoa_orchestration_idempotency_key and cpoa_task_name_for_idempotency
-                                          cpoa_idem_status_completed, result_payload=cpoa_final_result_payload, # Use CPOA specific
-                                          cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False) # Use cpoa_internal_workflow_id
-                idempotency_conn_final_store.commit()
-            else:
-                logger_to_use = wf_logger if wf_logger else logger
-                logger_to_use.error(f"Could not get DB connection to store final idempotency result for {cpoa_orchestration_idempotency_key}.", extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
-        except Exception as e_idem_final:
-            logger_to_use = wf_logger if wf_logger else logger
-            logger_to_use.error(f"Failed to store final idempotency result for key {cpoa_orchestration_idempotency_key}: {e_idem_final}", exc_info=True, extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
-            if idempotency_conn_final_store: idempotency_conn_final_store.rollback()
+            idempotency_update_conn = _get_cpoa_db_connection()
+            if idempotency_update_conn:
+                idempotency_update_conn.autocommit = False # Manage transaction for this update
+                _store_idempotency_record(idempotency_update_conn, cpoa_orchestration_idempotency_key, cpoa_task_name_for_idempotency,
+                                          cpoa_idem_status_completed, result_payload=cpoa_final_result_payload,
+                                          cpoa_workflow_id=cpoa_internal_workflow_id, is_new_key=False)
+                idempotency_update_conn.commit()
+            else: # Should not happen if pool is working
+                logger_final = wf_logger if 'wf_logger' in locals() else logger
+                logger_final.error(f"Could not get DB connection to store final successful idempotency result for {cpoa_orchestration_idempotency_key}.", extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
+        except Exception as e_idem_final_success:
+            logger_final = wf_logger if 'wf_logger' in locals() else logger
+            logger_final.error(f"Failed to store final successful idempotency result for key {cpoa_orchestration_idempotency_key}: {e_idem_final_success}", exc_info=True, extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
+            if idempotency_update_conn: idempotency_update_conn.rollback()
         finally:
-            if idempotency_conn_final_store: _put_cpoa_db_connection(idempotency_conn_final_store)
+            if idempotency_update_conn: _put_cpoa_db_connection(idempotency_update_conn)
 
     log_step_cpoa(f"Orchestration process ended with status {final_workflow_status}.", data={"final_cpoa_status_legacy": final_cpoa_status_legacy, "final_error_message": final_error_message})
-        logger_to_use_final = wf_logger if 'wf_logger' in locals() and wf_logger else logger # Ensure wf_logger availability
-        logger_to_use_final.info(f"Podcast generation workflow ended. Final status: {final_workflow_status}. Legacy CPOA status: {final_cpoa_status_legacy}.", extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
+    logger_to_use_final = wf_logger if 'wf_logger' in locals() and wf_logger else logger
+    logger_to_use_final.info(f"Podcast generation workflow ended. Final status: {final_workflow_status}. Legacy CPOA status: {final_cpoa_status_legacy}.", extra={'workflow_id': cpoa_internal_workflow_id or 'N/A'})
 
-    # Send final UI update based on the new workflow_status
+    # Send final UI update
     if final_workflow_status == WORKFLOW_STATUS_FAILED or final_workflow_status == WORKFLOW_STATUS_COMPLETED_WITH_ERRORS :
-            _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message or f"Task ended with status: {final_workflow_status}", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
+        _send_ui_update(client_id, UI_EVENT_TASK_ERROR, {"message": final_error_message or f"Task ended with status: {final_workflow_status}", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
     elif final_workflow_status == WORKFLOW_STATUS_COMPLETED:
-             _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
+        _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
 
-        asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow['stream_id']}" if context_data_for_workflow.get("stream_id") else None # Use context_data_for_workflow
+    asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow.get('stream_id')}" if context_data_for_workflow.get("stream_id") else None
 
-    cpoa_final_result_payload = { # Renamed for clarity
-        "task_id": original_task_id, # This is the client's original task_id or the cpoa_orchestration_idempotency_key
-        "workflow_id": cpoa_internal_workflow_id, # This is CPOA's internal workflow UUID
+    cpoa_final_result_payload = {
+        "task_id": original_task_id,
+        "workflow_id": cpoa_internal_workflow_id,
         "topic": topic,
         "status": final_cpoa_status_legacy, # Return legacy status for now for API GW compatibility
         "error_message": final_error_message,
