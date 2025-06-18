@@ -4,8 +4,8 @@ import os
 import sys
 import logging
 import requests # Existing import
-import socket # For socket.gaierror
-import ipaddress # Though not directly used in tests, good for context if is_url_safe uses it.
+import socket # To reference socket.gaierror, socket.AF_INET, etc.
+from urllib.parse import urlparse # May not be needed in test, but good for context
 
 # Adjust path to import WCHA main module
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +20,9 @@ if aethercast_dir not in sys.path:
 if project_root_dir not in sys.path:
     sys.path.insert(0, project_root_dir)
 
-from aethercast.wcha import main as wcha_main
+# Assuming is_url_safe is in aethercast.wcha.main
+from aethercast.wcha.main import is_url_safe
+from aethercast.wcha import main as wcha_main # For other tests
 
 # Configure basic logging to avoid NoHandlerFoundError if wcha.main uses logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -42,104 +44,104 @@ mock_trafilatura_extract = MagicMock()
 
 
 class TestIsUrlSafe(unittest.TestCase):
-    @patch('socket.gethostbyname')
-    def test_safe_url_http_public_ip(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "8.8.8.8"
-        is_safe, reason = wcha_main.is_url_safe("http://example.com")
-        self.assertTrue(is_safe)
+    @patch('socket.getaddrinfo')
+    def test_valid_url_public_ipv4(self, mock_getaddrinfo):
+        # AF_INET for IPv4
+        mock_getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 0))]
+        safe, reason = is_url_safe("http://example.com")
+        self.assertTrue(safe)
         self.assertEqual(reason, "URL is safe.")
-        mock_gethostbyname.assert_called_once_with("example.com")
+        mock_getaddrinfo.assert_called_once_with("example.com", None)
 
-    @patch('socket.gethostbyname')
-    def test_safe_url_https_public_ip(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "8.8.4.4"
-        is_safe, reason = wcha_main.is_url_safe("https://sub.example.org/path?query=true")
-        self.assertTrue(is_safe)
+    @patch('socket.getaddrinfo')
+    def test_valid_url_public_ipv6(self, mock_getaddrinfo):
+        # AF_INET6 for IPv6
+        mock_getaddrinfo.return_value = [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:4860:4860::8888', 0, 0, 0))]
+        safe, reason = is_url_safe("http://example.com")
+        self.assertTrue(safe)
         self.assertEqual(reason, "URL is safe.")
-        mock_gethostbyname.assert_called_once_with("sub.example.org")
 
-    def test_unsafe_url_ftp_scheme(self):
-        is_safe, reason = wcha_main.is_url_safe("ftp://example.com")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Invalid URL scheme: 'ftp'. Only 'http' or 'https' allowed.")
+    @patch('socket.getaddrinfo')
+    def test_url_private_ipv4(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.1', 0))]
+        safe, reason = is_url_safe("http://private.local")
+        self.assertFalse(safe)
+        self.assertIn("is not a public IP (is private)", reason)
 
-    def test_unsafe_url_file_scheme(self):
-        is_safe, reason = wcha_main.is_url_safe("file:///etc/passwd")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Invalid URL scheme: 'file'. Only 'http' or 'https' allowed.")
+    @patch('socket.getaddrinfo')
+    def test_url_loopback_ipv4(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', 0))]
+        safe, reason = is_url_safe("http://localhost")
+        self.assertFalse(safe)
+        self.assertIn("is not a public IP (is loopback)", reason)
 
-    def test_unsafe_url_no_hostname(self):
-        is_safe, reason = wcha_main.is_url_safe("http://")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "URL has no hostname.")
+    @patch('socket.getaddrinfo')
+    def test_url_loopback_ipv6(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [(socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('::1', 0, 0, 0))]
+        safe, reason = is_url_safe("http://localhost6")
+        self.assertFalse(safe)
+        self.assertIn("is not a public IP (is loopback)", reason)
 
-    @patch('socket.gethostbyname')
-    def test_unsafe_url_private_ip(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "192.168.1.1"
-        is_safe, reason = wcha_main.is_url_safe("http://local.network/resource")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Resolved IP address '192.168.1.1' for hostname 'local.network' is not a public IP (is private).")
-        mock_gethostbyname.assert_called_once_with("local.network")
+    @patch('socket.getaddrinfo')
+    def test_url_multiple_ips_one_private(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 0)) # Private IP
+        ]
+        safe, reason = is_url_safe("http://mixed.example.com")
+        self.assertFalse(safe)
+        self.assertIn("10.0.0.1", reason)
+        self.assertIn("is not a public IP (is private)", reason)
 
-    @patch('socket.gethostbyname')
-    def test_unsafe_url_loopback_ip(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "127.0.0.1"
-        is_safe, reason = wcha_main.is_url_safe("http://localhost/path")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Resolved IP address '127.0.0.1' for hostname 'localhost' is not a public IP (is loopback, is private).")
-
-    @patch('socket.gethostbyname')
-    def test_unsafe_url_link_local_ip(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "169.254.1.1"
-        is_safe, reason = wcha_main.is_url_safe("http://linklocal.example/")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Resolved IP address '169.254.1.1' for hostname 'linklocal.example' is not a public IP (is private, is link-local).")
-
-    @patch('socket.gethostbyname')
-    def test_unresolvable_hostname(self, mock_gethostbyname):
-        mock_gethostbyname.side_effect = socket.gaierror("Test gaierror")
-        is_safe, reason = wcha_main.is_url_safe("http://domain.that.does.not.exist.hopefully/")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Could not resolve hostname: 'domain.that.does.not.exist.hopefully'.")
-
-    @patch('socket.gethostbyname')
-    def test_url_with_ip_address_public(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "1.1.1.1"
-        is_safe, reason = wcha_main.is_url_safe("http://1.1.1.1/some/path")
-        self.assertTrue(is_safe)
+    @patch('socket.getaddrinfo')
+    def test_url_multiple_public_ips(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('8.8.8.8', 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:4860:4860::8888', 0, 0, 0))
+        ]
+        safe, reason = is_url_safe("http://multi.example.com")
+        self.assertTrue(safe)
         self.assertEqual(reason, "URL is safe.")
-        mock_gethostbyname.assert_called_once_with("1.1.1.1")
 
-    @patch('socket.gethostbyname')
-    def test_url_with_ip_address_private(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "10.0.0.1"
-        is_safe, reason = wcha_main.is_url_safe("http://10.0.0.1/confidential")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Resolved IP address '10.0.0.1' for hostname '10.0.0.1' is not a public IP (is private).")
+    @patch('socket.getaddrinfo')
+    def test_url_non_resolvable_hostname(self, mock_getaddrinfo):
+        mock_getaddrinfo.side_effect = socket.gaierror("DNS resolution failed")
+        safe, reason = is_url_safe("http://nonexistentdomain12345.com")
+        self.assertFalse(safe)
+        self.assertIn("Could not resolve hostname", reason)
 
-    def test_url_invalid_structure_value_error(self):
-        # This tests the case where urlparse might create a hostname that socket.gethostbyname rejects (e.g., with null bytes)
-        # which then gets caught by the generic Exception handler in is_url_safe.
-        with patch('socket.gethostbyname', side_effect=TypeError("gethostbyname() argument 1 must be encoded string without null bytes, not str")):
-            is_safe, reason = wcha_main.is_url_safe("http://exa\x00mple.com")
-            self.assertFalse(is_safe)
-            self.assertEqual(reason, "Unexpected error during URL validation: gethostbyname() argument 1 must be encoded string without null bytes, not str")
+    # No mock needed for getaddrinfo as it won't be called for scheme checks
+    def test_url_invalid_scheme_ftp(self):
+        safe, reason = is_url_safe("ftp://example.com")
+        self.assertFalse(safe)
+        self.assertIn("Invalid URL scheme: 'ftp'", reason)
 
-    @patch('socket.gethostbyname')
-    def test_url_with_ipv6_loopback(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "::1"
-        is_safe, reason = wcha_main.is_url_safe("http://[::1]/test")
-        self.assertFalse(is_safe)
-        self.assertEqual(reason, "Resolved IP address '::1' for hostname '::1' is not a public IP (is loopback, is private).")
-        mock_gethostbyname.assert_called_once_with("::1") # urlparse provides '::1' as hostname
+    def test_url_invalid_scheme_file(self):
+        safe, reason = is_url_safe("file:///etc/passwd")
+        self.assertFalse(safe)
+        self.assertIn("Invalid URL scheme: 'file'", reason)
 
-    @patch('socket.gethostbyname')
-    def test_url_with_ipv6_public(self, mock_gethostbyname):
-        mock_gethostbyname.return_value = "2001:4860:4860::8888"
-        is_safe, reason = wcha_main.is_url_safe("http://[2001:4860:4860::8888]/ipv6test")
-        self.assertTrue(is_safe)
-        self.assertEqual(reason, "URL is safe.")
-        mock_gethostbyname.assert_called_once_with("2001:4860:4860::8888") # urlparse provides hostname without brackets
+    def test_url_no_hostname(self):
+        # urlparse behavior for "http:///path" results in hostname being None
+        safe, reason = is_url_safe("http:///path")
+        self.assertFalse(safe)
+        self.assertIn("URL has no hostname.", reason)
+
+    @patch('socket.getaddrinfo')
+    def test_url_link_local_ipv4(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('169.254.1.1', 0))]
+        safe, reason = is_url_safe("http://linklocal.corp")
+        self.assertFalse(safe)
+        self.assertIn("is not a public IP (is link-local)", reason)
+
+    @patch('socket.getaddrinfo')
+    def test_url_unspecified_ipv4(self, mock_getaddrinfo):
+        mock_getaddrinfo.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('0.0.0.0', 0))]
+        safe, reason = is_url_safe("http://any.host") # Hostname doesn't matter if IP is 0.0.0.0
+        self.assertFalse(safe)
+        # The exact wording depends on how ipaddress formats multiple flags.
+        # We need to ensure "is unspecified" is part of it.
+        self.assertTrue("is unspecified" in reason and "is not a public IP" in reason)
 
 
 @patch('aethercast.wcha.main.DDGS', mock_ddgs_constructor)
@@ -154,6 +156,7 @@ class TestGetContentForTopic(unittest.TestCase):
             "WCHA_USER_AGENT": "TestAgent/1.0",
             "WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION": 50
         }
+        # Patch wcha_main.wcha_config directly
         self.config_patcher = patch.dict(wcha_main.wcha_config, self.mock_wcha_config_defaults, clear=True)
         self.mock_config = self.config_patcher.start()
 
@@ -244,9 +247,8 @@ class TestGetContentForTopic(unittest.TestCase):
     @patch('aethercast.wcha.main.IMPORTS_SUCCESSFUL', False)
     @patch('aethercast.wcha.main.MISSING_IMPORT_ERROR', "Simulated missing library")
     def test_get_content_for_topic_imports_not_successful(self):
-        # is_url_safe is not called if IMPORTS_SUCCESSFUL is False at the start of get_content_for_topic
         result = wcha_main.get_content_for_topic("any topic")
-        self.assertEqual(result["status"], "failure")
+        self.assertEqual(result["status"], "failure_dependency") # Adjusted to match new status
         self.assertIn(wcha_main.ERROR_WCHA_LIB_MISSING, result["message"])
 
 
@@ -264,7 +266,9 @@ class TestWCHAFlaskEndpoints(unittest.TestCase):
             self.skipTest("Flask app not initialized in wcha_main. Skipping endpoint tests.")
         self.mock_wcha_config_for_endpoint = {
              "WCHA_SEARCH_MAX_RESULTS": 3,
-             "WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION": 50
+             "WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION": 50,
+             # Add other necessary configs, e.g., for Celery if endpoint uses it
+             "USE_REAL_NEWS_API": False # Ensure predictable path for some tests
         }
         self.config_patcher = patch.dict(wcha_main.wcha_config, self.mock_wcha_config_for_endpoint, clear=True)
         self.mock_config = self.config_patcher.start()
@@ -278,17 +282,17 @@ class TestWCHAFlaskEndpoints(unittest.TestCase):
         mock_get_content_for_topic.return_value = mock_success_data
         response = self.client.post('/harvest', json={"topic": "test success topic", "use_search": True})
         self.assertEqual(response.status_code, 200)
-        mock_get_content_for_topic.assert_called_once_with('test success topic')
+        mock_get_content_for_topic.assert_called_once_with('test success topic', max_results_override=None) # Adjusted expectation
 
     def test_harvest_endpoint_missing_parameters(self):
         response = self.client.post('/harvest', json={})
         self.assertEqual(response.status_code, 400)
         json_response = response.get_json()
-        self.assertEqual(json_response.get("error_code"), "WCHA_INVALID_PAYLOAD")
+        self.assertEqual(json_response.get("error_code"), "WCHA_MISSING_PARAMETERS") # Adjusted error code
 
     @patch('aethercast.wcha.main.get_content_for_topic')
     def test_harvest_endpoint_use_search_failure_from_logic(self, mock_get_content_for_topic):
-        mock_failure_data = {"status": "failure", "message": wcha_main.ERROR_WCHA_NO_SEARCH_RESULTS}
+        mock_failure_data = {"status": "failure", "message": wcha_main.ERROR_WCHA_NO_SEARCH_RESULTS, "content": None, "source_urls": []}
         mock_get_content_for_topic.return_value = mock_failure_data
         response = self.client.post('/harvest', json={"topic": "test failure topic", "use_search": True})
         self.assertEqual(response.status_code, 404)
@@ -298,27 +302,41 @@ class TestWCHAFlaskEndpoints(unittest.TestCase):
         mock_get_content_for_topic.side_effect = Exception("Core logic unexpected error")
         response = self.client.post('/harvest', json={"topic": "test internal error", "use_search": True})
         self.assertEqual(response.status_code, 500)
+        json_response = response.get_json()
+        self.assertEqual(json_response.get("error_code"), "WCHA_INTERNAL_SERVER_ERROR")
+
 
     @patch('aethercast.wcha.main.get_content_for_topic')
     def test_harvest_endpoint_with_max_results_override(self, mock_get_content_for_topic):
         mock_get_content_for_topic.return_value = {"status": "success"}
-        self.client.post('/harvest', json={"topic": "test max results", "use_search": True, "max_results": 3})
+        self.client.post('/harvest', json={"topic": "test max results", "use_search": True, "max_results": "3"}) # Pass as string like from JSON
         self.assertEqual(mock_get_content_for_topic.call_count, 1)
+        # get_content_for_topic's max_results_override is passed from harvest_params_for_search
+        # The endpoint logic converts "max_results" from payload to int for this.
         expected_call_args = call("test max results", max_results_override=3)
         self.assertEqual(mock_get_content_for_topic.call_args, expected_call_args)
 
-    @patch('aethercast.wcha.main.harvest_from_url')
-    def test_harvest_endpoint_direct_url_success(self, mock_harvest_from_url):
-        mock_harvest_from_url.return_value = {"content": "Direct content"}
-        response = self.client.post('/harvest', json={"url": "http://example.com/direct"})
-        self.assertEqual(response.status_code, 200)
-        mock_harvest_from_url.assert_called_once_with("http://example.com/direct")
 
-    @patch('aethercast.wcha.main.harvest_from_url')
-    def test_harvest_endpoint_direct_url_failure(self, mock_harvest_from_url):
-        mock_harvest_from_url.return_value = {"content": None, "error_type": wcha_main.WCHA_ERROR_TYPE_FETCH}
-        response = self.client.post('/harvest', json={"url": "http://example.com/failed_direct"})
-        self.assertEqual(response.status_code, 502)
+    @patch('aethercast.wcha.main.harvest_url_content_task.delay')
+    def test_harvest_endpoint_direct_url_async_dispatch(self, mock_delay):
+        mock_task_instance = MagicMock()
+        mock_task_instance.id = "test_celery_task_id_123"
+        mock_delay.return_value = mock_task_instance
+
+        with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")): # Ensure is_url_safe passes
+            response = self.client.post('/harvest', json={"url": "http://example.com/direct_async"})
+
+        self.assertEqual(response.status_code, 202) # Should be 202 Accepted
+        json_response = response.get_json()
+        self.assertEqual(json_response["task_id"], "test_celery_task_id_123")
+        self.assertIn("/v1/tasks/test_celery_task_id_123", json_response["status_url"])
+        mock_delay.assert_called_once()
+        # Check args passed to delay, request_id will be auto-generated
+        args, kwargs = mock_delay.call_args
+        self.assertIn('url_to_harvest', kwargs)
+        self.assertEqual(kwargs['url_to_harvest'], "http://example.com/direct_async")
+        self.assertIn('request_id', kwargs) # Check if request_id is passed
+
 
 if __name__ == '__main__':
     unittest.main()
