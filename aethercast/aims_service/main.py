@@ -223,6 +223,21 @@ except Exception as e:
     logger.error(f"Failed to initialize Vertex AI: {e}", exc_info=True)
     raise ValueError(f"AIMS Critical Error: Failed to initialize Vertex AI: {e}")
 
+# --- Global Generative Model Cache ---
+GLOBAL_GENERATIVE_MODELS: Dict[str, GenerativeModel] = {}
+
+if AIMS_GOOGLE_LLM_MODEL_ID: # Ensure it's configured before trying to load
+    try:
+        logger.info(f"AIMS: Pre-initializing default Vertex AI Generative Model: {AIMS_GOOGLE_LLM_MODEL_ID}")
+        GLOBAL_GENERATIVE_MODELS[AIMS_GOOGLE_LLM_MODEL_ID] = GenerativeModel(AIMS_GOOGLE_LLM_MODEL_ID)
+        logger.info(f"AIMS: Successfully pre-initialized and cached default model: {AIMS_GOOGLE_LLM_MODEL_ID}")
+    except Exception as e_model_load:
+        logger.error(f"AIMS: Failed to pre-initialize default model '{AIMS_GOOGLE_LLM_MODEL_ID}': {e_model_load}", exc_info=True)
+        # App will continue, but tasks using this default model might fail if not re-attempted successfully later.
+else:
+    logger.warning("AIMS: AIMS_GOOGLE_LLM_MODEL_ID not configured. Default model will not be pre-loaded.")
+
+
 # --- Database Initialization ---
 try:
     conn_init = get_db_connection() # Prime the pool
@@ -284,7 +299,23 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
             return {"error": {"type": "lock_acquisition_failed", "message": "Failed to acquire idempotency lock."}, "request_id": request_id}
 
         # Core LLM Invocation Logic
-        model = GenerativeModel(model_name_to_use)
+        model = None
+        if model_name_to_use in GLOBAL_GENERATIVE_MODELS:
+            model = GLOBAL_GENERATIVE_MODELS[model_name_to_use]
+            logger.info(f"AIMS Task {celery_task_internal_id}: Using pre-loaded/cached model: {model_name_to_use}", extra=log_extra)
+        else:
+            logger.info(f"AIMS Task {celery_task_internal_id}: Model {model_name_to_use} not in cache. Initializing on demand.", extra=log_extra)
+            try:
+                model = GenerativeModel(model_name_to_use)
+                GLOBAL_GENERATIVE_MODELS[model_name_to_use] = model # Cache it
+                logger.info(f"AIMS Task {celery_task_internal_id}: Initialized and cached AIMS model: {model_name_to_use}", extra=log_extra)
+            except Exception as e_model_demand:
+                logger.error(f"AIMS Task {celery_task_internal_id}: Failed to initialize AIMS model '{model_name_to_use}' on demand: {e_model_demand}", exc_info=True, extra=log_extra)
+                # Update idempotency record to failed before re-raising
+                error_payload_db = {"error_type": "ModelInitializationError", "message": str(e_model_demand), "details": f"Failed to initialize model {model_name_to_use}."}
+                update_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
+                raise # Propagate error to Celery task handler, which will call on_failure
+
         gemini_contents = [Part.from_text(prompt_text)]
         generation_config_params = {"temperature": temperature, "max_output_tokens": max_output_tokens}
         if response_mime_type_req == "json_object":

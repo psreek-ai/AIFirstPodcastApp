@@ -2010,29 +2010,83 @@ def orchestrate_snippet_generation(
 
             # Determine how to get db_conn for saving snippet
             # If db_conn_param is provided, use it. Otherwise, get a new one.
-            if db_conn_param:
-                _save_snippet_to_db(db_conn_param, snippet_data, workflow_id_for_log=workflow_id_for_log)
-                # Assuming commit/rollback is handled by the caller of orchestrate_snippet_generation
-                # if db_conn_param is passed.
-            else: # Manage connection internally for this save operation
-                db_conn_internal = _get_cpoa_db_connection()
-                if not db_conn_internal:
-                     current_logger.error(f"Failed to get DB connection to save snippet {snippet_data.get('snippet_id')}. Snippet not saved to DB.")
-                     # Depending on requirements, this could be a hard error or just a warning.
-                     # For now, the snippet_data is returned but not persisted.
-                     return {"error": "DB_CONNECTION_FAILED_FOR_SAVE", "details": "Could not connect to DB to save snippet.", "snippet_data_unsaved": snippet_data}
+
+            save_successful = False
+            max_save_retries = 3
+            retry_delay_base = 1.0  # seconds
+
+            for attempt in range(max_save_retries):
+                conn_for_save = None
+                is_externally_managed_conn = bool(db_conn_param)
 
                 try:
-                    _save_snippet_to_db(db_conn_internal, snippet_data, workflow_id_for_log=workflow_id_for_log)
-                    db_conn_internal.commit()
-                    current_logger.info(f"Snippet {snippet_data.get('snippet_id')} saved to DB successfully.")
-                except Exception as e_save:
-                    current_logger.error(f"Error saving snippet {snippet_data.get('snippet_id')} to DB: {e_save}", exc_info=True)
-                    if db_conn_internal: db_conn_internal.rollback()
-                    # Return error but also the snippet data that failed to save
-                    return {"error": "DB_SAVE_FAILED", "details": str(e_save), "snippet_data_unsaved": snippet_data}
-                finally:
-                    if db_conn_internal: _put_cpoa_db_connection(db_conn_internal)
+                    if is_externally_managed_conn:
+                        conn_for_save = db_conn_param
+                    else: # Manage connection internally for this save operation
+                        if db_conn_internal and not db_conn_internal.closed: # Reuse if already open and not closed
+                            conn_for_save = db_conn_internal
+                        else: # Get a new one
+                            db_conn_internal = _get_cpoa_db_connection()
+                            conn_for_save = db_conn_internal
+
+                    if not conn_for_save:
+                         current_logger.error(f"Failed to get DB connection to save snippet {snippet_data.get('snippet_id')} (attempt {attempt + 1}). Snippet not saved to DB.")
+                         # This is a connection acquisition error, might be retryable depending on broader strategy
+                         # For now, if internal connection fails to acquire, this attempt fails.
+                         if attempt + 1 < max_save_retries:
+                             time.sleep(retry_delay_base * (2 ** attempt))
+                             continue # Retry getting connection
+                         else: # Max retries for connection acquisition reached
+                             return {"error": "DB_CONNECTION_FAILED_FOR_SAVE", "details": "Could not connect to DB to save snippet after retries.", "snippet_data_unsaved": snippet_data}
+
+                    _save_snippet_to_db(conn_for_save, snippet_data, workflow_id_for_log=workflow_id_for_log)
+
+                    if not is_externally_managed_conn:
+                        conn_for_save.commit() # Commit if internally managed
+
+                    save_successful = True
+                    current_logger.info(f"Snippet {snippet_data.get('snippet_id')} saved to DB successfully (attempt {attempt + 1}).")
+                    break # Exit retry loop on success
+
+                except psycopg2.OperationalError as e_op:
+                    current_logger.warning(f"Operational DB error saving snippet {snippet_data.get('snippet_id')} (attempt {attempt + 1}/{max_save_retries}): {e_op}", exc_info=True)
+                    if not is_externally_managed_conn and conn_for_save and not conn_for_save.closed:
+                        try: conn_for_save.rollback()
+                        except Exception as e_rb: current_logger.error(f"Rollback failed after OperationalError: {e_rb}", exc_info=True)
+
+                    if attempt + 1 >= max_save_retries:
+                        current_logger.error(f"Max retries reached for operational DB error saving snippet {snippet_data.get('snippet_id')}.")
+                        return {"error": "DB_SAVE_OPERATIONAL_ERROR_MAX_RETRIES", "details": str(e_op), "snippet_data_unsaved": snippet_data}
+                    time.sleep(retry_delay_base * (2 ** attempt)) # Exponential backoff
+
+                except psycopg2.Error as e_db: # Other non-retryable psycopg2 errors
+                    current_logger.error(f"Non-retryable DB error saving snippet {snippet_data.get('snippet_id')}: {e_db}", exc_info=True)
+                    if not is_externally_managed_conn and conn_for_save and not conn_for_save.closed:
+                        try: conn_for_save.rollback()
+                        except Exception as e_rb: current_logger.error(f"Rollback failed after non-retryable DB error: {e_rb}", exc_info=True)
+                    return {"error": "DB_SAVE_NON_RETRYABLE_ERROR", "details": str(e_db), "snippet_data_unsaved": snippet_data}
+
+                except Exception as e_save_unexp: # Other unexpected errors during save attempt
+                    current_logger.error(f"Unexpected error saving snippet {snippet_data.get('snippet_id')} (attempt {attempt + 1}): {e_save_unexp}", exc_info=True)
+                    if not is_externally_managed_conn and conn_for_save and not conn_for_save.closed:
+                        try: conn_for_save.rollback()
+                        except Exception as e_rb: current_logger.error(f"Rollback failed after unexpected error: {e_rb}", exc_info=True)
+                    # Decide if this should be retryable or not. For now, treat as non-retryable.
+                    return {"error": "DB_SAVE_UNEXPECTED_ERROR", "details": str(e_save_unexp), "snippet_data_unsaved": snippet_data}
+
+                finally: # Ensure internally managed connection for THIS ATTEMPT is closed if it's not the main internal one to be reused
+                    if not is_externally_managed_conn and conn_for_save and conn_for_save != db_conn_internal:
+                        # This case would be if conn_for_save was a *new* connection for this attempt only
+                        # Not strictly the pattern here, as db_conn_internal is reused or re-obtained.
+                        # If db_conn_internal was re-obtained in the loop, it's handled by the main finally block.
+                        pass
+
+
+            if not save_successful:
+                # This point should ideally not be reached if errors are returned directly,
+                # but as a fallback if loop finishes without success and no error was returned.
+                current_logger.error(f"Snippet {snippet_data.get('snippet_id')} could not be saved after all retries, but no specific error was returned from loop.")
+                return {"error": "DB_SAVE_FAILED_UNKNOWN_REASON", "details": "Failed to save snippet after max retries without specific error.", "snippet_data_unsaved": snippet_data}
 
             return snippet_data
         else: # snippet_data is None after SCA success

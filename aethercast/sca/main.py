@@ -697,6 +697,28 @@ def craft_snippet_async_endpoint():
     if topic_info is None or not isinstance(topic_info, dict):
         return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_INFO", "message": "Validation failed: 'topic_info' must be a valid JSON object (dictionary)."}), 400
 
+    # Additional validation for topic_info fields
+    MAX_TOPIC_SUMMARY_LENGTH = 5000
+    MAX_KEYWORDS_COUNT = 10
+    MAX_KEYWORD_LENGTH = 100
+
+    if "summary" in topic_info and topic_info["summary"] is not None: # Check if summary exists and is not None
+        if not isinstance(topic_info["summary"], str):
+            return flask.jsonify({"error_code": "SCA_INVALID_TOPIC_SUMMARY_TYPE", "message": "Validation failed: 'topic_info.summary' must be a string."}), 400
+        if len(topic_info["summary"]) > MAX_TOPIC_SUMMARY_LENGTH:
+            return flask.jsonify({"error_code": "SCA_TOPIC_SUMMARY_TOO_LONG", "message": f"Validation failed: 'topic_info.summary' exceeds maximum length of {MAX_TOPIC_SUMMARY_LENGTH} characters."}), 400
+
+    if "keywords" in topic_info and topic_info["keywords"] is not None: # Check if keywords exist and is not None
+        if not isinstance(topic_info["keywords"], list):
+            return flask.jsonify({"error_code": "SCA_INVALID_KEYWORDS_TYPE", "message": "Validation failed: 'topic_info.keywords' must be a list."}), 400
+        if len(topic_info["keywords"]) > MAX_KEYWORDS_COUNT:
+            return flask.jsonify({"error_code": "SCA_TOO_MANY_KEYWORDS", "message": f"Validation failed: Number of 'topic_info.keywords' exceeds maximum of {MAX_KEYWORDS_COUNT}."}), 400
+        for keyword in topic_info["keywords"]:
+            if not isinstance(keyword, str):
+                return flask.jsonify({"error_code": "SCA_INVALID_KEYWORD_ITEM_TYPE", "message": "Validation failed: Each keyword in 'topic_info.keywords' must be a string."}), 400
+            if len(keyword) > MAX_KEYWORD_LENGTH:
+                return flask.jsonify({"error_code": "SCA_KEYWORD_TOO_LONG", "message": f"Validation failed: A keyword in 'topic_info.keywords' exceeds maximum length of {MAX_KEYWORD_LENGTH} characters."}), 400
+
     app.logger.info(f"Request {request_id}: Dispatching snippet crafting to Celery task. TopicID: '{topic_id}', Idempotency-Key: {idempotency_key}")
 
     task = craft_snippet_task.delay(

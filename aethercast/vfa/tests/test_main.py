@@ -83,25 +83,34 @@ class BaseVfaIdempotencyTest(unittest.TestCase):
         self.config_patcher = patch.dict(vfa_config, self.test_config_overrides, clear=False)
         self.mocked_vfa_config = self.config_patcher.start()
 
-        # Mock for AIMS_TTS calls made by the Celery task
+        # Mock for AIMS_TTS calls made by the Celery task, now using GLOBAL_REQUESTS_SESSION
         self.mock_aims_tts_success_payload = {
             "request_id": "mock_aims_tts_req_success",
             "voice_id": "mock-voice", "audio_url": "gs://mock-bucket/audio.mp3",
             "audio_duration_seconds": 5.0, "audio_format": "mp3"
         }
-        self.patch_requests_post = patch('requests.post')
-        self.mock_requests_post = self.patch_requests_post.start()
-        # Default successful AIMS_TTS task submission and polling result
+
+        self.patch_session_post = patch('aethercast.vfa.main.GLOBAL_REQUESTS_SESSION.post')
+        self.mock_session_post = self.patch_session_post.start()
+
+        self.patch_session_get = patch('aethercast.vfa.main.GLOBAL_REQUESTS_SESSION.get')
+        self.mock_session_get = self.patch_session_get.start()
+
+        # Default successful AIMS_TTS task submission (POST)
         mock_aims_initial_response = MagicMock(status_code=202)
         mock_aims_initial_response.json.return_value = {"task_id": "aims-tts-task-123", "status_url": "/aims_tts_tasks/aims-tts-task-123"}
+        self.mock_session_post.return_value = mock_aims_initial_response
+
+        # Default successful AIMS_TTS polling result (GET)
         mock_aims_poll_response = MagicMock(status_code=200)
         mock_aims_poll_response.json.return_value = {"status": "SUCCESS", "result": self.mock_aims_tts_success_payload}
-        self.mock_requests_post.side_effect = [mock_aims_initial_response, mock_aims_poll_response]
+        self.mock_session_get.return_value = mock_aims_poll_response
 
 
     def tearDown(self):
         self.config_patcher.stop()
-        self.patch_requests_post.stop()
+        self.patch_session_post.stop()
+        self.patch_session_get.stop()
         reset_mock_vfa_db_connections()
 
 @unittest.skip("Skipping tests for deprecated forge_voice logic")

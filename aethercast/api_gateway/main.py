@@ -17,6 +17,8 @@ from google.cloud import storage # Added for GCS
 from google.api_core import exceptions as google_api_exceptions # For GCS error handling
 # from google.oauth2 import service_account # Not strictly needed if using ADC
 import logging # Added for JSON logging
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 # --- Path Setup for CPOA Import ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -132,6 +134,17 @@ class SubscribePayload(BaseModel):
 # --- Service URLs ---
 TDA_SERVICE_URL = os.getenv("TDA_SERVICE_URL", "http://localhost:5000/discover_topics")
 GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME") # Added for signed URLs
+
+# --- Startup Logging for GCS_BUCKET_NAME ---
+# Ensure app.logger is available or use a temp logger if this is too early
+# setup_json_logging() should have run, making app.logger ready.
+if hasattr(app, 'logger') and app.logger:
+    if GCS_BUCKET_NAME:
+        app.logger.info(f"API Gateway configured to generate signed URLs for GCS Bucket: {GCS_BUCKET_NAME}")
+    else:
+        app.logger.critical("CRITICAL: GCS_BUCKET_NAME is not set in environment. Signed URL generation will be disabled/fail.")
+else: # Fallback if app.logger somehow not ready (should not happen)
+    print(f"INFO: API Gateway configured for GCS Bucket: {GCS_BUCKET_NAME}" if GCS_BUCKET_NAME else "CRITICAL: GCS_BUCKET_NAME not set for API Gateway.")
 
 # --- Database Configuration ---
 DATABASE_TYPE = os.getenv("DATABASE_TYPE", "sqlite") # Default to sqlite
@@ -409,21 +422,31 @@ def init_db():
 
 # --- GCS Signed URL Helper ---
 def generate_gcs_signed_url(gcs_uri: str, expiration_minutes: int = 15) -> Optional[str]:
+    # GCS_BUCKET_NAME is already loaded at module level
+    if not GCS_BUCKET_NAME:
+        app.logger.critical("CRITICAL: GCS_BUCKET_NAME is not configured. Signed URL generation is disabled.")
+        return None
+
     try:
         if not gcs_uri or not gcs_uri.startswith("gs://"):
             app.logger.error(f"Invalid GCS URI provided for signed URL: {gcs_uri}")
             return None
+
         parts = gcs_uri.replace("gs://", "").split("/", 1)
-        bucket_name = parts[0]
+        uri_bucket_name = parts[0]
         object_name = parts[1] if len(parts) > 1 else None
+
         if not object_name:
             app.logger.error(f"Could not parse object name from GCS URI: {gcs_uri}")
             return None
-        configured_bucket = os.getenv("GCS_BUCKET_NAME")
-        if configured_bucket and bucket_name != configured_bucket:
-            app.logger.warning(f"GCS URI bucket '{bucket_name}' does not match configured bucket '{configured_bucket}'. Proceeding with URI's bucket.")
+
+        if uri_bucket_name != GCS_BUCKET_NAME:
+            app.logger.error(f"Disallowed bucket access attempt for signed URL. Requested: '{uri_bucket_name}', Configured: '{GCS_BUCKET_NAME}'. URI: '{gcs_uri}'")
+            return None
+
+        # If we reach here, uri_bucket_name matches GCS_BUCKET_NAME
         storage_client = storage.Client()
-        bucket = storage_client.bucket(bucket_name)
+        bucket = storage_client.bucket(GCS_BUCKET_NAME) # Use the configured bucket name
         blob = bucket.blob(object_name)
         signed_url = blob.generate_signed_url(
             version="v4",
@@ -556,6 +579,19 @@ app.config['JWT_EXPIRATION_DAYS'] = int(os.getenv('API_GATEWAY_JWT_EXPIRATION_DA
 if app.config['SECRET_KEY'] == 'a_default_fallback_secret_key_for_dev':
     app.logger.warning("Using default Flask SECRET_KEY. Please set API_GATEWAY_FLASK_SECRET_KEY for production.")
 
+# --- Rate Limiting Configuration ---
+app.config['API_RATE_LIMIT_ENABLED'] = os.getenv('API_RATE_LIMIT_ENABLED', 'true').lower() == 'true'
+app.config['API_DEFAULT_RATE_LIMIT'] = os.getenv('API_DEFAULT_RATE_LIMIT', '100 per minute, 2000 per hour')
+app.config['API_DEFAULT_STRATEGY'] = os.getenv('API_DEFAULT_STRATEGY', 'fixed-window') # or "moving-window", "fixed-window-elastic-expiry"
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[app.config['API_DEFAULT_RATE_LIMIT']] if app.config['API_RATE_LIMIT_ENABLED'] else [],
+    storage_uri=os.getenv("RATELIMIT_STORAGE_URL", "memory://"), # Example: use memory for simplicity, consider Redis for production
+    strategy=app.config['API_DEFAULT_STRATEGY'],
+    default_limits_exempt_when=lambda: not app.config['API_RATE_LIMIT_ENABLED'] # Exempt all if disabled
+)
 
 # --- Auth Helper Functions & Decorator ---
 def hash_password(password: str) -> str:
@@ -660,6 +696,9 @@ else:
 
 
 @app.route('/health', methods=['GET'])
+@limiter.exempt # Exempt this specific route from global limits
+# Or, apply a very high limit specific to this route if desired:
+# @limiter.limit("1000 per minute")
 def health_check_endpoint():
     """Provides a simple health check endpoint."""
     # Additional checks could be added here (e.g., DB connectivity)

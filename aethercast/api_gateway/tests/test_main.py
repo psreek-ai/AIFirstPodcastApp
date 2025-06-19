@@ -11,6 +11,7 @@ import sys
 import json
 import sqlite3 # For direct DB assertions
 from datetime import datetime, timedelta # Added timedelta for session tests
+import time # Added for rate limit tests
 
 # Adjust path to import API Gateway main module and CPOA (for mocking)
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -288,6 +289,211 @@ class TestAPIGateway(unittest.TestCase):
         
         self.assertEqual(response.status_code, 201) # Or 200 depending on actual endpoint logic for success
         # ... rest of assertions for this test
+
+
+# --- Rate Limiting Tests ---
+class TestAPIGatewayRateLimiting(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        api_gw_main.app.config['TESTING'] = True
+        # Set rate limit specific configs BEFORE creating the test client or initializing Limiter for the app
+        api_gw_main.app.config['API_RATE_LIMIT_ENABLED'] = True
+        api_gw_main.app.config['API_DEFAULT_RATE_LIMIT'] = "2 per second" # Test-friendly limit
+        api_gw_main.app.config['API_DEFAULT_STRATEGY'] = "fixed-window"
+        api_gw_main.app.config['RATELIMIT_STORAGE_URL'] = "memory://" # Ensure in-memory storage for tests
+
+        # Re-initialize or reconfigure the limiter on the main app instance
+        # This is crucial because the limiter is initialized when main.py is imported.
+        # We need to ensure the test client uses an app with test-specific rate limits.
+        if hasattr(api_gw_main, 'limiter'):
+            # If limiter is already initialized, try to reconfigure its default limits
+            # This might not be the cleanest way, depends on Flask-Limiter's API
+            # A better way might be to ensure limiter is initialized *after* config is set in tests,
+            # or use an app factory pattern.
+            # For now, let's assume we can reset/reconfigure.
+            # This is a bit of a hack; ideally, the app and its extensions are configured once.
+            # We might need to re-create the limiter instance for the app.
+            from flask_limiter import Limiter
+            from flask_limiter.util import get_remote_address
+
+            # Detach old limiter if present from app.extensions (Flask-Limiter might do this internally)
+            if 'limiter' in api_gw_main.app.extensions:
+                del api_gw_main.app.extensions['limiter']
+
+            api_gw_main.limiter = Limiter(
+                get_remote_address,
+                app=api_gw_main.app, # Pass the app instance
+                default_limits=[api_gw_main.app.config['API_DEFAULT_RATE_LIMIT']],
+                storage_uri=api_gw_main.app.config['RATELIMIT_STORAGE_URL'],
+                strategy=api_gw_main.app.config['API_DEFAULT_STRATEGY'],
+                default_limits_exempt_when=lambda: not api_gw_main.app.config['API_RATE_LIMIT_ENABLED']
+            )
+        else:
+            # This path would be taken if limiter wasn't defined in main.py yet,
+            # which is not the case here.
+            pass
+
+        cls.client = api_gw_main.app.test_client()
+
+        # Patch the database for other tests if they run in parallel or affect global state
+        # For rate limiting tests specifically, DB interaction is usually not the focus unless
+        # limits are stored in DB. Here, it's memory.
+        cls.db_file_patcher = patch.object(api_gw_main, 'DATABASE_FILE', "file::memory:?cache=shared")
+        cls.mock_db_file_uri = cls.db_file_patcher.start()
+        cls.db_type_patcher = patch.object(api_gw_main, 'DATABASE_TYPE', "sqlite")
+        cls.mock_db_type = cls.db_type_patcher.start()
+
+
+    @classmethod
+    def tearDownClass(cls):
+        # Reset limiter or app config if necessary
+        # Stop patchers if they were started in setUpClass
+        cls.db_file_patcher.stop()
+        cls.db_type_patcher.stop()
+        # Restore original limiter settings if possible, or ensure app is clean for other test classes
+        # This is tricky with module-level app. For true isolation, app factory is better.
+        # For now, we assume subsequent test classes will re-initialize app/limiter as needed.
+
+
+    def setUp(self):
+        # Reset limiter state before each test
+        if hasattr(api_gw_main, 'limiter') and api_gw_main.limiter.storage:
+            api_gw_main.limiter.storage.clear() # Clear in-memory storage
+
+        # Ensure a valid token for @token_required endpoints if we test them
+        api_gw_main.app.config['SECRET_KEY'] = 'test_secret_key_for_rate_limit_tests'
+        self.test_token = self._generate_test_token(session_id="test_session_rate_limit", user_id="test_user_rate_limit")
+
+
+    def _generate_test_token(self, session_id, user_id=None, secret_key=None, expires_delta_days=1):
+        # Copied from TestAPIGateway class, consider moving to a shared utility if many classes need it
+        key_to_use = secret_key or api_gw_main.app.config['SECRET_KEY']
+        payload = {
+            'session_id': session_id,
+            'user_id': user_id,
+            'exp': datetime.utcnow() + timedelta(days=expires_delta_days)
+        }
+        return generate_jwt(payload, key_to_use)
+
+    def test_health_endpoint_not_limited(self):
+        """Test that the /health endpoint is not rate-limited by default exemption."""
+        for _ in range(5): # Hit it more times than the default limit (2 per second)
+            response = self.client.get('/health')
+            self.assertEqual(response.status_code, 200)
+
+    def test_rate_limiting_on_general_endpoint(self):
+        """Test rate limiting on a general endpoint (e.g., /api/v1/podcasts)."""
+        # This endpoint requires auth, so use the token
+        headers = {'Authorization': f'Bearer {self.test_token}'}
+
+        # First two requests should succeed (limit is "2 per second")
+        response1 = self.client.get('/api/v1/podcasts', headers=headers)
+        self.assertEqual(response1.status_code, 200)
+        response2 = self.client.get('/api/v1/podcasts', headers=headers)
+        self.assertEqual(response2.status_code, 200)
+
+        # Third request within the same second should be rate-limited
+        response3 = self.client.get('/api/v1/podcasts', headers=headers)
+        self.assertEqual(response3.status_code, 429) # Too Many Requests
+
+        # Wait for the window to reset (1 second for "2 per second")
+        time.sleep(1.1) # Sleep a bit more than 1 second
+
+        # Request after window reset should succeed
+        response4 = self.client.get('/api/v1/podcasts', headers=headers)
+        self.assertEqual(response4.status_code, 200)
+
+    def test_rate_limit_disabled_allows_requests(self):
+        """Test that if rate limiting is disabled, requests are not limited."""
+        original_enabled_state = api_gw_main.app.config.get('API_RATE_LIMIT_ENABLED', True)
+        api_gw_main.app.config['API_RATE_LIMIT_ENABLED'] = False
+        # The limiter's default_limits_exempt_when should now make it exempt all
+
+        headers = {'Authorization': f'Bearer {self.test_token}'}
+        try:
+            for i in range(5): # More than the "2 per second" limit
+                response = self.client.get('/api/v1/podcasts', headers=headers)
+                self.assertEqual(response.status_code, 200, f"Request {i+1} failed when rate limiting was disabled.")
+        finally:
+            # Restore original state
+            api_gw_main.app.config['API_RATE_LIMIT_ENABLED'] = original_enabled_state
+
+
+# --- GCS Signed URL Security Tests ---
+class TestGcsSignedUrlSecurity(unittest.TestCase):
+    def setUp(self):
+        # Ensure a consistent testing state for GCS_BUCKET_NAME
+        self.original_gcs_bucket_name = os.environ.get("GCS_BUCKET_NAME")
+        os.environ["GCS_BUCKET_NAME"] = "test-configured-bucket"
+        # Update the module-level variable in api_gw_main if it was set at import time
+        api_gw_main.GCS_BUCKET_NAME = "test-configured-bucket"
+
+
+    def tearDown(self):
+        # Restore original GCS_BUCKET_NAME environment variable
+        if self.original_gcs_bucket_name is None:
+            if "GCS_BUCKET_NAME" in os.environ:
+                del os.environ["GCS_BUCKET_NAME"]
+        else:
+            os.environ["GCS_BUCKET_NAME"] = self.original_gcs_bucket_name
+        # Restore module-level variable in api_gw_main
+        api_gw_main.GCS_BUCKET_NAME = self.original_gcs_bucket_name
+
+
+    @patch('aethercast.api_gateway.main.storage.Client')
+    def test_generate_url_allowed_bucket(self, mock_storage_client_cls):
+        """Test generating a signed URL for the configured GCS_BUCKET_NAME."""
+        mock_blob = MagicMock()
+        mock_blob.generate_signed_url.return_value = "https://example.com/signed-url-dummy"
+        mock_bucket_instance = MagicMock()
+        mock_bucket_instance.blob.return_value = mock_blob
+        mock_storage_client_instance = MagicMock()
+        mock_storage_client_instance.bucket.return_value = mock_bucket_instance
+        mock_storage_client_cls.return_value = mock_storage_client_instance
+
+        gcs_uri = "gs://test-configured-bucket/path/to/object.mp3"
+        signed_url = api_gw_main.generate_gcs_signed_url(gcs_uri)
+
+        self.assertEqual(signed_url, "https://example.com/signed-url-dummy")
+        mock_storage_client_cls.assert_called_once()
+        mock_storage_client_instance.bucket.assert_called_once_with("test-configured-bucket")
+        mock_bucket_instance.blob.assert_called_once_with("path/to/object.mp3")
+        mock_blob.generate_signed_url.assert_called_once()
+
+    @patch('aethercast.api_gateway.main.storage.Client')
+    def test_generate_url_disallowed_bucket(self, mock_storage_client_cls):
+        """Test that a URL is not generated if the bucket name does not match GCS_BUCKET_NAME."""
+        gcs_uri = "gs://other-bucket/path/to/object.mp3"
+        signed_url = api_gw_main.generate_gcs_signed_url(gcs_uri)
+        self.assertIsNone(signed_url)
+        mock_storage_client_cls.assert_not_called() # Should fail before client instantiation for this specific check
+
+    @patch.dict(os.environ, {"GCS_BUCKET_NAME": ""}) # Simulate GCS_BUCKET_NAME not set or empty
+    @patch('aethercast.api_gateway.main.storage.Client')
+    def test_generate_url_gcs_bucket_name_not_set(self, mock_storage_client_cls):
+        """Test that no URL is generated if GCS_BUCKET_NAME is not configured."""
+        # Temporarily modify the module-level GCS_BUCKET_NAME as it's loaded at import time
+        with patch.object(api_gw_main, 'GCS_BUCKET_NAME', None):
+            gcs_uri = "gs://any-bucket/path/to/object.mp3"
+            signed_url = api_gw_main.generate_gcs_signed_url(gcs_uri)
+            self.assertIsNone(signed_url)
+            mock_storage_client_cls.assert_not_called()
+
+    def test_generate_url_malformed_uri_no_gs_prefix(self):
+        """Test with a URI not starting with 'gs://'."""
+        signed_url = api_gw_main.generate_gcs_signed_url("http://test-configured-bucket/object.mp3")
+        self.assertIsNone(signed_url)
+
+    def test_generate_url_malformed_uri_no_object_name(self):
+        """Test with a URI that doesn't have an object name part."""
+        signed_url = api_gw_main.generate_gcs_signed_url("gs://test-configured-bucket/")
+        self.assertIsNone(signed_url)
+
+    def test_generate_url_malformed_uri_bucket_only(self):
+        """Test with a URI that is only a bucket name."""
+        signed_url = api_gw_main.generate_gcs_signed_url("gs://test-configured-bucket")
+        self.assertIsNone(signed_url)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -24,6 +24,7 @@ from psycopg2 import pool, OperationalError # Import for mocking
 import time # For time.sleep mock
 # Import requests specifically for requests.exceptions.RequestException etc.
 import requests
+from psycopg2 import DataError # For testing non-retryable DB errors
 
 
 class TestConnectionPoolInitialization(unittest.TestCase):

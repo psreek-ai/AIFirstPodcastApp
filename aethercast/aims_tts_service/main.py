@@ -229,6 +229,25 @@ if not GCS_BUCKET_NAME:
     logger.critical("CRITICAL: GCS_BUCKET_NAME is not set. Audio file uploads to GCS will fail.")
     raise ValueError("AIMS_TTS Critical Error: GCS_BUCKET_NAME environment variable not set.")
 
+# --- Global Google Cloud Clients ---
+GLOBAL_TTS_CLIENT = None
+try:
+    logger.info("AIMS_TTS: Initializing global Google TTS Client...")
+    GLOBAL_TTS_CLIENT = texttospeech.TextToSpeechClient()
+    logger.info("AIMS_TTS: Successfully initialized global Google TTS Client.")
+except Exception as e_tts_client_init:
+    logger.error(f"AIMS_TTS: Failed to initialize global Google TTS Client: {e_tts_client_init}", exc_info=True)
+    # GLOBAL_TTS_CLIENT remains None, tasks will fail if they try to use it.
+
+GLOBAL_STORAGE_CLIENT_TTS = None
+try:
+    logger.info("AIMS_TTS: Initializing global Google Cloud Storage Client...")
+    GLOBAL_STORAGE_CLIENT_TTS = storage.Client()
+    logger.info("AIMS_TTS: Successfully initialized global Google Cloud Storage Client.")
+except Exception as e_storage_client_init:
+    logger.error(f"AIMS_TTS: Failed to initialize global Google Cloud Storage Client: {e_storage_client_init}", exc_info=True)
+    # GLOBAL_STORAGE_CLIENT_TTS remains None.
+
 # --- Audio Encoding Mapping ---
 AUDIO_ENCODING_MAP = {
     "MP3": {"enum": texttospeech.AudioEncoding.MP3, "mimetype": "audio/mpeg"},

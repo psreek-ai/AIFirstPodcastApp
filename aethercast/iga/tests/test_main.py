@@ -84,19 +84,22 @@ class BaseIgaServiceTest(unittest.TestCase):
         self.mock_vertex_model.generate_images.return_value = MagicMock(images=[self.mock_vertex_image])
 
         self.gcs_blob_mock = MagicMock()
+        self.mock_gcs_client_instance_for_patch = MagicMock() # This is the instance storage.Client() would return
+        self.mock_gcs_client_instance_for_patch.bucket.return_value.blob.return_value = self.gcs_blob_mock
 
-        self.patch_vertex_from_pretrained = patch('aethercast.iga.main.ImageGenerationModel.from_pretrained', return_value=self.mock_vertex_model)
-        self.patch_gcs_client = patch('aethercast.iga.main.storage.Client')
+        # Patch the global variables that are set at module load time in iga.main
+        # These globals are assigned the *result* of from_pretrained() and Client()
+        self.patch_global_vertex_model = patch('aethercast.iga.main.GLOBAL_IMAGE_MODEL', self.mock_vertex_model)
+        self.patch_global_gcs_client = patch('aethercast.iga.main.GLOBAL_STORAGE_CLIENT', self.mock_gcs_client_instance_for_patch)
 
-        self.mock_gcs_client_instance = self.patch_gcs_client.start()
-        self.mock_gcs_client_instance.return_value.bucket.return_value.blob.return_value = self.gcs_blob_mock
-        self.mock_vertex_init = self.patch_vertex_from_pretrained.start()
+        self.mock_global_vertex_model = self.patch_global_vertex_model.start()
+        self.mock_global_gcs_client = self.patch_global_gcs_client.start()
 
 
     def tearDown(self):
         self.config_patcher.stop()
-        self.patch_vertex_from_pretrained.stop()
-        self.patch_gcs_client.stop()
+        self.patch_global_vertex_model.stop()
+        self.patch_global_gcs_client.stop()
         reset_mock_iga_db_connections()
 
 # --- Flask Endpoint Idempotency Tests ---

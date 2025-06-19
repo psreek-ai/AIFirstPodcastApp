@@ -153,6 +153,30 @@ except Exception as e:
     # Continue if Vertex AI init fails, but log critical error. Task will fail if it tries to use it.
     # raise ValueError(f"IGA Critical Error: Failed to initialize Vertex AI: {e}") # Or decide to fail startup
 
+# --- Global Clients Initialized After Config and Vertex AI Init ---
+GLOBAL_IMAGE_MODEL = None
+if iga_config.get('IGA_VERTEXAI_IMAGE_MODEL_ID'): # Check if model ID is configured
+    try:
+        app.logger.info(f"IGA: Pre-loading Vertex AI Image Generation Model: {iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}")
+        GLOBAL_IMAGE_MODEL = ImageGenerationModel.from_pretrained(iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
+        app.logger.info("IGA: Vertex AI Image Generation Model pre-loaded successfully.")
+    except Exception as e_model_load:
+        app.logger.critical(f"IGA CRITICAL: Failed to pre-load Vertex AI Image Generation Model '{iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID']}': {e_model_load}", exc_info=True)
+        # Depending on strictness, could raise an error to halt startup.
+        # For now, GLOBAL_IMAGE_MODEL will be None, and task will fail if it's used.
+else:
+    app.logger.warning("IGA: IGA_VERTEXAI_IMAGE_MODEL_ID not configured. Image model will not be pre-loaded.")
+
+
+GLOBAL_STORAGE_CLIENT = None
+try:
+    app.logger.info("IGA: Initializing Google Cloud Storage client...")
+    GLOBAL_STORAGE_CLIENT = storage.Client()
+    app.logger.info("IGA: Google Cloud Storage client initialized successfully.")
+except Exception as e_storage_client_init:
+    app.logger.critical(f"IGA CRITICAL: Failed to initialize Google Cloud Storage client: {e_storage_client_init}", exc_info=True)
+    # Task will fail if it tries to use GCS and this is None.
+
 # --- Idempotency Database Helper Functions ---
 def _get_iga_db_connection():
     """Establishes a connection to the PostgreSQL database for IGA idempotency."""
@@ -350,34 +374,35 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
 
         # --- Main Task Logic ---
         app.logger.info(f"IGA Task {task_log_id}: Proceeding with image generation for key '{idempotency_key}'.", extra=log_extra_base)
-        model = ImageGenerationModel.from_pretrained(model_id)
-        images_response = model.generate_images(
+
+        if GLOBAL_IMAGE_MODEL is None:
+            app.logger.error(f"IGA Task {task_log_id}: Global Vertex AI image model is not available. Cannot generate image.", extra=log_extra_base)
+            raise RuntimeError("IGA Critical: Vertex AI Image Model not loaded at startup.") # Triggers on_failure
+
+        images_response = GLOBAL_IMAGE_MODEL.generate_images(
             prompt=prompt,
             number_of_images=1,
             aspect_ratio=aspect_ratio,
             add_watermark=add_watermark
+            # model_id is implicitly the one GLOBAL_IMAGE_MODEL was loaded with.
+            # If model_id parameter to task is for overriding, this needs more complex logic.
+            # For now, assume model_id passed to task is informational or should match global.
         )
 
         if not images_response or not images_response.images:
-            app.logger.error(f"Celery Task {self.request.id}: No images from Vertex AI for prompt: '{prompt}'")
-            raise ValueError("Vertex AI returned no images.")
-
-        images_response = model.generate_images(
-            prompt=prompt, number_of_images=1,
-            aspect_ratio=aspect_ratio, add_watermark=add_watermark
-        )
-
-        if not images_response or not images_response.images:
-            app.logger.error(f"IGA Task {task_log_id}: No images from Vertex AI for prompt: '{prompt}'", extra=log_extra_base)
-            raise ValueError("Vertex AI returned no images.") # This will trigger on_failure
+            app.logger.error(f"IGA Task {task_log_id}: No images from Vertex AI (using global model) for prompt: '{prompt}'", extra=log_extra_base)
+            raise ValueError("Vertex AI returned no images using global model.") # Triggers on_failure
 
         image_object = images_response.images[0]
         if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
-            app.logger.error(f"IGA Task {task_log_id}: Vertex AI image bytes missing for prompt: '{prompt}'", extra=log_extra_base)
-            raise ValueError("Vertex AI produced empty image bytes.") # Triggers on_failure
+            app.logger.error(f"IGA Task {task_log_id}: Vertex AI image bytes missing (using global model) for prompt: '{prompt}'", extra=log_extra_base)
+            raise ValueError("Vertex AI produced empty image bytes using global model.") # Triggers on_failure
 
-        storage_client = storage.Client()
-        bucket = storage_client.bucket(gcs_bucket_name)
+        if GLOBAL_STORAGE_CLIENT is None:
+            app.logger.error(f"IGA Task {task_log_id}: Global GCS storage client is not available. Cannot upload image.", extra=log_extra_base)
+            raise RuntimeError("IGA Critical: GCS Storage Client not initialized at startup.") # Triggers on_failure
+
+        bucket = GLOBAL_STORAGE_CLIENT.bucket(gcs_bucket_name)
         file_extension = "png"
         gcs_object_name = f"{gcs_image_prefix.strip('/')}/{request_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
         blob = bucket.blob(gcs_object_name)

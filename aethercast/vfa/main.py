@@ -15,6 +15,9 @@ from datetime import datetime, timezone # For Idempotency locked_at
 # --- Load Environment Variables ---
 load_dotenv()
 
+# --- Global HTTP Session for AIMS_TTS calls ---
+GLOBAL_REQUESTS_SESSION = requests.Session()
+
 # --- Idempotency Constants ---
 IDEMPOTENCY_KEY_HEADER = "X-Idempotency-Key" # Added
 
@@ -399,7 +402,7 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
         logger.info(f"Celery Task {self.request.id}: Sending initial request to AIMS_TTS. URL: {aims_tts_url}", extra={"orig_req_id": request_id_celery})
         # ... (AIMS_TTS call and polling logic as before) ...
         # --- Start of AIMS_TTS interaction (copied and adapted from original) ---
-        initial_response = requests.post(aims_tts_url, json=aims_tts_payload, timeout=aims_tts_initial_request_timeout)
+        initial_response = GLOBAL_REQUESTS_SESSION.post(aims_tts_url, json=aims_tts_payload, timeout=aims_tts_initial_request_timeout)
         initial_response.raise_for_status()
         if initial_response.status_code != 202:
             raise Exception(f"AIMS_TTS task not accepted: {initial_response.status_code} - {initial_response.text}")
@@ -416,7 +419,7 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
             if time.time() - polling_start_time > polling_timeout:
                 raise Exception(f"Polling AIMS_TTS task {task_id_from_aims_tts} timed out.")
             try:
-                poll_response = requests.get(poll_status_url, timeout=10)
+                    poll_response = GLOBAL_REQUESTS_SESSION.get(poll_status_url, timeout=10)
                 poll_response.raise_for_status(); task_status_data = poll_response.json(); task_state = task_status_data.get("status")
                 if task_state == "SUCCESS":
                     aims_tts_data = task_status_data.get("result")
