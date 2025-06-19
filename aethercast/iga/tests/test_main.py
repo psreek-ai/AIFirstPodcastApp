@@ -629,5 +629,154 @@ class TestIgaTaskDirectlyIdempotency(BaseIgaServiceTest): # Inherits mocks for V
         self.assertEqual(mock_conn.commit.call_count, 2)
 
 
+class TestIgaTaskTestScenarios(BaseIgaServiceTest):
+
+    def setUp(self):
+        super().setUp() # Call BaseIgaServiceTest.setUp
+        # Reset mocks that might be checked for call counts specifically in these tests
+        self.mock_global_vertex_model.generate_images.reset_mock()
+        self.mock_global_gcs_client.bucket.reset_mock()
+        # Reset idempotency DB mocks (cursor typically)
+        if hasattr(self, 'mock_db_conn') and self.mock_db_conn: # If using a shared mock_db_conn from base
+            self.mock_db_conn.cursor.return_value.__enter__.return_value.reset_mock()
+            self.mock_db_conn.reset_mock() # Reset commit/rollback counts etc.
+        elif hasattr(self, 'mock_db_cursor_instance') and self.mock_db_cursor_instance: # If it's directly set
+             self.mock_db_cursor_instance.reset_mock()
+
+
+    @patch('aethercast.iga.main._store_idempotency_record') # Mock this to verify its calls
+    @patch('aethercast.iga.main._check_idempotency_key', return_value=None) # Simulate new key
+    @patch('aethercast.iga.main.acquire_idempotency_lock', return_value=True) # Simulate lock acquired
+    def test_generate_image_task_test_mode_success_placeholder(self, mock_acquire_lock, mock_check_key, mock_store_record):
+        """Test task with test_scenario='success_placeholder'."""
+
+        idempotency_key = f"iga-task-test-placeholder-{uuid.uuid4()}"
+        task_args = {
+            'request_id': "req_placeholder_001",
+            'prompt': "A placeholder image",
+            'aspect_ratio': "16:9",
+            'add_watermark': False,
+            'model_id': iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'],
+            'gcs_bucket_name': iga_config['GCS_BUCKET_NAME'],
+            'gcs_image_prefix': iga_config['IGA_GCS_IMAGE_PREFIX'],
+            'idempotency_key': idempotency_key,
+            'workflow_id': "wf_placeholder_001",
+            'test_scenario': 'success_placeholder'
+        }
+
+        result = generate_image_vertex_ai_task.apply(kwargs=task_args).get()
+
+        self.assertIn("image_url", result)
+        self.assertTrue(result["image_url"].startswith(f"gs://{iga_config['GCS_BUCKET_NAME']}/{iga_config['IGA_GCS_IMAGE_PREFIX'].strip('/')}/test_placeholder_image_"))
+        self.assertEqual(result["prompt_used"], task_args['prompt'])
+        self.assertEqual(result["model_version"], "test-mode-placeholder-model")
+        self.assertIn("test mode - placeholder", result["status_message"])
+
+        # Verify external services were NOT called
+        self.mock_global_vertex_model.generate_images.assert_not_called()
+        self.mock_global_gcs_client.bucket.assert_not_called()
+
+        # Verify idempotency record was updated to completed
+        mock_store_record.assert_any_call(
+            ANY, # db_conn
+            idempotency_key,
+            generate_image_vertex_ai_task.name, # task_name
+            iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'],
+            workflow_id="wf_placeholder_001",
+            result_payload=result,
+            is_new_key=False # Because acquire_idempotency_lock would have set it to PROCESSING first
+        )
+
+
+    @patch('aethercast.iga.main._store_idempotency_record')
+    @patch('aethercast.iga.main._check_idempotency_key', return_value=None)
+    @patch('aethercast.iga.main.acquire_idempotency_lock', return_value=True)
+    def test_generate_image_task_test_mode_error_vertex_ai(self, mock_acquire_lock, mock_check_key, mock_store_record):
+        """Test task with test_scenario='error_vertex_ai' raises error and updates idempotency."""
+        idempotency_key = f"iga-task-test-error-{uuid.uuid4()}"
+        task_args = {
+            'request_id': "req_error_sim_001",
+            'prompt': "A prompt for simulated error",
+            'aspect_ratio': "1:1",
+            'add_watermark': True,
+            'model_id': iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'],
+            'gcs_bucket_name': iga_config['GCS_BUCKET_NAME'],
+            'gcs_image_prefix': iga_config['IGA_GCS_IMAGE_PREFIX'],
+            'idempotency_key': idempotency_key,
+            'workflow_id': "wf_error_sim_001",
+            'test_scenario': 'error_vertex_ai'
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "Simulated Vertex AI error in IGA test mode"):
+            generate_image_vertex_ai_task.apply(kwargs=task_args).get()
+
+        # Verify external services were NOT called
+        self.mock_global_vertex_model.generate_images.assert_not_called()
+        self.mock_global_gcs_client.bucket.assert_not_called()
+
+        # Verify idempotency record was updated to failed
+        expected_error_payload = {
+            "error_type": "SimulatedVertexAIError",
+            "message": "Test mode: Simulated Vertex AI image generation failure.",
+            "details": "Vertex AI unavailable (test scenario)"
+        }
+        mock_store_record.assert_any_call(
+            ANY, # db_conn
+            idempotency_key,
+            generate_image_vertex_ai_task.name,
+            iga_config['IGA_IDEMPOTENCY_STATUS_FAILED'],
+            workflow_id="wf_error_sim_001",
+            error_payload=expected_error_payload,
+            is_new_key=False
+        )
+        # Note: The actual on_failure handler in GenerateImageTask would also call _store_idempotency_record.
+        # Depending on how Celery's eager mode interacts with custom Task.on_failure,
+        # _store_idempotency_record might be called twice (once by the test mode logic, once by on_failure).
+        # For this test, we primarily care that it *was* called with FAILED by the test mode logic before raising.
+
+
+    @patch('aethercast.iga.main._store_idempotency_record')
+    @patch('aethercast.iga.main._check_idempotency_key', return_value=None)
+    @patch('aethercast.iga.main.acquire_idempotency_lock', return_value=True)
+    def test_generate_image_task_no_test_mode_normal_path(self, mock_acquire_lock, mock_check_key, mock_store_record):
+        """Test task proceeds normally when test_scenario is None."""
+        idempotency_key = f"iga-task-normal-path-{uuid.uuid4()}"
+        task_args = {
+            'request_id': "req_normal_001",
+            'prompt': "A normal image prompt",
+            'aspect_ratio': "1:1",
+            'add_watermark': False,
+            'model_id': iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'], # Use default model
+            'gcs_bucket_name': iga_config['GCS_BUCKET_NAME'],
+            'gcs_image_prefix': iga_config['IGA_GCS_IMAGE_PREFIX'],
+            'idempotency_key': idempotency_key,
+            'workflow_id': "wf_normal_001",
+            'test_scenario': None # Explicitly None for this test
+        }
+
+        # Ensure global mocks (from BaseIgaServiceTest.setUp) are active and will be called
+        # self.mock_global_vertex_model.generate_images should be called
+        # self.mock_global_gcs_client.bucket().blob().upload_from_string should be called
+
+        result = generate_image_vertex_ai_task.apply(kwargs=task_args).get()
+
+        self.mock_global_vertex_model.generate_images.assert_called_once()
+        self.mock_global_gcs_client.bucket.assert_called_once_with(iga_config['GCS_BUCKET_NAME'])
+        self.mock_global_gcs_client.bucket.return_value.blob.return_value.upload_from_string.assert_called_once()
+
+        self.assertIn("image_url", result)
+        self.assertTrue(result["image_url"].startswith(f"gs://{iga_config['GCS_BUCKET_NAME']}/{iga_config['IGA_GCS_IMAGE_PREFIX'].strip('/')}/req_normal_001_"))
+
+        mock_store_record.assert_any_call(
+            ANY, # db_conn
+            idempotency_key,
+            generate_image_vertex_ai_task.name,
+            iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'],
+            workflow_id="wf_normal_001",
+            result_payload=result,
+            is_new_key=False
+        )
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

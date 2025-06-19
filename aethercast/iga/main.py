@@ -317,9 +317,10 @@ class GenerateImageTask(Celery.Task): # Inherit from Celery.Task for on_failure
                     except Exception: pass # Ignore errors on close during failure handling
 
 @celery_app.task(bind=True, base=GenerateImageTask, name='generate_image_vertex_ai_task')
-def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_ratio: str, add_watermark: bool, model_id: str, gcs_bucket_name: str, gcs_image_prefix: str, idempotency_key: Optional[str] = None, workflow_id: Optional[str] = None):
+def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_ratio: str, add_watermark: bool, model_id: str, gcs_bucket_name: str, gcs_image_prefix: str, idempotency_key: Optional[str] = None, workflow_id: Optional[str] = None, test_scenario: Optional[str] = None):
     """
     Celery task to generate an image using Vertex AI, upload to GCS, with idempotency.
+    Includes test_scenario parameter for test mode behavior.
     """
     task_log_id = self.request.id # Celery's unique ID for this task execution
     log_extra_base = {"orig_req_id": request_id, "celery_task_id": task_log_id, "idempotency_key": idempotency_key}
@@ -372,21 +373,64 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
 
         db_conn.commit() # Commit the PROCESSING state
 
-        # --- Main Task Logic ---
+        # --- Test Scenario Handling ---
+        if test_scenario:
+            if test_scenario == 'success_placeholder':
+                app.logger.info(f"IGA Task {task_log_id}: Test mode 'success_placeholder' active.", extra=log_extra_base)
+                mock_gcs_object_name = f"{gcs_image_prefix.strip('/')}/test_placeholder_image_{request_id}_{uuid.uuid4().hex[:8]}.png"
+                mock_gcs_uri = f"gs://{gcs_bucket_name}/{mock_gcs_object_name}"
+                task_result_payload = {
+                    "image_url": mock_gcs_uri,
+                    "prompt_used": prompt,
+                    "model_version": "test-mode-placeholder-model",
+                    "status_message": "Image generation successful (test mode - placeholder)."
+                }
+                if db_conn and idempotency_key:
+                    _store_idempotency_record(db_conn, idempotency_key, self.name, iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'], workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
+                    db_conn.commit()
+                return task_result_payload
+
+            elif test_scenario == 'error_vertex_ai':
+                app.logger.warning(f"IGA Task {task_log_id}: Test mode 'error_vertex_ai' active. Simulating Vertex AI failure.", extra=log_extra_base)
+                error_payload_for_idempotency = {
+                    "error_type": "SimulatedVertexAIError",
+                    "message": "Test mode: Simulated Vertex AI image generation failure.",
+                    "details": "Vertex AI unavailable (test scenario)"
+                }
+                if db_conn and idempotency_key:
+                    _store_idempotency_record(db_conn, idempotency_key, self.name, iga_config['IGA_IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=error_payload_for_idempotency, is_new_key=False)
+                    db_conn.commit()
+                raise RuntimeError("Simulated Vertex AI error in IGA test mode") # Will be caught by on_failure
+
+        # --- Main Task Logic (if not handled by test_scenario) ---
         app.logger.info(f"IGA Task {task_log_id}: Proceeding with image generation for key '{idempotency_key}'.", extra=log_extra_base)
 
-        if GLOBAL_IMAGE_MODEL is None:
-            app.logger.error(f"IGA Task {task_log_id}: Global Vertex AI image model is not available. Cannot generate image.", extra=log_extra_base)
-            raise RuntimeError("IGA Critical: Vertex AI Image Model not loaded at startup.") # Triggers on_failure
+        model_to_use = None
+        if model_id == iga_config.get('IGA_VERTEXAI_IMAGE_MODEL_ID') and GLOBAL_IMAGE_MODEL:
+            model_to_use = GLOBAL_IMAGE_MODEL
+            app.logger.info(f"IGA Task {task_log_id}: Using pre-loaded default model: {model_id}", extra=log_extra_base)
+        elif GLOBAL_IMAGE_MODEL is None and model_id == iga_config.get('IGA_VERTEXAI_IMAGE_MODEL_ID'):
+            app.logger.error(f"IGA Task {task_log_id}: Default global Vertex AI image model ('{model_id}') is not available (failed pre-load). Cannot generate image.", extra=log_extra_base)
+            raise RuntimeError(f"IGA Critical: Default Vertex AI Image Model ('{model_id}') not loaded at startup and needed for this task.")
+        else: # Non-default model or default model that wasn't pre-loaded (should be rare if pre-load works)
+            app.logger.info(f"IGA Task {task_log_id}: Model '{model_id}' not pre-loaded or not default. Attempting on-demand load.", extra=log_extra_base)
+            try:
+                model_to_use = ImageGenerationModel.from_pretrained(model_id)
+                # Note: On-demand loaded models are not added to a global cache here,
+                # unlike AIMS service. This could be a future enhancement if non-default models are used frequently.
+            except Exception as e_model_demand:
+                app.logger.error(f"IGA Task {task_log_id}: Failed to initialize model '{model_id}' on demand: {e_model_demand}", exc_info=True, extra=log_extra_base)
+                raise RuntimeError(f"IGA Critical: Failed to load model '{model_id}' on demand.") from e_model_demand
 
-        images_response = GLOBAL_IMAGE_MODEL.generate_images(
+        if model_to_use is None: # Should be caught by earlier checks, but as a safeguard
+             app.logger.error(f"IGA Task {task_log_id}: Model '{model_id}' could not be loaded/retrieved.", extra=log_extra_base)
+             raise RuntimeError(f"IGA Critical: Model '{model_id}' unavailable for generation.")
+
+        images_response = model_to_use.generate_images(
             prompt=prompt,
             number_of_images=1,
             aspect_ratio=aspect_ratio,
             add_watermark=add_watermark
-            # model_id is implicitly the one GLOBAL_IMAGE_MODEL was loaded with.
-            # If model_id parameter to task is for overriding, this needs more complex logic.
-            # For now, assume model_id passed to task is informational or should match global.
         )
 
         if not images_response or not images_response.images:
@@ -533,8 +577,9 @@ def generate_image_async_endpoint():
     aspect_ratio = data.get("aspect_ratio", iga_config['IGA_DEFAULT_ASPECT_RATIO'])
     add_watermark = data.get("add_watermark", iga_config['IGA_ADD_WATERMARK'])
     model_id_to_use = data.get("model_id_override", iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'])
+    test_scenario_header = request.headers.get('X-Test-Scenario')
 
-    app.logger.info(f"IGA Request {request_id}: Dispatching image generation to Celery task. Prompt: '{prompt[:50]}...', Idempotency-Key: {idempotency_key}")
+    app.logger.info(f"IGA Request {request_id}: Dispatching image generation to Celery task. Prompt: '{prompt[:50]}...', Idempotency-Key: {idempotency_key}, Test-Scenario: {test_scenario_header}")
 
     task = generate_image_vertex_ai_task.delay(
         request_id=request_id,
@@ -545,7 +590,8 @@ def generate_image_async_endpoint():
         gcs_bucket_name=iga_config['GCS_BUCKET_NAME'],
         gcs_image_prefix=iga_config['IGA_GCS_IMAGE_PREFIX'],
         idempotency_key=idempotency_key, # Pass the key
-        workflow_id=workflow_id
+        workflow_id=workflow_id,
+        test_scenario=test_scenario_header # New parameter
     )
 
     return jsonify({
