@@ -429,7 +429,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         # Removed "dummy.db" from the call
         result = cpoa_main.orchestrate_podcast_generation("Test Topic", "task_podcast_001", client_id=client_id_test, user_preferences=None)
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-TEST-Voice")
         self.assertTrue(result['asf_notification_status'].startswith("ASF notified successfully"))
 
@@ -501,7 +502,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             client_id=client_id_test_vp,
             user_preferences=None
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         self.assertIn("tts_settings_used", result['final_audio_details'])
         mock_send_ui_update.assert_called()
         self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-GB-Standard-A")
@@ -524,7 +526,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         client_id_wcha_fail = "client_wcha_fail"
         result = cpoa_main.orchestrate_podcast_generation("Obscure Topic", "task_wcha_fail_001", client_id=client_id_wcha_fail, user_preferences=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST)
+        self.assertEqual(result['status'], "FAILURE")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST)
         self.assertEqual(result['error_message'], "WCHA: No search results found for topic: Obscure Topic")
         mock_send_ui_update.assert_any_call(client_id_wcha_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_WCHA, "final_status": cpoa_main.CPOA_STATUS_FAILED_WCHA_CONTENT_HARVEST}, workflow_id_for_log=unittest.mock.ANY)
 
@@ -582,7 +585,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Fail", "task_pswa_fail_001", client_id=client_id_pswa_fail, user_preferences=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION)
+        self.assertEqual(result['status'], "FAILURE")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION)
         self.assertIn("PSWA service call failed", result['error_message'])
         mock_send_ui_update.assert_any_call(client_id_pswa_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_PSWA, "final_status": cpoa_main.CPOA_STATUS_FAILED_PSWA_REQUEST_EXCEPTION}, workflow_id_for_log=unittest.mock.ANY)
         self.assertIn("503", result['error_message'])
@@ -626,7 +630,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation("Test Topic PSWA Malformed Segments", "task_pswa_malformed_seg_001", user_preferences=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE)
+        self.assertEqual(result['status'], "FAILURE")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE)
         self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
 
         # Check legacy DB update
@@ -665,7 +670,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation("Test PSWA Malformed ID", "task_pswa_malformed_id_001", user_preferences=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE)
+        self.assertEqual(result['status'], "FAILURE")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_PSWA_BAD_SCRIPT_STRUCTURE)
         self.assertIn("PSWA service returned invalid or malformed structured script", result['error_message'])
 
         found_legacy_update = False
@@ -716,7 +722,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         client_id_vfa_fail = "client_vfa_fail"
         result = cpoa_main.orchestrate_podcast_generation("Test Topic VFA Fail", "task_vfa_fail_001", client_id=client_id_vfa_fail, user_preferences=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION)
+        self.assertEqual(result['status'], "FAILURE")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION)
         self.assertIn("VFA service call failed", result['error_message'])
         mock_send_ui_update.assert_any_call(client_id_vfa_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "stage": cpoa_main.ORCHESTRATION_STAGE_VFA, "final_status": cpoa_main.CPOA_STATUS_FAILED_VFA_REQUEST_EXCEPTION}, workflow_id_for_log=unittest.mock.ANY)
         self.assertIn("500", result['error_message'])
@@ -769,7 +776,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         client_id_asf_fail = "client_asf_fail"
         result = cpoa_main.orchestrate_podcast_generation("Test Topic ASF Fail", "task_asf_fail_001", client_id=client_id_asf_fail, user_preferences=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE)
+        self.assertEqual(result['status'], "SUCCESS_WITH_WARNINGS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE)
         self.assertIn("ASF notification failed", result['error_message'])
         mock_send_ui_update.assert_any_call(client_id_asf_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": result['error_message'], "final_status": cpoa_main.CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE, "is_terminal": True}, workflow_id_for_log=unittest.mock.ANY)
         self.assertIn("ConnectionError", result['error_message'])
@@ -799,7 +807,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
                 client_id_wcha_import_fail = "client_wcha_import_fail"
                 result = cpoa_main.orchestrate_podcast_generation("Test Topic WCHA Import Fail", "task_wcha_import_fail", client_id=client_id_wcha_import_fail, user_preferences=None) # Removed "dummy.db"
 
-                self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_MODULE_ERROR)
+                self.assertEqual(result['status'], "FAILURE")
+                self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_WCHA_MODULE_ERROR)
                 self.assertIn("Simulated WCHA import error", result['error_message'])
                 # Initial UI update for init failure.
                 mock_send_ui_update.assert_any_call(client_id_wcha_import_fail, cpoa_main.UI_EVENT_TASK_ERROR, {"message": "Simulated WCHA import error", "stage": cpoa_main.ORCHESTRATION_STAGE_INITIALIZATION, "final_status": cpoa_main.CPOA_STATUS_FAILED_WCHA_MODULE_ERROR}, workflow_id_for_log=unittest.mock.ANY)
@@ -848,7 +857,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
         client_id_ui_send_fail = "client_ui_send_fail"
         with patch.object(cpoa_main.logger, 'error') as mock_logger_error: # Check CPOA's own logger
             result = cpoa_main.orchestrate_podcast_generation("UI Send Fail Topic", "task_ui_send_fail", client_id=client_id_ui_send_fail, user_preferences=None) # Removed "dummy.db"
-            self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+            self.assertEqual(result['status'], "SUCCESS")
+            self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
             self.assertTrue(mock_direct_send_ui_update_call.called)
             # Check that CPOA's logger (not _send_ui_update's internal one if it had one) logged the error from the exception
             # This depends on how orchestrate_podcast_generation catches and logs errors from _send_ui_update.
@@ -886,7 +896,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
 
         result = cpoa_main.orchestrate_podcast_generation("No Client ID Topic", "task_no_client_id", client_id=None) # Removed "dummy.db"
 
-        self.assertEqual(result['status'], "completed")
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         for call_args in mock_send_ui_update.call_args_list:
             self.assertIsNone(call_args[0][0])
 
@@ -929,7 +940,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             voice_params_input=None,
             user_preferences=user_prefs
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], preferred_voice)
 
     @patch.object(cpoa_main, '_get_cpoa_db_connection')
@@ -971,7 +983,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             voice_params_input=direct_voice_params,
             user_preferences=user_prefs_ignored
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         self.assertEqual(result['final_audio_details']['tts_settings_used']['voice_name'], "en-GB-OverrideDirect")
 
     @patch.object(cpoa_main, '_get_cpoa_db_connection')
@@ -1013,7 +1026,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             "Scenario Header Test", "task_scenario_header", # Removed "dummy.db"
             test_scenarios=test_scenarios_payload
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         self.assertTrue(any(call[0][1] == cpoa_main.PSWA_SERVICE_URL for call in mock_requests_retry.call_args_list))
         self.assertTrue(any(call[0][1] == cpoa_main.VFA_SERVICE_URL for call in mock_requests_retry.call_args_list))
 
@@ -1062,7 +1076,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             original_task_id="task_cache_hit_001"
             # db_path removed
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED)
+        self.assertEqual(result['status'], "SUCCESS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED)
         pswa_call_made = any(
             call_args[0][1] == cpoa_main.PSWA_SERVICE_URL for call_args in mock_requests_retry.call_args_list
         )
@@ -1131,7 +1146,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             original_task_id="task_vfa_skipped_json_001"
             # db_path removed
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_COMPLETED_WITH_VFA_SKIPPED)
+        self.assertEqual(result['status'], "SUCCESS_WITH_WARNINGS")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_COMPLETED_WITH_VFA_SKIPPED)
         self.assertIn("VFA skipped: Script too short (simulated).", result['error_message'])
         self.assertIsNone(result['final_audio_details'].get('audio_filepath'))
         self.assertEqual(result['final_audio_details'].get('status'), "skipped")
@@ -1175,7 +1191,8 @@ class TestOrchestratePodcastGeneration(unittest.TestCase):
             original_task_id="task_vfa_error_json_001"
             # db_path removed
         )
-        self.assertEqual(result['status'], cpoa_main.CPOA_STATUS_FAILED_VFA_REPORTED_ERROR)
+        self.assertEqual(result['status'], "FAILURE")
+        self.assertEqual(result['legacy_cpoa_internal_status'], cpoa_main.CPOA_STATUS_FAILED_VFA_REPORTED_ERROR)
         self.assertIn("VFA internal processing error (simulated in JSON).", result['error_message'])
         self.assertEqual(result['final_audio_details'].get('status'), "error")
         self.assertEqual(result['final_audio_details'].get('message'), "VFA internal processing error (simulated in JSON).")
@@ -2046,7 +2063,8 @@ class TestCpoaTaskSelfIdempotency(BaseCpoaIdempotencyTest):
 
         # --- Assertions ---
         self.assertIsNotNone(task_result, "Task result should not be None")
-        self.assertEqual(task_result.get('status'), cpoa_main.CPOA_STATUS_COMPLETED, f"Task status should be COMPLETED. Got: {task_result.get('status')}, Error: {task_result.get('error_message')}")
+        self.assertEqual(task_result.get('status'), "SUCCESS")
+        self.assertEqual(task_result.get('legacy_cpoa_internal_status'), cpoa_main.CPOA_STATUS_COMPLETED)
         self.assertEqual(task_result.get('workflow_id'), self.mock_workflow_id, "Workflow ID in result should match mock")
         self.assertIsNotNone(task_result.get('final_audio_details'), "Final audio details should be present")
         self.assertIsNotNone(task_result['final_audio_details'].get('audio_filepath'), "Audio filepath should be present")
@@ -2077,7 +2095,13 @@ class TestCpoaTaskSelfIdempotency(BaseCpoaIdempotencyTest):
         self.assertEqual(call_args_completed[0][2], cpoa_task_name_for_idempotency_check)
         self.assertEqual(call_args_completed[0][3], self.mock_idem_status_comp) # status (patched global)
         self.assertEqual(call_args_completed[1]['cpoa_workflow_id'], self.mock_workflow_id)
-        self.assertEqual(call_args_completed[1]['result_payload'], task_result) # Full task result stored
+
+        # Verify the structure of the result_payload stored for idempotency
+        stored_payload = call_args_completed[1]['result_payload']
+        self.assertEqual(stored_payload.get('status'), "SUCCESS") # Check simplified status in stored payload
+        self.assertEqual(stored_payload.get('legacy_cpoa_internal_status'), cpoa_main.CPOA_STATUS_COMPLETED) # Check legacy status in stored payload
+        self.assertEqual(stored_payload, task_result) # Ensure the whole task_result is stored
+
         self.assertFalse(call_args_completed[1]['is_new_key']) # is_new_key=False
 
         self.assertEqual(mock_store_idempotency_record.call_count, 2)

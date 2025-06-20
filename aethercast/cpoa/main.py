@@ -1491,11 +1491,25 @@ def orchestrate_podcast_generation(
 
     # Prepare the final result payload for the CPOA task's idempotency record and for return
     current_orchestration_stage_legacy = ORCHESTRATION_STAGE_FINALIZATION
+
+    # Simplified status mapping
+    simplified_output_status = "UNKNOWN" # Default
+    if final_cpoa_status_legacy == CPOA_STATUS_COMPLETED:
+        simplified_output_status = "SUCCESS"
+    elif final_cpoa_status_legacy.startswith("completed_with_"):
+        simplified_output_status = "SUCCESS_WITH_WARNINGS"
+    elif final_cpoa_status_legacy.startswith("failed_") or final_cpoa_status_legacy == CPOA_STATUS_INIT_FAILURE:
+        simplified_output_status = "FAILURE"
+    elif final_cpoa_status_legacy == CPOA_STATUS_PENDING:
+        simplified_output_status = "PENDING"
+    # Add any other necessary mappings if intermediate statuses can be terminal
+
     cpoa_final_result_payload = {
-        "task_id": original_task_id, # original_task_id is the idempotency key
-        "workflow_id": workflow_id,
+        "task_id": original_task_id, # original_task_id is the idempotency key for CPOA's own task
+        "workflow_id": cpoa_internal_workflow_id, # The CPOA-managed workflow UUID
         "topic": topic,
-        "status": final_cpoa_status_legacy,
+        "status": simplified_output_status, # Use the new simplified status
+        "legacy_cpoa_internal_status": final_cpoa_status_legacy, # Store the original granular status
         "error_message": final_error_message,
         "asf_notification_status": asf_notification_status_message,
         "asf_websocket_url": f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow['stream_id']}" if context_data_for_workflow.get("stream_id") else None,
@@ -1507,6 +1521,9 @@ def orchestrate_podcast_generation(
 
 
     # Store final result for idempotency if CPOA task completed successfully or with handled errors
+    # Use the original granular status for storing in the idempotency record for detailed internal state,
+    # but the simplified status is what's returned in the main 'status' field of the payload.
+    # The `cpoa_final_result_payload` already contains both.
     if final_workflow_status in [WORKFLOW_STATUS_COMPLETED, WORKFLOW_STATUS_COMPLETED_WITH_ERRORS]:
         idempotency_update_conn = None
         try:
@@ -1537,23 +1554,27 @@ def orchestrate_podcast_generation(
     elif final_workflow_status == WORKFLOW_STATUS_COMPLETED:
         _send_ui_update(client_id, UI_EVENT_GENERATION_STATUS, {"message": "Podcast generation complete!", "final_status": final_workflow_status, "is_terminal": True}, workflow_id_for_log=cpoa_internal_workflow_id)
 
-    asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow.get('stream_id')}" if context_data_for_workflow.get("stream_id") else None
+    # Reconstruct payload with the simplified status for the actual function return,
+    # ensuring `cpoa_internal_workflow_id` is used for the `workflow_id` field.
+    # The payload for idempotency record (`cpoa_final_result_payload`) already has this structure.
+    # We can just return it.
+    # asf_ws_url = f"{ASF_WEBSOCKET_BASE_URL}?stream_id={context_data_for_workflow.get('stream_id')}" if context_data_for_workflow.get("stream_id") else None
+    # cpoa_final_return_dict = {
+    #     "task_id": original_task_id,
+    #     "workflow_id": cpoa_internal_workflow_id, # Use the CPOA internal workflow ID
+    #     "topic": topic,
+    #     "status": simplified_output_status,
+    #     "legacy_cpoa_internal_status": final_cpoa_status_legacy,
+    #     "error_message": final_error_message,
+    #     "asf_notification_status": asf_notification_status_message,
+    #     "asf_websocket_url": asf_ws_url,
+    #     "final_audio_details": vfa_result_dict,
+    #     "orchestration_log": orchestration_log_cpoa
+    # }
+    # if "tts_settings_used" not in vfa_result_dict and "tts_settings_used" in context_data_for_workflow:
+    #      vfa_result_dict["tts_settings_used"] = context_data_for_workflow["tts_settings_used"]
 
-    cpoa_final_result_payload = {
-        "task_id": original_task_id,
-        "workflow_id": cpoa_internal_workflow_id,
-        "topic": topic,
-        "status": final_cpoa_status_legacy, # Return legacy status for now for API GW compatibility
-        "error_message": final_error_message,
-        "asf_notification_status": asf_notification_status_message,
-        "asf_websocket_url": asf_ws_url,
-        "final_audio_details": vfa_result_dict,
-        "orchestration_log": orchestration_log_cpoa
-    }
-    if "tts_settings_used" not in vfa_result_dict and "tts_settings_used" in context_data_for_workflow: # Ensure tts_settings are in final_audio_details
-         vfa_result_dict["tts_settings_used"] = context_data_for_workflow["tts_settings_used"]
-
-    return cpoa_final_result
+    return cpoa_final_result_payload # This payload already has the simplified status
 
 @celery_app.task(bind=True, name='cpoa.orchestrate_podcast_task')
 def cpoa_orchestrate_podcast_task(self,

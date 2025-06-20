@@ -27,7 +27,7 @@ This document presents the consolidated findings and a prioritized, actionable m
 *   **FS11 (Security - General):** Verbose error messages in some API responses; input validation could be more systematic (schema-based); API Gateway lacks general rate limiting. **Status: Largely Addressed.** (API Gateway input validation via Pydantic is Addressed. API Gateway rate limiting is Addressed. Secure GCS Signed URL bucket usage in API-GW is Addressed. Verbose error messages from some sources might still exist - Partially Addressed).
 *   **FS12 (Testing):** Good use of test modes in many services (PSWA, VFA, SCA, TDA). IGA lacks one. WCHA tests fixed and passing. Most other unit tests status unknown due to FS1. **Status: Partially Addressed. (Test modes exist in PSWA, VFA, SCA, TDA, and IGA. WCHA tests fixed. FS1 resolution allows most unit tests to run, but overall coverage gaps remain).**
 *   **FS13 (was VFA/IGA-S1 & AIMS/AIMS_TTS-P1): GCP Client Instantiation:** AI/TTS/Storage clients in IGA, AIMS, AIMS_TTS instantiated per request. **Status: Addressed.** (GCP client instantiations in IGA, VFA, AIMS, AIMS_TTS optimized to use global/cached clients).
-*   **FS14 (Minor Code/Logic Issues):** CPOA snippet save failure handling, CPOA dual status system, TDA summary truncation, IGA image byte access. **Status: Partially Addressed.** (CPOA snippet save failure handling is Addressed with retries. CPOA dual status system is Partially Addressed. TDA summary truncation for NewsAPI artifact is Addressed. IGA image byte access (_image_bytes) is Still Open. CPOA logging ValueErrors is Closed (Not Applicable in CPOA)).
+*   **FS14 (Minor Code/Logic Issues):** CPOA snippet save failure handling, CPOA dual status system, TDA summary truncation, IGA image byte access. **Status: Partially Addressed.** (CPOA snippet save failure handling is Addressed with retries. CPOA dual status system is Addressed. TDA summary truncation for NewsAPI artifact is Addressed. IGA image byte access (_image_bytes) is Still Open. CPOA logging ValueErrors is Closed (Not Applicable in CPOA)).
 
 ## III. Updated and Prioritized Mitigation Plan:
 
@@ -58,7 +58,8 @@ This document presents the consolidated findings and a prioritized, actionable m
 13. **Robust LLM Output Parsing (M-C4.1, M-C4.2):** (Addresses part of FS10) **Status: Largely Addressed.** (PSWA good, SCA indirect via AIMS).
 14. **Standardize Logging Configuration (M-C1.1 / M-CPOA-S2.1):** (Addresses part of FS10) **Status: Partially Addressed.** (JSON logging in WCHA, AIMS, AIMS_TTS; structured text in API-GW, CPOA).
 15. **Improve Snippet DB Save Error Handling in CPOA (M-CPOA-S1.1):** (Addresses FS14) **Status: Addressed.**
-16. **Consolidate CPOA Status System (M-CPOA-S4.1):** (Addresses FS14) **Status: Partially Addressed.**
+16. **Consolidate CPOA Status System (M-CPOA-S4.1):** (Addresses FS14) **Status: Addressed.**
+    *   *Resolution:* Addressed by simplifying the top-level `status` field returned by the CPOA orchestration task (`cpoa_orchestrate_podcast_task`). The externally exposed `status` now uses a standardized set (e.g., 'SUCCESS', 'FAILURE', 'SUCCESS_WITH_WARNINGS'). The original granular, internal CPOA step status is preserved in a new field `legacy_cpoa_internal_status` in the task's JSON output for debugging purposes. The `podcasts.cpoa_status` column continues to store the detailed legacy status for internal tracking. This clarifies the external API contract while retaining detailed internal state.
 17. **Robust CPOA Task Status DB Updates (M-CPOA-S5.1):** (Addresses FS14) **Status: Addressed.** (As per original report, not re-verified in this pass).
 18. **Reduce API Error Verbosity (M-D3.1):** (Addresses part of FS11) **Status: Partially Addressed.**
 19. **Add Test Mode to IGA (M-E2.1):** (Addresses part of FS12) **Status: Addressed. (IGA's `generate_image_vertex_ai_task` now supports test mode via `X-Test-Scenario` header, providing mock success and error simulation).**
@@ -111,7 +112,7 @@ The following items, previously marked as "Addressed" or "Completed", were re-ve
 - **FS11 (Security - Verbose Errors):** While API Gateway Pydantic validation errors are structured, and Celery task errors are somewhat structured, the propagation of detailed error messages (especially from Celery tasks through CPOA to the API Gateway) could still lead to verbose errors reaching the client. Status: Partially Addressed.
 - **FS12 (Testing):** Overall unit test gaps (M-T1.1-3) remain 'Partially Addressed', though test modes are now present in all key generation services including IGA.
 - **FS14 (Minor Code/Logic Issues):**
-    - CPOA dual status system (M-CPOA-S4.1): Partially Addressed (legacy `podcasts.cpoa_status` likely still updated).
+    - CPOA dual status system (M-CPOA-S4.1): Addressed. The CPOA task's primary output `status` is now simplified (SUCCESS, FAILURE, etc.), with the detailed internal step status preserved in `legacy_cpoa_internal_status`.
     - TDA summary truncation (M-TDA-D2.1): Addressed for the specific NewsAPI artifact. If a general max-length truncation was implied, that remains open.
     - IGA image byte access (M-IGA-C1.1): Still Open (direct `_image_bytes` access).
     - CPOA Logging ValueErrors (M-C6.1): Closed (Not Applicable in CPOA). CPOA does not directly log Pydantic `ValidationError`s. Logging of downstream HTTP 4xx client errors (which could stem from Pydantic validation in those services) is standard.
