@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 from celery import Celery
 from celery.result import AsyncResult
 
+import base64 # Added for base64 encoding
 # --- Google Cloud specific imports ---
 from google.cloud import aiplatform
 from vertexai.preview.vision_models import ImageGenerationModel
@@ -377,13 +378,14 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
         if test_scenario:
             if test_scenario == 'success_placeholder':
                 app.logger.info(f"IGA Task {task_log_id}: Test mode 'success_placeholder' active.", extra=log_extra_base)
-                mock_gcs_object_name = f"{gcs_image_prefix.strip('/')}/test_placeholder_image_{request_id}_{uuid.uuid4().hex[:8]}.png"
-                mock_gcs_uri = f"gs://{gcs_bucket_name}/{mock_gcs_object_name}"
+                placeholder_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
                 task_result_payload = {
-                    "image_url": mock_gcs_uri,
-                    "prompt_used": prompt,
-                    "model_version": "test-mode-placeholder-model",
-                    "status_message": "Image generation successful (test mode - placeholder)."
+                    "status": "success",
+                    "image_base64": placeholder_base64,
+                    "image_format": "png",
+                    "gcs_uri": None, # Explicitly null as GCS upload is bypassed
+                    "signed_url": None, # Explicitly null
+                    "message": "Placeholder image generated successfully."
                 }
                 if db_conn and idempotency_key:
                     _store_idempotency_record(db_conn, idempotency_key, self.name, iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'], workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
@@ -416,13 +418,11 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
             app.logger.info(f"IGA Task {task_log_id}: Model '{model_id}' not pre-loaded or not default. Attempting on-demand load.", extra=log_extra_base)
             try:
                 model_to_use = ImageGenerationModel.from_pretrained(model_id)
-                # Note: On-demand loaded models are not added to a global cache here,
-                # unlike AIMS service. This could be a future enhancement if non-default models are used frequently.
             except Exception as e_model_demand:
                 app.logger.error(f"IGA Task {task_log_id}: Failed to initialize model '{model_id}' on demand: {e_model_demand}", exc_info=True, extra=log_extra_base)
                 raise RuntimeError(f"IGA Critical: Failed to load model '{model_id}' on demand.") from e_model_demand
 
-        if model_to_use is None: # Should be caught by earlier checks, but as a safeguard
+        if model_to_use is None:
              app.logger.error(f"IGA Task {task_log_id}: Model '{model_id}' could not be loaded/retrieved.", extra=log_extra_base)
              raise RuntimeError(f"IGA Critical: Model '{model_id}' unavailable for generation.")
 
@@ -434,44 +434,49 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
         )
 
         if not images_response or not images_response.images:
-            app.logger.error(f"IGA Task {task_log_id}: No images from Vertex AI (using global model) for prompt: '{prompt}'", extra=log_extra_base)
-            raise ValueError("Vertex AI returned no images using global model.") # Triggers on_failure
+            app.logger.error(f"IGA Task {task_log_id}: No images from Vertex AI for prompt: '{prompt}'", extra=log_extra_base)
+            # Update idempotency record to failed for this specific error
+            error_payload = {"error_type": "NoImageGenerated", "message": "Vertex AI returned no images."}
+            if db_conn and idempotency_key:
+                _store_idempotency_record(db_conn, idempotency_key, self.name, iga_config['IGA_IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=error_payload, is_new_key=False)
+                db_conn.commit()
+            return {"status": "error", "message": "Image generation failed: No images returned from Vertex AI."}
+
 
         image_object = images_response.images[0]
         if not hasattr(image_object, '_image_bytes') or not image_object._image_bytes:
-            app.logger.error(f"IGA Task {task_log_id}: Vertex AI image bytes missing (using global model) for prompt: '{prompt}'", extra=log_extra_base)
-            raise ValueError("Vertex AI produced empty image bytes using global model.") # Triggers on_failure
+            app.logger.error(f"IGA Task {task_log_id}: Vertex AI image bytes missing for prompt: '{prompt}'", extra=log_extra_base)
+            error_payload = {"error_type": "EmptyImageBytes", "message": "Vertex AI produced empty image bytes."}
+            if db_conn and idempotency_key:
+                _store_idempotency_record(db_conn, idempotency_key, self.name, iga_config['IGA_IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=error_payload, is_new_key=False)
+                db_conn.commit()
+            return {"status": "error", "message": "Image generation failed: Empty image data."}
 
-        if GLOBAL_STORAGE_CLIENT is None:
-            app.logger.error(f"IGA Task {task_log_id}: Global GCS storage client is not available. Cannot upload image.", extra=log_extra_base)
-            raise RuntimeError("IGA Critical: GCS Storage Client not initialized at startup.") # Triggers on_failure
-
-        bucket = GLOBAL_STORAGE_CLIENT.bucket(gcs_bucket_name)
-        file_extension = "png"
-        gcs_object_name = f"{gcs_image_prefix.strip('/')}/{request_id}_{uuid.uuid4().hex[:8]}.{file_extension}"
-        blob = bucket.blob(gcs_object_name)
-        gcs_content_type = 'image/png'
-
-        blob.upload_from_string(image_object._image_bytes, content_type=gcs_content_type)
-        image_gcs_uri = f"gs://{gcs_bucket_name}/{gcs_object_name}"
-        app.logger.info(f"IGA Task {task_log_id}: Image uploaded to GCS: {image_gcs_uri}", extra=log_extra_base)
+        image_bytes = image_object._image_bytes
+        encoded_bytes = base64.b64encode(image_bytes).decode('utf-8')
+        app.logger.info(f"IGA Task {task_log_id}: Image bytes accessed and base64 encoded.", extra=log_extra_base)
 
         task_result_payload = {
-            "image_url": image_gcs_uri, "prompt_used": prompt,
-            "model_version": f"vertex-ai-{model_id}"
+            "status": "success",
+            "image_base64": encoded_bytes,
+            "image_format": "png", # Assuming PNG, Vertex might provide this, or we infer
+            "message": "Image generated and returned as base64."
         }
 
-        # Store successful result in idempotency table
+        # GCS Upload is bypassed for this primary success path.
+        # The original GCS upload code would be here if not bypassed.
+
         _store_idempotency_record(db_conn, idempotency_key, self.name,
                                   iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'],
                                   workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
         db_conn.commit()
-        app.logger.info(f"IGA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'.", extra=log_extra_base)
+        app.logger.info(f"IGA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'. Image returned as base64.", extra=log_extra_base)
         return task_result_payload
 
     except google_exceptions.GoogleAPIError as e: # Specific retryable error for Google APIs
         app.logger.error(f"IGA Task {task_log_id}: Google Vertex AI/GCS API Error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
-        # Let on_failure handle marking idempotency as FAILED. Celery will manage retries.
+        # on_failure handler will be called by Celery due to re-raise.
+        # It will try to update idempotency if key and db_conn are available.
         raise self.retry(exc=e, countdown=20, max_retries=3) # Increased countdown for API errors
     except Exception as e: # Catch-all for other unexpected errors
         app.logger.error(f"IGA Task {task_log_id}: Unexpected error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
