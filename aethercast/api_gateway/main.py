@@ -572,6 +572,19 @@ app.logger.setLevel(logging.INFO)
 
 app.logger.info("API Gateway Flask app initialized and logger configured to use root settings.")
 
+# --- Global Error Handler ---
+@app.errorhandler(Exception)
+def handle_global_exception(e):
+    """Handles all unhandled exceptions by returning a generic 500 error."""
+    # Log the full exception details internally
+    app.logger.error("Unhandled exception caught by global error handler", exc_info=True)
+
+    # Return a generic JSON response to the client
+    response = {
+        "error_code": "API_GW_INTERNAL_SERVER_ERROR",
+        "message": "An internal server error occurred. Please try again later or contact support if the issue persists."
+    }
+    return jsonify(response), 500
 
 # --- Flask App Configuration ---
 app.config['SECRET_KEY'] = os.getenv('API_GATEWAY_FLASK_SECRET_KEY', 'a_default_fallback_secret_key_for_dev')

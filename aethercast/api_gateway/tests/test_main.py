@@ -290,6 +290,71 @@ class TestAPIGateway(unittest.TestCase):
         self.assertEqual(response.status_code, 201) # Or 200 depending on actual endpoint logic for success
         # ... rest of assertions for this test
 
+    @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
+    def test_create_podcast_task_cpoa_returns_error(self, mock_orchestrate_podcast_func):
+        """Test API Gateway response when CPOA returns a sanitized error."""
+        app.config['SECRET_KEY'] = 'test_secret_key_for_testing_suite'
+        token = self._generate_test_token(session_id="any_session_for_cpoa_error", user_id="user_for_cpoa_error")
+
+        # Mock CPOA to return a sanitized error
+        mock_cpoa_error_response = {
+            "status": "FAILURE", # Simplified status from CPOA
+            "error_message": "This is a sanitized error message from CPOA.", # Sanitized message
+            "legacy_cpoa_internal_status": "failed_some_internal_step", # Example legacy status
+            "workflow_id": "wf_mock_error_123"
+        }
+        mock_orchestrate_podcast_func.return_value = mock_cpoa_error_response
+
+        post_payload = {'topic': 'Test CPOA Failure Topic'}
+        response = self.client.post(
+            '/api/v1/podcasts',
+            json=post_payload,
+            headers={'Authorization': f'Bearer {token}', 'X-Idempotency-Key': 'idem-key-cpoa-error'} # Added idempotency key
+        )
+
+        # Expecting API Gateway to return a 500 or 502 based on the CPOA error
+        # The logic in main.py: if "request_exception" or "reported_error" or "WORKFLOW_CREATION_FAILED" in status or "timeout" -> 502, else 500
+        # For a generic "FAILURE" status from CPOA, it should be 500.
+        self.assertEqual(response.status_code, 500)
+        json_response = response.get_json()
+
+        self.assertEqual(json_response.get("error_code"), "API_GW_CPOA_ORCHESTRATION_ERROR_FAILURE")
+        self.assertEqual(json_response.get("message"), "This is a sanitized error message from CPOA.")
+        self.assertEqual(json_response.get("workflow_id"), "wf_mock_error_123")
+        # Ensure no raw internal details like "failed_some_internal_step" are in the top-level message/error_code
+        self.assertNotIn("failed_some_internal_step", json_response.get("error_code", ""))
+        self.assertNotIn("failed_some_internal_step", json_response.get("message", ""))
+
+
+    @patch.object(api_gw_main.app.logger, 'error')
+    def test_global_error_handler_returns_standard_json_500(self, mock_logger_error):
+        """Test that the global error handler catches unhandled exceptions and returns a standard JSON 500 response."""
+        # Define a simple route that will raise an unhandled exception
+        @self.client.application.route('/_test_unhandled_error')
+        def _test_error_route():
+            raise Exception("Simulated unhandled test error")
+
+        response = self.client.get('/_test_unhandled_error')
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.content_type, 'application/json')
+
+        json_response = response.get_json()
+        expected_response = {
+            "error_code": "API_GW_INTERNAL_SERVER_ERROR",
+            "message": "An internal server error occurred. Please try again later or contact support if the issue persists."
+        }
+        self.assertEqual(json_response, expected_response)
+
+        # Assert that the error was logged, specifically checking for exc_info=True
+        mock_logger_error.assert_called_once()
+        # Check the call arguments for exc_info=True
+        # The actual call object is mock_logger_error.call_args
+        # It's a tuple: (args, kwargs). We need to check kwargs.
+        args, kwargs = mock_logger_error.call_args
+        self.assertTrue(kwargs.get('exc_info', False), "logger.error should be called with exc_info=True")
+        self.assertIn("Simulated unhandled test error", args[0]) # Check if the original error message part is in the log
+
 
 # --- Rate Limiting Tests ---
 class TestAPIGatewayRateLimiting(unittest.TestCase):

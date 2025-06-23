@@ -1370,11 +1370,14 @@ def orchestrate_podcast_generation(
                 asf_output_summary = {"message": asf_notification_status_message, "response_status": response_asf.status_code}
                 log_step_cpoa(asf_notification_status_message, data=asf_output_summary)
             except Exception as e_asf:
-                asf_error_details = {"message": f"ASF notification failed: {str(e_asf)}", "exception_type": type(e_asf).__name__}
-                asf_notification_status_message = asf_error_details["message"] # For legacy field
-                final_error_message = asf_error_details["message"]
+                detailed_asf_error = f"ASF notification failed: {str(e_asf)}" # Keep detailed error for logging
+                asf_error_details = {"message": detailed_asf_error, "exception_type": type(e_asf).__name__}
+                wf_logger.error(f"ASF Notification stage error: {detailed_asf_error}", exc_info=True, extra={'task_id': asf_task_id})
+
+                # Set sanitized messages for upward propagation
+                asf_notification_status_message = "Failed during notification stage." # Sanitized for legacy field if used in final payload
+                final_error_message = "Failed during notification stage." # Sanitized for final payload
                 final_cpoa_status_legacy = CPOA_STATUS_COMPLETED_WITH_ASF_NOTIFICATION_FAILURE
-                wf_logger.error(f"ASF Notification stage error: {asf_error_details['message']}", exc_info=True, extra={'task_id': asf_task_id})
 
             if asf_task_id:
                 _update_task_instance_status(db_conn, asf_task_id, TASK_STATUS_COMPLETED if not asf_error_details else TASK_STATUS_FAILED,
@@ -1397,7 +1400,7 @@ def orchestrate_podcast_generation(
 
     except Exception as e_main_workflow:
         wf_logger.error(f"Podcast generation workflow critically failed at stage '{current_orchestration_stage_legacy}': {e_main_workflow}", exc_info=True)
-        final_error_message = final_error_message or str(e_main_workflow)
+        final_error_message = final_error_message or "An unexpected error occurred during podcast orchestration." # Sanitized
         final_workflow_status = WORKFLOW_STATUS_FAILED
 
         # Ensure legacy status reflects a failure if not already specific from a caught block
@@ -1441,7 +1444,7 @@ def orchestrate_podcast_generation(
         except Exception as e_main_workflow_logic:
             # This catches errors within the WCHA,PSWA,VFA,ASF stages
             wf_logger.error(f"Podcast generation workflow critically failed at stage '{current_orchestration_stage_legacy}': {e_main_workflow_logic}", exc_info=True)
-            final_error_message = final_error_message or str(e_main_workflow_logic)
+            final_error_message = final_error_message or f"Error during {current_orchestration_stage_legacy}." # Sanitized
             final_workflow_status = WORKFLOW_STATUS_FAILED
             if not final_cpoa_status_legacy.startswith("failed_") and not final_cpoa_status_legacy.startswith("completed_with_"):
                 final_cpoa_status_legacy = CPOA_STATUS_FAILED_UNKNOWN_STAGE_EXCEPTION
@@ -2115,19 +2118,19 @@ def orchestrate_snippet_generation(
             return {"error": "SCA_POLLING_LOGIC_ERROR", "details": "Snippet data missing after SCA task success."}
 
     except requests.exceptions.RequestException as e_req: # For initial SCA call
-        error_message = f"SCA service initial call failed for topic_id {topic_id}: {str(e_req)}"
-        current_logger.error(f"{function_name} - {error_message}", exc_info=True)
-        return {"error": SCA_STATUS_CALL_FAILED_AFTER_RETRIES, "details": error_message}
+        detailed_error_log = f"SCA service initial call failed for topic_id {topic_id}: {str(e_req)}"
+        current_logger.error(f"{function_name} - {detailed_error_log}", exc_info=True)
+        return {"error": SCA_STATUS_CALL_FAILED_AFTER_RETRIES, "details": "SCA service call failed after retries."} # Sanitized
     except json.JSONDecodeError as e_json: # For initial SCA call response
-        error_message = f"SCA service initial response was not valid JSON for topic_id {topic_id}: {str(e_json)}"
+        detailed_error_log = f"SCA service initial response was not valid JSON for topic_id {topic_id}: {str(e_json)}"
         # Use initial_sca_response if it's in scope, otherwise 'N/A'
         raw_response_text = initial_sca_response.text[:500] if 'initial_sca_response' in locals() and hasattr(initial_sca_response, 'text') else "N/A"
-        current_logger.error(f"{function_name} - {error_message}", exc_info=True)
-        return {"error": SCA_STATUS_RESPONSE_INVALID_JSON, "details": error_message, "raw_response": raw_response_text}
+        current_logger.error(f"{function_name} - {detailed_error_log}", exc_info=True)
+        return {"error": SCA_STATUS_RESPONSE_INVALID_JSON, "details": "SCA service response was not valid JSON.", "raw_response": raw_response_text} # Sanitized
     except Exception as e: # General exception catch
-        error_message = f"Unexpected error during SCA interaction for topic_id {topic_id}: {str(e)}"
-        current_logger.error(f"{function_name} - {error_message}", exc_info=True)
-        return {"error": SCA_STATUS_CALL_UNEXPECTED_ERROR, "details": error_message}
+        detailed_error_log = f"Unexpected error during SCA interaction for topic_id {topic_id}: {str(e)}"
+        current_logger.error(f"{function_name} - {detailed_error_log}", exc_info=True)
+        return {"error": SCA_STATUS_CALL_UNEXPECTED_ERROR, "details": "Unexpected error during SCA interaction."} # Sanitized
     finally: # Ensure locally managed DB connection is closed if orchestrate_snippet_generation handled it
         if db_conn_internal and not db_conn_param: # Only if it was NOT passed in
             _put_cpoa_db_connection(db_conn_internal)
@@ -2466,18 +2469,23 @@ def orchestrate_topic_exploration(
                     time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
 
         except requests.exceptions.RequestException as e_req:
-            tda_error_details = {"message": f"TDA service initial call failed for exploration: {str(e_req)}", "exception_type": type(e_req).__name__}
+                wf_logger.error(f"TDA service initial call failed for exploration: {str(e_req)}", exc_info=True, extra={'task_id': tda_task_id})
+                tda_error_details = {"message": "TDA service call failed.", "exception_type": type(e_req).__name__} # Sanitized
         except json.JSONDecodeError as e_json:
-             tda_error_details = {"message": f"Failed to decode TDA initial response for exploration: {str(e_json)}", "response_preview": initial_tda_response.text[:200] if 'initial_tda_response' in locals() else "N/A"}
+                response_preview = initial_tda_response.text[:200] if 'initial_tda_response' in locals() else "N/A"
+                wf_logger.error(f"Failed to decode TDA initial response for exploration: {str(e_json)}. Response preview: {response_preview}", exc_info=True, extra={'task_id': tda_task_id})
+                tda_error_details = {"message": "Failed to decode TDA response.", "response_preview": response_preview} # Sanitized
         except Exception as e_gen_tda: # Catch other errors during dispatch or polling setup
-            tda_error_details = tda_error_details or {"message": f"Unexpected error during TDA interaction for exploration: {str(e_gen_tda)}", "exception_type": type(e_gen_tda).__name__}
+                wf_logger.error(f"Unexpected error during TDA interaction for exploration: {str(e_gen_tda)}", exc_info=True, extra={'task_id': tda_task_id})
+                tda_error_details = tda_error_details or {"message": "Unexpected error during TDA interaction.", "exception_type": type(e_gen_tda).__name__} # Sanitized
 
     if tda_error_details or not tda_topics: # If any error occurred or still no topics
-        final_error_msg = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for exploration."
-        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg, context_data={"tda_query": query_for_tda})
-        # Ensure the CPOA task instance is also updated
-        if tda_task_id: _update_task_instance_status(tda_task_id, TASK_STATUS_FAILED, output_summary=tda_output_summary, error_details=tda_error_details or {"message":final_error_msg}, workflow_id_for_log=workflow_id)
-        return {"error": "TDA_FAILURE", "details": final_error_msg, "explored_topics": [], "workflow_id": workflow_id}
+        final_error_msg_for_return = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for exploration."
+        # Log the sanitized error message for the workflow status
+        _update_workflow_instance_status(db_conn, workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg_for_return, context_data={"tda_query": query_for_tda})
+        # The tda_error_details (which might contain more specific, but still sanitized, info) is logged for the task instance
+        if tda_task_id: _update_task_instance_status(db_conn, tda_task_id, TASK_STATUS_FAILED, output_summary=tda_output_summary, error_details=tda_error_details or {"message": final_error_msg_for_return}, workflow_id_for_log=workflow_id)
+        return {"error": "TDA_FAILURE", "details": final_error_msg_for_return, "explored_topics": [], "workflow_id": workflow_id}
 
     # Update CPOA task instance for TDA successfully
     if tda_task_id: _update_task_instance_status(tda_task_id, TASK_STATUS_COMPLETED, output_summary=tda_output_summary, workflow_id_for_log=workflow_id)
@@ -2619,18 +2627,22 @@ def orchestrate_search_results_generation(query: str, user_preferences: Optional
                     time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
 
         except requests.exceptions.RequestException as e_req:
-            tda_error_details = {"message": f"TDA service initial call failed for search: {str(e_req)}", "exception_type": type(e_req).__name__}
+            wf_logger.error(f"TDA service initial call failed for search: {str(e_req)}", exc_info=True, extra={'task_id': tda_task_id})
+            tda_error_details = {"message": "TDA service call failed.", "exception_type": type(e_req).__name__} # Sanitized
         except json.JSONDecodeError as e_json:
-             tda_error_details = {"message": f"Failed to decode TDA initial response for search: {str(e_json)}", "response_preview": initial_tda_response.text[:200] if 'initial_tda_response' in locals() else "N/A"}
+            response_preview = initial_tda_response.text[:200] if 'initial_tda_response' in locals() else "N/A"
+            wf_logger.error(f"Failed to decode TDA initial response for search: {str(e_json)}. Response preview: {response_preview}", exc_info=True, extra={'task_id': tda_task_id})
+            tda_error_details = {"message": "Failed to decode TDA response.", "response_preview": response_preview} # Sanitized
         except Exception as e_gen_tda:
-            tda_error_details = tda_error_details or {"message": f"Unexpected error during TDA interaction for search: {str(e_gen_tda)}", "exception_type": type(e_gen_tda).__name__}
+            wf_logger.error(f"Unexpected error during TDA interaction for search: {str(e_gen_tda)}", exc_info=True, extra={'task_id': tda_task_id})
+            tda_error_details = tda_error_details or {"message": "Unexpected error during TDA interaction.", "exception_type": type(e_gen_tda).__name__} # Sanitized
 
     if tda_error_details or not tda_topics: # If any error occurred or still no topics
-        final_error_msg = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for search."
-        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg, context_data={"tda_query": query})
-        # Ensure the CPOA task instance is also updated
-        if tda_task_id: _update_task_instance_status(tda_task_id, TASK_STATUS_FAILED, output_summary=tda_output_summary, error_details=tda_error_details or {"message": final_error_msg}, workflow_id_for_log=workflow_id)
-        return {"error": "TDA_FAILURE", "details": final_error_msg, "search_results": [], "workflow_id": workflow_id}
+        final_error_msg_for_return = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for search."
+        _update_workflow_instance_status(workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg_for_return, context_data={"tda_query": query})
+        # The tda_error_details (which might contain more specific, but still sanitized, info) is logged for the task instance
+        if tda_task_id: _update_task_instance_status(tda_task_id, TASK_STATUS_FAILED, output_summary=tda_output_summary, error_details=tda_error_details or {"message": final_error_msg_for_return}, workflow_id_for_log=workflow_id)
+        return {"error": "TDA_FAILURE", "details": final_error_msg_for_return, "search_results": [], "workflow_id": workflow_id}
 
     # Update CPOA task instance for TDA successfully
     if tda_task_id: _update_task_instance_status(tda_task_id, TASK_STATUS_COMPLETED, output_summary=tda_output_summary, workflow_id_for_log=workflow_id)
@@ -3112,24 +3124,31 @@ def orchestrate_landing_page_snippets(limit: int = 5, user_preferences: Optional
                         time.sleep(CPOA_TDA_POLLING_INTERVAL_SECONDS)
 
             except requests.exceptions.RequestException as e_req: # For initial TDA call
-                tda_error_details = {"message": f"TDA service initial call failed for landing page: {str(e_req)}", "exception_type": type(e_req).__name__}
+                wf_logger.error(f"TDA service initial call failed for landing page: {str(e_req)}", exc_info=True, extra={'task_id': tda_task_id})
+                tda_error_details = {"message": "TDA service call failed.", "exception_type": type(e_req).__name__} # Sanitized
             except json.JSONDecodeError as e_json: # For initial TDA call
-                 tda_error_details = {"message": f"Failed to decode TDA initial response for landing page: {str(e_json)}", "response_preview": initial_tda_response.text[:200] if 'initial_tda_response' in locals() else "N/A"}
+                response_preview = initial_tda_response.text[:200] if 'initial_tda_response' in locals() else "N/A"
+                wf_logger.error(f"Failed to decode TDA initial response for landing page: {str(e_json)}. Response preview: {response_preview}", exc_info=True, extra={'task_id': tda_task_id})
+                tda_error_details = {"message": "Failed to decode TDA response.", "response_preview": response_preview} # Sanitized
             except Exception as e_gen_tda: # General catch for TDA interaction
-                tda_error_details = tda_error_details or {"message": f"Unexpected error during TDA interaction for landing page: {str(e_gen_tda)}", "exception_type": type(e_gen_tda).__name__}
+                wf_logger.error(f"Unexpected error during TDA interaction for landing page: {str(e_gen_tda)}", exc_info=True, extra={'task_id': tda_task_id})
+                tda_error_details = tda_error_details or {"message": "Unexpected error during TDA interaction.", "exception_type": type(e_gen_tda).__name__} # Sanitized
 
 
         if tda_error_details:
-             wf_logger.error(f"TDA task failed: {tda_error_details['message']}", exc_info=True if "exception_type" in tda_error_details else False, extra={'task_id': tda_task_id})
+             # The detailed error (str(e)) is already logged by the specific except blocks above.
+             # This log ensures that the sanitized message from tda_error_details is also logged if it was populated.
+             wf_logger.error(f"TDA task failed (post-exception processing): {tda_error_details['message']}", exc_info=False, extra={'task_id': tda_task_id}) # exc_info=False as original exception logged already
+
         if tda_task_id : # Ensure tda_task_id was created before trying to update its status
             _update_task_instance_status(db_conn, tda_task_id, TASK_STATUS_COMPLETED if not tda_error_details else TASK_STATUS_FAILED,
                                      output_summary=tda_output_summary, error_details=tda_error_details, workflow_id_for_log=workflow_id)
 
         if tda_error_details or not tda_topics:
-            final_error_msg = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for landing page."
-            _update_workflow_instance_status(db_conn, workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg, context_data={"tda_query": query_for_tda})
+            final_error_msg_for_return = (tda_error_details.get("message") if tda_error_details else None) or "TDA returned no topics for landing page."
+            _update_workflow_instance_status(db_conn, workflow_id, WORKFLOW_STATUS_FAILED, error_message=final_error_msg_for_return, context_data={"tda_query": query_for_tda})
             db_conn.commit()
-            return {"error": "TDA_FAILURE", "details": final_error_msg, "snippets": [], "workflow_id": workflow_id}
+            return {"error": "TDA_FAILURE", "details": final_error_msg_for_return, "snippets": [], "workflow_id": workflow_id}
 
         # --- Snippet Generation Loop ---
         generated_snippets: List[Dict[str, Any]] = []
