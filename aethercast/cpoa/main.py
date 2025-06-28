@@ -15,6 +15,7 @@ import random # Added for landing page snippet keyword randomization
 from celery import Celery
 from celery.result import AsyncResult
 from flask import Flask, jsonify as flask_jsonify # To avoid conflict if jsonify is used elsewhere
+from python_json_logger import jsonlogger # Added for JSON logging
 
 # Ensure the 'aethercast' directory is in the Python path.
 current_script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -166,13 +167,40 @@ DB_RETRY_BACKOFF_FACTOR = 1 # Added
 
 
 # --- Logging Configuration ---
-logger = logging.getLogger(__name__)
-if not logger.hasHandlers():
-    # New format to include workflow_id and task_id, which will be added via LoggerAdapter
-    # Added default "N/A" for workflow_id and task_id if not provided in the log record.
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - CPOA - %(workflow_id:-N/A)s - %(task_id:-N/A)s - %(message)s')
+# ServiceNameFilter class (similar to WCHA and API-GW for consistency if desired, or rely on 'extra')
+class ServiceNameFilter(logging.Filter):
+    def filter(self, record):
+        record.service_name = "cpoa-service" # CPOA service name
+        # Ensure workflow_id and task_id are present, defaulting to "N/A"
+        # This is important if logs are emitted without going through LoggerAdapter
+        if not hasattr(record, 'workflow_id'):
+            record.workflow_id = "N/A"
+        if not hasattr(record, 'task_id'):
+            record.task_id = "N/A"
+        return True
 
-# Log loaded configuration (initial logging without workflow/task IDs)
+logger = logging.getLogger(__name__)
+if not logger.hasHandlers(): # Configure only if no handlers are present
+    logger.handlers.clear() # Clear any pre-existing handlers from other modules
+    stream_handler = logging.StreamHandler()
+
+    # Add the service_name filter to the handler
+    service_name_filter = ServiceNameFilter()
+    stream_handler.addFilter(service_name_filter)
+
+    # Use JsonFormatter
+    # The format string defines the fields that python-json-logger will try to extract.
+    # Fields like 'workflow_id' and 'task_id' will be picked up if present in the LogRecord
+    # (e.g., added by LoggerAdapter or 'extra' in logging calls).
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(workflow_id)s %(task_id)s"
+    )
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False # Optional: prevent logs from propagating to the root logger if it has other handlers
+
+# Log loaded configuration (initial logging without workflow/task IDs, ServiceNameFilter will add defaults)
 # Create a temporary adapter for these initial logs if needed, or log directly.
 initial_log_extra = {'workflow_id': 'N/A', 'task_id': 'N/A'}
 logger.info("--- CPOA Configuration ---", extra=initial_log_extra)

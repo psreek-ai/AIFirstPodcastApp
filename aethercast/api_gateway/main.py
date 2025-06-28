@@ -17,6 +17,7 @@ from google.cloud import storage # Added for GCS
 from google.api_core import exceptions as google_api_exceptions # For GCS error handling
 # from google.oauth2 import service_account # Not strictly needed if using ADC
 import logging # Added for JSON logging
+from python_json_logger import jsonlogger # Added for JSON logging
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
@@ -57,9 +58,9 @@ def setup_json_logging():
     logHandler.addFilter(service_filter)
 
     # Format includes common fields, service_name, and placeholders for workflow/task IDs
-    # Standard formatter, fields like levelname, name, asctime are standard
+    # JsonFormatter will structure these as key-value pairs.
     # Custom fields service_name, workflow_id, task_id are added by ServiceNameFilter
-    formatter = logging.Formatter(
+    formatter = jsonlogger.JsonFormatter(
         fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(workflow_id)s %(task_id)s"
     )
     logHandler.setFormatter(formatter)
@@ -69,7 +70,7 @@ def setup_json_logging():
 
     # Test log
     initial_logger = logging.getLogger(__name__) # Use a logger for this specific module
-    initial_logger.info("Standard logging configured for API Gateway.")
+    initial_logger.info("JSON logging configured for API Gateway.")
 
 setup_json_logging() # Call early to configure logging
 
