@@ -2789,74 +2789,101 @@ def _run_wcha_stage(
 
         wcha_internal_task_id_from_service = None # To store WCHA's own Celery task ID if async
 
-        if initial_wcha_response.status_code == 200: # Synchronous success from WCHA (e.g., DDGS path)
-            wf_logger.info(f"WCHA returned synchronous success for topic '{topic}'.", extra={'task_id': wcha_task_db_id})
+        if initial_wcha_response.status_code == 200: # Synchronous success from WCHA (e.g., old DDGS path or mock)
+            wf_logger.info(f"WCHA returned synchronous success (200 OK) for topic '{topic}'.", extra={'task_id': wcha_task_db_id})
             wcha_sync_result = initial_wcha_response.json()
             if wcha_sync_result.get("status") == "success" and wcha_sync_result.get("content"):
                 wcha_content = wcha_sync_result.get("content")
                 source_urls = wcha_sync_result.get("source_urls", [])
-                wcha_output_summary = {"content_length": len(wcha_content), "source_urls": source_urls, "message": wcha_sync_result.get("message", "WCHA synchronous success.")}
+                wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": wcha_sync_result.get("message", "WCHA synchronous success.")}
                 log_step_cpoa_fn("WCHA synchronous success, content received.", data=wcha_output_summary)
             else:
-                wcha_error_details = {"message": "WCHA synchronous response indicates failure or no content.", "wcha_response": wcha_sync_result}
+                wcha_error_details = {"message": "WCHA synchronous 200 OK response indicates failure or no content.", "wcha_response": wcha_sync_result}
                 raise Exception(wcha_error_details["message"])
-        elif initial_wcha_response.status_code == 202: # Asynchronous task submitted to WCHA
+
+        elif initial_wcha_response.status_code == 202: # Asynchronous task submitted to WCHA (NewsAPI or new DDGS aggregation)
             wcha_task_init_data = initial_wcha_response.json()
-            wcha_internal_task_id_from_service = wcha_task_init_data.get("task_id")
-            wcha_status_url_suffix = wcha_task_init_data.get("status_url")
+            wcha_internal_task_id_from_service = wcha_task_init_data.get("task_id") # This is WCHA's Celery task_id (either for NewsAPI or DDGS aggregation)
+            wcha_status_url_suffix = wcha_task_init_data.get("status_url") # Relative path like /v1/tasks/<task_id>
 
             if not wcha_internal_task_id_from_service or not wcha_status_url_suffix:
-                wcha_error_details = {"message": "WCHA task submission response missing task_id or status_url.", "response_data": wcha_task_init_data}
+                wcha_error_details = {"message": "WCHA async task submission (202) response missing task_id or status_url.", "response_data": wcha_task_init_data}
                 raise Exception(wcha_error_details["message"])
 
+            # Construct the full polling URL using WCHA_SERVICE_BASE_URL and the suffix
             wcha_poll_url = f"{WCHA_SERVICE_BASE_URL.rstrip('/')}{wcha_status_url_suffix}"
-            log_step_cpoa_fn(f"WCHA task {wcha_internal_task_id_from_service} submitted. Polling at {wcha_poll_url}", data=wcha_task_init_data)
-            wf_logger.info(f"WCHA task {wcha_internal_task_id_from_service} submitted. Polling status at {wcha_poll_url}", extra={'task_id': wcha_task_db_id})
+
+            # Log which type of async task CPOA is now polling (NewsAPI or DDGS Aggregation)
+            # The initial_wcha_response message might indicate this.
+            # For now, we log generically.
+            log_step_cpoa_fn(f"WCHA async task {wcha_internal_task_id_from_service} submitted. Polling at {wcha_poll_url}", data=wcha_task_init_data)
+            wf_logger.info(f"WCHA async task {wcha_internal_task_id_from_service} submitted. Polling status at {wcha_poll_url}", extra={'task_id': wcha_task_db_id})
 
             polling_start_time = time.time()
             while True:
                 if time.time() - polling_start_time > CPOA_WCHA_POLLING_TIMEOUT_SECONDS:
-                    wcha_error_details = {"message": f"Polling WCHA task {wcha_internal_task_id_from_service} timed out."}
+                    wcha_error_details = {"message": f"Polling WCHA async task {wcha_internal_task_id_from_service} timed out."}
                     raise Exception(wcha_error_details["message"])
 
                 time.sleep(CPOA_WCHA_POLLING_INTERVAL_SECONDS)
+                # Use requests.get for polling, not requests_with_retry, to avoid retrying the poll call itself too aggressively.
+                # Timeout for the poll GET request should be shorter.
                 poll_response_wcha = requests.get(wcha_poll_url, timeout=15)
-                poll_response_wcha.raise_for_status()
+                poll_response_wcha.raise_for_status() # Check for HTTP errors on poll
 
                 wcha_task_status_data = poll_response_wcha.json()
-                wcha_task_state = wcha_task_status_data.get("status")
-                log_step_cpoa_fn(f"WCHA task {wcha_internal_task_id_from_service} status: {wcha_task_state}", data=wcha_task_status_data)
-                wf_logger.info(f"WCHA task {wcha_internal_task_id_from_service} status: {wcha_task_state}", extra={'task_id': wcha_task_db_id})
+                wcha_task_state = wcha_task_status_data.get("status") # Celery task status: PENDING, SUCCESS, FAILURE
+
+                log_step_cpoa_fn(f"WCHA async task {wcha_internal_task_id_from_service} status: {wcha_task_state}", data=wcha_task_status_data)
+                wf_logger.info(f"WCHA async task {wcha_internal_task_id_from_service} status: {wcha_task_state}", extra={'task_id': wcha_task_db_id})
 
                 if wcha_task_state == "SUCCESS":
-                    wcha_result_dict = wcha_task_status_data.get("result", {})
-                    if wcha_result_dict.get("status") == "success":
+                    wcha_result_dict = wcha_task_status_data.get("result", {}) # This is the actual return value of the WCHA Celery task
+
+                    # The structure of wcha_result_dict will depend on whether it's from
+                    # fetch_news_articles_task or aggregate_ddgs_harvest_results_task.
+                    # Both should provide "status", "content", "source_urls".
+                    if wcha_result_dict.get("status") == "success" or wcha_result_dict.get("status") == "partial_success": # Check logical success from task result
                         wcha_content = wcha_result_dict.get("content")
                         source_urls = wcha_result_dict.get("source_urls", [])
-                        if not wcha_content and wcha_result_dict.get("articles"): # NewsAPI path might return articles
-                             wf_logger.info(f"WCHA task {wcha_internal_task_id_from_service} (NewsAPI) returned articles; CPOA needs further processing (not yet implemented here). Content may be missing.", extra={'task_id': wcha_task_db_id})
-                             # For now, if 'content' is primary and missing, flag as potential issue.
-                             if not wcha_content:
-                                 wcha_error_details = {"message": "WCHA task (NewsAPI) succeeded but 'content' field is missing.", "wcha_response": wcha_result_dict}
-                                 # This will be caught by the final check for wcha_content
 
-                        wcha_output_summary = {"content_length": len(wcha_content) if wcha_content else 0, "source_urls": source_urls, "message": "WCHA task content received."}
-                        log_step_cpoa_fn("WCHA task polling successful, content received.", data=wcha_output_summary)
-                        if not wcha_content and not wcha_result_dict.get("articles"): # If neither content nor articles, it's an issue
-                            wcha_error_details = {"message": wcha_output_summary.get("message") or "WCHA success but no content or articles."}
-                    else: # WCHA task's internal logic reported failure
-                        wcha_error_details = {"message": "WCHA task succeeded but reported internal failure or invalid result.", "wcha_response": wcha_result_dict}
-                    break
-                elif wcha_task_state == "FAILURE":
-                    wcha_error_details = {"message": "WCHA task execution failed.", "wcha_celery_response": wcha_task_status_data.get("result")}
-                    wf_logger.error(f"WCHA task {wcha_internal_task_id_from_service} reported FAILURE. Response: {wcha_task_status_data.get('result')}", extra={'task_id': wcha_task_db_id})
+                        # Specific handling for NewsAPI path that might only return articles (and no direct content yet)
+                        # This part of the logic might need review if WCHA's NewsAPI task changes.
+                        # For now, if content is missing but articles are present, it's treated as a special case.
+                        if not wcha_content and wcha_result_dict.get("articles"):
+                             wf_logger.info(f"WCHA task {wcha_internal_task_id_from_service} (NewsAPI) returned articles; CPOA needs further processing (currently not implemented in this stage). Content may be missing.", extra={'task_id': wcha_task_db_id})
+                             if not wcha_content: # If content is still missing, this is an issue unless articles are processed by CPOA
+                                 wcha_error_details = {"message": "WCHA NewsAPI task succeeded but 'content' field is missing and CPOA doesn't process 'articles' here.", "wcha_response": wcha_result_dict}
+                                 # This will be caught by the final check for wcha_content below.
+
+                        wcha_output_summary = {
+                            "content_length": len(wcha_content) if wcha_content else 0,
+                            "source_urls": source_urls,
+                            "message": wcha_result_dict.get("message", "WCHA async task content received.")
+                        }
+                        log_step_cpoa_fn("WCHA async task polling successful, content received.", data=wcha_output_summary)
+
+                        # If content is still None after all this (e.g. NewsAPI path with no content, or DDGS agg with no content)
+                        # and no specific error was set above for this, it's an issue.
+                        if not wcha_content and not wcha_error_details:
+                             wcha_error_details = {"message": wcha_output_summary.get("message") or "WCHA async task success but no content provided in result."}
+
+                    else: # WCHA Celery task returned SUCCESS, but its internal logical status was a failure.
+                        wcha_error_details = {"message": "WCHA async task succeeded (Celery) but reported internal logical failure or invalid result.", "wcha_celery_task_result": wcha_result_dict}
+                        wf_logger.warning(f"WCHA async task {wcha_internal_task_id_from_service} result indicates logical failure: {wcha_result_dict.get('message', 'N/A')}", extra={'task_id': wcha_task_db_id})
+                    break # Exit polling loop on Celery SUCCESS
+
+                elif wcha_task_state == "FAILURE": # WCHA Celery task itself failed
+                    wcha_error_details = {"message": "WCHA async task execution failed (Celery FAILURE).", "wcha_celery_task_info": wcha_task_status_data.get("result")} # result is usually exception info
+                    wf_logger.error(f"WCHA async task {wcha_internal_task_id_from_service} reported Celery FAILURE. Info: {wcha_task_status_data.get('result')}", extra={'task_id': wcha_task_db_id})
                     log_step_cpoa_fn(wcha_error_details["message"], data=wcha_error_details, is_error_payload=True)
-                    break
-        else: # Other non-200/202 status from WCHA initial call
+                    break # Exit polling loop on Celery FAILURE
+
+        else: # Other non-200/202 status from WCHA initial /harvest call
             wcha_error_details = {"message": f"WCHA service did not accept task or failed synchronously. Status: {initial_wcha_response.status_code}", "response_text": initial_wcha_response.text[:200]}
             raise Exception(wcha_error_details["message"])
 
-    except requests.exceptions.RequestException as e_req:
+    except requests.exceptions.RequestException as e_req: # Covers initial POST and polling GET errors
         wcha_error_details = {"message": f"WCHA stage request error: {str(e_req)}", "exception_type": type(e_req).__name__}
         wf_logger.error(f"WCHA stage request error: {str(e_req)}", exc_info=True, extra={'task_id': wcha_task_db_id})
     except json.JSONDecodeError as e_json:

@@ -28,6 +28,8 @@ import logging
 import requests # Existing import
 import socket # To reference socket.gaierror, socket.AF_INET, etc.
 from urllib.parse import urlparse # May not be needed in test, but good for context
+import uuid # For generating unique IDs in tests
+from celery.result import AsyncResult # For mocking Celery task results
 
 # Adjust path to import WCHA main module
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -190,16 +192,40 @@ class TestGetContentForTopic(unittest.TestCase):
         with patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
             result = wcha_main.get_content_for_topic("test topic")
 
-        self.assertEqual(result["status"], "success")
-        self.assertIn(page1_content, result["content"])
-        self.assertIn(page2_content, result["content"])
-        self.assertEqual(len(result["source_urls"]), 2)
-        self.assertIn("http://example.com/page1", result["source_urls"])
-        self.assertIn("http://example.com/page2", result["source_urls"])
-        self.assertIn("Successfully consolidated content from 2 out of 2 URLs", result["message"])
-        mock_ddgs_instance.text.assert_called_once_with(keywords="test topic", region='wt-wt', safesearch='moderate', max_results=3)
-        self.assertEqual(mock_requests_get.call_count, 2)
-        self.assertEqual(mock_trafilatura_extract.call_count, 2)
+        # This test needs to be updated for the new async DDGS path.
+        # It should now check for Celery task dispatch, not direct content.
+        mock_harvest_task_delay = MagicMock()
+        mock_aggregate_task_delay = MagicMock()
+        mock_harvest_task_delay.return_value = MagicMock(id="harvest_task_id_1")
+        mock_aggregate_task_delay.return_value = MagicMock(id="aggregate_task_id_123")
+
+        with patch('aethercast.wcha.main.harvest_url_content_task.delay', mock_harvest_task_delay), \
+             patch('aethercast.wcha.main.aggregate_ddgs_harvest_results_task.delay', mock_aggregate_task_delay), \
+             patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe.")):
+
+            result = wcha_main.get_content_for_topic("test topic async ddgs")
+
+        self.assertEqual(result["status"], "pending_ddgs_aggregation")
+        self.assertEqual(result["task_id"], "aggregate_task_id_123")
+        self.assertIn("DDGS content harvesting and aggregation initiated", result["message"])
+
+        mock_ddgs_instance.text.assert_called_once_with(keywords="test topic async ddgs", region='wt-wt', safesearch='moderate', max_results=3)
+        # requests.get and trafilatura.extract should not be called directly by get_content_for_topic anymore for DDGS path
+        mock_requests_get.assert_not_called()
+        mock_trafilatura_extract.assert_not_called()
+
+        # Check that harvest_url_content_task.delay was called for each URL from DDGS
+        self.assertEqual(mock_harvest_task_delay.call_count, 2) # Since DDGS mock returns 2 URLs
+        mock_harvest_task_delay.assert_any_call(request_id=unittest.mock.ANY, url_to_harvest='http://example.com/page1', min_length=50)
+        mock_harvest_task_delay.assert_any_call(request_id=unittest.mock.ANY, url_to_harvest='http://example.com/page2', min_length=50)
+
+        # Check that aggregate_ddgs_harvest_results_task.delay was called with the IDs from harvest_url_content_task
+        mock_aggregate_task_delay.assert_called_once()
+        args, kwargs = mock_aggregate_task_delay.call_args
+        self.assertIn("harvest_task_ids", kwargs)
+        self.assertListEqual(kwargs["harvest_task_ids"], ["harvest_task_id_1", "harvest_task_id_1"]) # Mocked ID is same for both calls
+        self.assertEqual(kwargs["original_topic"], "test topic async ddgs")
+
 
     @patch('aethercast.wcha.main.DDGS')
     def test_get_content_for_topic_no_search_results(self, mock_ddgs_constructor):
@@ -338,8 +364,27 @@ class TestWCHAFlaskEndpoints(unittest.TestCase):
         mock_success_data = {"status": "success", "content": "Content.", "source_urls": [], "message": ""}
         mock_get_content_for_topic.return_value = mock_success_data
         response = self.client.post('/harvest', json={"topic": "test success topic", "use_search": True})
-        self.assertEqual(response.status_code, 200)
-        mock_get_content_for_topic.assert_called_once_with('test success topic', max_results_override=None) # Adjusted expectation
+        self.assertEqual(response.status_code, 200) # This assumes get_content_for_topic returns a synchronous success for this mock
+        mock_get_content_for_topic.assert_called_once_with('test success topic', task_id=unittest.mock.ANY, workflow_id='N/A', max_results_override=None)
+
+    @patch('aethercast.wcha.main.get_content_for_topic')
+    def test_harvest_endpoint_use_search_ddgs_async_pending(self, mock_get_content_for_topic):
+        # Simulate get_content_for_topic returning a pending aggregation task for DDGS
+        mock_pending_agg_data = {
+            "status": "pending_ddgs_aggregation",
+            "task_id": "agg_task_for_cpoa_poll_123",
+            "message": "DDGS content harvesting and aggregation initiated."
+        }
+        mock_get_content_for_topic.return_value = mock_pending_agg_data
+
+        response = self.client.post('/harvest', json={"topic": "test ddgs async topic", "use_search": True})
+
+        self.assertEqual(response.status_code, 202) # Expect 202 Accepted
+        json_response = response.get_json()
+        self.assertEqual(json_response["task_id"], "agg_task_for_cpoa_poll_123")
+        self.assertIn("/v1/tasks/agg_task_for_cpoa_poll_123", json_response["status_url"])
+        self.assertEqual(json_response["message"], "DDGS content harvesting and aggregation accepted.")
+        mock_get_content_for_topic.assert_called_once_with('test ddgs async topic', task_id=unittest.mock.ANY, workflow_id='N/A', max_results_override=None)
 
     def test_harvest_endpoint_missing_parameters(self):
         response = self.client.post('/harvest', json={})
@@ -370,7 +415,7 @@ class TestWCHAFlaskEndpoints(unittest.TestCase):
         self.assertEqual(mock_get_content_for_topic.call_count, 1)
         # get_content_for_topic's max_results_override is passed from harvest_params_for_search
         # The endpoint logic converts "max_results" from payload to int for this.
-        expected_call_args = call("test max results", max_results_override=3)
+        expected_call_args = call("test max results", task_id=unittest.mock.ANY, workflow_id='N/A', max_results_override=3) # Adjusted for task_id & workflow_id
         self.assertEqual(mock_get_content_for_topic.call_args, expected_call_args)
 
 
@@ -395,5 +440,210 @@ class TestWCHAFlaskEndpoints(unittest.TestCase):
         self.assertIn('request_id', kwargs) # Check if request_id is passed
 
 
+class TestAggregateDdgsHarvestResultsTask(unittest.TestCase):
+    def setUp(self):
+        # Ensure Celery is in eager mode for tests
+        wcha_main.celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        self.mock_db_conn = MagicMock()
+        self.get_db_patcher = patch('aethercast.wcha.main.get_db_connection', return_value=self.mock_db_conn)
+        self.mock_get_db_conn = self.get_db_patcher.start()
+        self.addCleanup(self.get_db_patcher.stop)
+
+        self.check_idempotency_patcher = patch('aethercast.wcha.main.check_idempotency')
+        self.mock_check_idempotency = self.check_idempotency_patcher.start()
+        self.addCleanup(self.check_idempotency_patcher.stop)
+
+        self.acquire_lock_patcher = patch('aethercast.wcha.main.acquire_idempotency_lock')
+        self.mock_acquire_lock = self.acquire_lock_patcher.start()
+        self.addCleanup(self.acquire_lock_patcher.stop)
+
+        self.update_record_patcher = patch('aethercast.wcha.main.update_idempotency_record')
+        self.mock_update_record = self.update_record_patcher.start()
+        self.addCleanup(self.update_record_patcher.stop)
+
+        # Patch wcha_config directly for min_length
+        self.wcha_config_patcher = patch.dict(wcha_main.wcha_config, {'WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION': 10})
+        self.wcha_config_patcher.start()
+        self.addCleanup(self.wcha_config_patcher.stop)
+
+
+    @patch('aethercast.wcha.main.AsyncResult')
+    def test_aggregation_all_sub_tasks_success(self, MockAsyncResult):
+        self.mock_check_idempotency.return_value = None # New task
+        self.mock_acquire_lock.return_value = True
+
+        harvest_task_ids = ["task_1", "task_2"]
+        original_topic = "Test Topic Aggregation"
+
+        mock_result_1 = MagicMock()
+        mock_result_1.successful.return_value = True
+        mock_result_1.get.return_value = {"url": "url1", "content": "Content from URL1.", "error_type": None}
+
+        mock_result_2 = MagicMock()
+        mock_result_2.successful.return_value = True
+        mock_result_2.get.return_value = {"url": "url2", "content": "More content from URL2.", "error_type": None}
+
+        MockAsyncResult.side_effect = [mock_result_1, mock_result_2]
+
+        agg_task_id = f"agg_req_{uuid.uuid4().hex[:6]}"
+        # Directly call the task function for eager testing
+        # Need to ensure 'self' (the bound task instance) is handled if task uses it explicitly
+        # For tasks decorated with @celery_app.task(bind=True), when called directly, 'self' is not automatically injected.
+        # However, our aggregate_ddgs_harvest_results_task uses self.request.id. For direct calls, this won't work.
+        # A common pattern for testing such tasks is to use .apply(kwargs={...}, task_id=...).get()
+        # or to mock self.request.id if calling directly.
+        # Let's use .apply().get() for more realistic Celery task testing.
+
+        # Create a mock 'self' for direct call if not using .apply()
+        mock_self = MagicMock()
+        mock_self.request.id = f"celery_agg_task_{uuid.uuid4().hex[:6]}"
+
+        result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+            mock_self, # Pass the mocked self
+            request_id=agg_task_id,
+            harvest_task_ids=harvest_task_ids,
+            original_topic=original_topic
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn("Content from URL1", result["content"])
+        self.assertIn("More content from URL2", result["content"])
+        self.assertListEqual(result["source_urls"], ["url1", "url2"])
+        self.assertEqual(len(result["failed_harvest_details"]), 0)
+        self.mock_update_record.assert_called_once_with(
+            self.mock_db_conn, agg_task_id, "wcha_aggregate_ddgs_harvest_task", 'completed', result_payload=result
+        )
+
+    @patch('aethercast.wcha.main.AsyncResult')
+    def test_aggregation_partial_success_one_sub_task_fails(self, MockAsyncResult):
+        self.mock_check_idempotency.return_value = None
+        self.mock_acquire_lock.return_value = True
+
+        harvest_task_ids = ["task_ok", "task_fail"]
+
+        mock_result_ok = MagicMock()
+        mock_result_ok.successful.return_value = True
+        mock_result_ok.get.return_value = {"url": "url_ok", "content": "Good content here.", "error_type": None}
+
+        mock_result_fail = MagicMock()
+        mock_result_fail.successful.return_value = False
+        mock_result_fail.status = "FAILURE"
+        mock_result_fail.info = "Simulated sub-task failure"
+
+        MockAsyncResult.side_effect = [mock_result_ok, mock_result_fail]
+
+        agg_task_id = "agg_partial_fail"
+        mock_self = MagicMock(); mock_self.request.id = "celery_agg_partial"
+        result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+            mock_self, agg_task_id, harvest_task_ids, "Partial Fail Topic"
+        )
+
+        self.assertEqual(result["status"], "partial_success")
+        self.assertEqual(result["content"], "Source: url_ok\nGood content here.")
+        self.assertListEqual(result["source_urls"], ["url_ok"])
+        self.assertEqual(len(result["failed_harvest_details"]), 1)
+        self.assertEqual(result["failed_harvest_details"][0]["error"], "sub_task_failed")
+        self.assertIn("Simulated sub-task failure", result["failed_harvest_details"][0]["message"])
+
+    @patch('aethercast.wcha.main.AsyncResult')
+    def test_aggregation_all_sub_tasks_fail(self, MockAsyncResult):
+        self.mock_check_idempotency.return_value = None
+        self.mock_acquire_lock.return_value = True
+        harvest_task_ids = ["task_f1", "task_f2"]
+
+        mock_result_f1 = MagicMock()
+        mock_result_f1.successful.return_value = True
+        mock_result_f1.get.return_value = {"url": "url_f1", "content": None, "error_type": "fetch_error", "error_message": "404 Not Found"}
+
+        mock_result_f2 = MagicMock()
+        mock_result_f2.successful.return_value = False
+        mock_result_f2.status = "FAILURE"
+        mock_result_f2.info = "Sub-task 2 crashed"
+
+        MockAsyncResult.side_effect = [mock_result_f1, mock_result_f2]
+
+        agg_task_id = "agg_all_fail"
+        mock_self = MagicMock(); mock_self.request.id = "celery_agg_all_fail"
+        result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+            mock_self, agg_task_id, harvest_task_ids, "All Fail Topic"
+        )
+
+        self.assertEqual(result["status"], "failure")
+        self.assertIsNone(result["content"])
+        self.assertEqual(len(result["source_urls"]), 0)
+        self.assertEqual(len(result["failed_harvest_details"]), 2)
+
+    @patch('aethercast.wcha.main.AsyncResult')
+    def test_aggregation_sub_task_timeout(self, MockAsyncResult):
+        self.mock_check_idempotency.return_value = None
+        self.mock_acquire_lock.return_value = True
+        harvest_task_ids = ["task_timeout"]
+
+        mock_result_timeout = MagicMock()
+        mock_result_timeout.get.side_effect = TimeoutError("Sub-task timed out")
+        MockAsyncResult.return_value = mock_result_timeout
+
+        agg_task_id = "agg_timeout"
+        mock_self = MagicMock(); mock_self.request.id = "celery_agg_timeout"
+        result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+            mock_self, agg_task_id, harvest_task_ids, "Timeout Topic"
+        )
+
+        self.assertEqual(result["status"], "failure")
+        self.assertEqual(len(result["failed_harvest_details"]), 1)
+        self.assertEqual(result["failed_harvest_details"][0]["error"], "sub_task_timeout")
+
+    def test_aggregation_idempotency_completed(self):
+        agg_task_id = "agg_idem_completed"
+        stored_result = {"status": "success", "content": "Already done", "source_urls": ["url_done"], "message": "From cache"}
+        self.mock_check_idempotency.return_value = {'status': 'completed', 'result': stored_result}
+
+        mock_self = MagicMock(); mock_self.request.id = "celery_agg_idem_comp"
+        result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+            mock_self, agg_task_id, [], "Idempotent Completed Topic"
+        )
+
+        self.assertEqual(result, stored_result)
+        self.mock_acquire_lock.assert_not_called()
+
+    def test_aggregation_idempotency_conflict(self):
+        agg_task_id = "agg_idem_conflict"
+        self.mock_check_idempotency.return_value = {'status': 'conflict', 'message': 'Task already processing'}
+
+        mock_self = MagicMock(); mock_self.request.id = "celery_agg_idem_conf"
+        result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+            mock_self, agg_task_id, [], "Idempotent Conflict Topic"
+        )
+
+        self.assertEqual(result["status"], "conflict")
+        self.mock_acquire_lock.assert_not_called()
+
+    @patch('aethercast.wcha.main.AsyncResult')
+    def test_aggregation_content_too_short(self, MockAsyncResult):
+        self.mock_check_idempotency.return_value = None
+        self.mock_acquire_lock.return_value = True
+        harvest_task_ids = ["task_short"]
+
+        mock_result_short = MagicMock()
+        mock_result_short.successful.return_value = True
+        mock_result_short.get.return_value = {"url": "url_short", "content": "Too short.", "error_type": None} # Length is 10
+
+        MockAsyncResult.return_value = mock_result_short
+
+        with patch.dict(wcha_main.wcha_config, {'WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION': 15}):
+            agg_task_id = "agg_content_short"
+            mock_self = MagicMock(); mock_self.request.id = "celery_agg_short"
+            result = wcha_main.aggregate_ddgs_harvest_results_task.__wrapped__(
+                mock_self, agg_task_id, harvest_task_ids, "Content Too Short Topic"
+            )
+
+        self.assertEqual(result["status"], "failure")
+        self.assertIsNone(result["content"])
+        self.assertEqual(len(result["source_urls"]), 0)
+        self.assertEqual(len(result["failed_harvest_details"]), 1)
+        self.assertEqual(result["failed_harvest_details"][0]["error"], "content_too_short")
+
 if __name__ == '__main__':
     unittest.main()
+
+[end of aethercast/wcha/tests/test_main.py]

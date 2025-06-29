@@ -2204,6 +2204,11 @@ class TestOrchestrationStageHelpers(BaseCpoaIdempotencyTest): # Inherit for comm
         self.mock_requests_retry.side_effect = None # Clear base
         self.mock_requests_retry.return_value = mock_wcha_sync_resp
 
+        # Patch requests.get to ensure it's not called in a sync success scenario
+        mock_requests_get_patcher = patch('requests.get')
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+
         result = cpoa_main._run_wcha_stage(
             db_conn=mock_db_conn,
             cpoa_internal_workflow_id="wf_wcha_test_sync",
@@ -2217,7 +2222,8 @@ class TestOrchestrationStageHelpers(BaseCpoaIdempotencyTest): # Inherit for comm
         self.assertEqual(result["content"], "Sync WCHA content")
         self.mock_create_task.assert_called_once()
         self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_COMPLETED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
-        self.mock_requests_retry.assert_called_once() # Only initial POST, no polling
+        self.mock_requests_retry.assert_called_once()
+        mock_requests_get.assert_not_called() # Ensure polling GET was not called
 
     def test_run_wcha_stage_polling_timeout(self):
         mock_db_conn = self.mock_db_conn
@@ -2265,6 +2271,59 @@ class TestOrchestrationStageHelpers(BaseCpoaIdempotencyTest): # Inherit for comm
                 wf_logger=mock_wf_logger, client_id="client_submit_fail", log_step_cpoa_fn=mock_log_step_cpoa_fn
             )
         self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_wcha_stage_ddgs_aggregation_success(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        # 1. Initial POST to WCHA /harvest returns 202 for DDGS aggregation
+        mock_wcha_submit_resp = MagicMock(status_code=202)
+        # This task_id is for WCHA's *aggregation* task
+        mock_wcha_submit_resp.json.return_value = {"task_id": "wcha_ddgs_agg_task_1", "status_url": "/v1/tasks/wcha_ddgs_agg_task_1"}
+
+        # 2. Subsequent GET to WCHA status URL for the aggregation task returns SUCCESS
+        mock_wcha_agg_poll_resp = MagicMock(status_code=200)
+        mock_wcha_agg_poll_resp.json.return_value = {
+            "status": "SUCCESS",  # Celery status of the aggregation task
+            "result": { # Actual result from aggregate_ddgs_harvest_results_task
+                "status": "success", # Logical status from aggregation logic
+                "content": "Aggregated DDGS content",
+                "source_urls": ["http://ddgs.example.com/res1"],
+                "message": "Successfully aggregated DDGS content."
+            }
+        }
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_wcha_agg_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_wcha_submit_resp # For the initial POST to /harvest
+
+        result = cpoa_main._run_wcha_stage(
+            db_conn=mock_db_conn,
+            cpoa_internal_workflow_id="wf_wcha_ddgs_agg_succ",
+            current_task_order=1,
+            topic="Test DDGS Aggregation",
+            parent_idempotency_key="parent_idem_ddgs_agg",
+            wf_logger=mock_wf_logger,
+            client_id="client_ddgs_agg",
+            log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+
+        self.assertEqual(result["content"], "Aggregated DDGS content")
+        self.assertEqual(result["source_urls"], ["http://ddgs.example.com/res1"])
+
+        # Check initial POST to WCHA /harvest
+        self.mock_requests_retry.assert_called_once()
+        self.assertEqual(self.mock_requests_retry.call_args[0][1], f"{wcha_main.WCHA_SERVICE_BASE_URL.rstrip('/')}/harvest")
+
+        # Check polling GET to WCHA /v1/tasks/...
+        mock_requests_get.assert_called_once()
+        self.assertEqual(mock_requests_get.call_args[0][0], f"{wcha_main.WCHA_SERVICE_BASE_URL.rstrip('/')}/v1/tasks/wcha_ddgs_agg_task_1")
+
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_COMPLETED, unittest.mock.ANY,unittest.mock.ANY, unittest.mock.ANY)
+
 
     # TODO: Add tests for _run_pswa_stage, _run_vfa_stage, _run_asf_notification_stage
     # covering success, different types of failures (HTTP error, logical error from service, timeout).
