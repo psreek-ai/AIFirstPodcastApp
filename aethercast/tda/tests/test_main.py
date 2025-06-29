@@ -685,3 +685,68 @@ class TestSaveTopicToDb(BaseTdaServiceTest): # Inherit for config and DB mock se
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestTdaCeleryLogging(BaseTdaServiceTest): # Inherit for config and Celery setup
+    @patch('aethercast.tda.main.app.logger') # Patch the app.logger used by tasks
+    @patch('aethercast.tda.main.call_real_news_api') # Mock the actual NewsAPI call
+    @patch('aethercast.tda.main._get_tda_db_connection', side_effect=mock_get_tda_db_connection_side_effect) # Mock DB for idempotency
+    def test_fetch_news_from_newsapi_task_json_logging(self, mock_db_conn_getter, mock_call_real_news_api, mock_app_logger):
+        # Configure mocks
+        mock_call_real_news_api.return_value = [{"topic_id": "news1", "title_suggestion": "Mock News Article"}]
+
+        # Mock idempotency checks to allow task to run
+        mock_conn_instance = mock_get_tda_db_connection_side_effect() # Get a fresh mock connection
+        mock_cursor_instance = mock_conn_instance.cursor.return_value.__enter__.return_value
+        mock_cursor_instance.fetchone.return_value = None # Simulate new key for initial check
+
+        # Task arguments
+        task_request_id = f"tda_log_test_req_{uuid.uuid4().hex[:6]}"
+        task_idempotency_key = f"tda_log_test_idem_{uuid.uuid4().hex[:6]}"
+        task_workflow_id = f"wf_tda_log_test_{uuid.uuid4().hex[:6]}"
+
+        # Execute the task (eagerly)
+        tda_main.fetch_news_from_newsapi_task(
+            request_id_celery=task_request_id,
+            keywords=["test"],
+            idempotency_key=task_idempotency_key,
+            workflow_id=task_workflow_id
+        )
+
+        # Assert logger was called
+        self.assertTrue(mock_app_logger.info.called)
+
+        # Find a specific log call and check its 'extra' content
+        found_log_call = None
+        celery_task_id_from_call = None
+        for call_args_tuple in mock_app_logger.info.call_args_list:
+            message_arg = call_args_tuple[0][0] # First positional argument
+            if "TDA NewsAPI Task" in message_arg and "Starting" in message_arg:
+                found_log_call = call_args_tuple
+                # Extract task_id from the message itself for comparison, as self.request.id is dynamic
+                # Example: "TDA NewsAPI Task <dynamic_celery_id>: Starting..."
+                # This part is tricky if the dynamic ID isn't easily extractable or predictable.
+                # For now, we'll focus on the `extra` dict.
+                # A more robust way might be to ensure the `extra` dict contains the *correct* dynamic task_id.
+                # The task internally uses `self.request.id` which is dynamic.
+                # Let's assume the first log call is the "Starting" message.
+                if found_log_call[1].get('extra', {}).get('task_id'):
+                     celery_task_id_from_call = found_log_call[1]['extra']['task_id']
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected starting log message not found.")
+
+        if found_log_call:
+            log_kwargs = found_log_call[1] # Keyword arguments to logger.info
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+
+            self.assertEqual(log_extra_dict.get('orig_req_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_idempotency_key)
+            self.assertEqual(log_extra_dict.get('workflow_id'), task_workflow_id)
+            self.assertIn('task_id', log_extra_dict) # Check presence of Celery's task_id
+            if celery_task_id_from_call: # If we captured it
+                 self.assertEqual(log_extra_dict.get('task_id'), celery_task_id_from_call)
+
+        # This test assumes the JSON formatting is correctly handled by the JsonFormatter.
+        # A more direct test of JSON output would involve capturing stdout.

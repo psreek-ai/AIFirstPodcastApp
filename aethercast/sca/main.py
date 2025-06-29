@@ -69,13 +69,18 @@ def setup_json_logging(flask_app):
     logHandler = logging.StreamHandler()
     service_filter = ServiceNameFilter("sca")
     logHandler.addFilter(service_filter)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
+
+    # Use JsonFormatter
+    from python_json_logger import jsonlogger # Ensure import
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s %(topic_id)s"
     )
     logHandler.setFormatter(formatter)
+
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("Standard logging configured for SCA service.")
+    # Add default extra fields for the initial log message
+    flask_app.logger.info("JSON logging configured for SCA service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A', 'topic_id': 'N/A'})
 
 setup_json_logging(app)
 
@@ -477,8 +482,15 @@ def craft_snippet_task(self, request_id: str, topic_id: str, content_brief: str,
     Celery task for crafting a snippet. Includes logic from original craft_snippet_endpoint.
     Now with Idempotency.
     """
-    task_log_id = self.request.id
-    log_extra_base = {"orig_req_id": request_id, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "topic_id": topic_id}
+    task_log_id = self.request.id # Celery's internal task ID
+    # Ensure keys in log_extra_base match the formatter fields for direct inclusion
+    log_extra_base = {
+        "orig_req_id": request_id,
+        "task_id": task_log_id,
+        "idempotency_key": idempotency_key,
+        "workflow_id": workflow_id, # Make sure workflow_id is passed to the task
+        "topic_id": topic_id
+    }
     app.logger.info(f"SCA Celery Task {task_log_id}: Starting. Brief: '{content_brief[:50]}...'", extra=log_extra_base)
 
     if not idempotency_key:

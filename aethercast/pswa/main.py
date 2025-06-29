@@ -113,10 +113,50 @@ pswa_celery_app.finalize() # Explicitly finalize the app
 
 
 # --- Logging Setup ---
-# Basic logging configuration
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] [%(levelname)s] [%(name)s] [%(module)s.%(funcName)s:%(lineno)d] - %(message)s')
-logger = logging.getLogger("PSWA_Service")
-app.logger.handlers.extend(logger.handlers) # Integrate Flask's logger if desired
+# Custom filter to add service_name to log records
+class ServiceNameFilter(logging.Filter):
+    def __init__(self, service_name="pswa-service"): # Consistent service name
+        super().__init__()
+        self.service_name = service_name
+
+    def filter(self, record):
+        record.service_name = self.service_name
+        # Ensure context fields exist, defaulting to "N/A"
+        for field in ['task_id', 'workflow_id', 'idempotency_key', 'topic']:
+            if not hasattr(record, field):
+                setattr(record, field, "N/A")
+        return True
+
+# Configure JSON logging for the Flask app and Celery tasks
+def setup_json_logging(app_instance):
+    # Use the Flask app's logger if available, otherwise get a logger by service name
+    # This allows Celery tasks to use the same logger instance if they don't have direct app context.
+    logger_instance = app_instance.logger if hasattr(app_instance, 'logger') else logging.getLogger("PSWA_Service")
+
+    logger_instance.handlers.clear() # Clear existing handlers
+    logHandler = logging.StreamHandler()
+
+    service_filter = ServiceNameFilter() # Uses "pswa-service"
+    logHandler.addFilter(service_filter)
+
+    from python_json_logger import jsonlogger # Ensure import
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s %(topic)s"
+    )
+    logHandler.setFormatter(formatter)
+
+    logger_instance.addHandler(logHandler)
+    logger_instance.setLevel(logging.INFO) # Or from config
+    logger_instance.propagate = False # Avoid double logging to root
+
+    # Log initial message with default context
+    logger_instance.info("JSON logging configured for PSWA service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A', 'topic': 'N/A'})
+    return logger_instance
+
+# Initialize logging for the Flask app context
+logger = setup_json_logging(app)
+# For Celery tasks that might not have `app.logger` (e.g. if worker is separate),
+# they can get `logging.getLogger("PSWA_Service")` which is now configured.
 
 # --- Database Schema (for reference, typically in a migrations system) ---
 DB_SCHEMA_PSWA_CACHE_TABLE = """
@@ -554,11 +594,18 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
     request_id_celery is for logging and can be the original HTTP request ID.
     idempotency_key and workflow_id are provided by the calling service.
     """
-    task_id_for_logging = self.request.id # Celery's own task ID
-    log_ctx = {"orig_req_id": request_id_celery, "idempotency_key": idempotency_key, "workflow_id": workflow_id, "celery_task_id": task_id_for_logging}
+    task_id_celery_internal = self.request.id # Celery's own task ID
+    # Ensure keys in log_ctx match the formatter fields for direct inclusion
+    log_ctx = {
+        "orig_req_id": request_id_celery,
+        "task_id": task_id_celery_internal,
+        "idempotency_key": idempotency_key,
+        "workflow_id": workflow_id,
+        "topic": topic # Add topic context for PSWA logs
+    }
 
     if not idempotency_key:
-        logger.error(f"Celery Task {task_id_for_logging}: Idempotency key not provided for weave_script_task. This is required.", extra=log_ctx)
+        logger.error(f"Celery Task {task_id_celery_internal}: Idempotency key not provided for weave_script_task. This is required.", extra=log_ctx)
         return {"error": "PSWA_IDEMPOTENCY_KEY_MISSING", "message": "Idempotency key is required for PSWA task."}
 
     logger.info(f"Celery Task {task_id_for_logging}: Weaving script for topic '{topic}'. Persona: {persona or 'default'}", extra=log_ctx)

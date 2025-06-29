@@ -69,16 +69,52 @@ def setup_json_logging(flask_app):
     service_filter = ServiceNameFilter("tda") # Service name for TDA
     logHandler.addFilter(service_filter)
 
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
+    # Use JsonFormatter
+    # Ensure python-json-logger is imported
+    from python_json_logger import jsonlogger
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s"
     )
     logHandler.setFormatter(formatter)
 
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("Standard logging configured for TDA service.")
+    # For the initial log message, we might not have task_id, etc.
+    # The filter will add default "N/A" if these fields are missing from the LogRecord.
+    # To make this specific log more structured if desired:
+    flask_app.logger.info("JSON logging configured for TDA service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A'})
 
 setup_json_logging(app)
+
+# --- Celery Task-Specific Logger Setup ---
+# It's good practice for Celery tasks to use a logger that is explicitly configured,
+# especially if they might run in different contexts or if we want different formatting/handlers.
+# However, if the app.logger is already JSON and globally accessible, tasks can use it directly.
+# For consistency with other services and to ensure task-specific context can be easily added,
+# we can define a way to get a task-specific logger or ensure app.logger is used with proper `extra`.
+
+# For TDA, since app.logger is now JSON, tasks can continue to use it.
+# We need to ensure context (task_id, workflow_id, idempotency_key) is passed via `extra`.
+
+# Example of how a task-specific logger could be set up if needed:
+# def get_celery_task_logger(task_name: str):
+#     task_logger = logging.getLogger(f"tda.celery.{task_name}")
+#     if not task_logger.hasHandlers(): # Configure only once
+#         task_logger.handlers.clear()
+#         logHandler = logging.StreamHandler()
+#         service_filter = ServiceNameFilter("tda") # Re-use or create new
+#         logHandler.addFilter(service_filter)
+#         formatter = jsonlogger.JsonFormatter(
+#             fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s"
+#         )
+#         logHandler.setFormatter(formatter)
+#         task_logger.addHandler(logHandler)
+#         task_logger.setLevel(logging.INFO) # Or from config
+#         task_logger.propagate = False # Avoid double logging if root logger is also configured
+#     return task_logger
+# In tasks: task_specific_logger = get_celery_task_logger(self.name)
+#           task_specific_logger.info("message", extra={...})
+# For now, we will ensure app.logger is used with `extra` in tasks.
 
 
 # --- Application Configuration ---
@@ -496,9 +532,16 @@ def fetch_news_from_newsapi_task(self, request_id_celery: str, keywords: list[st
     Celery task to fetch articles from NewsAPI.org with idempotency.
     request_id_celery is for logging correlation with the dispatching request.
     """
-    task_log_id = self.request.id
+    task_log_id = self.request.id # This is the Celery task's own unique ID
     task_name_for_idempotency = self.name # "fetch_news_from_newsapi_task"
-    log_extra_base = {"orig_req_id": request_id_celery, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "workflow_id": workflow_id, "keywords": keywords}
+    # Ensure keys in log_extra_base match the formatter fields for direct inclusion
+    log_extra_base = {
+        "orig_req_id": request_id_celery,
+        "task_id": task_log_id,
+        "idempotency_key": idempotency_key,
+        "workflow_id": workflow_id,
+        "keywords": keywords
+    }
     app.logger.info(f"TDA NewsAPI Task {task_log_id}: Starting. Keywords: {keywords}", extra=log_extra_base)
 
     if not idempotency_key:
@@ -703,8 +746,15 @@ def discover_topics_task(self, request_id_main: str, query: Optional[str], limit
     # For brevity, I'll just show the call to the actual logic, assuming it's moved or called.
     # This is a simplified representation. The actual implementation would move the previous function's body here.
     # The core logic of discovering topics (simulated or real)
-    task_log_id = self.request.id
-    log_extra_base = {"orig_req_id": request_id_main, "celery_task_id": task_log_id, "idempotency_key": idempotency_key, "query": query}
+    task_log_id = self.request.id # Celery's own unique ID for this task execution
+    # Ensure keys in log_extra_base match the formatter fields for direct inclusion
+    log_extra_base = {
+        "orig_req_id": request_id_main,
+        "task_id": task_log_id,
+        "idempotency_key": idempotency_key,
+        "workflow_id": workflow_id, # Added workflow_id
+        "query": query
+    }
     app.logger.info(f"TDA Celery Task {task_log_id}: Starting. Limit: {limit}, UseNewsAPI: {use_real_news_api_flag}", extra=log_extra_base)
 
     if not idempotency_key:

@@ -780,3 +780,100 @@ class TestIgaTaskTestScenarios(BaseIgaServiceTest):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestIgaCeleryLogging(BaseIgaServiceTest):
+    @patch('aethercast.iga.main.app.logger') # Patch the app.logger used by tasks
+    @patch('aethercast.iga.main._get_iga_db_connection', side_effect=mock_get_iga_db_connection_side_effect)
+    # Mocks for Vertex AI and GCS are already set up in BaseIgaServiceTest.setUp
+    # and will be used by the task if test_scenario is None.
+    def test_generate_image_task_json_logging_normal_path(self, mock_db_conn_getter, mock_app_logger):
+        # Mock idempotency checks to allow task to run
+        mock_conn_instance = mock_get_iga_db_connection_side_effect()
+        mock_cursor_instance = mock_conn_instance.cursor.return_value.__enter__.return_value
+        mock_cursor_instance.fetchone.return_value = None # Simulate new key
+
+        # Task arguments
+        task_request_id = f"iga_log_test_req_{uuid.uuid4().hex[:6]}"
+        task_prompt = "A test prompt for IGA logging"
+        task_idempotency_key = f"iga_log_test_idem_{uuid.uuid4().hex[:6]}"
+        task_workflow_id = f"wf_iga_log_test_{uuid.uuid4().hex[:6]}"
+
+        # Execute the task (eagerly), normal path (no test_scenario)
+        generate_image_vertex_ai_task.apply(
+            kwargs={
+                'request_id': task_request_id,
+                'prompt': task_prompt,
+                'aspect_ratio': '1:1', 'add_watermark': False,
+                'model_id': iga_config['IGA_VERTEXAI_IMAGE_MODEL_ID'],
+                'gcs_bucket_name': iga_config['GCS_BUCKET_NAME'],
+                'gcs_image_prefix': iga_config['IGA_GCS_IMAGE_PREFIX'],
+                'idempotency_key': task_idempotency_key,
+                'workflow_id': task_workflow_id,
+                'test_scenario': None
+            }
+        ).get()
+
+        self.assertTrue(mock_app_logger.info.called)
+
+        found_log_call = None
+        celery_task_id_from_call = None
+        for call_args_tuple in mock_app_logger.info.call_args_list:
+            message_arg = call_args_tuple[0][0]
+            if "IGA Celery Task" in message_arg and "Starting" in message_arg:
+                found_log_call = call_args_tuple
+                if found_log_call[1].get('extra', {}).get('task_id'):
+                     celery_task_id_from_call = found_log_call[1]['extra']['task_id']
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected starting log message not found.")
+
+        if found_log_call:
+            log_kwargs = found_log_call[1]
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+
+            self.assertEqual(log_extra_dict.get('orig_req_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_idempotency_key)
+            self.assertEqual(log_extra_dict.get('workflow_id'), task_workflow_id)
+            expected_prompt_preview = (task_prompt[:50] + "...") if len(task_prompt) > 50 else task_prompt
+            self.assertEqual(log_extra_dict.get('prompt_preview'), expected_prompt_preview)
+            self.assertIn('task_id', log_extra_dict)
+            if celery_task_id_from_call:
+                 self.assertEqual(log_extra_dict.get('task_id'), celery_task_id_from_call)
+
+    @patch('aethercast.iga.main.app.logger')
+    @patch('aethercast.iga.main._get_iga_db_connection', side_effect=mock_get_iga_db_connection_side_effect)
+    def test_generate_image_task_json_logging_test_scenario(self, mock_db_conn_getter, mock_app_logger):
+        # Test logging when a test_scenario is active
+        mock_conn_instance = mock_get_iga_db_connection_side_effect()
+        mock_cursor_instance = mock_conn_instance.cursor.return_value.__enter__.return_value
+        mock_cursor_instance.fetchone.return_value = None
+
+        task_request_id = f"iga_log_test_scen_req_{uuid.uuid4().hex[:6]}"
+        task_prompt = "Another prompt for placeholder"
+        task_idempotency_key = f"iga_log_test_scen_idem_{uuid.uuid4().hex[:6]}"
+        task_workflow_id = f"wf_iga_log_test_scen_{uuid.uuid4().hex[:6]}"
+
+        generate_image_vertex_ai_task.apply(
+            kwargs={
+                'request_id': task_request_id, 'prompt': task_prompt,
+                'aspect_ratio': '1:1', 'add_watermark': False, 'model_id': 'model',
+                'gcs_bucket_name': 'bucket', 'gcs_image_prefix': 'prefix',
+                'idempotency_key': task_idempotency_key, 'workflow_id': task_workflow_id,
+                'test_scenario': 'success_placeholder'
+            }
+        ).get()
+
+        self.assertTrue(mock_app_logger.info.called)
+        # Check that the log for test mode activation contains the context
+        found_test_mode_log = None
+        for call_args_tuple in mock_app_logger.info.call_args_list:
+            if "Test mode 'success_placeholder' active" in call_args_tuple[0][0]:
+                found_test_mode_log = call_args_tuple
+                break
+        self.assertIsNotNone(found_test_mode_log, "Log for test mode activation not found.")
+        if found_test_mode_log:
+            log_extra_dict = found_test_mode_log[1].get('extra', {})
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_idempotency_key)
+            self.assertEqual(log_extra_dict.get('workflow_id'), task_workflow_id)

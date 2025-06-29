@@ -556,6 +556,88 @@ class TestAggregateDdgsHarvestResultsTask(unittest.TestCase):
         self.assertEqual(len(result["failed_harvest_details"]), 1)
         self.assertEqual(result["failed_harvest_details"][0]["error"], "content_too_short")
 
+
+class TestWchaCeleryLogging(unittest.TestCase):
+    def setUp(self):
+        # Ensure Celery tasks run eagerly and propagate exceptions for testing
+        wcha_main.celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+
+        # Patch the global logger used by WCHA tasks
+        self.patcher = patch('aethercast.wcha.main.logger')
+        self.mock_logger = self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+        # Mock DB interactions for idempotency, as tasks use them
+        self.get_db_patcher = patch('aethercast.wcha.main.get_db_connection')
+        self.mock_get_db_conn = self.get_db_patcher.start()
+        self.mock_db_conn_instance = MagicMock()
+        self.mock_get_db_conn.return_value = self.mock_db_conn_instance
+        self.addCleanup(self.get_db_patcher.stop)
+
+        self.check_idempotency_patcher = patch('aethercast.wcha.main.check_idempotency', return_value=None) # Assume new key
+        self.mock_check_idempotency = self.check_idempotency_patcher.start()
+        self.addCleanup(self.check_idempotency_patcher.stop)
+
+        self.acquire_lock_patcher = patch('aethercast.wcha.main.acquire_idempotency_lock', return_value=True) # Assume lock acquired
+        self.mock_acquire_lock = self.acquire_lock_patcher.start()
+        self.addCleanup(self.acquire_lock_patcher.stop)
+
+        self.update_record_patcher = patch('aethercast.wcha.main.update_idempotency_record')
+        self.mock_update_record = self.update_record_patcher.start()
+        self.addCleanup(self.update_record_patcher.stop)
+
+
+    @patch('aethercast.wcha.main.requests.get')
+    @patch('aethercast.wcha.main.trafilatura.extract')
+    @patch('aethercast.wcha.main.is_url_safe', return_value=(True, "URL is safe."))
+    def test_harvest_url_content_task_json_logging(self, mock_is_safe, mock_extract, mock_requests_get):
+        mock_requests_get.return_value = MagicMock(status_code=200, content=b"<html><body>Test Content</body></html>", headers={'Content-Type': 'text/html'})
+        mock_extract.return_value = "Test Content Extracted"
+
+        task_request_id = f"test_log_req_{uuid.uuid4().hex[:6]}"
+
+        # Execute the task
+        # Since it's eager, it runs directly. We don't need .delay() or .get() here unless checking AsyncResult.
+        wcha_main.harvest_url_content_task(
+            request_id=task_request_id,
+            url_to_harvest="http://example.com/testlog",
+            min_length=5
+        )
+
+        # Check if logger.info (or other levels) was called
+        self.assertTrue(self.mock_logger.info.called)
+
+        # Verify the log message content and structure for one of the calls
+        # Example: find a specific log call, e.g., the one indicating successful extraction.
+        found_log_call = None
+        for call_args in self.mock_logger.info.call_args_list:
+            message_arg = call_args[0][0] # First positional argument to logger.info
+            if "Trafilatura successfully extracted" in message_arg:
+                found_log_call = call_args
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected log message not found.")
+
+        # The 'extra' argument passed to the logger should contain task_id and workflow_id
+        # WCHA's logger is a global one, and the formatter pulls from the LogRecord.
+        # The `extra` dict passed to logger calls populates the LogRecord.
+        # The JsonFormatter should then include these in the output.
+        # We can't directly assert the JSON output here without capturing stdout and parsing it.
+        # Instead, we verify that the logger was called with the correct `extra` context.
+
+        if found_log_call:
+            log_kwargs = found_log_call[1] # Keyword arguments
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+            self.assertEqual(log_extra_dict.get('task_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('workflow_id'), 'N/A') # Default in this task
+
+        # To actually test the JSON output, one would typically:
+        # 1. Patch sys.stdout or use a custom log handler that writes to a StringIO buffer.
+        # 2. Parse the JSON from the buffer.
+        # 3. Assert fields in the parsed JSON.
+        # This is more involved. For this basic test, checking the call to logger with `extra` is a good start.
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
 

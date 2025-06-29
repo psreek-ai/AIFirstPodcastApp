@@ -69,13 +69,18 @@ def setup_json_logging(flask_app):
     logHandler = logging.StreamHandler()
     service_filter = ServiceNameFilter("iga")
     logHandler.addFilter(service_filter)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
+
+    # Use JsonFormatter
+    from python_json_logger import jsonlogger # Ensure import
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s %(prompt_preview)s"
     )
     logHandler.setFormatter(formatter)
+
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("Standard logging configured for IGA service.")
+    # Add default extra fields for the initial log message
+    flask_app.logger.info("JSON logging configured for IGA service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A', 'prompt_preview': 'N/A'})
 
 setup_json_logging(app)
 
@@ -324,7 +329,14 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
     Includes test_scenario parameter for test mode behavior.
     """
     task_log_id = self.request.id # Celery's unique ID for this task execution
-    log_extra_base = {"orig_req_id": request_id, "celery_task_id": task_log_id, "idempotency_key": idempotency_key}
+    # Ensure keys in log_extra_base match the formatter fields for direct inclusion
+    log_extra_base = {
+        "orig_req_id": request_id,
+        "task_id": task_log_id, # Celery's internal task ID
+        "idempotency_key": idempotency_key,
+        "workflow_id": workflow_id,
+        "prompt_preview": (prompt[:50] + "..." if len(prompt) > 50 else prompt) if isinstance(prompt, str) else "N/A"
+    }
     app.logger.info(f"IGA Celery Task {task_log_id}: Starting. Prompt: '{prompt[:50]}...'", extra=log_extra_base)
 
     if not idempotency_key:

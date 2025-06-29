@@ -144,3 +144,93 @@ class TestInvokeLlmVertexAiTaskOptimized(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestAimsCeleryLogging(unittest.TestCase):
+    def setUp(self):
+        aims_celery_app.conf.update(task_always_eager=True, task_eager_propagates=True)
+        GLOBAL_GENERATIVE_MODELS.clear()
+
+        # Mock DB interactions for idempotency
+        self.mock_db_conn_patcher = patch('aethercast.aims_service.main.get_db_connection')
+        self.mock_get_db_conn = self.mock_db_conn_patcher.start()
+        self.mock_db_conn_instance = MagicMock(name="MockAimsDbConnectionLoggingTest")
+        self.mock_db_cursor_instance = MagicMock(name="MockAimsDbCursorLoggingTest")
+        self.mock_get_db_conn.return_value = self.mock_db_conn_instance
+        self.mock_db_conn_instance.cursor.return_value.__enter__.return_value = self.mock_db_cursor_instance
+        self.mock_db_cursor_instance.fetchone.return_value = None # Simulate new idempotency key
+
+        # Patch the logger used by AIMS tasks
+        self.logger_patcher = patch('aethercast.aims_service.main.logger')
+        self.mock_logger = self.logger_patcher.start()
+
+        self.addCleanup(self.mock_db_conn_patcher.stop)
+        self.addCleanup(self.logger_patcher.stop)
+        self.addCleanup(GLOBAL_GENERATIVE_MODELS.clear)
+
+
+    @patch('aethercast.aims_service.main.GenerativeModel')
+    def test_invoke_llm_task_json_logging(self, mock_generative_model_class):
+        # Configure Vertex AI mock for a successful run
+        model_name = "gemini-test-log-model"
+        mock_model_instance = MagicMock(spec=GenerativeModel)
+        mock_model_instance.generate_content.return_value = MagicMock(
+            candidates=[MagicMock(content=MagicMock(parts=[MagicMock(text="Log test response")]))],
+            usage_metadata=MagicMock(prompt_token_count=7, candidates_token_count=3, total_token_count=10)
+        )
+        mock_generative_model_class.return_value = mock_model_instance
+
+        # Task arguments
+        task_request_id = f"aims_log_test_req_{uuid.uuid4().hex[:6]}"
+        # Idempotency key for AIMS task is the same as request_id
+
+        # Execute the task
+        invoke_llm_vertex_ai_task(
+            request_id=task_request_id,
+            prompt_text="Test prompt for AIMS logging",
+            model_name_to_use=model_name,
+            temperature=0.6,
+            max_output_tokens=60
+        )
+
+        self.assertTrue(self.mock_logger.info.called)
+
+        # Find the initial "Starting LLM call" log message
+        found_log_call = None
+        celery_task_id_from_call = None # To capture the dynamic Celery task ID
+        for call_args_tuple in self.mock_logger.info.call_args_list:
+            message_arg = call_args_tuple[0][0]
+            if "Starting LLM call" in message_arg:
+                found_log_call = call_args_tuple
+                if found_log_call[1].get('extra', {}).get('task_id'):
+                     celery_task_id_from_call = found_log_call[1]['extra']['task_id']
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected starting log message not found.")
+
+        if found_log_call:
+            log_kwargs = found_log_call[1]
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+
+            self.assertEqual(log_extra_dict.get('orig_req_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_request_id) # AIMS uses request_id as idempotency key
+            self.assertEqual(log_extra_dict.get('workflow_id'), "N/A") # Default as not passed
+            self.assertEqual(log_extra_dict.get('model_id_used'), model_name)
+            self.assertIn('task_id', log_extra_dict)
+            if celery_task_id_from_call:
+                 self.assertEqual(log_extra_dict.get('task_id'), celery_task_id_from_call)
+
+        # Verify idempotency DB calls were made (simplified check)
+        self.mock_db_cursor_instance.execute.assert_any_call(
+            "SELECT status, result_payload, locked_at, error_payload FROM idempotency_keys WHERE key = %s AND task_name = %s",
+            (task_request_id, "aims_invoke_llm_vertex_ai_task")
+        )
+        self.mock_db_cursor_instance.execute.assert_any_call(
+            unittest.mock.ANY, # SQL for INSERT
+            (task_request_id, "aims_invoke_llm_vertex_ai_task", "N/A", unittest.mock.ANY, "processing", None, None, unittest.mock.ANY)
+        )
+        self.mock_db_cursor_instance.execute.assert_any_call(
+            unittest.mock.ANY, # SQL for UPDATE to completed
+            ('completed', unittest.mock.ANY, None, task_request_id, "aims_invoke_llm_vertex_ai_task")
+        )

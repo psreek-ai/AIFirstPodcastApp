@@ -57,16 +57,21 @@ def setup_json_logging(flask_app):
     logHandler = logging.StreamHandler()
     service_filter = ServiceNameFilter("vfa")
     logHandler.addFilter(service_filter)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
+
+    # Use JsonFormatter
+    from python_json_logger import jsonlogger # Ensure import
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s %(topic)s %(script_id)s"
     )
     logHandler.setFormatter(formatter)
+
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("Standard logging configured for VFA service.")
+    # Add default extra fields for the initial log message
+    flask_app.logger.info("JSON logging configured for VFA service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A', 'topic': 'N/A', 'script_id': 'N/A'})
 
 setup_json_logging(app)
-logger = app.logger
+logger = app.logger # This logger is now JSON configured.
 
 # --- VFA Configuration ---
 vfa_config = {}
@@ -257,9 +262,19 @@ def _store_vfa_idempotency_result(db_conn, idempotency_key: str, task_name: str,
 
 @celery_app.task(bind=True, base=VfaCeleryTask, name='forge_voice_task') # Use VfaCeleryTask as base
 def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_params_input: Optional[dict] = None, test_scenario_header: Optional[str] = None, idempotency_key: Optional[str] = None, workflow_id: Optional[str] = None) -> dict:
-    logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id_celery}, Idempotency Key: {idempotency_key}, Workflow ID: {workflow_id}): Starting voice forging. Topic: {script_input.get('topic', 'N/A')}")
-    stream_id = f"strm_{self.request.id}"
-    original_topic = script_input.get("topic", "Unknown Topic")
+    task_celery_id = self.request.id
+    log_extra_base = {
+        "orig_req_id": request_id_celery,
+        "task_id": task_celery_id,
+        "idempotency_key": idempotency_key,
+        "workflow_id": workflow_id,
+        "topic": script_input.get('topic', 'N/A'),
+        "script_id": script_input.get('script_id', 'N/A')
+    }
+    logger.info(f"Starting voice forging.", extra=log_extra_base)
+
+    stream_id = f"strm_{task_celery_id}" # Use task_celery_id for stream_id
+    original_topic = script_input.get("topic", "Unknown Topic") # Keep for internal logic if needed
     voice_params_input = voice_params_input or {}
 
     requested_tts_settings = {
@@ -303,16 +318,18 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
     vfa_task_name_for_idempotency = self.name # "forge_voice_task"
 
     if not idempotency_key:
-        logger.error(f"Celery Task {self.request.id}: Idempotency key not provided by CPOA. This is required.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
-        # This is a programming error or misconfiguration if CPOA doesn't send it.
-        # Raising an error is appropriate as the task cannot proceed correctly.
+        # Use log_extra_base which is already defined with all context fields
+        logger.error(f"Idempotency key not provided by CPOA. This is required.", extra=log_extra_base)
         raise ValueError("Idempotency key is required for VFA task execution.")
 
-    if not PSYCOPG2_AVAILABLE: # Check if psycopg2 library is available
-        logger.error(f"Celery Task {self.request.id}: psycopg2 not available, cannot perform idempotency checks. Failing task.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
-        raise ConnectionError("VFA Task: psycopg2 is required for idempotency but not available.")
+    # PSYCOPG2_AVAILABLE check was removed in previous refactors as direct import implies availability.
+    # If direct import fails, service won't start. If it's uninstalled while running, _get_vfa_db_connection will fail.
+    # if not PSYCOPG2_AVAILABLE:
+    #     logger.error(f"psycopg2 not available, cannot perform idempotency checks. Failing task.", extra=log_extra_base)
+    #     raise ConnectionError("VFA Task: psycopg2 is required for idempotency but not available.")
 
-    logger.info(f"Celery Task {self.request.id} (Idempotency Key: {idempotency_key}, Workflow ID: {workflow_id}): Starting voice forging. Topic: {script_input.get('topic', 'N/A')}")
+    # Initial log message already uses log_extra_base.
+    # The message "Starting voice forging." is general. Specific details like topic are in log_extra_base.
     self.update_state(state='PENDING', meta={'message': 'Initiated, checking idempotency.'})
 
     db_conn = None

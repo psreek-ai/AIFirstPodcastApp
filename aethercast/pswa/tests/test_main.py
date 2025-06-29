@@ -1422,3 +1422,74 @@ class TestWeaveScriptEndpointValidation(BasePswaServiceTest):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestPswaCeleryLogging(BasePswaServiceTest): # Inherit for config and Celery setup
+    @patch('aethercast.pswa.main.logger') # Patch the logger used by tasks
+    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+    # Mock the AIMS call to prevent external dependency and control task flow
+    @patch('aethercast.pswa.main.requests.post')
+    @patch('aethercast.pswa.main.requests.get')
+    def test_weave_script_task_json_logging(self, mock_requests_get, mock_requests_post, mock_db_conn_getter, mock_task_logger):
+        # Configure AIMS call mocks for a successful run
+        mock_aims_initial_response = MagicMock(status_code=202)
+        mock_aims_initial_response.json.return_value = {"task_id": "mock_aims_task_pswa_log", "status_url": "/mock_aims_status/pswa_log"}
+        mock_requests_post.return_value = mock_aims_initial_response
+
+        mock_aims_poll_success = MagicMock(status_code=200)
+        # Ensure the result from AIMS is a valid JSON string if PSWA_LLM_JSON_MODE is true,
+        # or plain text otherwise. For this test, let's assume JSON mode.
+        aims_llm_output = json.dumps({
+            "title": "Logged Title", "intro": "Logged intro.",
+            "segments": [{"segment_title": "s1", "content": "c1"}],
+            "outro": "Logged outro."
+        })
+        mock_aims_poll_success.json.return_value = {"status": "SUCCESS", "result": {"choices": [{"text": aims_llm_output}], "model_id": "log-test-model"}}
+        mock_requests_get.return_value = mock_aims_poll_success
+
+        # Mock idempotency checks to allow task to run
+        mock_conn_instance = mock_get_pswa_db_connection_idempotency_side_effect()
+        mock_cursor_instance = mock_conn_instance.cursor.return_value.__enter__.return_value
+        mock_cursor_instance.fetchone.return_value = None # Simulate new key
+
+        # Task arguments
+        task_request_id = f"pswa_log_test_req_{uuid.uuid4().hex[:6]}"
+        task_topic = "Logging Test PSWA"
+        task_idempotency_key = f"pswa_log_test_idem_{uuid.uuid4().hex[:6]}"
+        task_workflow_id = f"wf_pswa_log_test_{uuid.uuid4().hex[:6]}"
+
+        # Execute the task (eagerly)
+        pswa_main.weave_script_task(
+            request_id_celery=task_request_id,
+            content="Some content for logging test.",
+            topic=task_topic,
+            idempotency_key=task_idempotency_key,
+            workflow_id=task_workflow_id
+        )
+
+        self.assertTrue(mock_task_logger.info.called)
+
+        found_log_call = None
+        celery_task_id_from_call = None
+        for call_args_tuple in mock_task_logger.info.call_args_list:
+            message_arg = call_args_tuple[0][0]
+            if "Celery Task" in message_arg and "Weaving script" in message_arg: # Initial log message
+                found_log_call = call_args_tuple
+                if found_log_call[1].get('extra', {}).get('task_id'):
+                     celery_task_id_from_call = found_log_call[1]['extra']['task_id']
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected starting log message not found.")
+
+        if found_log_call:
+            log_kwargs = found_log_call[1]
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+
+            self.assertEqual(log_extra_dict.get('orig_req_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_idempotency_key)
+            self.assertEqual(log_extra_dict.get('workflow_id'), task_workflow_id)
+            self.assertEqual(log_extra_dict.get('topic'), task_topic)
+            self.assertIn('task_id', log_extra_dict)
+            if celery_task_id_from_call:
+                 self.assertEqual(log_extra_dict.get('task_id'), celery_task_id_from_call)

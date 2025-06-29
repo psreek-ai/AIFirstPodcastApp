@@ -1452,3 +1452,58 @@ class TestForgeVoiceTaskOnFailure(BaseVfaIdempotencyTest):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestVfaCeleryLogging(BaseVfaIdempotencyTest):
+    @patch('aethercast.vfa.main.logger') # Patch the logger used by VFA tasks
+    @patch('aethercast.vfa.main._get_vfa_db_connection', side_effect=mock_get_vfa_db_connection_side_effect)
+    # Mocks for AIMS_TTS are set up in BaseVfaIdempotencyTest and will be used
+    def test_forge_voice_task_json_logging(self, mock_db_conn_getter, mock_task_logger):
+        # Mock idempotency checks to allow task to run
+        mock_conn_instance = mock_get_vfa_db_connection_side_effect()
+        mock_cursor_instance = mock_conn_instance.cursor.return_value.__enter__.return_value
+        mock_cursor_instance.fetchone.return_value = None # Simulate new key
+
+        # Task arguments
+        task_request_id = f"vfa_log_test_req_{uuid.uuid4().hex[:6]}"
+        task_script_input = {"script_id": f"script_log_{uuid.uuid4().hex[:4]}", "topic": "VFA Logging Test", "full_raw_script": "This is a test script for VFA logging."}
+        task_idempotency_key = f"vfa_log_test_idem_{uuid.uuid4().hex[:6]}"
+        task_workflow_id = f"wf_vfa_log_test_{uuid.uuid4().hex[:6]}"
+
+        # Execute the task (eagerly)
+        # Ensure VFA_TEST_MODE_ENABLED is False so it goes through the AIMS path (which is mocked)
+        with patch.dict(vfa_config, {"VFA_TEST_MODE_ENABLED": False}):
+            vfa_main.forge_voice_task(
+                request_id_celery=task_request_id,
+                script_input=task_script_input,
+                idempotency_key=task_idempotency_key,
+                workflow_id=task_workflow_id
+            )
+
+        self.assertTrue(mock_task_logger.info.called)
+
+        found_log_call = None
+        celery_task_id_from_call = None
+        for call_args_tuple in mock_task_logger.info.call_args_list:
+            message_arg = call_args_tuple[0][0]
+            if "Starting voice forging" in message_arg: # Check for the initial log message
+                found_log_call = call_args_tuple
+                if found_log_call[1].get('extra', {}).get('task_id'):
+                     celery_task_id_from_call = found_log_call[1]['extra']['task_id']
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected starting log message not found.")
+
+        if found_log_call:
+            log_kwargs = found_log_call[1]
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+
+            self.assertEqual(log_extra_dict.get('orig_req_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_idempotency_key)
+            self.assertEqual(log_extra_dict.get('workflow_id'), task_workflow_id)
+            self.assertEqual(log_extra_dict.get('topic'), task_script_input.get('topic'))
+            self.assertEqual(log_extra_dict.get('script_id'), task_script_input.get('script_id'))
+            self.assertIn('task_id', log_extra_dict)
+            if celery_task_id_from_call:
+                 self.assertEqual(log_extra_dict.get('task_id'), celery_task_id_from_call)

@@ -61,13 +61,18 @@ def setup_json_logging(flask_app):
     logHandler = logging.StreamHandler()
     service_filter = ServiceNameFilter("aims-llm-service")
     logHandler.addFilter(service_filter)
-    formatter = logging.Formatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s"
+
+    # Use JsonFormatter
+    from python_json_logger import jsonlogger # Ensure import
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s %(model_id_used)s"
     )
     logHandler.setFormatter(formatter)
+
     flask_app.logger.addHandler(logHandler)
     flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("Standard logging configured for AIMS (LLM) service.")
+    # Add default extra fields for the initial log message
+    flask_app.logger.info("JSON logging configured for AIMS (LLM) service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A', 'model_id_used': 'N/A'})
 
 setup_json_logging(app)
 
@@ -268,17 +273,19 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
     'self' is the task instance.
     """
     celery_task_internal_id = self.request.id or f"sync_{uuid.uuid4().hex[:8]}"
-    log_extra = {
-        'request_id': request_id, # User-provided request_id
-        'celery_task_id': celery_task_internal_id, # Celery's internal task ID
-        'workflow_id': "N/A", # workflow_id is not explicitly passed to this task yet
-        'model_id_used': model_name_to_use,
-        'service_name': 'aims-service'
-    }
-    logger.info(f"AIMS Task {celery_task_internal_id}: Starting LLM call for user request {request_id}. Model: {model_name_to_use}", extra=log_extra)
+    idempotency_key_str = request_id # Use the original request_id for idempotency for this task
 
-    idempotency_key_str = request_id # Use the original request_id for idempotency
-    task_name_str = "aims_invoke_llm_vertex_ai_task"
+    log_extra = {
+        "orig_req_id": request_id, # User-provided request_id, also used as idempotency key here
+        "task_id": celery_task_internal_id, # Celery's internal task ID
+        "idempotency_key": idempotency_key_str,
+        "workflow_id": "N/A", # AIMS task is not directly aware of CPOA workflow_id unless passed by caller
+        "model_id_used": model_name_to_use
+        # service_name is added by the filter
+    }
+    logger.info(f"Starting LLM call.", extra=log_extra) # Message simplified
+
+    task_name_str = "aims_invoke_llm_vertex_ai_task" # For DB interaction
     db_conn = None
     task_final_result = None # To hold the result that will be stored and returned
 

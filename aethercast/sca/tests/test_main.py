@@ -866,3 +866,61 @@ class TestCraftSnippetEndpointValidation(BaseScaServiceTest):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class TestScaCeleryLogging(BaseScaServiceTest):
+    @patch('aethercast.sca.main.app.logger') # Patch the app.logger used by tasks
+    @patch('aethercast.sca.main._get_sca_db_connection', side_effect=mock_get_sca_db_connection_side_effect) # Mock DB for idempotency
+    def test_craft_snippet_task_json_logging(self, mock_db_conn_getter, mock_app_logger):
+        # Mock idempotency checks to allow task to run
+        mock_conn_instance = mock_get_sca_db_connection_side_effect()
+        mock_cursor_instance = mock_conn_instance.cursor.return_value.__enter__.return_value
+        mock_cursor_instance.fetchone.return_value = None # Simulate new key for initial check
+
+        # Ensure placeholder LLM is used and returns successfully (default from BaseScaServiceTest)
+        self.mock_call_placeholder_llm_service.side_effect = None
+        self.mock_call_placeholder_llm_service.return_value = self.mock_placeholder_success_payload
+
+        # Task arguments
+        task_request_id = f"sca_log_test_req_{uuid.uuid4().hex[:6]}"
+        task_topic_id = f"topic_log_test_{uuid.uuid4().hex[:6]}"
+        task_idempotency_key = f"sca_log_test_idem_{uuid.uuid4().hex[:6]}"
+        task_workflow_id = f"wf_sca_log_test_{uuid.uuid4().hex[:6]}"
+
+        # Execute the task (eagerly)
+        sca_main.craft_snippet_task(
+            request_id=task_request_id,
+            topic_id=task_topic_id,
+            content_brief="Test brief for logging.",
+            topic_info={"title_suggestion": "Logging Test Topic"},
+            idempotency_key=task_idempotency_key,
+            workflow_id=task_workflow_id
+        )
+
+        self.assertTrue(mock_app_logger.info.called)
+
+        # Find a specific log call and check its 'extra' content
+        found_log_call = None
+        celery_task_id_from_call = None
+        for call_args_tuple in mock_app_logger.info.call_args_list:
+            message_arg = call_args_tuple[0][0]
+            if "SCA Celery Task" in message_arg and "Starting" in message_arg:
+                found_log_call = call_args_tuple
+                if found_log_call[1].get('extra', {}).get('task_id'):
+                     celery_task_id_from_call = found_log_call[1]['extra']['task_id']
+                break
+
+        self.assertIsNotNone(found_log_call, "Expected starting log message not found.")
+
+        if found_log_call:
+            log_kwargs = found_log_call[1]
+            self.assertIn('extra', log_kwargs)
+            log_extra_dict = log_kwargs['extra']
+
+            self.assertEqual(log_extra_dict.get('orig_req_id'), task_request_id)
+            self.assertEqual(log_extra_dict.get('idempotency_key'), task_idempotency_key)
+            self.assertEqual(log_extra_dict.get('workflow_id'), task_workflow_id)
+            self.assertEqual(log_extra_dict.get('topic_id'), task_topic_id)
+            self.assertIn('task_id', log_extra_dict) # Celery's internal task ID
+            if celery_task_id_from_call:
+                 self.assertEqual(log_extra_dict.get('task_id'), celery_task_id_from_call)
