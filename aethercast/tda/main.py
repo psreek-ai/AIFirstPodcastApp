@@ -145,6 +145,8 @@ if missing_pg_vars:
     raise ValueError(error_msg)
 
 # --- Constants ---
+MAX_SUMMARY_LENGTH = 250 # Define max summary length
+
 DB_SCHEMA_TDA_TABLES = """
 CREATE TABLE IF NOT EXISTS topics_snippets (
     id UUID PRIMARY KEY,
@@ -320,24 +322,30 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
         cursor = conn.cursor()
 
         keywords_data = topic_object.get("keywords", [])
-        keywords_to_save = json.dumps(keywords_data) if keywords_data else None # Ensure JSON string for PG JSONB
+        keywords_to_save = json.dumps(keywords_data) if keywords_data else None
 
         potential_sources = topic_object.get("potential_sources", [])
         source_url = potential_sources[0].get("url") if potential_sources and len(potential_sources) > 0 else None
         source_name = potential_sources[0].get("source_name") if potential_sources and len(potential_sources) > 0 else None
 
         current_ts_iso = datetime.utcnow().isoformat()
-        # For PostgreSQL, TIMESTAMPTZ will handle ISO format string correctly.
-        # SQLite TEXT also handles ISO format string.
         publication_date_to_save = topic_object.get("publication_date", current_ts_iso)
         last_accessed_ts_to_save = current_ts_iso
 
-        # Generate UUID if topic_id is not already a valid UUID string
         topic_id_str = topic_object.get("topic_id")
         try:
-            uuid.UUID(topic_id_str) # Validate if it's a UUID
+            uuid.UUID(topic_id_str)
         except (ValueError, TypeError, AttributeError):
-            topic_id_str = str(uuid.uuid4()) # Generate new if not valid
+            topic_id_str = str(uuid.uuid4())
+
+        summary_to_save = topic_object.get("summary")
+        if summary_to_save and len(summary_to_save) > MAX_SUMMARY_LENGTH:
+            cutoff_point = summary_to_save.rfind(' ', 0, MAX_SUMMARY_LENGTH - 3)
+            if cutoff_point == -1: # No space found, hard cut
+                summary_to_save = summary_to_save[:MAX_SUMMARY_LENGTH - 3] + "..."
+            else:
+                summary_to_save = summary_to_save[:cutoff_point] + "..."
+            app.logger.info(f"Truncated summary for topic {topic_id_str} as it exceeded {MAX_SUMMARY_LENGTH} chars.")
 
 
         sql_insert = """
@@ -367,13 +375,13 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
             topic_id_str,
             DB_TYPE_TOPIC,
             topic_object.get("title_suggestion"),
-            topic_object.get("summary"),
+            summary_to_save, # Use the potentially truncated summary
             keywords_to_save,
             source_url,
             source_name,
-            json.dumps(topic_object.get("original_topic_details")) if topic_object.get("original_topic_details") else None, # Ensure JSON string for PG JSONB
-            None, # llm_model_used_for_snippet
-            None, # cover_art_prompt
+            json.dumps(topic_object.get("original_topic_details")) if topic_object.get("original_topic_details") else None,
+            None,
+            None,
             topic_object.get("image_url"),
             publication_date_to_save,
             last_accessed_ts_to_save,
@@ -384,10 +392,10 @@ def _save_topic_to_db(topic_object: dict): # Removed db_path argument
         app.logger.info(f"Saved/Replaced topic {topic_id_str} to PostgreSQL DB: {topic_object.get('title_suggestion')}")
 
     except psycopg2.Error as e:
-        app.logger.error(f"PostgreSQL error saving topic {topic_object.get('topic_id')}: {e}", exc_info=True)
+        app.logger.error(f"PostgreSQL error saving topic {topic_id_str}: {e}", exc_info=True) # Use topic_id_str for logging
         if conn: conn.rollback()
     except Exception as e_unexp:
-        app.logger.error(f"Unexpected error saving topic {topic_object.get('topic_id')} to PostgreSQL DB: {e_unexp}", exc_info=True)
+        app.logger.error(f"Unexpected error saving topic {topic_id_str} to PostgreSQL DB: {e_unexp}", exc_info=True) # Use topic_id_str for logging
         if conn: conn.rollback()
     finally:
         if cursor:

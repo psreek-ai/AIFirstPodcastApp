@@ -577,5 +577,111 @@ class TestTdaTaskDirectlyIdempotency(BaseTdaServiceTest):
         self.assertEqual(mock_conn.commit.call_count, 2)
 
 
+class TestSaveTopicToDb(BaseTdaServiceTest): # Inherit for config and DB mock setup
+
+    @patch('aethercast.tda.main._get_tda_db_connection') # Mock at the source of the call
+    def test_save_topic_summary_no_truncation(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        short_summary = "This is a short summary."
+        topic = {"topic_id": "t1", "title_suggestion": "Short Sum", "summary": short_summary}
+
+        wcha_main._save_topic_to_db(topic) # Using wcha_main as tda_main was used before. Correcting to tda_main
+
+        # Correcting the module for _save_topic_to_db
+        tda_main._save_topic_to_db(topic)
+
+        args, _ = mock_cursor.execute.call_args
+        self.assertEqual(args[1][3], short_summary) # summary is the 4th param (index 3)
+
+    @patch('aethercast.tda.main._get_tda_db_connection')
+    def test_save_topic_summary_truncation_with_space(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        long_summary = "This is a very long summary that will definitely exceed the maximum length. " * 10
+        # Expected: Find last space before MAX_SUMMARY_LENGTH-3, append "..."
+        # MAX_SUMMARY_LENGTH is 250. MAX_SUMMARY_LENGTH-3 = 247
+        # We need to find what the truncated string would be.
+        # For this test, let's assume a more controlled input for easier assertion.
+        # Example: "word1 word2 ... wordN" where wordN is just before 247 chars.
+
+        # Construct a string that will be truncated cleanly
+        # Repeat 'word ' until it's close to MAX_SUMMARY_LENGTH
+        base_word = "word " # 5 chars
+        num_repeats = (tda_main.MAX_SUMMARY_LENGTH - 10) // len(base_word)
+        controlled_long_summary = (base_word * num_repeats).strip() # Ends with "word"
+        # This summary should be truncated at the last space before 247 chars + "..."
+
+        # Let's use a simpler long string for direct assertion
+        # "This is a test sentence that is very long and should be truncated at a word boundary. This part should be cut off."
+        # If MAX_SUMMARY_LENGTH = 50, then cut at 47.
+        # "This is a test sentence that is very long and..." (length 47 including ...)
+        with patch.object(tda_main, 'MAX_SUMMARY_LENGTH', 50):
+            test_summary_long = "This is a test sentence that is very long and should be truncated at a word boundary. This part should be cut off."
+            expected_truncated = "This is a test sentence that is very long and..."
+
+            topic = {"topic_id": "t2", "title_suggestion": "Long Sum Space", "summary": test_summary_long}
+            tda_main._save_topic_to_db(topic)
+            args, _ = mock_cursor.execute.call_args
+            self.assertEqual(args[1][3], expected_truncated)
+            self.assertTrue(len(args[1][3]) <= 50)
+
+
+    @patch('aethercast.tda.main._get_tda_db_connection')
+    def test_save_topic_summary_truncation_no_space_hard_cut(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        # A very long word that will force a hard cut
+        long_word_summary = "a" * (tda_main.MAX_SUMMARY_LENGTH + 50)
+
+        with patch.object(tda_main, 'MAX_SUMMARY_LENGTH', 30): # Use a smaller MAX_SUMMARY_LENGTH for this test
+            expected_truncated = ("a" * (30 - 3)) + "..." # 27 'a's + "..."
+            topic = {"topic_id": "t3", "title_suggestion": "Long Word Sum", "summary": long_word_summary}
+            tda_main._save_topic_to_db(topic)
+            args, _ = mock_cursor.execute.call_args
+            self.assertEqual(args[1][3], expected_truncated)
+            self.assertTrue(len(args[1][3]) <= 30)
+
+    @patch('aethercast.tda.main._get_tda_db_connection')
+    def test_save_topic_summary_none_or_empty(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        topic_none = {"topic_id": "t4", "title_suggestion": "None Sum", "summary": None}
+        tda_main._save_topic_to_db(topic_none)
+        args_none, _ = mock_cursor.execute.call_args
+        self.assertIsNone(args_none[1][3]) # Summary should be None
+
+        topic_empty = {"topic_id": "t5", "title_suggestion": "Empty Sum", "summary": ""}
+        tda_main._save_topic_to_db(topic_empty)
+        args_empty, _ = mock_cursor.execute.call_args
+        self.assertEqual(args_empty[1][3], "") # Summary should be empty string
+
+
+    @patch('aethercast.tda.main._get_tda_db_connection')
+    def test_save_topic_summary_at_max_length(self, mock_get_conn):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_get_conn.return_value = mock_conn
+        mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+        summary_at_max = "a" * tda_main.MAX_SUMMARY_LENGTH
+        topic = {"topic_id": "t6", "title_suggestion": "Max Length Sum", "summary": summary_at_max}
+        tda_main._save_topic_to_db(topic)
+        args, _ = mock_cursor.execute.call_args
+        self.assertEqual(args[1][3], summary_at_max) # No truncation
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
