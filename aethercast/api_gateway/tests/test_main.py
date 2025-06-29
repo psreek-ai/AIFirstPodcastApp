@@ -248,6 +248,399 @@ class TestAPIGateway(unittest.TestCase):
             # if 'preferences' in detail.get('loc', []): found_preferences_error = True; break
         self.assertTrue(found_preferences_error, "Details should mention 'preferences' field type error.")
 
+    # --- Auth Endpoint Tests ---
+    def test_register_user_success(self):
+        payload = {"username": "testuser", "email": "test@example.com", "password": "password123"}
+        response = self.client.post('/api/v1/auth/register', json=payload)
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data["message"], "User registered successfully.")
+        self.assertIn("user_id", data)
+
+        # Verify user in DB (optional, but good for sanity)
+        conn = api_gw_main.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ?", ("testuser",))
+        user_row = cursor.fetchone()
+        api_gw_main.release_db_connection(conn)
+        self.assertIsNotNone(user_row)
+        self.assertEqual(user_row["email"], "test@example.com")
+
+    def test_register_user_existing_username(self):
+        # First registration
+        payload1 = {"username": "existinguser", "email": "email1@example.com", "password": "password123"}
+        self.client.post('/api/v1/auth/register', json=payload1)
+        # Attempt to register again with same username
+        payload2 = {"username": "existinguser", "email": "email2@example.com", "password": "password456"}
+        response = self.client.post('/api/v1/auth/register', json=payload2)
+        self.assertEqual(response.status_code, 409)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_USER_EXISTS")
+
+    def test_register_user_existing_email(self):
+        payload1 = {"username": "user1", "email": "existingemail@example.com", "password": "password123"}
+        self.client.post('/api/v1/auth/register', json=payload1)
+        payload2 = {"username": "user2", "email": "existingemail@example.com", "password": "password456"}
+        response = self.client.post('/api/v1/auth/register', json=payload2)
+        self.assertEqual(response.status_code, 409)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_USER_EXISTS")
+
+    def test_register_user_validation_error_short_password(self):
+        payload = {"username": "validuser", "email": "valid@example.com", "password": "short"}
+        response = self.client.post('/api/v1/auth/register', json=payload)
+        self.assertEqual(response.status_code, 422)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_VALIDATION_ERROR")
+        # Check that 'password' field is mentioned in the Pydantic error details
+        found_password_error = any('password' in detail.get('loc', []) for detail in data.get('details', []))
+        self.assertTrue(found_password_error, "Details should mention 'password' field error for short password.")
+
+    def test_login_user_success_with_username(self):
+        # First, register user
+        reg_payload = {"username": "loginuser", "email": "login@example.com", "password": "password123"}
+        self.client.post('/api/v1/auth/register', json=reg_payload)
+
+        login_payload = {"identifier": "loginuser", "password": "password123"}
+        response = self.client.post('/api/v1/auth/login', json=login_payload)
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["message"], "Login successful.")
+        self.assertIn("token", data)
+        self.assertEqual(data["username"], "loginuser")
+        self.assertIn("client_id", data) # Should also get a client_id (session_id)
+
+    def test_login_user_success_with_email(self):
+        reg_payload = {"username": "emailuser", "email": "email_login@example.com", "password": "password123"}
+        self.client.post('/api/v1/auth/register', json=reg_payload)
+
+        login_payload = {"identifier": "email_login@example.com", "password": "password123"}
+        response = self.client.post('/api/v1/auth/login', json=login_payload)
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertIn("token", data)
+        self.assertEqual(data["username"], "emailuser") # Should return username even if logged in with email
+
+    def test_login_user_incorrect_password(self):
+        reg_payload = {"username": "wrongpassuser", "email": "wrongpass@example.com", "password": "correctpassword"}
+        self.client.post('/api/v1/auth/register', json=reg_payload)
+
+        login_payload = {"identifier": "wrongpassuser", "password": "incorrectpassword"}
+        response = self.client.post('/api/v1/auth/login', json=login_payload)
+        self.assertEqual(response.status_code, 401)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_LOGIN_INVALID_CREDS")
+
+    def test_login_user_non_existent_identifier(self):
+        login_payload = {"identifier": "nouser", "password": "anypassword"}
+        response = self.client.post('/api/v1/auth/login', json=login_payload)
+        self.assertEqual(response.status_code, 401)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_LOGIN_INVALID_CREDS")
+
+    # --- Podcast Read Endpoints Tests ---
+    def test_list_podcasts_empty(self):
+        response = self.client.get('/api/v1/podcasts')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["podcasts"], [])
+
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_list_podcasts_with_data(self, mock_generate_signed_url):
+        mock_generate_signed_url.return_value = "http://mock.signed.url/audio.mp3"
+        # Add some podcast data to the DB
+        conn = api_gw_main.get_db_connection()
+        cursor = conn.cursor()
+        ts = datetime.utcnow().isoformat()
+        podcasts_data = [
+            ("podcast1", "Topic 1", "completed", ts, "gs://bucket/audio1.mp3"),
+            ("podcast2", "Topic 2", "failed", ts, None) # No audio path
+        ]
+        for pid, topic, status, created_ts, audio_path in podcasts_data:
+            cursor.execute(
+                "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, final_audio_filepath) VALUES (?, ?, ?, ?, ?)",
+                (pid, topic, status, created_ts, audio_path)
+            )
+        conn.commit()
+        api_gw_main.release_db_connection(conn)
+
+        response = self.client.get('/api/v1/podcasts')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(len(data["podcasts"]), 2)
+
+        podcast1_resp = next(p for p in data["podcasts"] if p["podcast_id"] == "podcast1")
+        podcast2_resp = next(p for p in data["podcasts"] if p["podcast_id"] == "podcast2")
+
+        self.assertEqual(podcast1_resp["topic"], "Topic 1")
+        self.assertEqual(podcast1_resp["audio_url_signed"], "http://mock.signed.url/audio.mp3")
+        mock_generate_signed_url.assert_called_once_with("gs://bucket/audio1.mp3")
+
+        self.assertEqual(podcast2_resp["topic"], "Topic 2")
+        self.assertNotIn("audio_url_signed", podcast2_resp) # No signed URL if no GCS path
+
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_get_podcast_details_success(self, mock_generate_signed_url):
+        mock_generate_signed_url.return_value = "http://mock.signed.url/details.mp3"
+        podcast_id = str(uuid.uuid4())
+        ts = datetime.utcnow().isoformat()
+        conn = api_gw_main.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, final_audio_filepath, cpoa_full_orchestration_log) VALUES (?, ?, ?, ?, ?, ?)",
+            (podcast_id, "Details Topic", "completed", ts, "gs://bucket/details.mp3", json.dumps({"log": "data"}))
+        )
+        conn.commit()
+        api_gw_main.release_db_connection(conn)
+
+        response = self.client.get(f'/api/v1/podcasts/{podcast_id}')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["podcast_id"], podcast_id)
+        self.assertEqual(data["topic"], "Details Topic")
+        self.assertEqual(data["audio_url_signed"], "http://mock.signed.url/details.mp3")
+        self.assertEqual(data["cpoa_full_orchestration_log"], {"log": "data"}) # Check JSON parsing
+        mock_generate_signed_url.assert_called_once_with("gs://bucket/details.mp3")
+
+    def test_get_podcast_details_not_found(self):
+        non_existent_id = str(uuid.uuid4())
+        response = self.client.get(f'/api/v1/podcasts/{non_existent_id}')
+        self.assertEqual(response.status_code, 404)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_PODCAST_NOT_FOUND")
+
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_serve_podcast_audio_gcs_redirect(self, mock_generate_signed_url):
+        mock_generate_signed_url.return_value = "http://redirect.signed.url/audio.mp3"
+        podcast_id = str(uuid.uuid4())
+        ts = datetime.utcnow().isoformat()
+        conn = api_gw_main.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, final_audio_filepath) VALUES (?, ?, ?, ?, ?)",
+            (podcast_id, "Audio Topic", "completed", ts, "gs://bucket/audio_serve.mp3")
+        )
+        conn.commit()
+        api_gw_main.release_db_connection(conn)
+
+        response = self.client.get(f'/api/v1/podcasts/{podcast_id}/audio')
+        self.assertEqual(response.status_code, 302) # Redirect
+        self.assertEqual(response.location, "http://redirect.signed.url/audio.mp3")
+        mock_generate_signed_url.assert_called_once_with("gs://bucket/audio_serve.mp3", expiration_minutes=5)
+
+    def test_serve_podcast_audio_not_found(self):
+        non_existent_id = str(uuid.uuid4())
+        response = self.client.get(f'/api/v1/podcasts/{non_existent_id}/audio')
+        self.assertEqual(response.status_code, 404) # Podcast itself not found
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_AUDIO_NOT_FOUND_OR_NO_PATH")
+
+    def test_serve_podcast_audio_no_audio_path_in_db(self):
+        podcast_id = str(uuid.uuid4())
+        ts = datetime.utcnow().isoformat()
+        conn = api_gw_main.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute( # Insert record with NULL final_audio_filepath
+            "INSERT INTO podcasts (podcast_id, topic, cpoa_status, task_created_timestamp, final_audio_filepath) VALUES (?, ?, ?, ?, NULL)",
+            (podcast_id, "No Audio Path Topic", "completed", ts)
+        )
+        conn.commit()
+        api_gw_main.release_db_connection(conn)
+
+        response = self.client.get(f'/api/v1/podcasts/{podcast_id}/audio')
+        self.assertEqual(response.status_code, 404)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_AUDIO_NOT_FOUND_OR_NO_PATH")
+
+    # --- Other CPOA-Dependent Endpoints Tests ---
+    @patch('aethercast.api_gateway.main.orchestrate_landing_page_snippets')
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url') # For _process_snippets_for_signed_urls
+    def test_get_dynamic_snippets_success(self, mock_generate_signed_url, mock_orchestrate_landing_snippets):
+        mock_generate_signed_url.return_value = "http://signed.url/image.png"
+        mock_cpoa_response = {
+            "workflow_id": "wf_snippets_123",
+            "snippets": [
+                {"title": "Snippet 1", "image_url": "gs://bucket/img1.png"},
+                {"title": "Snippet 2", "image_url": "http://non-gcs-url/img2.png"} # Non-GCS URL
+            ],
+            "source": "generation"
+        }
+        mock_orchestrate_landing_snippets.return_value = mock_cpoa_response
+
+        response = self.client.get('/api/v1/snippets?limit=2')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["workflow_id"], "wf_snippets_123")
+        self.assertEqual(len(data["snippets"]), 2)
+        self.assertEqual(data["snippets"][0]["title"], "Snippet 1")
+        self.assertEqual(data["snippets"][0]["image_url_signed"], "http://signed.url/image.png")
+        self.assertEqual(data["snippets"][1]["title"], "Snippet 2")
+        self.assertNotIn("image_url_signed", data["snippets"][1]) # No signed URL for non-GCS path
+        mock_orchestrate_landing_snippets.assert_called_once_with(limit=2, user_id=None, idempotency_key=None)
+        mock_generate_signed_url.assert_called_once_with("gs://bucket/img1.png")
+
+    @patch('aethercast.api_gateway.main.orchestrate_landing_page_snippets')
+    def test_get_dynamic_snippets_cpoa_error(self, mock_orchestrate_landing_snippets):
+        mock_cpoa_response = {"error": "SCA_ERROR", "details": "SCA failed", "workflow_id": "wf_snippet_fail"}
+        mock_orchestrate_landing_snippets.return_value = mock_cpoa_response
+
+        response = self.client.get('/api/v1/snippets')
+        self.assertEqual(response.status_code, 503) # Based on current error mapping
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_CPOA_SNIPPET_ERROR_SCA_ERROR")
+        self.assertEqual(data["message"], "SCA failed")
+
+    @patch('aethercast.api_gateway.main.get_popular_categories')
+    def test_get_categories_success(self, mock_get_categories_cpoa):
+        mock_cpoa_response = {"categories": ["Tech", "Science"]}
+        mock_get_categories_cpoa.return_value = mock_cpoa_response
+
+        response = self.client.get('/api/v1/categories')
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["categories"], ["Tech", "Science"])
+        mock_get_categories_cpoa.assert_called_once()
+
+    @patch('aethercast.api_gateway.main.orchestrate_topic_exploration')
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_explore_topic_success(self, mock_generate_signed_url, mock_orchestrate_explore):
+        token = self._generate_test_token(session_id="s1", user_id="u1")
+        mock_generate_signed_url.return_value = "http://signed.url/explore_img.png"
+        mock_cpoa_response = {
+            "workflow_id": "wf_explore_1",
+            "explored_topics": [{"title": "Explored Topic", "image_url": "gs://bucket/explore.png"}]
+        }
+        mock_orchestrate_explore.return_value = mock_cpoa_response
+        payload = {"keywords": ["AI safety"], "client_id": "s1"} # client_id for preferences
+
+        response = self.client.post('/api/v1/topics/explore',
+                                    json=payload,
+                                    headers={'Authorization': f'Bearer {token}', 'X-Idempotency-Key': 'idem-explore-1'})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["explored_topics"][0]["image_url_signed"], "http://signed.url/explore_img.png")
+        mock_orchestrate_explore.assert_called_once()
+        # TODO: Could add more detailed check for args passed to mock_orchestrate_explore (user_prefs, etc.)
+
+    def test_explore_topic_missing_idempotency_key(self):
+        token = self._generate_test_token(session_id="s_no_idem", user_id="u_no_idem")
+        payload = {"keywords": ["test"]}
+        response = self.client.post('/api/v1/topics/explore', json=payload, headers={'Authorization': f'Bearer {token}'})
+        self.assertEqual(response.status_code, 400)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_MISSING_IDEMPOTENCY_KEY")
+
+    def test_explore_topic_validation_error_no_keywords_or_topic_id(self):
+        token = self._generate_test_token(session_id="s_explore_val", user_id="u_explore_val")
+        payload = {} # Missing both current_topic_id and keywords
+        response = self.client.post('/api/v1/topics/explore',
+                                    json=payload,
+                                    headers={'Authorization': f'Bearer {token}', 'X-Idempotency-Key': 'idem-explore-val'})
+        self.assertEqual(response.status_code, 422)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_VALIDATION_ERROR")
+        self.assertTrue(any("Either current_topic_id or a non-empty list of keywords must be provided." in detail.get('msg', '') for detail in data.get('details', [])))
+
+
+    @patch('aethercast.api_gateway.main.orchestrate_search_results_generation')
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_search_podcasts_success(self, mock_generate_signed_url, mock_orchestrate_search):
+        token = self._generate_test_token(session_id="s_search", user_id="u_search")
+        mock_generate_signed_url.return_value = "http://signed.url/search_img.png"
+        mock_cpoa_response = {
+            "workflow_id": "wf_search_1",
+            "search_results": [{"title": "Search Result Topic", "image_url": "gs://bucket/search.png"}]
+        }
+        mock_orchestrate_search.return_value = mock_cpoa_response
+        payload = {"query": "AI ethics"}
+
+        response = self.client.post('/api/v1/search/podcasts',
+                                    json=payload,
+                                    headers={'Authorization': f'Bearer {token}', 'X-Idempotency-Key': 'idem-search-1'})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["search_results"][0]["image_url_signed"], "http://signed.url/search_img.png")
+        mock_orchestrate_search.assert_called_once()
+
+    # --- Subscribe Endpoint Tests ---
+    def test_subscribe_success(self):
+        payload = {"email": "new_subscriber@example.com"}
+        response = self.client.post('/api/v1/subscribe', json=payload)
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data["message"], "Successfully subscribed! Thank you.")
+        # Verify in DB
+        conn = api_gw_main.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM subscribers WHERE email = ?", ("new_subscriber@example.com",))
+        self.assertIsNotNone(cursor.fetchone())
+        api_gw_main.release_db_connection(conn)
+
+    def test_subscribe_email_already_exists(self):
+        payload = {"email": "existing_subscriber@example.com"}
+        self.client.post('/api/v1/subscribe', json=payload) # First time
+        response = self.client.post('/api/v1/subscribe', json=payload) # Second time
+        self.assertEqual(response.status_code, 409)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "SUBSCRIBE_EMAIL_EXISTS")
+
+    def test_subscribe_invalid_email_payload(self):
+        payload = {"email": "invalid-email"}
+        response = self.client.post('/api/v1/subscribe', json=payload)
+        self.assertEqual(response.status_code, 422) # Pydantic validation error
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_VALIDATION_ERROR")
+        self.assertTrue(any("invalid email address" in detail.get('msg','').lower() for detail in data.get('details', [])))
+
+    def test_subscribe_missing_email_payload(self):
+        payload = {} # Missing email
+        response = self.client.post('/api/v1/subscribe', json=payload)
+        self.assertEqual(response.status_code, 422)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_VALIDATION_ERROR")
+        self.assertTrue(any("'email'" in str(detail.get('loc', '')) for detail in data.get('details', [])))
+
+
+    # --- Internal Media Access URL Endpoint Tests ---
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_get_internal_media_access_url_success(self, mock_generate_signed_url):
+        token = self._generate_test_token(session_id="s_internal", user_id="u_internal_service") # Or a service-specific token
+        mock_generate_signed_url.return_value = "http://signed.internal.url/media.mp3"
+        gcs_uri_param = "gs://test-configured-bucket/internal/media.mp3"
+
+        response = self.client.get(f'/api/v1/internal/media_access_url?gcs_uri={gcs_uri_param}',
+                                   headers={'Authorization': f'Bearer {token}'})
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["gcs_uri"], gcs_uri_param)
+        self.assertEqual(data["signed_url"], "http://signed.internal.url/media.mp3")
+        mock_generate_signed_url.assert_called_once_with(gcs_uri_param, expiration_minutes=5)
+
+    def test_get_internal_media_access_url_missing_token(self):
+        response = self.client.get('/api/v1/internal/media_access_url?gcs_uri=gs://any/uri')
+        self.assertEqual(response.status_code, 401) # Token required
+
+    def test_get_internal_media_access_url_missing_gcs_uri_param(self):
+        token = self._generate_test_token(session_id="s_internal_err", user_id="u_internal_err")
+        response = self.client.get('/api/v1/internal/media_access_url',
+                                   headers={'Authorization': f'Bearer {token}'})
+        self.assertEqual(response.status_code, 400)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_INVALID_GCS_URI_PARAM")
+
+    @patch('aethercast.api_gateway.main.generate_gcs_signed_url')
+    def test_get_internal_media_access_url_signed_url_generation_fails(self, mock_generate_signed_url):
+        token = self._generate_test_token(session_id="s_internal_gen_fail", user_id="u_internal_gen_fail")
+        mock_generate_signed_url.return_value = None # Simulate failure
+        gcs_uri_param = "gs://test-configured-bucket/fail/media.mp3"
+
+        response = self.client.get(f'/api/v1/internal/media_access_url?gcs_uri={gcs_uri_param}',
+                                   headers={'Authorization': f'Bearer {token}'})
+        self.assertEqual(response.status_code, 500)
+        data = response.get_json()
+        self.assertEqual(data["error_code"], "API_GW_INTERNAL_SIGNED_URL_FAILURE")
+
+
     # Keep other existing tests below this point...
     # For example:
     @patch('aethercast.api_gateway.main.orchestrate_podcast_generation')
