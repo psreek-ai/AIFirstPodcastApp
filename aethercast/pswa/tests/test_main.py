@@ -1009,5 +1009,416 @@ class TestPswaPromptEngineering(unittest.TestCase):
         self.assertEqual(mock_conn.commit.call_count, 2)
 
 
+class TestParseLlmScriptOutput(unittest.TestCase):
+    def setUp(self):
+        # Patch pswa_config for PSWA_LLM_MODEL used in parse_llm_script_output
+        self.config_patcher = patch.dict(pswa_config, {"PSWA_LLM_MODEL": "test-parser-model"})
+        self.mocked_config = self.config_patcher.start()
+        self.addCleanup(self.config_patcher.stop)
+
+    def test_parse_valid_json_output(self):
+        raw_json_text = json.dumps({
+            "title": "Awesome Podcast Title",
+            "intro": "Welcome to our amazing show!",
+            "segments": [
+                {"segment_title": "Segment 1", "content": "Content for segment one."},
+                {"segment_title": "Segment 2", "content": "Content for segment two."}
+            ],
+            "outro": "Thanks for tuning in!"
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Test Topic JSON")
+
+        self.assertEqual(parsed["title"], "Awesome Podcast Title")
+        self.assertEqual(parsed["topic"], "Test Topic JSON")
+        self.assertEqual(len(parsed["segments"]), 4) # Intro, Seg1, Seg2, Outro
+        self.assertEqual(parsed["segments"][0]["segment_title"], "Intro")
+        self.assertEqual(parsed["segments"][0]["content"], "Welcome to our amazing show!")
+        self.assertEqual(parsed["segments"][1]["segment_title"], "Segment 1")
+        self.assertEqual(parsed["segments"][2]["content"], "Content for segment two.")
+        self.assertEqual(parsed["segments"][3]["segment_title"], "Outro")
+        self.assertEqual(parsed["llm_model_used"], "test-parser-model")
+
+    def test_parse_json_missing_optional_fields(self):
+        raw_json_text = json.dumps({ # Missing intro and outro
+            "title": "Minimal Podcast",
+            "segments": [{"segment_title": "Main Point", "content": "Just the facts."}]
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Minimal Topic")
+        self.assertEqual(parsed["title"], "Minimal Podcast")
+        self.assertEqual(len(parsed["segments"]), 1)
+        self.assertEqual(parsed["segments"][0]["segment_title"], "Main Point")
+
+    def test_parse_json_insufficient_content_error(self):
+        raw_json_text = json.dumps({
+            "error": "Insufficient content",
+            "message": "Not enough data to generate a meaningful script."
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Insufficient Topic")
+        self.assertIn("Error: Insufficient Content", parsed["title"])
+        self.assertEqual(len(parsed["segments"]), 1)
+        self.assertEqual(parsed["segments"][0]["segment_title"], "ERROR")
+        self.assertIn("Not enough data", parsed["segments"][0]["content"])
+
+    def test_parse_malformed_json_fallback(self):
+        raw_text = "This is not JSON. [TITLE]Fallback Title\n[INTRO]Fallback Intro\n[SEGMENT_ONE_TITLE]Seg1\n[SEGMENT_ONE_CONTENT]Content1\n[OUTRO]Fallback Outro"
+        parsed = pswa_main.parse_llm_script_output(raw_text, "Fallback Topic")
+        self.assertEqual(parsed["title"], "Fallback Title")
+        self.assertEqual(len(parsed["segments"]), 3) # Intro, Seg1, Outro
+        self.assertEqual(parsed["segments"][0]["segment_title"], "INTRO")
+        self.assertEqual(parsed["segments"][1]["segment_title"], "Seg1") # From SEGMENT_ONE_TITLE
+        self.assertEqual(parsed["segments"][1]["content"], "Content1")
+        self.assertEqual(parsed["segments"][2]["segment_title"], "OUTRO")
+
+    def test_parse_fallback_error_insufficient_content_string(self):
+        raw_text = "[ERROR] Insufficient content for this topic. Please provide more details."
+        parsed = pswa_main.parse_llm_script_output(raw_text, "Error String Topic")
+        self.assertIn("Error: Insufficient Content", parsed["title"])
+        self.assertEqual(len(parsed["segments"]), 1)
+        self.assertEqual(parsed["segments"][0]["segment_title"], "ERROR")
+        self.assertEqual(parsed["segments"][0]["content"], raw_text)
+
+    def test_parse_fallback_no_tags(self):
+        raw_text = "Just a plain string with no tags at all. This should become a single content segment after default title."
+        parsed = pswa_main.parse_llm_script_output(raw_text, "No Tags Topic")
+        self.assertEqual(parsed["title"], "Podcast on No Tags Topic") # Default title
+        # The fallback parser might put the whole text into one segment or none if no tags.
+        # Current logic: if no tags are found, it might result in an empty segments list.
+        # If the expectation is to treat raw text as a single segment, the parser would need adjustment.
+        # For now, testing current behavior: no segments if no tags.
+        # Let's assume it should create a generic segment if no tags are found.
+        # The current fallback parser might not create segments if no tags are found.
+        # Let's test the actual behavior: it likely defaults to an empty segment list if no tags found.
+        # If the entire raw_text should be a segment, the test or code needs adjustment.
+        # Based on the loop `if active_tag and current_tag_content:`, if no tags, no segments.
+        self.assertEqual(len(parsed["segments"]), 0)
+        # If we want it to be a single segment:
+        # self.assertEqual(len(parsed["segments"]), 1)
+        # self.assertEqual(parsed["segments"][0]["content"], raw_text)
+
+
+    def test_parse_fallback_mixed_title_content_tags(self):
+        raw_text = ("[TITLE]My Show Title\n"
+                    "[INTRO_TITLE]Welcome\n[INTRO_CONTENT]Hello world.\n"
+                    "[MAIN_SEGMENT_TITLE]The Core\n[MAIN_SEGMENT_CONTENT]This is important.\n"
+                    "[OUTRO_TITLE]Goodbye\n[OUTRO_CONTENT]Farewell.")
+        parsed = pswa_main.parse_llm_script_output(raw_text, "Mixed Tags Topic")
+        self.assertEqual(parsed["title"], "My Show Title")
+        self.assertEqual(len(parsed["segments"]), 3)
+        self.assertEqual(parsed["segments"][0]["segment_title"], "Welcome")
+        self.assertEqual(parsed["segments"][0]["content"], "Hello world.")
+        self.assertEqual(parsed["segments"][1]["segment_title"], "The Core")
+        self.assertEqual(parsed["segments"][2]["segment_title"], "Goodbye")
+
+    def test_parse_json_empty_segments_list(self):
+        raw_json_text = json.dumps({
+            "title": "Podcast with No Segments",
+            "intro": "Just an intro.",
+            "segments": [], # Empty list
+            "outro": "And an outro."
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Empty Segments Topic")
+        self.assertEqual(parsed["title"], "Podcast with No Segments")
+        self.assertEqual(len(parsed["segments"]), 2) # Intro and Outro only
+        self.assertEqual(parsed["segments"][0]["segment_title"], "Intro")
+        self.assertEqual(parsed["segments"][1]["segment_title"], "Outro")
+
+    def test_parse_json_segments_not_list(self):
+        raw_json_text = json.dumps({
+            "title": "Podcast with Invalid Segments",
+            "segments": "This should be a list"
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Invalid Segments Topic")
+        self.assertEqual(parsed["title"], "Podcast with Invalid Segments")
+        # Expect an empty list or just intro/outro if they were present
+        self.assertEqual(len(parsed["segments"]), 0) # No valid segments extracted
+
+    def test_parse_json_segment_item_not_dict(self):
+        raw_json_text = json.dumps({
+            "title": "Podcast with Invalid Segment Item",
+            "segments": ["This is not a dict segment"]
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Invalid Segment Item Topic")
+        self.assertEqual(parsed["title"], "Podcast with Invalid Segment Item")
+        self.assertEqual(len(parsed["segments"]), 0)
+
+    def test_parse_json_segment_item_missing_keys(self):
+        raw_json_text = json.dumps({
+            "title": "Podcast with Segment Missing Keys",
+            "segments": [{"segment_title": "Only Title"}] # Missing content
+        })
+        parsed = pswa_main.parse_llm_script_output(raw_json_text, "Segment Missing Keys Topic")
+        self.assertEqual(parsed["title"], "Podcast with Segment Missing Keys")
+        self.assertEqual(len(parsed["segments"]), 0) # Invalid segment is skipped
+
+
+class TestCallRealLlmServicePswa(BasePswaServiceTest): # Renamed to avoid clash with SCA's test class if files were merged by mistake
+
+    def setUp(self):
+        super().setUp()
+        # Ensure USE_REAL_LLM_SERVICE is True for these tests
+        self.mocked_pswa_config["USE_REAL_LLM_SERVICE"] = True
+
+        # Patch requests.post and requests.get as call_real_llm_service uses them directly
+        self.requests_post_patcher = patch('requests.post')
+        self.mock_requests_post = self.requests_post_patcher.start()
+        self.addCleanup(self.requests_post_patcher.stop)
+
+        self.requests_get_patcher = patch('requests.get')
+        self.mock_requests_get = self.requests_get_patcher.start()
+        self.addCleanup(self.requests_get_patcher.stop)
+
+    def test_call_real_llm_success_after_polling(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "pswa_aims_task_1", "status_url": "/aims_status/pswa_1"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_pending = MagicMock(status_code=200)
+        mock_aims_poll_pending.json.return_value = {"status": "PENDING"}
+
+        mock_aims_poll_success = MagicMock(status_code=200)
+        aims_result_payload = {
+            "choices": [{"text": "LLM Title\nLLM Content"}],
+            "model_id": "pswa-llm-model"
+        }
+        mock_aims_poll_success.json.return_value = {"status": "SUCCESS", "result": aims_result_payload}
+        self.mock_requests_get.side_effect = [mock_aims_poll_pending, mock_aims_poll_success]
+
+        prompt = "Test PSWA prompt"
+        topic_info = {"title_suggestion": "PSWA LLM Test"}
+        result = pswa_main.call_real_llm_service(prompt, topic_info)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["title"], "LLM Title")
+        self.assertEqual(result["text_content"], "LLM Content")
+        self.assertEqual(result["llm_model_used"], "pswa-llm-model")
+        self.mock_requests_post.assert_called_once()
+        self.assertEqual(self.mock_requests_get.call_count, 2)
+
+    def test_call_real_llm_aims_submit_http_error(self):
+        self.mock_requests_post.side_effect = requests.exceptions.HTTPError("AIMS Server Error 503", response=MagicMock(status_code=503, reason="Service Unavailable", text="AIMS down"))
+        result = pswa_main.call_real_llm_service("p", {})
+        self.assertEqual(result["error_code"], "SCA_AIMS_HTTP_ERROR") # SCA_ prefix is from SCA's error consts, PSWA might need its own
+        self.assertEqual(result["status_code"], 503)
+
+    def test_call_real_llm_aims_submit_not_202(self):
+        mock_aims_submit_fail = MagicMock(status_code=401)
+        mock_aims_submit_fail.text = "AIMS Unauthorized"
+        self.mock_requests_post.return_value = mock_aims_submit_fail
+        result = pswa_main.call_real_llm_service("p", {})
+        self.assertEqual(result["error_code"], "SCA_AIMS_TASK_REJECTED")
+        self.assertEqual(result["status_code"], 401)
+
+    def test_call_real_llm_polling_timeout(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "pswa_aims_timeout", "status_url": "/aims_status/pswa_timeout"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_pending = MagicMock(status_code=200)
+        mock_aims_poll_pending.json.return_value = {"status": "PENDING"}
+        self.mock_requests_get.return_value = mock_aims_poll_pending
+
+        with patch.dict(pswa_config, {"AIMS_POLLING_TIMEOUT_SECONDS": 0.01, "AIMS_POLLING_INTERVAL_SECONDS": 0.005}):
+            result = pswa_main.call_real_llm_service("p", {})
+        self.assertEqual(result["error_code"], "SCA_AIMS_POLLING_TIMEOUT")
+
+    def test_call_real_llm_aims_task_failure_on_poll(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "pswa_aims_taskfail", "status_url": "/aims_status/pswa_taskfail"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_failure = MagicMock(status_code=200)
+        mock_aims_poll_failure.json.return_value = {"status": "FAILURE", "result": {"error": {"message": "AIMS LLM processing failed internally"}}}
+        self.mock_requests_get.return_value = mock_aims_poll_failure
+
+        result = pswa_main.call_real_llm_service("p", {})
+        self.assertEqual(result["error_code"], "SCA_AIMS_TASK_FAILED")
+        self.assertIn("AIMS LLM processing failed internally", result["details"])
+
+    def test_call_real_llm_response_missing_choices(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "pswa_aims_nochoice", "status_url": "/aims_status/pswa_nochoice"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_success_no_choices = MagicMock(status_code=200)
+        mock_aims_poll_success_no_choices.json.return_value = {"status": "SUCCESS", "result": {"model_id": "model-x"}} # Missing choices
+        self.mock_requests_get.return_value = mock_aims_poll_success_no_choices
+
+        result = pswa_main.call_real_llm_service("p", {})
+        self.assertEqual(result["error_code"], "SCA_AIMS_BAD_RESPONSE_STRUCTURE")
+        self.assertIn("Missing 'choices[0].text'", result["details"])
+
+
+class TestPswaScriptCaching(BasePswaServiceTest):
+
+    def setUp(self):
+        super().setUp()
+        # Ensure caching is enabled for these tests and configure a short cache age for expiry tests
+        self.mocked_pswa_config["PSWA_SCRIPT_CACHE_ENABLED"] = True
+        self.mocked_pswa_config["PSWA_SCRIPT_CACHE_MAX_AGE_HOURS"] = 1 # 1 hour for testing expiry
+
+        # Mock the DB connection used by cache functions
+        # These tests will focus on SQLite path for simplicity, as DB interaction is basic.
+        # If PostgreSQL specific features were heavily used in cache logic, separate mocks might be needed.
+        self.mocked_pswa_config["DATABASE_TYPE"] = "sqlite"
+        self.mock_db_conn_cache = MagicMock(spec=sqlite3.Connection)
+        self.mock_cursor_cache = MagicMock(spec=sqlite3.Cursor)
+
+        self.get_db_cache_patcher = patch('aethercast.pswa.main._get_db_connection_script_cache', return_value=self.mock_db_conn_cache)
+        self.mock_get_db_cache_conn = self.get_db_cache_patcher.start()
+        self.addCleanup(self.get_db_cache_patcher.stop)
+
+        self.mock_db_conn_cache.cursor.return_value = self.mock_cursor_cache
+
+    def test_calculate_content_hash(self):
+        hash1 = pswa_main._calculate_content_hash("Topic A", "Content for A")
+        hash2 = pswa_main._calculate_content_hash("Topic A", "Content for A")
+        hash3 = pswa_main._calculate_content_hash("Topic B", "Content for A")
+        self.assertEqual(hash1, hash2)
+        self.assertNotEqual(hash1, hash3)
+
+    def test_save_and_get_cached_script_success(self):
+        topic = "Cache Test Topic"
+        content = "Cache test content."
+        topic_hash = pswa_main._calculate_content_hash(topic, content)
+        script_id = "cache_script_1"
+        llm_model = "gpt-cache-test"
+        structured_script_to_cache = {
+            "script_id": script_id, "title": "Cached Title", "topic": topic,
+            "segments": [{"segment_title": "Intro", "content": "Cached intro"}]
+        }
+
+        # Simulate _get_cached_script finding nothing initially
+        self.mock_cursor_cache.fetchone.return_value = None
+        cached = pswa_main._get_cached_script(topic_hash, 1)
+        self.assertIsNone(cached)
+
+        # Save the script
+        pswa_main._save_script_to_cache(script_id, topic_hash, structured_script_to_cache, llm_model)
+
+        # Verify save call (SQLite uses ? placeholders)
+        expected_sql_insert_part = "INSERT OR REPLACE INTO generated_scripts"
+        # Check that execute was called and its first arg (the SQL string) contains the expected part
+        self.assertTrue(any(expected_sql_insert_part in str(call_args[0]) for call_args, _ in self.mock_cursor_cache.execute.call_args_list))
+        self.mock_db_conn_cache.commit.assert_called_once()
+
+        # Now, simulate _get_cached_script finding it
+        # The generation_timestamp will be recent. last_accessed_timestamp will be updated.
+        # In SQLite, timestamps are often stored as ISO strings.
+        mock_db_row = {
+            'script_id': script_id,
+            'structured_script_json': json.dumps(structured_script_to_cache),
+            'llm_model_used': llm_model,
+            'generation_timestamp': datetime.now(timezone.utc).isoformat() # Freshly generated
+        }
+        self.mock_cursor_cache.fetchone.return_value = mock_db_row
+
+        retrieved_script = pswa_main._get_cached_script(topic_hash, 1) # Max age 1 hour
+        self.assertIsNotNone(retrieved_script)
+        self.assertEqual(retrieved_script["script_id"], script_id)
+        self.assertEqual(retrieved_script["title"], "Cached Title")
+        self.assertEqual(retrieved_script["source"], "cache")
+
+        # Check that last_accessed_timestamp was updated
+        found_update_access = False
+        for call_args, _ in self.mock_cursor_cache.execute.call_args_list:
+            if "UPDATE generated_scripts SET last_accessed_timestamp" in str(call_args):
+                found_update_access = True
+                break
+        self.assertTrue(found_update_access, "UPDATE for last_accessed_timestamp not called.")
+        self.assertGreaterEqual(self.mock_db_conn_cache.commit.call_count, 2) # Initial save + access update
+
+    def test_get_cached_script_stale(self):
+        topic_hash = "stale_hash"
+        stale_timestamp = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat() # 2 hours old
+        mock_db_row_stale = {
+            'script_id': "stale_script_id",
+            'structured_script_json': json.dumps({"title": "Stale Script"}),
+            'llm_model_used': "old-model",
+            'generation_timestamp': stale_timestamp
+        }
+        self.mock_cursor_cache.fetchone.return_value = mock_db_row_stale
+
+        # Max age is 1 hour, so this should be considered stale
+        retrieved_script = pswa_main._get_cached_script(topic_hash, 1)
+        self.assertIsNone(retrieved_script, "Stale script should not be returned.")
+
+    def test_get_cached_script_db_error(self):
+        self.mock_cursor_cache.execute.side_effect = sqlite3.Error("Simulated DB error on get")
+        topic_hash = "db_error_hash"
+        retrieved = pswa_main._get_cached_script(topic_hash, 1)
+        self.assertIsNone(retrieved)
+
+    def test_save_script_to_cache_db_error(self):
+        self.mock_cursor_cache.execute.side_effect = sqlite3.Error("Simulated DB error on save")
+        with self.assertLogs(logger=pswa_main.logger, level='ERROR') as cm:
+            pswa_main._save_script_to_cache("s_err", "h_err", {"title":"t"}, "m_err")
+            self.assertTrue(any("Error saving script" in log_msg for log_msg in cm.output))
+        self.mock_db_conn_cache.commit.assert_not_called() # Should not commit if error during execute
+
+
+class TestWeaveScriptEndpointValidation(BasePswaServiceTest):
+
+    def test_weave_script_endpoint_missing_topic(self):
+        payload = {"content": "Valid content."} # Missing topic
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key-no-topic"}
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "PSWA_MISSING_CONTENT_OR_TOPIC")
+
+    def test_weave_script_endpoint_empty_content(self):
+        payload = {"topic": "Valid Topic", "content": " "} # Empty content after strip
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key-empty-content"}
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "PSWA_MISSING_CONTENT_OR_TOPIC")
+
+    def test_weave_script_endpoint_topic_too_long(self):
+        payload = {"topic": "t" * 201, "content": "Valid Content"}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key-long-topic"}
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "PSWA_TOPIC_TOO_LONG")
+
+    def test_weave_script_endpoint_content_too_long(self):
+        payload = {"topic": "Valid Topic", "content": "c" * 50001}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key-long-content"}
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "PSWA_CONTENT_TOO_LONG")
+
+    def test_weave_script_endpoint_guidance_too_long(self):
+        payload = {"topic": "Valid Topic", "content": "Valid Content", "narrative_guidance": "g" * 1001}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key-long-guidance"}
+        response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "PSWA_GUIDANCE_TOO_LONG")
+
+    def test_weave_script_endpoint_valid_optional_guidance(self):
+        # This test ensures that valid optional guidance doesn't cause an error
+        # and primarily tests that the endpoint dispatches successfully (mocking the task)
+        payload = {"topic": "Guidance Topic", "content": "Guidance Content", "narrative_guidance": "Make it snappy."}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key-guidance"}
+
+        # Mock the Celery task dispatch
+        mock_task_delay = MagicMock()
+        mock_task_instance = MagicMock(id="pswa_task_guidance_test")
+        mock_task_delay.return_value = mock_task_instance
+
+        with patch('aethercast.pswa.main.weave_script_task.delay', mock_task_delay):
+            response = self.app.post('/v1/weave_script', json=payload, headers=headers)
+
+        self.assertEqual(response.status_code, 202) # Task accepted
+        json_data = response.get_json()
+        self.assertEqual(json_data["task_id"], "pswa_task_guidance_test")
+        mock_task_delay.assert_called_once()
+        called_kwargs = mock_task_delay.call_args.kwargs
+        self.assertEqual(called_kwargs.get("narrative_guidance"), "Make it snappy.")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
