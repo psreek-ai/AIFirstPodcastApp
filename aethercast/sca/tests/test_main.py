@@ -676,5 +676,193 @@ class TestScaPromptEngineering(BaseScaServiceTest):
         self.assertIn(f"<topic_keyword>{keyword_injection}</topic_keyword>", prompt_sent_to_llm)
 
 
+class TestCallRealLlmService(BaseScaServiceTest):
+
+    def setUp(self):
+        super().setUp()
+        # Ensure USE_REAL_LLM_SERVICE is True for these tests, overriding BaseScaServiceTest default
+        self.mocked_sca_config["USE_REAL_LLM_SERVICE"] = True
+        # Patch requests.post and requests.get as call_real_llm_service uses them directly
+        self.requests_post_patcher = patch('requests.post')
+        self.mock_requests_post = self.requests_post_patcher.start()
+        self.addCleanup(self.requests_post_patcher.stop)
+
+        self.requests_get_patcher = patch('requests.get')
+        self.mock_requests_get = self.requests_get_patcher.start()
+        self.addCleanup(self.requests_get_patcher.stop)
+
+    def test_call_real_llm_success_after_polling(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "aims_task_123", "status_url": "/aims_status/123"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_pending_response = MagicMock(status_code=200)
+        mock_aims_poll_pending_response.json.return_value = {"status": "PENDING"}
+
+        mock_aims_poll_success_response = MagicMock(status_code=200)
+        mock_aims_llm_result_payload = {
+            "choices": [{"text": "Generated Title\nGenerated Snippet Content"}],
+            "model_id": "gpt-sca-test"
+        }
+        mock_aims_poll_success_response.json.return_value = {"status": "SUCCESS", "result": mock_aims_llm_result_payload}
+
+        self.mock_requests_get.side_effect = [mock_aims_poll_pending_response, mock_aims_poll_success_response]
+
+        prompt = "Test prompt"
+        topic_info = {"title_suggestion": "Test Topic"}
+        result = wcha_main.call_real_llm_service(prompt, topic_info) # Corrected to tda_main -> sca_main
+
+        # Correcting the module for call_real_llm_service
+        result = sca_main.call_real_llm_service(prompt, topic_info)
+
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["title"], "Generated Title")
+        self.assertEqual(result["text_content"], "Generated Snippet Content")
+        self.assertEqual(result["llm_model_used"], "gpt-sca-test")
+        self.mock_requests_post.assert_called_once()
+        self.assertEqual(self.mock_requests_get.call_count, 2) # PENDING then SUCCESS
+
+    def test_call_real_llm_aims_submit_http_error(self):
+        self.mock_requests_post.side_effect = requests.exceptions.HTTPError("AIMS Server Error", response=MagicMock(status_code=500, reason="Server Error", text="AIMS down"))
+        prompt = "Test prompt"
+        topic_info = {"title_suggestion": "Test Topic"}
+        result = sca_main.call_real_llm_service(prompt, topic_info)
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "SCA_AIMS_HTTP_ERROR")
+        self.assertEqual(result["status_code"], 500)
+
+    def test_call_real_llm_aims_submit_not_202(self):
+        mock_aims_submit_fail_response = MagicMock(status_code=400)
+        mock_aims_submit_fail_response.text = "Bad AIMS Request"
+        self.mock_requests_post.return_value = mock_aims_submit_fail_response
+        prompt = "Test prompt"
+        topic_info = {"title_suggestion": "Test Topic"}
+        result = sca_main.call_real_llm_service(prompt, topic_info)
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "SCA_AIMS_TASK_REJECTED")
+        self.assertEqual(result["status_code"], 400)
+
+    def test_call_real_llm_polling_timeout(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "aims_task_timeout", "status_url": "/aims_status/timeout"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_pending_response = MagicMock(status_code=200)
+        mock_aims_poll_pending_response.json.return_value = {"status": "PENDING"}
+        self.mock_requests_get.return_value = mock_aims_poll_pending_response # Always pending
+
+        prompt = "Test prompt"
+        topic_info = {"title_suggestion": "Test Topic"}
+        with patch.dict(sca_config, {"AIMS_POLLING_TIMEOUT_SECONDS": 0.01, "AIMS_POLLING_INTERVAL_SECONDS": 0.005}):
+            result = sca_main.call_real_llm_service(prompt, topic_info)
+
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "SCA_AIMS_POLLING_TIMEOUT")
+
+    def test_call_real_llm_polling_task_fails_at_aims(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "aims_task_fail", "status_url": "/aims_status/fail"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_failure_response = MagicMock(status_code=200)
+        mock_aims_poll_failure_response.json.return_value = {"status": "FAILURE", "result": {"error": {"message": "LLM processing failed"}}}
+        self.mock_requests_get.return_value = mock_aims_poll_failure_response
+
+        prompt = "Test prompt"
+        topic_info = {"title_suggestion": "Test Topic"}
+        result = sca_main.call_real_llm_service(prompt, topic_info)
+
+        self.assertIn("error_code", result)
+        self.assertEqual(result["error_code"], "SCA_AIMS_TASK_FAILED")
+        self.assertIn("LLM processing failed", result["details"])
+
+    def test_call_real_llm_success_no_newline_in_response(self):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "aims_task_nonewline", "status_url": "/aims_status/nonewline"}
+        self.mock_requests_post.return_value = mock_aims_submit_response
+
+        mock_aims_poll_success_response = MagicMock(status_code=200)
+        mock_aims_llm_result_payload = {"choices": [{"text": "Single line content only."}], "model_id": "gpt-sca-test-nonl"}
+        mock_aims_poll_success_response.json.return_value = {"status": "SUCCESS", "result": mock_aims_llm_result_payload}
+        self.mock_requests_get.return_value = mock_aims_poll_success_response
+
+        prompt = "Test prompt"
+        topic_info = {"title_suggestion": "No Newline Topic"}
+        result = sca_main.call_real_llm_service(prompt, topic_info)
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["title"], "AI-Generated Title for No Newline Topic") # Default title
+        self.assertEqual(result["text_content"], "Single line content only.")
+        self.assertEqual(result["llm_model_used"], "gpt-sca-test-nonl")
+
+
+class TestCraftSnippetEndpointValidation(BaseScaServiceTest):
+
+    def test_craft_snippet_endpoint_missing_topic_id(self):
+        payload = {"content_brief": "A valid brief.", "topic_info": {}}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_INVALID_TOPIC_ID")
+
+    def test_craft_snippet_endpoint_empty_content_brief(self):
+        payload = {"topic_id": "t123", "content_brief": " ", "topic_info": {}} # Empty string after strip
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_INVALID_CONTENT_BRIEF")
+
+    def test_craft_snippet_endpoint_content_brief_too_long(self):
+        payload = {"topic_id": "t123", "content_brief": "a" * 1001, "topic_info": {}}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_CONTENT_BRIEF_TOO_LONG")
+
+    def test_craft_snippet_endpoint_topic_info_not_dict(self):
+        payload = {"topic_id": "t123", "content_brief": "brief", "topic_info": "not a dict"}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_INVALID_TOPIC_INFO")
+
+    def test_craft_snippet_endpoint_topic_summary_too_long(self):
+        payload = {"topic_id": "t123", "content_brief": "brief", "topic_info": {"summary": "s" * 5001}}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_TOPIC_SUMMARY_TOO_LONG")
+
+    def test_craft_snippet_endpoint_too_many_keywords(self):
+        payload = {"topic_id": "t123", "content_brief": "brief", "topic_info": {"keywords": ["k"] * 11}}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_TOO_MANY_KEYWORDS")
+
+    def test_craft_snippet_endpoint_keyword_too_long(self):
+        payload = {"topic_id": "t123", "content_brief": "brief", "topic_info": {"keywords": ["k" * 101]}}
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_KEYWORD_TOO_LONG")
+
+    def test_craft_snippet_endpoint_invalid_keyword_type(self):
+        payload = {"topic_id": "t123", "content_brief": "brief", "topic_info": {"keywords": [123]}} # Keyword is not a string
+        headers = {IDEMPOTENCY_KEY_HEADER: "valid-idem-key"}
+        response = self.app.post('/craft_snippet', json=payload, headers=headers)
+        self.assertEqual(response.status_code, 400)
+        json_data = response.get_json()
+        self.assertEqual(json_data["error_code"], "SCA_INVALID_KEYWORD_ITEM_TYPE")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
