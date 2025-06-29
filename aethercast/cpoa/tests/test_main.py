@@ -2133,3 +2133,427 @@ class TestCpoaTaskSelfIdempotency(BaseCpoaIdempotencyTest):
             {"message": "Podcast generation complete!", "final_status": cpoa_main.WORKFLOW_STATUS_COMPLETED, "is_terminal": True},
             workflow_id_for_log=self.mock_workflow_id
         )
+
+
+class TestOrchestrationStageHelpers(BaseCpoaIdempotencyTest): # Inherit for common mocks setup
+
+    def test_run_wcha_stage_success_async_poll(self):
+        mock_db_conn = self.mock_db_conn # from BaseCpoaIdempotencyTest
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        # Configure requests_with_retry and requests.get mocks for WCHA
+        # 1. Initial POST to WCHA /harvest returns 202
+        mock_wcha_submit_resp = MagicMock(status_code=202)
+        mock_wcha_submit_resp.json.return_value = {"task_id": "wcha_async_1", "status_url": "/wcha_status/wcha_async_1"}
+
+        # 2. Subsequent GET to WCHA status URL returns SUCCESS
+        mock_wcha_poll_resp = MagicMock(status_code=200)
+        mock_wcha_poll_resp.json.return_value = {
+            "status": "SUCCESS",
+            "result": {"status": "success", "content": "Harvested WCHA content", "source_urls": ["http://wcha.example.com"]}
+        }
+
+        # Override the default side_effect from BaseCpoaIdempotencyTest for this specific test
+        self.mock_requests_retry.side_effect = None # Clear base class side effect
+
+        # Mock requests.get separately for polling if requests_with_retry is only for initial POST
+        # For simplicity, if requests_with_retry is used for all, configure its side_effect carefully.
+        # Assuming requests_with_retry is used for initial POST, and requests.get for polling.
+        mock_requests_get_patcher = patch('requests.get')
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop) # Ensure it's stopped after test
+
+        self.mock_requests_retry.return_value = mock_wcha_submit_resp # For the initial POST
+        mock_requests_get.return_value = mock_wcha_poll_resp # For polling GET
+
+        result = cpoa_main._run_wcha_stage(
+            db_conn=mock_db_conn,
+            cpoa_internal_workflow_id="wf_wcha_test_async",
+            current_task_order=1,
+            topic="Test WCHA Async",
+            parent_idempotency_key="parent_idem_wcha_async",
+            wf_logger=mock_wf_logger,
+            client_id="client_wcha_async",
+            log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+
+        self.assertEqual(result["content"], "Harvested WCHA content")
+        self.assertEqual(result["source_urls"], ["http://wcha.example.com"])
+        self.mock_create_task.assert_called_once()
+        # Check specific call to _update_task_instance_status (at least for completion)
+        self.mock_update_task.assert_any_call(
+            mock_db_conn, unittest.mock.ANY, # task_id is generated
+            cpoa_main.TASK_STATUS_COMPLETED,
+            output_summary=unittest.mock.ANY,
+            error_details=None,
+            workflow_id_for_log="wf_wcha_test_async"
+        )
+        self.mock_requests_retry.assert_called_once() # Initial POST
+        mock_requests_get.assert_called_once() # Polling GET
+
+    def test_run_wcha_stage_success_sync(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        # WCHA returns 200 directly
+        mock_wcha_sync_resp = MagicMock(status_code=200)
+        mock_wcha_sync_resp.json.return_value = {"status": "success", "content": "Sync WCHA content", "source_urls": ["http://sync.example.com"]}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        self.mock_requests_retry.return_value = mock_wcha_sync_resp
+
+        result = cpoa_main._run_wcha_stage(
+            db_conn=mock_db_conn,
+            cpoa_internal_workflow_id="wf_wcha_test_sync",
+            current_task_order=1,
+            topic="Test WCHA Sync",
+            parent_idempotency_key="parent_idem_wcha_sync",
+            wf_logger=mock_wf_logger,
+            client_id="client_wcha_sync",
+            log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+        self.assertEqual(result["content"], "Sync WCHA content")
+        self.mock_create_task.assert_called_once()
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_COMPLETED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+        self.mock_requests_retry.assert_called_once() # Only initial POST, no polling
+
+    def test_run_wcha_stage_polling_timeout(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_wcha_submit_resp = MagicMock(status_code=202)
+        mock_wcha_submit_resp.json.return_value = {"task_id": "wcha_timeout_1", "status_url": "/wcha_status/wcha_timeout_1"}
+
+        # Polling always returns PENDING or similar, leading to timeout
+        mock_wcha_poll_pending_resp = MagicMock(status_code=200)
+        mock_wcha_poll_pending_resp.json.return_value = {"status": "PENDING"} # Or "PROCESSING"
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_wcha_poll_pending_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+
+        self.mock_requests_retry.return_value = mock_wcha_submit_resp # For initial POST
+
+        with patch.object(cpoa_main, 'CPOA_WCHA_POLLING_TIMEOUT_SECONDS', 0.01), \
+             patch.object(cpoa_main, 'CPOA_WCHA_POLLING_INTERVAL_SECONDS', 0.005): # Fast timeout for test
+            with self.assertRaisesRegex(Exception, "Polling WCHA task wcha_timeout_1 timed out."):
+                cpoa_main._run_wcha_stage(
+                    db_conn=mock_db_conn,
+                    cpoa_internal_workflow_id="wf_wcha_timeout",
+                    current_task_order=1, topic="Test Timeout", parent_idempotency_key="parent_timeout",
+                    wf_logger=mock_wf_logger, client_id="client_timeout", log_step_cpoa_fn=mock_log_step_cpoa_fn
+                )
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_wcha_stage_initial_submit_fails(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        self.mock_requests_retry.side_effect = requests.exceptions.ConnectionError("WCHA service down")
+
+        with self.assertRaisesRegex(Exception, "WCHA stage request error: WCHA service down"):
+            cpoa_main._run_wcha_stage(
+                db_conn=mock_db_conn,
+                cpoa_internal_workflow_id="wf_wcha_submit_fail",
+                current_task_order=1, topic="Test Submit Fail", parent_idempotency_key="parent_submit_fail",
+                wf_logger=mock_wf_logger, client_id="client_submit_fail", log_step_cpoa_fn=mock_log_step_cpoa_fn
+            )
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    # TODO: Add tests for _run_pswa_stage, _run_vfa_stage, _run_asf_notification_stage
+    # covering success, different types of failures (HTTP error, logical error from service, timeout).
+
+    def test_run_pswa_stage_success_async_poll(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_pswa_submit_resp = MagicMock(status_code=202)
+        mock_pswa_submit_resp.json.return_value = {"task_id": "pswa_async_1", "status_url": "/pswa_status/pswa_async_1"}
+
+        mock_script_data = {"script_id": "s123", "title": "Test Script", "segments": [{"content": "Hello"}]}
+        mock_pswa_poll_resp = MagicMock(status_code=200)
+        mock_pswa_poll_resp.json.return_value = {
+            "status": "SUCCESS",
+            "result": {"script_data": mock_script_data}
+        }
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_pswa_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_pswa_submit_resp
+
+        result = cpoa_main._run_pswa_stage(
+            db_conn=mock_db_conn,
+            cpoa_internal_workflow_id="wf_pswa_test_async",
+            current_task_order=2,
+            topic="Test PSWA Async",
+            wcha_content="Some input content",
+            parent_idempotency_key="parent_idem_pswa_async",
+            wf_logger=mock_wf_logger,
+            client_id="client_pswa_async",
+            test_scenarios=None,
+            log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+
+        self.assertEqual(result["script"], mock_script_data)
+        self.mock_create_task.assert_called_once()
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_COMPLETED, unittest.mock.ANY,unittest.mock.ANY, unittest.mock.ANY)
+        self.mock_requests_retry.assert_called_once()
+        mock_requests_get.assert_called_once()
+
+    def test_run_pswa_stage_idempotent_hit_200_direct(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_script_data = {"script_id": "s200", "title": "Idempotent Script", "segments": [{"content": "Cached"}]}
+        mock_pswa_direct_resp = MagicMock(status_code=200)
+        mock_pswa_direct_resp.json.return_value = {"script_data": mock_script_data, "source": "cache"} # PSWA might indicate source
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        self.mock_requests_retry.return_value = mock_pswa_direct_resp
+
+        mock_requests_get_patcher = patch('requests.get') # To ensure it's not called
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+
+        result = cpoa_main._run_pswa_stage(
+            db_conn=mock_db_conn,
+            cpoa_internal_workflow_id="wf_pswa_test_idem",
+            current_task_order=2, topic="Test PSWA Idempotent", wcha_content="Content",
+            parent_idempotency_key="parent_idem_pswa_idem", wf_logger=mock_wf_logger,
+            client_id="client_pswa_idem", test_scenarios=None, log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+        self.assertEqual(result["script"], mock_script_data)
+        self.assertEqual(result["output_summary"]["source"], "idempotency_cache")
+        self.mock_requests_retry.assert_called_once()
+        mock_requests_get.assert_not_called() # No polling for 200 direct response
+
+    def test_run_pswa_stage_fails_invalid_script_structure(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_pswa_submit_resp = MagicMock(status_code=202)
+        mock_pswa_submit_resp.json.return_value = {"task_id": "pswa_invalid_1", "status_url": "/pswa_status/pswa_invalid_1"}
+
+        malformed_script_data = {"title": "Only Title"} # Missing script_id and segments
+        mock_pswa_poll_resp = MagicMock(status_code=200)
+        mock_pswa_poll_resp.json.return_value = {"status": "SUCCESS", "result": {"script_data": malformed_script_data}}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_pswa_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_pswa_submit_resp
+
+        with self.assertRaisesRegex(Exception, "PSWA service returned invalid or malformed structured script."):
+            cpoa_main._run_pswa_stage(
+                db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_pswa_invalid", current_task_order=2,
+                topic="Test Invalid Script", wcha_content="Content", parent_idempotency_key="parent_invalid",
+                wf_logger=mock_wf_logger, client_id="client_invalid", test_scenarios=None, log_step_cpoa_fn=mock_log_step_cpoa_fn
+            )
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_pswa_stage_polling_fails_logical_error(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_pswa_submit_resp = MagicMock(status_code=202)
+        mock_pswa_submit_resp.json.return_value = {"task_id": "pswa_pollfail_1", "status_url": "/pswa_status/pswa_pollfail_1"}
+
+        mock_pswa_poll_resp = MagicMock(status_code=200)
+        # PSWA task itself reports FAILURE
+        mock_pswa_poll_resp.json.return_value = {"status": "FAILURE", "result": {"error": "LLM unavailable"}}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_pswa_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_pswa_submit_resp
+
+        with self.assertRaisesRegex(Exception, "PSWA task execution failed."):
+            cpoa_main._run_pswa_stage(
+                db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_pswa_pollfail", current_task_order=2,
+                topic="Test Poll Fail", wcha_content="Content", parent_idempotency_key="parent_pollfail",
+                wf_logger=mock_wf_logger, client_id="client_pollfail", test_scenarios=None, log_step_cpoa_fn=mock_log_step_cpoa_fn
+            )
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_vfa_stage_success_async_poll(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_vfa_submit_resp = MagicMock(status_code=202)
+        mock_vfa_submit_resp.json.return_value = {"task_id": "vfa_async_1", "status_url": "/vfa_status/vfa_async_1"}
+
+        mock_vfa_result_data = {"status": "success", "audio_filepath": "/audio/podcast.mp3", "stream_id": "st123", "tts_settings_used": {}}
+        mock_vfa_poll_resp = MagicMock(status_code=200)
+        mock_vfa_poll_resp.json.return_value = {"status": "SUCCESS", "result": mock_vfa_result_data}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_vfa_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_vfa_submit_resp
+
+        mock_script = {"script_id": "s1", "title": "T1", "segments": []}
+
+        result = cpoa_main._run_vfa_stage(
+            db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_vfa_async", current_task_order=3,
+            structured_script=mock_script, voice_params_input=None, user_preferences=None,
+            parent_idempotency_key="parent_vfa_async", wf_logger=mock_wf_logger, client_id="client_vfa_async",
+            test_scenarios=None, log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+        self.assertEqual(result, mock_vfa_result_data)
+        self.mock_create_task.assert_called_once()
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_COMPLETED, unittest.mock.ANY,unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_vfa_stage_logical_error_from_service(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_vfa_submit_resp = MagicMock(status_code=202)
+        mock_vfa_submit_resp.json.return_value = {"task_id": "vfa_logic_err_1", "status_url": "/vfa_status/vfa_logic_err_1"}
+
+        # VFA's Celery task completes, but VFA's internal logic returns an error status
+        mock_vfa_logical_error_data = {"status": "error", "message": "TTS provider unavailable", "error_code": "VFA_TTS_PROVIDER_DOWN"}
+        mock_vfa_poll_resp = MagicMock(status_code=200)
+        mock_vfa_poll_resp.json.return_value = {"status": "SUCCESS", "result": mock_vfa_logical_error_data}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_vfa_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_vfa_submit_resp
+
+        mock_script = {"script_id": "s2", "title": "T2", "segments": []}
+
+        expected_exception_message_regex = f"{cpoa_main.CPOA_STATUS_FAILED_VFA_REPORTED_ERROR}: TTS provider unavailable .*VFA_TTS_PROVIDER_DOWN.*"
+        with self.assertRaisesRegex(Exception, expected_exception_message_regex):
+            cpoa_main._run_vfa_stage(
+                db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_vfa_logic_err", current_task_order=3,
+                structured_script=mock_script, voice_params_input=None, user_preferences=None,
+                parent_idempotency_key="parent_vfa_logic_err", wf_logger=mock_wf_logger, client_id="client_vfa_logic_err",
+                test_scenarios=None, log_step_cpoa_fn=mock_log_step_cpoa_fn
+            )
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_vfa_stage_skipped_from_service(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_vfa_submit_resp = MagicMock(status_code=202)
+        mock_vfa_submit_resp.json.return_value = {"task_id": "vfa_skip_1", "status_url": "/vfa_status/vfa_skip_1"}
+
+        mock_vfa_skipped_data = {"status": "skipped", "message": "Script too short for VFA"}
+        mock_vfa_poll_resp = MagicMock(status_code=200)
+        mock_vfa_poll_resp.json.return_value = {"status": "SUCCESS", "result": mock_vfa_skipped_data}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        mock_requests_get_patcher = patch('requests.get', return_value=mock_vfa_poll_resp)
+        mock_requests_get = mock_requests_get_patcher.start()
+        self.addCleanup(mock_requests_get_patcher.stop)
+        self.mock_requests_retry.return_value = mock_vfa_submit_resp
+
+        mock_script = {"script_id": "s3", "title": "T3", "segments": []}
+
+        expected_exception_message_regex = f"{cpoa_main.CPOA_STATUS_COMPLETED_WITH_VFA_SKIPPED}: Script too short for VFA"
+        with self.assertRaisesRegex(Exception, expected_exception_message_regex):
+            cpoa_main._run_vfa_stage(
+                db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_vfa_skip", current_task_order=3,
+                structured_script=mock_script, voice_params_input=None, user_preferences=None,
+                parent_idempotency_key="parent_vfa_skip", wf_logger=mock_wf_logger, client_id="client_vfa_skip",
+                test_scenarios=None, log_step_cpoa_fn=mock_log_step_cpoa_fn
+            )
+        # Even if skipped, the task instance itself might be marked FAILED from CPOA's perspective of not getting audio
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY, unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_asf_notification_stage_success(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        mock_asf_response = MagicMock(status_code=200)
+        mock_asf_response.json.return_value = {"message": "ASF notified successfully"}
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        self.mock_requests_retry.return_value = mock_asf_response
+
+        result = cpoa_main._run_asf_notification_stage(
+            db_conn=mock_db_conn,
+            cpoa_internal_workflow_id="wf_asf_test_succ",
+            current_task_order=4,
+            stream_id="stream123",
+            audio_gcs_uri="gs://bucket/audio.mp3",
+            wf_logger=mock_wf_logger,
+            client_id="client_asf_succ",
+            log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+
+        self.assertTrue(result["notification_successful"])
+        self.assertIsNone(result["error_details"])
+        self.assertIn("ASF notified successfully", result["status_message_for_legacy_log"])
+        self.mock_create_task.assert_called_once()
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_COMPLETED, unittest.mock.ANY,unittest.mock.ANY, unittest.mock.ANY)
+        self.mock_requests_retry.assert_called_once_with(
+            "post", cpoa_main.ASF_NOTIFICATION_URL,
+            json={"stream_id": "stream123", "filepath": "gs://bucket/audio.mp3"},
+            timeout=10,
+            max_retries=unittest.mock.ANY, # from CPOA_SERVICE_RETRY_COUNT
+            backoff_factor=unittest.mock.ANY, # from CPOA_SERVICE_RETRY_BACKOFF_FACTOR
+            workflow_id_for_log="wf_asf_test_succ",
+            task_id_for_log=unittest.mock.ANY
+        )
+
+    def test_run_asf_notification_stage_failure_request_exception(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        self.mock_requests_retry.side_effect = None # Clear base
+        self.mock_requests_retry.side_effect = requests.exceptions.ConnectionError("ASF service down")
+
+        result = cpoa_main._run_asf_notification_stage(
+            db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_asf_fail", current_task_order=4,
+            stream_id="stream_fail", audio_gcs_uri="gs://bucket/audio_fail.mp3",
+            wf_logger=mock_wf_logger, client_id="client_asf_fail", log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+
+        self.assertFalse(result["notification_successful"])
+        self.assertIsNotNone(result["error_details"])
+        self.assertEqual(result["error_details"]["exception_type"], "ConnectionError")
+        self.assertIn("Failed during ASF notification stage (RequestException)", result["status_message_for_legacy_log"])
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY,unittest.mock.ANY, unittest.mock.ANY)
+
+    def test_run_asf_notification_stage_skipped_no_uri_or_streamid(self):
+        mock_db_conn = self.mock_db_conn
+        mock_wf_logger = MagicMock(spec=logging.LoggerAdapter)
+        mock_log_step_cpoa_fn = MagicMock()
+
+        self.mock_requests_retry.side_effect = None # Clear base
+
+        result = cpoa_main._run_asf_notification_stage(
+            db_conn=mock_db_conn, cpoa_internal_workflow_id="wf_asf_skip", current_task_order=4,
+            stream_id=None, audio_gcs_uri="gs://bucket/audio_skip.mp3", # stream_id is None
+            wf_logger=mock_wf_logger, client_id="client_asf_skip", log_step_cpoa_fn=mock_log_step_cpoa_fn
+        )
+
+        self.assertFalse(result["notification_successful"])
+        self.assertIsNotNone(result["error_details"])
+        self.assertIn("ASF notification skipped", result["error_details"]["message"])
+        self.assertIn("ASF notification skipped", result["status_message_for_legacy_log"])
+        self.mock_update_task.assert_any_call(mock_db_conn, unittest.mock.ANY, cpoa_main.TASK_STATUS_FAILED, unittest.mock.ANY,unittest.mock.ANY, unittest.mock.ANY)
+        self.mock_requests_retry.assert_not_called() # Should not attempt call if inputs missing
