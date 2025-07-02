@@ -836,5 +836,116 @@ class TestSnippetParsing(BaseScaServiceTest):
         self.assertEqual(snippet["cover_art_prompt"], expected_cover_art_prompt)
 
 
+class TestSnippetParsing(BaseScaServiceTest):
+    def setUp(self):
+        super().setUp()
+        self.mocked_sca_config["USE_REAL_LLM_SERVICE"] = True
+
+        self.task_args = {
+            'request_id': "test_req_parse",
+            'topic_id': "topic_parse",
+            'content_brief': "A brief for parsing.",
+            'topic_info': {"title_suggestion": "Parsing Test Topic", "summary": "Summary for parsing.", "keywords":["kw1","kw2"]},
+            'idempotency_key': f"idem_parse_{uuid.uuid4().hex}"
+        }
+        self.patcher_check_idem = patch('aethercast.sca.main._check_idempotency_key', return_value=None)
+        self.mock_check_idem = self.patcher_check_idem.start()
+        self.addCleanup(self.patcher_check_idem.stop)
+
+        self.patcher_store_idem = patch('aethercast.sca.main._store_idempotency_record')
+        self.mock_store_idem = self.patcher_store_idem.start()
+        self.addCleanup(self.patcher_store_idem.stop)
+
+        self.celery_task_id = f"celery_sca_parse_task_{uuid.uuid4().hex[:8]}"
+
+    def run_task_and_get_snippet_obj(self, llm_text_output_from_aims_choices):
+        mock_aims_submit_response = MagicMock(status_code=202)
+        mock_aims_submit_response.json.return_value = {"task_id": "aims_parse_task", "status_url": "/aims_status/parse"}
+
+        mock_aims_poll_success_response = MagicMock(status_code=200)
+        mock_aims_llm_result_payload = {
+            "choices": [{"text": llm_text_output_from_aims_choices}],
+            "model_id": "test-parse-model"
+        }
+        mock_aims_poll_success_response.json.return_value = {"status": "SUCCESS", "result": mock_aims_llm_result_payload}
+
+        with patch('requests.post', return_value=mock_aims_submit_response), \
+             patch('requests.get', return_value=mock_aims_poll_success_response):
+            with patch.object(craft_snippet_task, 'request', MagicMock(id=self.celery_task_id)):
+                task_result = craft_snippet_task.apply(kwargs=self.task_args).get()
+        return task_result
+
+    def test_parsing_valid_title_and_content(self):
+        llm_output = "This is the Title\nThis is the content."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        self.assertEqual(snippet["title"], "This is the Title")
+        self.assertEqual(snippet["text_content"], "This is the content.")
+        self.assertEqual(snippet["summary"], "This is the content.")
+
+    def test_parsing_no_newline(self):
+        llm_output = "Title and content all in one line no newline here."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        self.assertEqual(snippet["title"], expected_title)
+        self.assertEqual(snippet["text_content"], llm_output)
+        self.assertEqual(snippet["summary"], llm_output)
+
+    def test_parsing_multiple_newlines(self):
+        llm_output = "Main Title\n\nFirst line of content.\nSecond line of content."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        self.assertEqual(snippet["title"], "Main Title")
+        self.assertEqual(snippet["text_content"], "First line of content.\nSecond line of content.")
+
+    def test_parsing_empty_string_from_llm(self):
+        llm_output = ""
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        self.assertEqual(snippet["title"], expected_title)
+        self.assertEqual(snippet["text_content"], "")
+        self.assertEqual(snippet["summary"], "")
+
+    def test_parsing_only_newline_from_llm(self):
+        llm_output = "\n"
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        self.assertEqual(snippet["title"], expected_title)
+        self.assertEqual(snippet["text_content"], "")
+
+    def test_parsing_long_first_line_as_title_fallback(self):
+        long_title = "a" * 250
+        llm_output = f"{long_title}\nSome content."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        self.assertEqual(snippet["title"], expected_title)
+        self.assertEqual(snippet["text_content"], llm_output)
+
+    def test_parsing_title_and_empty_content_after_newline_fallback(self):
+        llm_output = "Actual Title\n"
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        self.assertEqual(snippet["title"], expected_title)
+        self.assertEqual(snippet["text_content"], llm_output.strip())
+
+    def test_parsing_identical_title_and_content_uses_default_title_fallback(self):
+        llm_output = "This is a single line that becomes both title and content."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        self.assertEqual(snippet["title"], expected_title)
+        self.assertEqual(snippet["text_content"], llm_output)
+
+    def test_cover_art_prompt_generation(self):
+        llm_output = "My Snippet Title\nMy snippet content."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_cover_art_prompt = "Podcast cover: My Snippet Title"
+        self.assertEqual(snippet["cover_art_prompt"], expected_cover_art_prompt)
+
+    def test_cover_art_prompt_with_default_title(self):
+        llm_output = "Single line content, so title will be default."
+        snippet = self.run_task_and_get_snippet_obj(llm_output)
+        expected_default_title = f"AI-Generated Title for {self.task_args['topic_info']['title_suggestion']}"
+        expected_cover_art_prompt = f"Podcast cover: {expected_default_title}"
+        self.assertEqual(snippet["cover_art_prompt"], expected_cover_art_prompt)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
