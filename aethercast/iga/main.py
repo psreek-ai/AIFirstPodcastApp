@@ -465,45 +465,58 @@ def generate_image_vertex_ai_task(self, request_id: str, prompt: str, aspect_rat
             return {"status": "error", "message": "Image generation failed: Empty image data."}
 
         image_bytes = image_object._image_bytes
-        encoded_bytes = base64.b64encode(image_bytes).decode('utf-8')
-        app.logger.info(f"IGA Task {task_log_id}: Image bytes accessed and base64 encoded.", extra=log_extra_base)
+        app.logger.info(f"IGA Task {task_log_id}: Image bytes accessed from Vertex AI.", extra=log_extra_base)
+
+        # --- GCS Upload Logic ---
+        if not gcs_bucket_name or not GLOBAL_STORAGE_CLIENT:
+            app.logger.error(f"IGA Task {task_log_id}: GCS bucket name or storage client not available. Cannot upload image.", extra=log_extra_base)
+            raise ValueError("GCS configuration error: Bucket name or client missing.")
+
+        # Generate a unique filename
+        # Using idempotency_key or request_id in filename for better traceability
+        # Ensure gcs_image_prefix ends with a slash if it's a folder structure
+        prefix = gcs_image_prefix.strip('/') + '/' if gcs_image_prefix.strip('/') else ''
+        image_filename = f"{prefix}{idempotency_key or request_id}_{uuid.uuid4().hex[:8]}.png"
+
+        storage_client = GLOBAL_STORAGE_CLIENT
+        bucket = storage_client.bucket(gcs_bucket_name)
+        blob = bucket.blob(image_filename)
+
+        upload_start_time = time.time()
+        try:
+            blob.upload_from_string(image_bytes, content_type="image/png")
+            gcs_uri = f"gs://{gcs_bucket_name}/{image_filename}"
+            upload_duration_ms = (time.time() - upload_start_time) * 1000
+            app.logger.info(f"IGA Task {task_log_id}: Image successfully uploaded to {gcs_uri}. Upload duration: {upload_duration_ms:.2f}ms",
+                            extra={**log_extra_base, "metric_name": "iga_gcs_upload_duration_ms", "value": round(upload_duration_ms, 2), "gcs_uri": gcs_uri})
+        except google_exceptions.GoogleAPIError as e_gcs:
+            app.logger.error(f"IGA Task {task_log_id}: GCS upload failed for {image_filename}: {e_gcs}", exc_info=True, extra=log_extra_base)
+            # This will be caught by the broader GoogleAPIError handler below and retried by Celery.
+            raise # Re-raise to trigger Celery retry or on_failure.
 
         task_result_payload = {
             "status": "success",
-            "image_base64": encoded_bytes,
-            "image_format": "png", # Assuming PNG, Vertex might provide this, or we infer
-            "message": "Image generated and returned as base64."
+            "image_url": gcs_uri, # Return GCS URI
+            "prompt_used": prompt,
+            "model_version": model_id # Or model_to_use.name if available and preferred
         }
-
-        # GCS Upload is bypassed for this primary success path.
-        # The original GCS upload code would be here if not bypassed.
 
         _store_idempotency_record(db_conn, idempotency_key, self.name,
                                   iga_config['IGA_IDEMPOTENCY_STATUS_COMPLETED'],
                                   workflow_id=workflow_id, result_payload=task_result_payload, is_new_key=False)
         db_conn.commit()
-        app.logger.info(f"IGA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'. Image returned as base64.", extra=log_extra_base)
+        app.logger.info(f"IGA Task {task_log_id}: Successfully processed and stored COMPLETED status for key '{idempotency_key}'. Image GCS URI: {gcs_uri}.", extra=log_extra_base)
         return task_result_payload
 
-    except google_exceptions.GoogleAPIError as e: # Specific retryable error for Google APIs
+    except google_exceptions.GoogleAPIError as e:
         app.logger.error(f"IGA Task {task_log_id}: Google Vertex AI/GCS API Error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
-        # on_failure handler will be called by Celery due to re-raise.
-        # It will try to update idempotency if key and db_conn are available.
-        raise self.retry(exc=e, countdown=20, max_retries=3) # Increased countdown for API errors
-    except Exception as e: # Catch-all for other unexpected errors
+        raise self.retry(exc=e, countdown=20, max_retries=3)
+    except Exception as e:
         app.logger.error(f"IGA Task {task_log_id}: Unexpected error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra_base)
-        # Let on_failure handle marking idempotency as FAILED. Celery will manage retries if configured, or task fails.
-        # For non-API errors, retry might be less useful, but depends on error.
-        # Default Celery task retry is often 3 times. We can customize if needed.
-        raise # Re-raise to trigger on_failure and standard Celery error handling/retry.
+        raise
     finally:
         if db_conn:
-            if not db_conn.closed: # Ensure not to operate on a closed connection
-                # If autocommit was false and an unhandled exception occurred before commit/rollback for PROCESSING,
-                # the transaction might be open. Rollback to be safe, though commits are explicit.
-                # psycopg2 typically requires a rollback after an error in a transaction.
-                # However, our commits are explicit for idempotency state changes.
-                # A simple close should be fine here as commit/rollback is handled per state change.
+            if not db_conn.closed:
                 db_conn.close()
                 app.logger.debug(f"IGA Task {task_log_id}: Closed DB connection for key '{idempotency_key}'.", extra=log_extra_base)
 
@@ -660,5 +673,3 @@ if __name__ == "__main__":
 
     app.logger.info(f"--- IGA Service (Vertex AI & GCS) starting on {host}:{port} (Debug: {flask_debug_mode}) ---")
     app.run(host=host, port=port, debug=flask_debug_mode)
-
-[end of aethercast/iga/main.py]

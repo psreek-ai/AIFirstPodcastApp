@@ -951,9 +951,9 @@ class TestPswaPromptEngineering(unittest.TestCase):
 
 
 @patch('aethercast.pswa.main.pswa_config', new_callable=MagicMock)
-    @patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
-    @patch('aethercast.pswa.main._call_aims_service_for_script')
-    def test_retry_after_failure_direct_call_success(self, mock_call_aims, mock_db_conn_fn_getter, mock_dynamic_pswa_config):
+@patch('aethercast.pswa.main._get_pswa_db_connection_idempotency', side_effect=mock_get_pswa_db_connection_idempotency_side_effect)
+@patch('aethercast.pswa.main._call_aims_service_for_script')
+def test_retry_after_failure_direct_call_success(self, mock_call_aims, mock_db_conn_fn_getter, mock_dynamic_pswa_config):
         """Test direct task call re-processes and succeeds after a previous 'failed' record."""
         current_config = pswa_config.copy()
         current_config["PSWA_TEST_MODE_ENABLED"] = False
