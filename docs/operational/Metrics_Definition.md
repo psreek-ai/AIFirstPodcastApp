@@ -282,3 +282,42 @@ This approach allows for easy filtering and aggregation in a log analytics platf
     *   **Description:** Number of UI update messages that failed to be relayed.
     *   **Value:** `1`.
     *   **Tags:** `event_name`.
+
+### 3.11. WCHA (Web Content Harvester Agent)
+
+*   **`wcha_harvest_request_count`** (Counter)
+    *   **Description:** Tracks requests to the `/harvest` endpoint.
+    *   **Value:** `1`.
+    *   **Tags:** `status` (e.g., "success_sync_ddgs", "success_async_newsapi_dispatch", "success_async_url_dispatch", "validation_error_payload", "no_results_ddgs", "all_urls_failed_harvest").
+*   **`wcha_harvest_latency_ms`** (Histogram/Summary)
+    *   **Description:** Overall latency for a `/harvest` request. For async dispatches, this measures the time to dispatch the Celery task. For synchronous DDGS, it's the full processing time.
+    *   **Value:** Duration in milliseconds.
+    *   **Tags:** `type` (e.g., "sync_ddgs", "async_newsapi_dispatch", "async_url_dispatch").
+*   **`wcha_celery_task_duration_ms`** (Histogram/Summary)
+    *   **Description:** Duration of WCHA Celery tasks (`fetch_news_articles_task`, `harvest_url_content_task`).
+    *   **Value:** Duration in milliseconds.
+    *   **Tags:** `task_name` (e.g., "fetch_news_articles_task", "harvest_url_content_task"), `status` ("success", "failure").
+*   **`wcha_ddgs_search_latency_ms`** (Histogram/Summary)
+    *   **Description:** Latency for DuckDuckGo searches performed synchronously by the `/harvest` endpoint.
+    *   **Value:** Duration in milliseconds.
+*   **`wcha_newsapi_call_latency_ms`** (Histogram/Summary)
+    *   **Description:** Latency for NewsAPI calls made by `fetch_news_articles_task`.
+    *   **Value:** Duration in milliseconds.
+*   **`wcha_url_fetch_latency_ms`** (Histogram/Summary)
+    *   **Description:** Latency for fetching content from a single URL (within DDGS sync path or `harvest_url_content_task`).
+    *   **Value:** Duration in milliseconds.
+*   **`wcha_content_extraction_latency_ms`** (Histogram/Summary)
+    *   **Description:** Latency for `trafilatura` content extraction from a single page.
+    *   **Value:** Duration in milliseconds.
+*   **`wcha_urls_found_count`** (Histogram/Summary)
+    *   **Description:** Number of URLs found by a search operation (DDGS or NewsAPI).
+    *   **Value:** Count of URLs.
+    *   **Tags:** `source` ("ddgs", "newsapi").
+*   **`wcha_urls_successfully_harvested_count`** (Histogram/Summary)
+    *   **Description:** Number of URLs from which content was successfully extracted in a single operation.
+    *   **Value:** Count of successfully harvested URLs.
+    *   **Tags:** `source_operation` ("ddgs_sync_harvest", "newsapi_task", "direct_url_task").
+*   **`wcha_harvest_error_count`** (Counter)
+    *   **Description:** Tracks errors during content harvesting from individual URLs or from search APIs.
+    *   **Value:** `1`.
+    *   **Tags:** `source_type` ("ddgs_search", "newsapi_call", "url_fetch", "content_extraction"), `error_class` (e.g., "requests.Timeout", "trafilatura.ExtractionError", "NewsAPIException").

@@ -22,6 +22,8 @@ graph TD
     subgraph Asynchronous Agents (Celery-based)
         TDA_Service["TDA Service (Flask App)"]
         TDA_Worker["TDA Worker (Celery)"]
+        WCHA_Service["WCHA Service (Flask App)"]
+        WCHA_Worker["WCHA Worker (Celery)"]
         SCA_Service["SCA Service (Flask App)"]
         SCA_Worker["SCA Worker (Celery)"]
         PSWA_Service["PSWA Service (Flask App)"]
@@ -32,7 +34,6 @@ graph TD
         VFA_Worker["VFA Worker (Celery)"]
     end
 
-    WCHA["WebContentHarvesterAgent (Library)"]
     DUIA["DynamicUIAgent (DUIA - Conceptual/Module)"]
 
     subgraph AI Model Services
@@ -68,8 +69,12 @@ graph TD
     SCA_Worker -- "DB Read/Write (Idempotency)" --> PostgresDB
     SCA_Service -- "Task Status Poll by CPOA" --> CPOA
 
-    CPOA -- "Call as Library" --> WCHA
-    WCHA -- "HTTP Call" --> Internet
+    CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> WCHA_Service
+    WCHA_Service -- "Celery Task" --> Redis
+    Redis --> WCHA_Worker
+    WCHA_Worker -- "HTTP Call" --> Internet
+    WCHA_Worker -- "DB Read/Write (Idempotency)" --> PostgresDB
+    WCHA_Service -- "Task Status Poll by CPOA" --> CPOA
 
     CPOA -- "Dispatch Celery Task </br> (X-Idem-Key, X-Workflow-ID)" --> PSWA_Service
     PSWA_Service -- "Celery Task" --> Redis
@@ -121,10 +126,10 @@ graph TD
     style IGA_Service fill:#ff9,stroke:#333,stroke-width:2px
     style TDA_Worker fill:#fde,stroke:#333,stroke-width:2px
     style SCA_Worker fill:#fde,stroke:#333,stroke-width:2px
+    style WCHA_Worker fill:#fde,stroke:#333,stroke-width:2px
     style PSWA_Worker fill:#fde,stroke:#333,stroke-width:2px
     style VFA_Worker fill:#fde,stroke:#333,stroke-width:2px
     style IGA_Worker fill:#fde,stroke:#333,stroke-width:2px
-    style WCHA fill:#fdb,stroke:#333,stroke-width:2px
     style DUIA fill:#f9c,stroke:#333,stroke-width:2px
     style AIMS_SVC fill:#9cf,stroke:#333,stroke-width:2px
     style AIMS_TTS_SVC fill:#9cf,stroke:#333,stroke-width:2px
@@ -173,23 +178,23 @@ Below are descriptions of the major components depicted in the architecture diag
     * **Key Responsibilities:** Workflow management, task delegation (Celery), polling for task results, state persistence (PostgreSQL), error handling.
     * **Potential Technologies:** Python, Flask (as part of API GW).
 
-* **Specialized AI Agents (TDA, SCA, PSWA, IGA, VFA):**
-  Each of these agents is now a microservice consisting of a Flask app (for task status polling and potentially direct interaction if ever needed) and Celery workers for asynchronous task processing. They implement idempotency for their core Celery tasks using `X-Idempotency-Key` and a shared PostgreSQL table (`idempotency_keys`).
+* **Specialized AI Agents (TDA, WCHA, SCA, PSWA, IGA, VFA):**
+  Each of these agents is now a microservice consisting of a Flask app (for task status polling and potentially direct interaction if ever needed) and Celery workers for asynchronous task processing. They implement idempotency for their core Celery tasks using `X-Idempotency-Key` (propagated by CPOA) and a shared PostgreSQL table (`idempotency_keys`).
 
     * **`TopicDiscoveryAgent` (TDA):**
         * **Description:** Asynchronously discovers topics via its `discover_topics_task` (Celery). Uses NewsAPI (via `fetch_news_from_newsapi_task` sub-task) or simulated data. Stores topics in PostgreSQL.
-        * **Interaction:** Receives Celery task from CPOA (with idempotency keys). Uses PostgreSQL for idempotency and topic storage. Calls external News APIs.
+        * **Interaction:** Receives Celery task from CPOA. Uses PostgreSQL for idempotency and topic storage. Calls external News APIs.
         * **Potential Technologies:** Python, Flask, Celery, NewsAPI client, PostgreSQL.
+
+    * **`WebContentHarvesterAgent` (WCHA):**
+        * **Description:** Asynchronously harvests web content via Celery tasks (`fetch_news_articles_task`, `harvest_url_content_task`). It can search for content based on topics (using NewsAPI or DuckDuckGo) or fetch content from specific URLs. It uses `trafilatura` for text extraction. Core operations are idempotent using the shared PostgreSQL `idempotency_keys` table.
+        * **Interaction:** Receives Celery task from CPOA. Uses PostgreSQL for idempotency. Calls external News APIs or websites.
+        * **Potential Technologies:** Python, Flask, Celery, `duckduckgo_search`, `trafilatura`, `psycopg2-binary`, `python-json-logger`, NewsAPI client.
 
     * **`SnippetCraftAgent` (SCA):**
         * **Description:** Asynchronously crafts snippets via its `sca_craft_snippet_task` (Celery). Calls AIMS for LLM.
         * **Interaction:** Receives Celery task from CPOA. Uses AIMS. Uses PostgreSQL for idempotency.
         * **Potential Technologies:** Python, Flask, Celery, Requests, PostgreSQL.
-
-    * **`WebContentHarvesterAgent` (WCHA):**
-        * **Description:** Functions as a Python library called by CPOA for initial content requests. Internally, WCHA can dispatch asynchronous Celery tasks (e.g., for fetching news via NewsAPI or harvesting specific URLs) which are idempotent and use the shared `idempotency_keys` PostgreSQL table. For other operations like DDG search and immediate extraction, it may operate synchronously within the calling CPOA process.
-        * **Interaction:** Called as a library by CPOA. Can dispatch its own Celery tasks for specific harvesting operations, which then interact with the PostgreSQL DB (for idempotency) and the External Web/News APIs.
-        * **Potential Technologies:** Python, Flask (for task status endpoint), Celery, `duckduckgo_search`, `trafilatura`, `psycopg2-binary`, `python-json-logger`.
 
     * **`PodcastScriptWeaverAgent` (PSWA):**
         * **Description:** Asynchronously weaves scripts via `weave_script_task` (Celery). Calls AIMS. Supports script caching (SQLite or PostgreSQL).
@@ -211,13 +216,13 @@ Below are descriptions of the major components depicted in the architecture diag
 ### 3.3. Supporting Infrastructure
 
 * **AI Model Services:**
-    * **`AIMS Service (AIMS_SVC)`:** Synchronous HTTP proxy for general LLMs (e.g., GPT via Vertex AI).
-    * **`AIMS_TTS Service (AIMS_TTS_SVC)`:** Synchronous HTTP proxy for TTS services (e.g., Google TTS via Vertex AI), handles audio generation and upload to GCS, returns GCS URI.
+    * **`AIMS Service (AIMS_SVC)`:** HTTP service acting as a proxy for general LLMs (e.g., Gemini via Vertex AI). Its core LLM invocation is handled asynchronously by a Celery worker (`invoke_llm_vertex_ai_task`) which implements idempotency using the shared PostgreSQL `idempotency_keys` table.
+    * **`AIMS_TTS Service (AIMS_TTS_SVC)`:** HTTP service acting as a proxy for TTS services (e.g., Google TTS). Its core TTS synthesis and GCS upload are handled asynchronously by a Celery worker (`invoke_tts_google_task`) which implements idempotency using the shared PostgreSQL `idempotency_keys` table. It returns a GCS URI for the generated audio.
     * **`Vertex AI Imagen`:** Google Cloud service for image generation, called by IGA.
 * **Databases & Messaging:**
     * **`PostgreSQL DB`:** Central relational database storing:
         * CPOA workflow and task instance state (`workflow_instances`, `task_instances`).
-        * Shared `idempotency_keys` table for TDA, SCA, PSWA, IGA, VFA.
+        * Shared `idempotency_keys` table for TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS.
         * TDA's discovered topics (`topics_snippets` table).
         * PSWA's script cache (if configured for PostgreSQL).
         * User accounts, sessions, subscriptions (managed by API Gateway).

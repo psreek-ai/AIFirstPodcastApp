@@ -17,7 +17,7 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 * **Single Responsibility (Largely):** Each agent focuses on a well-defined set of tasks.
 * **Orchestrated Interaction:** Agents primarily interact via the CPOA.
 * **Statelessness (Task-Level):** For their core processing, agents aim to be stateless, receiving necessary context from CPOA. State related to long-running asynchronous tasks (e.g., for idempotency or retries) is managed externally, typically in a database (like PostgreSQL for idempotency).
-* **Standardized Communication:** Agents use defined data formats (JSON) and protocols (HTTP APIs, Celery tasks). Asynchronous tasks (TDA, SCA, PSWA, IGA, VFA) accept an `X-Idempotency-Key` header for idempotent operations.
+* **Standardized Communication:** Agents use defined data formats (JSON) and protocols (HTTP APIs, Celery tasks). Asynchronous tasks (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS) accept an `X-Idempotency-Key` header (or use a propagated key internally) for idempotent operations.
 * **Error Reporting:** Agents provide structured error information to CPOA, and Celery tasks use `on_failure` handlers to update idempotency records.
 * **Scalability:** Agents (Flask app + Celery workers) are designed as containerized microservices for independent scalability.
 
@@ -129,23 +129,25 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
 
 ### 3.3. Agent Name: `WebContentHarvesterAgent` (WCHA)
 
-* **Purpose/Mission:** To autonomously gather, retrieve, and pre-process relevant, up-to-date information from the web for a given topic. WCHA functions primarily as a library called by CPOA.
+* **Purpose/Mission:** To autonomously gather, retrieve, and pre-process relevant, up-to-date information from the web for a given topic or specific URLs. WCHA provides the core textual content used by PSWA for script generation. Its key operations (`fetch_news_articles_task`, `harvest_url_content_task`) are asynchronous (Celery-based) and idempotent, using an `X-Idempotency-Key` (propagated by CPOA) and a shared PostgreSQL database.
 * **Key Responsibilities:**
-    * Receives a topic from CPOA.
-    * Uses web search (DuckDuckGo) to find relevant URLs.
+    * Receives a topic or a direct URL from CPOA (including `X-Idempotency-Key`, `X-Workflow-ID`).
+    * If a topic is provided, uses web search (NewsAPI if configured, otherwise DuckDuckGo) to find relevant URLs.
     * Fetches content from URLs and extracts main text using Trafilatura.
-    * Consolidates text and returns it to CPOA.
+    * Consolidates text and returns it (or a reference to it) to CPOA.
 * **Core AI Models/Techniques Relied Upon:**
-    * Web search libraries (`duckduckgo_search`).
+    * Web search libraries (`duckduckgo_search`, NewsAPI client).
     * Content extraction libraries (`trafilatura`).
 * **Inputs:**
-    * Topic string (from CPOA).
-    * Configuration: Max search results, request timeouts.
+    * Task request from CPOA (with topic or URL, `X-Idempotency-Key`).
+    * Configuration: Max search results, request timeouts, NewsAPI key.
 * **Outputs:**
-    * To CPOA: A string containing consolidated text from harvested sources, with source URLs indicated.
+    * To CPOA: Structured data containing the harvested text, source URLs, and status (via Celery result polling).
 * **Primary Interactions:**
-    * Called by: CPOA (as a Python library).
-    * Calls: External web (DuckDuckGo, target websites).
+    * Tasked by: CPOA.
+    * Outputs to: CPOA (task ID first, then result).
+    * Calls: External web (DuckDuckGo, NewsAPI, target websites for harvesting).
+    * Database: Uses `idempotency_keys` table (PostgreSQL).
 * **Key Performance Indicators (KPIs)/Success Metrics:**
     * Relevance and quality of retrieved content.
     * Comprehensiveness/coverage of the topic (within defined constraints).
@@ -153,23 +155,20 @@ All specialized AI agents within the Aethercast ecosystem adhere to the followin
     * Efficiency of harvesting (time taken, resources consumed).
     * Success rate of content extraction.
 * **Error Scenarios & Handling:**
-    * Website unavailability, timeouts, or network errors: Retry with backoff, report persistent failures for specific URLs to CPOA.
-    * Blocked by websites (e.g., CAPTCHAs, IP blocks): Report to CPOA, may require proxy/CAPTCHA solving integration (advanced). Adhere to `robots.txt`.
-    * Inability to extract useful content from a page: Log error, skip page, report to CPOA.
-    * No relevant sources found for a topic: Report to CPOA.
+    * Website unavailability, timeouts, or network errors: Report error to CPOA for retry or failure.
+    * Blocked by websites: Report to CPOA. Adhere to `robots.txt`.
+    * Inability to extract useful content: Log error, skip page, report to CPOA.
+    * No relevant sources found: Report to CPOA.
 * **Scalability Considerations:**
-    * Can be scaled horizontally to process multiple topics or sources in parallel.
-    * Constrained by politeness policies (not overloading target websites) and potential IP blocking.
-    * Use of proxies or distributed IP addresses might be necessary for large-scale harvesting.
+    * Can be scaled horizontally by increasing Celery workers.
+    * Constrained by politeness policies and external API rate limits.
 * **Security Considerations:**
-    * Handling potentially malicious content or scripts from untrusted websites (parsing should be done in a sandboxed environment if possible, or use very robust parsers).
-    * Adherence to `robots.txt` and terms of service of websites.
-    * Managing user-agent strings.
+    * Handling potentially malicious content from untrusted websites.
+    * Adherence to `robots.txt`.
 * **Future Enhancements:**
     * Smarter source credibility assessment.
-    * Deeper understanding of content to extract structured facts, not just text.
-    * Adaptive crawling strategies.
-    * Integration with archival services to fetch older versions of pages.
+    * Deeper understanding of content.
+    * Adaptive crawling.
 
 ---
 

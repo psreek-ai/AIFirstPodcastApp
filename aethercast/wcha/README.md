@@ -120,19 +120,21 @@ WCHA's Flask app (`main.py`) provides an API to initiate harvesting tasks. For a
 
 -   **HTTP Method:** `POST`
 -   **URL Path:** `/harvest`
--   **Description:** Initiates content harvesting.
-    -   If `url` is provided, it dispatches `harvest_url_content_task` (asynchronous).
-    -   If `topic` and `use_search: true` are provided:
-        -   If `USE_REAL_NEWS_API=true`, it dispatches `fetch_news_articles_task` (asynchronous).
-        -   If `USE_REAL_NEWS_API=false`, it performs a synchronous search using DuckDuckGo and harvests content.
-    -   Mock data retrieval is a legacy synchronous path.
+-   **Description:** Initiates content harvesting. The behavior depends on the payload and configuration:
+    *   **Direct URL Harvest (Asynchronous):** If a `url` is provided, the `harvest_url_content_task` Celery task is dispatched.
+    *   **Topic-Based Harvest (NewsAPI - Asynchronous):** If `topic` and `use_search: true` are provided, AND `USE_REAL_NEWS_API=true` (env var), the `fetch_news_articles_task` Celery task is dispatched.
+    *   **Topic-Based Harvest (DuckDuckGo - Synchronous):** If `topic` and `use_search: true` are provided, AND `USE_REAL_NEWS_API=false` (env var), a synchronous search using DuckDuckGo is performed, followed by content harvesting.
+    *   Legacy mock data retrieval is also a synchronous path if specific mock parameters are sent.
+-   **Headers:**
+    -   `X-Idempotency-Key` (string, Optional but Recommended for async tasks): If provided for an operation that dispatches an asynchronous Celery task (like direct URL harvest or NewsAPI search), this key is used as the `request_id` for that Celery task, enabling idempotent execution of the underlying task.
+    -   `X-Workflow-ID` (string, Optional): An identifier to correlate this task with a larger workflow. This is passed to the Celery task if provided.
 -   **Request Payload Example (JSON) - Direct URL Harvest (Async):**
     ```json
     {
         "url": "https://en.wikipedia.org/wiki/Python_(programming_language)"
     }
     ```
--   **Request Payload Example (JSON) - Topic Search & Harvest (Async or Sync depending on `USE_REAL_NEWS_API`):**
+-   **Request Payload Example (JSON) - Topic Search & Harvest (Behavior depends on `USE_REAL_NEWS_API`):**
     ```json
     {
         "topic": "benefits of regular exercise",
@@ -140,16 +142,17 @@ WCHA's Flask app (`main.py`) provides an API to initiate harvesting tasks. For a
     }
     ```
 -   **Asynchronous Task Accepted Response (202 Accepted):**
-    For operations that dispatch a Celery task (direct URL harvest, NewsAPI topic search).
+    Returned when an asynchronous Celery task is successfully dispatched.
     ```json
     {
         "task_id": "some_celery_task_id",
         "status_url": "/v1/tasks/some_celery_task_id",
-        "message": "Harvest task accepted."
+        "message": "Harvest task accepted.",
+        "idempotency_key_processed": "client_provided_idempotency_key_if_any"
     }
     ```
 -   **Success Response (200 OK - Synchronous DDGS Path):**
-    Applicable if `USE_REAL_NEWS_API=false` and `use_search=true`.
+    Returned if `USE_REAL_NEWS_API=false` and `use_search=true` for a topic.
     ```json
     {
         "status": "success",

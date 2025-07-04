@@ -62,19 +62,21 @@ IGA now operates asynchronously using Celery for image generation tasks.
         }
     }
     ```
--   **Success Response (409 Conflict - JSON, if idempotency conflict):**
+-   **Conflict Response (200 OK - JSON, if task execution determined an idempotency conflict):**
+    If the task execution determined a conflict (e.g., another task with the same idempotency key is currently processing and not timed out), the task itself might complete successfully by returning this conflict information.
     ```json
     {
         "task_id": "celery_task_uuid_string",
-        "status": "SUCCESS", // Task itself finished by returning conflict
+        "status": "SUCCESS", // Celery task successfully determined and reported the conflict.
         "result": {
             "status": "PROCESSING_CONFLICT",
-            "message": "Task with this idempotency key is already processing.",
+            "message": "Task with this idempotency key is already processing or recently completed with a conflict.",
             "idempotency_key": "client_provided_idempotency_key"
         }
     }
     ```
--   **Error Response (500 Internal Server Error - JSON, if task failed):**
+-   **Error Response (200 OK - JSON, if task failed):**
+    If the task execution resulted in a failure, the status endpoint successfully retrieves this failure state.
     ```json
     {
         "task_id": "celery_task_uuid_string",

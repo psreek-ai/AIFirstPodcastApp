@@ -106,28 +106,29 @@ TDA operates asynchronously using Celery.
     {
         "task_id": "celery_task_uuid_string",
         "status": "SUCCESS",
-        "result": { /* Result from discover_topics_task */ }
+        "result": { /* Result from discover_topics_task, e.g., list of TopicObjects */ }
     }
     ```
--   **Conflict Response (409 Conflict - JSON, if idempotency conflict):**
-    If the task execution determined a conflict (e.g., another task with the same idempotency key is currently processing and not timed out).
+-   **Conflict Response (200 OK - JSON, if task execution determined an idempotency conflict):**
+    If the task execution determined a conflict (e.g., another task with the same idempotency key is currently processing and not timed out), the task itself might complete successfully by returning this conflict information.
     ```json
     {
         "task_id": "celery_task_uuid_string",
-        "status": "SUCCESS", // Celery task itself finished by returning the conflict info
+        "status": "SUCCESS", // Celery task successfully determined and reported the conflict.
         "result": {
             "status": "PROCESSING_CONFLICT",
-            "message": "Task with this idempotency key is already processing.",
+            "message": "Task with this idempotency key is already processing or recently completed with a conflict.",
             "idempotency_key": "client_provided_idempotency_key"
         }
     }
     ```
--   **Error Response (500 Internal Server Error - JSON, if task failed):**
+-   **Error Response (200 OK or 500 Internal Server Error - JSON, if task failed):**
+    If the task failed, the status endpoint might return 200 OK with status "FAILURE", or 500 if the endpoint itself has an issue retrieving the state.
     ```json
     {
         "task_id": "celery_task_uuid_string",
         "status": "FAILURE",
-        "result": { "error": {"type": "task_failed", "message": "..."} }
+        "result": { "error": {"type": "task_failed_exception_type", "message": "Details of the error..."} }
     }
     ```
 -   **Response (202 Accepted - JSON, if task is still pending/processing without conflict):**

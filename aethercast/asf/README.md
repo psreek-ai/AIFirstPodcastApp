@@ -53,12 +53,15 @@ Key variables include:
 
 ## Dependencies
 
-Project dependencies are listed in `requirements.txt` (includes `Flask`, `Flask-SocketIO`, `python-dotenv`, `eventlet`, `requests`). Install with `pip install -r requirements.txt`.
+Project dependencies are listed in `requirements.txt`. Key dependencies include `Flask`, `Flask-SocketIO`, `python-dotenv`, `eventlet`, `requests`, and `python-json-logger` (for structured logging). Install with:
+```bash
+pip install -r requirements.txt
+```
 
 ## Running the Service
 
 1.  Set environment variables.
-2.  Ensure shared audio directory is accessible.
+2.  For GCS streaming, ensure network connectivity and proper API Gateway configuration (`INTERNAL_API_GW_BASE_URL`). Local file streaming (if used as a fallback) would require the specified file paths to be accessible to ASF.
 3.  Run: `python aethercast/asf/main.py`.
     Service typically starts on `http://0.0.0.0:5006`.
 

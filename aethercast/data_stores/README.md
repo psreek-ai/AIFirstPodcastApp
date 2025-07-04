@@ -13,7 +13,7 @@ This PostgreSQL instance is accessed by multiple services and stores critical da
     *   `task_instances`: Tracks individual agent calls and steps within each CPOA workflow.
     *   *Schema Details:* `docs/architecture/CPOA_State_Management.md`
 *   **Shared Idempotency Records:**
-    *   `idempotency_keys`: A shared table used by asynchronous backend services (TDA, SCA, PSWA, IGA, VFA) to ensure their Celery tasks are processed idempotently based on client-provided `X-Idempotency-Key` and CPOA-provided `X-Workflow-ID`.
+    *   `idempotency_keys`: A shared table used by asynchronous backend services (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS) to ensure their Celery tasks are processed idempotently based on client-provided `X-Idempotency-Key` and CPOA-provided `X-Workflow-ID`.
     *   *Schema Details:* `aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql`
 *   **Topic and Snippet Data (TDA & CPOA):**
     *   `topics_snippets`: Stores discovered topics (by TDA) and generated snippet metadata (text from SCA, image GCS URIs from IGA, managed by CPOA).

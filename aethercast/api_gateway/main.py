@@ -15,7 +15,6 @@ import re # For email validation in /subscribe
 from werkzeug.security import generate_password_hash, check_password_hash
 from google.cloud import storage # Added for GCS
 from google.api_core import exceptions as google_api_exceptions # For GCS error handling
-# from google.oauth2 import service_account # Not strictly needed if using ADC
 import logging # Added for JSON logging
 from python_json_logger import jsonlogger # Added for JSON logging
 from flask_limiter import Limiter
@@ -656,11 +655,6 @@ def token_required(f):
 
             g.current_user = data # Store decoded JWT payload in g
 
-        # Removed specific jwt exception handling here as decode_jwt now handles and logs them, returning None.
-        # except jwt.ExpiredSignatureError:
-        #     return jsonify({"error_code": "API_GW_TOKEN_EXPIRED", "message": "Token has expired!"}), 401
-        # except jwt.InvalidTokenError:
-        #     return jsonify({"error_code": "API_GW_TOKEN_INVALID", "message": "Token is invalid!"}), 401
         except Exception as e_token_unexpected: # Catch any other unexpected error during token processing
             app.logger.error(f"Unexpected error during token validation: {e_token_unexpected}", exc_info=True)
             return jsonify({"error_code": "API_GW_TOKEN_VALIDATION_ERROR", "message": "Error validating token."}), 500
@@ -1602,14 +1596,5 @@ if __name__ == '__main__':
     # Initialize the DB pool at startup if using PostgreSQL
     if DATABASE_TYPE == "postgres":
         init_api_gw_db_pool()
-        # Optionally, test the pool by getting and putting a connection
-        # test_conn = None
-        # try:
-        #     test_conn = get_db_connection()
-        #     if test_conn: app.logger.info("Successfully tested DB pool connection from main.")
-        # except Exception as e_pool_test:
-        #     app.logger.error(f"Failed to test DB pool connection from main: {e_pool_test}", exc_info=True)
-        # finally:
-        #     if test_conn: release_db_connection(test_conn)
 
     app.run(debug=debug_mode, host=os.getenv("API_GATEWAY_HOST", "0.0.0.0"), port=int(os.getenv("API_GATEWAY_PORT", "5001")))

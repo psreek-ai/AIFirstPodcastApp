@@ -187,13 +187,13 @@ PSWA operates asynchronously using Celery for the core script weaving task.
         }
     }
     ```
-    *(Note: The HTTP status code for this scenario from the `/tasks/<task_id>` endpoint should be 409 if the task result payload indicates `PROCESSING_CONFLICT`.)*
--   **Error Response (500 Internal Server Error - JSON, if task failed):**
+-   **Error Response (200 OK - JSON, if task failed):**
+    If the task execution resulted in a failure, the status endpoint successfully retrieves this failure state.
     ```json
     {
         "task_id": "celery_task_uuid_string",
         "status": "FAILURE",
-        "result": { "error": {"type": "task_failed", "message": "Details of the exception..."} }
+        "result": { "error": {"type": "task_failed_exception_type", "message": "Details of the exception..."} }
     }
     ```
 -   **Response (202 Accepted - JSON, if task is still pending/processing without conflict):**

@@ -9,8 +9,10 @@ The system consists of several microservices that work together:
 -   **API Gateway (API_GW):** The main entry point for clients (e.g., frontend UI). Routes requests, serves the frontend, and orchestrates calls to CPOA.
 -   **Central Podcast Orchestrator (CPOA):** Manages the podcast generation lifecycle, coordinating other agents. Its state and task management are persisted in a PostgreSQL database. (Note: CPOA logic currently runs as part of the API Gateway's process).
 -   **Topic Discovery Agent (TDA):** Identifies and suggests potential podcast topics from various sources. Core Celery task operations are idempotent.
+-   **Web Content Harvester Agent (WCHA):** Harvests textual content from specified URLs, providing source material for script generation. Used by PSWA. Core Celery task operations are idempotent.
 -   **Snippet Craft Agent (SCA):** Generates short, engaging text snippets based on topics or content briefs, leveraging AIMS. Core Celery task operations are idempotent.
--   **Podcast Script Weaver Agent (PSWA):** Generates a full podcast script from harvested content and a topic, using AIMS. Core Celery task operations are idempotent. It also features script caching in its configured database (SQLite or PostgreSQL, separate from the idempotency store).
+-   **Podcast Script Weaver Agent (PSWA):** Generates a full podcast script from harvested content (via WCHA) and a topic, using AIMS. Core Celery task operations are idempotent. It also features script caching in its configured database (SQLite or PostgreSQL, separate from the idempotency store).
+-   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen models, based on input prompts. Stores generated images in GCS. Core Celery task operations are idempotent.
 -   **Voice Forge Agent (VFA):** Synthesizes audio from the script by calling the AIMS_TTS service. (Idempotency for VFA tasks is a potential future enhancement).
 -   **Audio Stream Feeder (ASF):** Streams the generated audio to clients in real-time via WebSockets.
 
@@ -18,17 +20,17 @@ The system consists of several microservices that work together:
 
 -   **AIMS Service (`aims_service`):** (AI Model Service) Provides a unified interface to general-purpose AI models (e.g., Large Language Models like GPT). Used by SCA and PSWA for content generation.
 -   **AIMS TTS Service (`aims_tts_service`):** (AI Model Text-to-Speech Service) Handles Text-to-Speech synthesis using providers like Google Cloud TTS. It's called by the VFA to convert script segments into audio, which are then stored in GCS.
--   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen models, based on input prompts. Stores generated images in GCS. Core Celery task operations are idempotent.
 
 ## Implemented Features
 
 -   Automated topic discovery and suggestion (TDA).
--   AI-driven script generation (PSWA with AIMS).
+-   Web content harvesting from URLs (WCHA).
+-   AI-driven script generation (PSWA with AIMS, using content from WCHA).
 -   AI-driven snippet generation (SCA with AIMS).
 -   Dynamic image generation for podcast visuals (IGA with Vertex AI).
 -   Customizable voice synthesis (VFA with AIMS_TTS using Google Cloud TTS, output to GCS).
 -   Real-time audio streaming (ASF, sourcing from GCS signed URLs).
--   **Idempotent Task Processing:** Key asynchronous operations in TDA, SCA, PSWA, and IGA are designed to be idempotent. Clients making requests to initiate these operations (via the API Gateway and CPOA) should include an `X-Idempotency-Key` header (typically a UUID). The services use this key, in conjunction with a shared `idempotency_keys` table in the PostgreSQL database, to ensure that identical requests (same key, same task type) are processed only once, preventing duplicate resource creation or processing.
+-   **Idempotent Task Processing:** Key asynchronous operations in TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS (LLM), and AIMS_TTS are designed to be idempotent. Clients making requests to initiate these operations (via the API Gateway and CPOA, or directly to AIMS/AIMS_TTS if applicable) should include an `X-Idempotency-Key` header (typically a UUID). The services use this key, in conjunction with a shared `idempotency_keys` table in the PostgreSQL database, to ensure that identical requests (same key, same task type) are processed only once, preventing duplicate resource creation or processing.
     -   If a request with a new key is received, the task proceeds and its outcome is stored.
     -   If a request with a previously seen key is received:
         -   If the original task is still processing, a conflict status is typically returned (e.g., HTTP 409 from the task status endpoint after initial 202 acceptance).
@@ -77,7 +79,8 @@ aethercast/
 ├── pswa/               # PSWA: Podcast Script Weaver Agent service.
 ├── sca/                # SCA: Snippet Craft Agent service.
 ├── tda/                # TDA: Topic Discovery Agent service.
-└── vfa/                # VFA: Voice Forge Agent service.
+├── vfa/                # VFA: Voice Forge Agent service.
+├── wcha/               # WCHA: Web Content Harvester Agent service.
 docs/                   # Project documentation.
 tests/
 ├── integration/        # Integration tests for the full flow.
@@ -187,9 +190,9 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   Each service directory (e.g., `aethercast/api_gateway/`, `aethercast/tda/`, etc.) contains an `.env.example` file. For Docker Compose to work correctly with local overrides (like API keys), you should:
         *   Copy each `aethercast/service_name/.env.example` to `aethercast/service_name/.env`.
         *   **Edit these new `.env` files:**
-            *   **Database Configuration:** Most services (TDA, SCA, PSWA, IGA, API Gateway/CPOA) now rely on a **shared PostgreSQL database** for core functionalities like CPOA state management and idempotency tracking. Ensure the `POSTGRES_HOST`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `POSTGRES_PORT` variables are correctly set. These are typically defined in `common.env` and sourced by individual service `.env` files (e.g., `POSTGRES_HOST=${POSTGRES_HOST}`). The `postgres_db` service in `docker-compose.yml` provides this database.
-            *   **Idempotency Configuration:** Services implementing idempotency (TDA, SCA, PSWA, IGA) have specific environment variables in their `.env.example` files (e.g., `TDA_IDEMPOTENCY_STATUS_PROCESSING`, `TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`). Review these and ensure they are set as needed (defaults are provided). These configurations control the behavior of the idempotency mechanism for each service.
-            *   **Inter-service URLs:** Ensure these are set to use Docker Compose service names (e.g., `TDA_SERVICE_URL=http://tda:5000/discover_topics` in `api_gateway/.env`). The `.env.example` files generally reflect these Docker-friendly URLs.
+            *   **Database Configuration:** Most services (TDA, WCHA, SCA, PSWA, IGA, API Gateway/CPOA) now rely on a **shared PostgreSQL database** for core functionalities like CPOA state management and idempotency tracking. Ensure the `POSTGRES_HOST`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, and `POSTGRES_PORT` variables are correctly set. These are typically defined in `common.env` and sourced by individual service `.env` files (e.g., `POSTGRES_HOST=${POSTGRES_HOST}`). The `postgres_db` service in `docker-compose.yml` provides this database.
+            *   **Idempotency Configuration:** Services implementing idempotency (TDA, WCHA, SCA, PSWA, IGA) have specific environment variables in their `.env.example` files (e.g., `TDA_IDEMPOTENCY_STATUS_PROCESSING`, `TDA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`). Review these and ensure they are set as needed (defaults are provided). These configurations control the behavior of the idempotency mechanism for each service.
+            *   **Inter-service URLs:** Ensure these are set to use Docker Compose service names (e.g., `TDA_SERVICE_URL=http://tda:5000/discover_topics`, `WCHA_SERVICE_URL=http://wcha:5003/harvest_content` in `api_gateway/.env`). The `.env.example` files generally reflect these Docker-friendly URLs.
             *   **External API Keys & Test Modes:**
                 *   For services requiring external API keys (e.g., TDA for NewsAPI), populate these in the respective `.env` files if you intend to use the live services.
                 *   For development or testing without external calls, ensure "test mode" or placeholder flags are enabled (e.g., `USE_REAL_NEWS_API=False` in `tda/.env`, `PSWA_TEST_MODE_ENABLED=True` in `pswa/.env`). These are often defaulted in `common.env` but can be overridden.
@@ -197,8 +200,8 @@ This project uses Docker Compose to manage and run the suite of microservices in
 
 2.  **Database Initialization (PostgreSQL):**
     *   The PostgreSQL service defined in `docker-compose.yml` (`postgres_db`) will initialize itself.
-    *   The `api_gateway` service (which includes CPOA logic) and other services like TDA, PSWA, SCA, IGA will attempt to connect to this database.
-    *   **Idempotency Table Migration:** A SQL migration script (`aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql`) creates the necessary `idempotency_keys` table used by TDA, SCA, PSWA, and IGA. **This script must be applied manually** to the PostgreSQL database after the `postgres_db` container is up and running. You can use a PostgreSQL client tool (e.g., `psql` via `docker exec`, or a GUI tool like DBeaver or pgAdmin) connected to the PostgreSQL container.
+    *   The `api_gateway` service (which includes CPOA logic) and other services like TDA, WCHA, PSWA, SCA, IGA will attempt to connect to this database.
+    *   **Idempotency Table Migration:** A SQL migration script (`aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql`) creates the necessary `idempotency_keys` table used by TDA, WCHA, SCA, PSWA, and IGA. **This script must be applied manually** to the PostgreSQL database after the `postgres_db` container is up and running. You can use a PostgreSQL client tool (e.g., `psql` via `docker exec`, or a GUI tool like DBeaver or pgAdmin) connected to the PostgreSQL container.
         *   Example using `psql` via `docker exec`:
             ```bash
             docker exec -i $(docker-compose ps -q postgres_db) psql -U your_db_user -d aethercast_db < aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql
@@ -218,17 +221,18 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   **API Gateway / Frontend:** `http://localhost:5001`
     *   TDA: `http://localhost:5000`
     *   SCA: `http://localhost:5002`
+    *   WCHA: `http://localhost:5003`
     *   PSWA: `http://localhost:5004`
     *   VFA: `http://localhost:5005`
     *   ASF: `ws://localhost:5006` (for WebSocket connections)
+    *   IGA: `http://localhost:5007`
     *   AIMS Service: `http://localhost:8008` (maps to container port 8000)
     *   AIMS TTS Service: `http://localhost:9009` (maps to container port 9000)
-    *   IGA: `http://localhost:5007`
 
-    Note: Backend services like AIMS, AIMS TTS, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes.
+    Note: Backend services like AIMS, AIMS TTS, WCHA, and IGA are typically not accessed directly by the user via a browser. Their ports are exposed primarily for inter-service communication within the Docker network or for debugging purposes.
 
 5.  **Shared Volumes:**
-    *   `postgres_data`: A named volume used by the PostgreSQL service to persist database data. This is the primary database for the application, storing CPOA task states, idempotency records for TDA/SCA/PSWA/IGA, and potentially cached scripts (e.g., by PSWA if configured for PostgreSQL).
+    *   `postgres_data`: A named volume used by the PostgreSQL service to persist database data. This is the primary database for the application, storing CPOA task states, idempotency records for TDA/WCHA/SCA/PSWA/IGA, and potentially cached scripts (e.g., by PSWA if configured for PostgreSQL).
     *   `aethercast_db_data`: (Legacy for SQLite) This volume was used for SQLite databases. Its role is diminished as core functionalities use PostgreSQL.
     *   `aethercast_audio_data`: (Legacy for local file sharing) With GCS as the primary media store, this volume's importance is reduced.
 

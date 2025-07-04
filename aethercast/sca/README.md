@@ -129,12 +129,13 @@ SCA operates asynchronously using Celery.
         }
     }
     ```
--   **Error Response (500 Internal Server Error - JSON, if task failed):**
+-   **Error Response (200 OK - JSON, if task failed):**
+    If the task execution resulted in a failure, the status endpoint successfully retrieves this failure state.
     ```json
     {
         "task_id": "celery_task_uuid_string",
         "status": "FAILURE",
-        "result": { "error": {"type": "task_failed", "message": "..."} }
+        "result": { "error": {"type": "task_failed_exception_type", "message": "Details of the error..."} }
     }
     ```
 -   **Response (202 Accepted - JSON, if task is still pending/processing without conflict):**

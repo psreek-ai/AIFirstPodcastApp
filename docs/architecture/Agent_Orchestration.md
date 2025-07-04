@@ -31,15 +31,15 @@ The CPOA acts as the central nervous system and primary decision-maker for the A
     * Interprets user intent to initiate the appropriate workflow.
 * **Workflow Management & Execution:**
     * Defines and manages multi-step workflows for various generation tasks.
-    * Sequences asynchronous agent invocations (Celery tasks for TDA, SCA, PSWA, IGA, VFA) and handles their responses (typically by polling task status).
+    * Sequences asynchronous agent invocations (Celery tasks for TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS) and handles their responses (typically by polling task status).
     * Ensures correct order and dependency management for agent tasks.
 * **Task Delegation & Assignment:**
     * Identifies the appropriate specialized AI agent for each step.
     * Formats and dispatches task instructions to agents, including input data, parameters, context, and idempotency headers.
 * **Agent Communication Facilitation & Idempotency Propagation:**
-    * Primarily communicates with backend agents (TDA, SCA, PSWA, IGA, VFA) by dispatching Celery tasks.
+    * Primarily communicates with backend agents (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS) by dispatching Celery tasks or making HTTP calls that trigger Celery tasks.
     * Receives `X-Idempotency-Key` and `X-Workflow-ID` (optional) from its caller (e.g., API Gateway).
-    * Passes these headers to the Celery tasks of the backend agents. CPOA's own generated `workflow_id` (from `workflow_instances` table) is typically used as the `X-Workflow-ID` value for downstream calls, ensuring end-to-end traceability and linking idempotency records to the overarching CPOA workflow.
+    * Passes these headers to the Celery tasks of the backend agents (or includes the keys in payloads). CPOA's own generated `workflow_id` (from `workflow_instances` table) is typically used as the `X-Workflow-ID` value for downstream calls, ensuring end-to-end traceability and linking idempotency records to the overarching CPOA workflow.
 * **State Management:**
     * Manages its own workflow and task instance states in a PostgreSQL database (see section 6).
     * Maintains user session state (via API Gateway context).
@@ -246,23 +246,23 @@ The CPOA and specialized agents will communicate using a combination of protocol
 
 * **Primary Communication (CPOA to/from Specialized Agents):**
     * **Asynchronous Task Dispatch (Celery):**
-        * **Usage:** This is the primary method for CPOA to interact with TDA, SCA, PSWA, IGA, and VFA. CPOA dispatches a Celery task to the respective agent's service.
-        * **CPOA Perspective:** Calls the agent's Celery task (e.g., `discover_topics_task.delay(...)`) with necessary parameters, including the `X-Idempotency-Key` and an `X-Workflow-ID` (typically CPOA's own `workflow_id`). It receives a Celery `AsyncResult` object containing the `task_id`.
-        * **Agent Perspective:** The Celery worker in the target service picks up the task. The agent performs its processing, manages its own idempotency using the provided keys and a shared PostgreSQL `idempotency_keys` table, and eventually returns a result or an error.
+        * **Usage:** This is the primary method for CPOA to interact with TDA, WCHA (for its async operations), SCA, PSWA, IGA, VFA, and also how agents like PSWA/SCA/VFA interact with AIMS/AIMS_TTS (which also use Celery backends). CPOA dispatches a Celery task to the respective agent's service or makes an HTTP call that triggers one.
+        * **CPOA Perspective:** Calls the agent's Celery task (e.g., `discover_topics_task.delay(...)`) or HTTP endpoint with necessary parameters, including the `X-Idempotency-Key` and an `X-Workflow-ID` (typically CPOA's own `workflow_id`). It receives a Celery `AsyncResult` object containing the `task_id` (or an HTTP response with a task ID).
+        * **Agent Perspective:** The Celery worker in the target service (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS) picks up the task. The agent performs its processing, manages its own idempotency using the provided keys and a shared PostgreSQL `idempotency_keys` table, and eventually returns a result or an error.
         * **Result Retrieval:** CPOA polls the task status using the `task_id` via the agent's `/v1/tasks/<task_id>` HTTP endpoint.
         * **Pros:** Decoupling, resilience, load balancing, non-blocking for CPOA, standardized way to handle long-running AI operations.
         * **Cons:** Requires polling or a callback mechanism (currently polling is used) to get results.
     * **Synchronous Request-Response (HTTP APIs):**
-        * **Usage:** For calls to services that provide immediate responses and are not long-running by nature, such as AIMS, AIMS_TTS (though these services themselves might have internal async operations, their interface to CPOA's direct callers like PSWA/VFA is effectively synchronous for the initial request), or ASF for notifications. WCHA is used as a direct Python library call.
+        * **Usage:** Used by CPOA for ASF notifications. WCHA is also used as a direct Python library call by CPOA for some initial content gathering, though WCHA itself can then dispatch async Celery tasks.
         * **Pros:** Simpler for direct request-reply.
         * **Cons:** Can block CPOA if the synchronous call is unexpectedly long.
 * **Data Payloads:**
     * **JSON** is the standard format for request and response bodies for HTTP APIs and Celery task arguments/results.
-    * Headers like `X-Idempotency-Key` and `X-Workflow-ID` are used for relevant Celery task dispatches.
+    * Headers like `X-Idempotency-Key` and `X-Workflow-ID` are used for relevant Celery task dispatches or HTTP calls that trigger them.
 * **Service Discovery:**
     * Docker Compose service names are used for inter-service HTTP communication (e.g., `http://pswa_service:5004`). Celery tasks are routed via the configured message broker (e.g., Redis).
 
-**Decision: Asynchronous Celery tasks are the standard for interactions with TDA, SCA, PSWA, IGA, and VFA from CPOA.** Synchronous calls are used for AIMS/AIMS_TTS by these agents, and by CPOA for ASF notifications or WCHA library usage.
+**Decision: Asynchronous Celery tasks are the standard for interactions with TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, and AIMS_TTS from CPOA (or via intermediate agents).** Synchronous calls are used by CPOA for ASF notifications or WCHA library usage.
 
 ## 5. Task Management & Delegation by CPOA
 
@@ -270,7 +270,7 @@ The CPOA and specialized agents will communicate using a combination of protocol
     * Each task dispatch includes:
         * Target agent's Celery task name (e.g., `discover_topics_task`).
         * `args` and `kwargs` containing input data, parameters, and context.
-        * Crucially, `idempotency_key` and `workflow_id` (as `X-Workflow-ID`) are passed within `kwargs` to the Celery tasks of TDA, SCA, PSWA, IGA, VFA.
+        * Crucially, `idempotency_key` and `workflow_id` (as `X-Workflow-ID`) are passed within `kwargs` (or as headers to HTTP endpoints that trigger Celery tasks) to the backend agents (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS).
 * **Task Assignment:** (As before) CPOA selects the agent and constructs parameters.
 * **Task Progress Monitoring (for Celery tasks):**
     * CPOA receives a Celery `task_id` upon dispatch.
@@ -286,7 +286,7 @@ Effective state management is crucial for orchestration. CPOA uses a **PostgreSQ
 
 * **User Session State:** (As before - managed by API Gateway, context passed to CPOA)
 * **Workflow/Task Instance State (PostgreSQL):**
-    * **Storage:** This is implemented using two primary PostgreSQL tables: `workflow_instances` and `task_instances`. This same PostgreSQL database also hosts the shared `idempotency_keys` table, although CPOA does not directly write to `idempotency_keys` (the agents TDA, SCA, PSWA, IGA, VFA do).
+    * **Storage:** This is implemented using two primary PostgreSQL tables: `workflow_instances` and `task_instances`. This same PostgreSQL database also hosts the shared `idempotency_keys` table, used by TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, and AIMS_TTS.
     * **`workflow_instances`**: (As before) Stores high-level workflow information. The `workflow_id` from this table is used as the `X-Workflow-ID` when CPOA calls downstream services.
     * **`task_instances`**: (As before) Stores details for each agent call (now primarily Celery task dispatches). It records the Celery `task_id` received from the agent, the polled status, and eventually the summary of the result or error.
     * **Purpose:** (As before) Tracking, recovery, debugging, observability. (See `docs/architecture/CPOA_State_Management.md`).

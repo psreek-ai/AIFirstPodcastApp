@@ -14,9 +14,9 @@ Understanding these data flows is crucial for system design, development, debugg
 
 * **Data Formats:**
     * **Inter-Service Communication (Backend):**
-        *   **Asynchronous Operations (CPOA <-> TDA, SCA, PSWA, IGA, VFA):** CPOA dispatches Celery tasks. Arguments and results are JSON. CPOA polls HTTP GET endpoints (`/v1/tasks/<task_id>`) on these services to retrieve JSON results.
-        *   **Synchronous Operations (e.g., PSWA/SCA/VFA -> AIMS/AIMS_TTS, CPOA -> ASF notify):** JSON over HTTP/HTTPS.
-        *   **Idempotency Headers:** `X-Idempotency-Key` and `X-Workflow-ID` are passed as HTTP headers by the client to the API Gateway, then relayed by CPOA as parameters to the Celery tasks of idempotent backend services (TDA, SCA, PSWA, IGA, VFA). These services use the `X-Idempotency-Key` in conjunction with a shared `idempotency_keys` table in the PostgreSQL database to manage the state of operations and ensure exactly-once processing.
+        *   **Asynchronous Operations (CPOA <-> TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS):** CPOA dispatches Celery tasks (or makes HTTP calls that trigger Celery tasks). Arguments and results are JSON. CPOA polls HTTP GET endpoints (`/v1/tasks/<task_id>`) on these services to retrieve JSON results.
+        *   **Synchronous Operations (e.g., CPOA -> ASF notify):** JSON over HTTP/HTTPS. WCHA can also be used as a library by CPOA for some operations.
+        *   **Idempotency Headers:** `X-Idempotency-Key` and `X-Workflow-ID` are passed as HTTP headers by the client to the API Gateway, then relayed by CPOA as parameters/headers to the Celery tasks (or HTTP calls that trigger them) of idempotent backend services (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS). These services use the `X-Idempotency-Key` in conjunction with a shared `idempotency_keys` table in the PostgreSQL database to manage the state of operations and ensure exactly-once processing.
     * **Frontend-Backend Communication:** JSON over HTTPS.
     * **AI Model Interactions:** (As before).
 * **Security in Transit:** (As before - HTTPS for external, TLS for internal HTTP, secure Celery broker).
@@ -230,7 +230,7 @@ The primary database for structured data like CPOA state, idempotency records, a
     * **Storage:** PostgreSQL database.
 * **Idempotency Keys Table (`idempotency_keys`):**
     * **Data:** `idempotency_key`, `task_name`, `workflow_id`, `status`, `result_payload`, `error_payload`, timestamps.
-    * **Storage:** Shared PostgreSQL database. Used by TDA, SCA, PSWA, IGA, VFA.
+    * **Storage:** Shared PostgreSQL database. Used by TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, and AIMS_TTS.
 * **Discovered Topics & Snippets Metadata (`topics_snippets` table):**
     * **Data:** `TopicObjects` from TDA, `SnippetDataObjects` (text by SCA, image GCS URI by IGA).
     * **Storage:** PostgreSQL database (managed by TDA for initial topic creation, CPOA updates with snippet/image details).

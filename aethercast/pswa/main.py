@@ -544,13 +544,6 @@ def parse_llm_script_output(raw_script_text: str, topic: str) -> dict:
         logger.warning(f"[PSWA_PARSING_FALLBACK] Critical tags missing after fallback for topic '{topic}'. Output: '{raw_script_text[:200]}...'")
     return parsed_script
 
-# --- Helper for AIMS_TTS Interaction ---
-# This is a placeholder, actual interaction might be more complex
-# or PSWA might directly call AIMS_TTS's Celery tasks if available.
-def _call_aims_service_for_script(payload: dict, headers: dict) -> dict:
-    # ... (existing _call_aims_service_for_script implementation, using AIMS polling) ...
-    pass
-
 # --- Main Celery Task for Weaving Script ---
 class WeaveScriptTask(Task): # Inherit from Celery's Task class
     def on_failure(self, exc, task_id, args, kwargs, einfo):
@@ -608,13 +601,13 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
         logger.error(f"Celery Task {task_id_celery_internal}: Idempotency key not provided for weave_script_task. This is required.", extra=log_ctx)
         return {"error": "PSWA_IDEMPOTENCY_KEY_MISSING", "message": "Idempotency key is required for PSWA task."}
 
-    logger.info(f"Celery Task {task_id_for_logging}: Weaving script for topic '{topic}'. Persona: {persona or 'default'}", extra=log_ctx)
+    logger.info(f"Celery Task {task_id_celery_internal}: Weaving script for topic '{topic}'. Persona: {persona or 'default'}", extra=log_ctx)
     self.update_state(state='PROGRESS', meta={'current_step': 'Initiated, checking idempotency', 'progress_percent': 1, **log_ctx})
 
     db_conn_idem = None
     try:
         if not PSYCOPG2_AVAILABLE:
-             logger.error(f"Celery Task {task_id_for_logging}: psycopg2 not available in Celery worker. Cannot perform idempotency operations.", extra=log_ctx)
+             logger.error(f"Celery Task {task_id_celery_internal}: psycopg2 not available in Celery worker. Cannot perform idempotency operations.", extra=log_ctx)
              raise ConnectionError("psycopg2 not available in PSWA Celery worker.") # Will trigger on_failure
 
         db_conn_idem = _get_pswa_db_connection_idempotency()
@@ -652,7 +645,7 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
         # --- Test Mode Handling ---
         if pswa_config.get('PSWA_TEST_MODE_ENABLED'):
             scenario = test_scenario_header
-            logger.info(f"Celery Task {task_id_for_logging}: PSWA Test Mode enabled. Scenario: '{scenario}'", extra=log_ctx)
+            logger.info(f"Celery Task {task_id_celery_internal}: PSWA Test Mode enabled. Scenario: '{scenario}'", extra=log_ctx)
             self.update_state(state='PROGRESS', meta={'current_step': 'Test mode processing', 'progress_percent': 50, **log_ctx})
             time.sleep(0.1)
             test_result_payload = None
@@ -706,10 +699,10 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
         user_prompt_narrative_guidance = narrative_guidance or pswa_config.get('PSWA_NARRATIVE_GUIDANCE_USER_PROMPT_ADDITION', '')
         final_user_message = pswa_config.get('PSWA_DEFAULT_PROMPT_USER_TEMPLATE', '').format(topic=topic, content=content, narrative_guidance=user_prompt_narrative_guidance)
         aims_payload = {"model_id": pswa_config.get('PSWA_LLM_MODEL'), "system_message": final_system_message, "user_message": final_user_message, "temperature": pswa_config.get('PSWA_LLM_TEMPERATURE'), "max_tokens": pswa_config.get('PSWA_LLM_MAX_TOKENS'), "json_mode": pswa_config.get('PSWA_LLM_JSON_MODE')}
-        aims_request_id_header = {"X-Request-ID": f"pswa_to_aims_{task_id_for_logging}"}
+        aims_request_id_header = {"X-Request-ID": f"pswa_to_aims_{task_id_celery_internal}"}
 
         self.update_state(state='PROGRESS', meta={'current_step': 'Calling AIMS service', 'progress_percent': 30, **log_ctx})
-        logger.info(f"Celery Task {task_id_for_logging}: Calling AIMS service for script generation.", extra={"aims_model": aims_payload["model_id"], "orig_req_id": request_id_celery, **log_ctx})
+        logger.info(f"Celery Task {task_id_celery_internal}: Calling AIMS service for script generation.", extra={"aims_model": aims_payload["model_id"], "orig_req_id": request_id_celery, **log_ctx})
 
         # --- Integrated _call_aims_service_for_script logic starts ---
         aims_response_data = {} # Initialize to ensure it's always defined
@@ -724,10 +717,10 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
             status_url = aims_initial_response_data.get("status_url")
 
             if not task_id_from_aims_initial or not status_url:
-                logger.error(f"Celery Task {task_id_for_logging}: AIMS service response missing task_id or status_url. Response: {aims_initial_response_data}", extra=log_ctx)
+                logger.error(f"Celery Task {task_id_celery_internal}: AIMS service response missing task_id or status_url. Response: {aims_initial_response_data}", extra=log_ctx)
                 aims_response_data = {"error": "PSWA_AIMS_BAD_TASK_RESPONSE", "message": "AIMS service task submission response invalid."}
             else:
-                logger.info(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} submitted. Polling at {status_url}", extra=log_ctx)
+                logger.info(f"Celery Task {task_id_celery_internal}: AIMS task {task_id_from_aims_initial} submitted. Polling at {status_url}", extra=log_ctx)
                 self.update_state(state='PROGRESS', meta={'current_step': 'Polling AIMS for script', 'progress_percent': 40, 'aims_task_id': task_id_from_aims_initial, **log_ctx})
 
                 polling_start_time = time.time()
@@ -735,29 +728,29 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
 
                 while True:
                     if time.time() - polling_start_time > pswa_config['AIMS_POLLING_TIMEOUT_SECONDS']:
-                        logger.error(f"Celery Task {task_id_for_logging}: Polling AIMS task {task_id_from_aims_initial} timed out.", extra=log_ctx)
+                        logger.error(f"Celery Task {task_id_celery_internal}: Polling AIMS task {task_id_from_aims_initial} timed out.", extra=log_ctx)
                         aims_response_data = {"error": "PSWA_AIMS_TIMEOUT", "message": "Polling AIMS task timed out."}
                         break
                     try:
-                        logger.info(f"Celery Task {task_id_for_logging}: Polling AIMS task {task_id_from_aims_initial} at {status_url}", extra=log_ctx)
+                        logger.info(f"Celery Task {task_id_celery_internal}: Polling AIMS task {task_id_from_aims_initial} at {status_url}", extra=log_ctx)
                         poll_response = requests.get(status_url, timeout=10)
                         poll_response.raise_for_status()
                         try:
                             task_status_data = poll_response.json()
                         except json.JSONDecodeError as e_json_poll:
-                            logger.error(f"Celery Task {task_id_for_logging}: Failed to decode JSON from AIMS status poll for AIMS task {task_id_from_aims_initial}. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}", exc_info=True, extra=log_ctx)
+                            logger.error(f"Celery Task {task_id_celery_internal}: Failed to decode JSON from AIMS status poll for AIMS task {task_id_from_aims_initial}. Status: {poll_response.status_code}. Response: {poll_response.text[:200]}", exc_info=True, extra=log_ctx)
                             aims_response_data = {"error": "PSWA_AIMS_BAD_JSON_RESPONSE", "message": "AIMS service status response not valid JSON.", "details": str(e_json_poll), "response_preview": poll_response.text[:200]}
                             break
 
                         current_aims_status = task_status_data.get("status")
-                        logger.info(f"Celery Task {task_id_for_logging}: Polled AIMS task {task_id_from_aims_initial}. Status: {current_aims_status}", extra=log_ctx)
+                        logger.info(f"Celery Task {task_id_celery_internal}: Polled AIMS task {task_id_from_aims_initial}. Status: {current_aims_status}", extra=log_ctx)
 
                         if current_aims_status == "SUCCESS":
                             aims_final_result = task_status_data.get("result", {})
-                            logger.info(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} completed successfully.", extra=log_ctx)
+                            logger.info(f"Celery Task {task_id_celery_internal}: AIMS task {task_id_from_aims_initial} completed successfully.", extra=log_ctx)
                             break
                         elif current_aims_status == "FAILURE":
-                            logger.error(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} failed. Full response: {task_status_data}", extra=log_ctx)
+                            logger.error(f"Celery Task {task_id_celery_internal}: AIMS task {task_id_from_aims_initial} failed. Full response: {task_status_data}", extra=log_ctx)
                             aims_response_data = {"error": "PSWA_AIMS_TASK_FAILED", "message": "AIMS task reported failure.", "details": task_status_data.get("result")}
                             break
 
@@ -765,13 +758,13 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
                         time.sleep(pswa_config['AIMS_POLLING_INTERVAL_SECONDS'])
 
                     except requests.exceptions.RequestException as e_poll:
-                        logger.warning(f"Celery Task {task_id_for_logging}: Polling AIMS task {task_id_from_aims_initial} failed: {e_poll}. Retrying poll.", extra=log_ctx)
+                        logger.warning(f"Celery Task {task_id_celery_internal}: Polling AIMS task {task_id_from_aims_initial} failed: {e_poll}. Retrying poll.", extra=log_ctx)
                         time.sleep(pswa_config['AIMS_POLLING_INTERVAL_SECONDS']) # Wait before retrying poll
 
                 if aims_final_result: # If polling loop completed with SUCCESS
                     raw_script_text = aims_final_result.get("choices", [{}])[0].get("text", "")
                     if not raw_script_text:
-                        logger.error(f"Celery Task {task_id_for_logging}: AIMS task {task_id_from_aims_initial} result missing text.", extra={**log_ctx, "aims_result": aims_final_result})
+                        logger.error(f"Celery Task {task_id_celery_internal}: AIMS task {task_id_from_aims_initial} result missing text.", extra={**log_ctx, "aims_result": aims_final_result})
                         aims_response_data = {"error": "PSWA_AIMS_EMPTY_RESPONSE", "message": "AIMS task result was empty."}
                     else:
                         parsed_script = parse_llm_script_output(raw_script_text, topic)
@@ -781,28 +774,28 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
                         aims_response_data = parsed_script # This is the successful script data
 
         except requests.exceptions.RequestException as e_aims_initial:
-            logger.error(f"Celery Task {task_id_for_logging}: Initial AIMS service call failed: {e_aims_initial}", exc_info=True, extra=log_ctx)
+            logger.error(f"Celery Task {task_id_celery_internal}: Initial AIMS service call failed: {e_aims_initial}", exc_info=True, extra=log_ctx)
             aims_response_data = {"error": "PSWA_AIMS_HTTP_ERROR", "message": "AIMS service request failed.", "details": str(e_aims_initial)}
         except json.JSONDecodeError as e_json_initial:
-            logger.error(f"Celery Task {task_id_for_logging}: Failed to decode initial AIMS response: {e_json_initial}. Response: {response_aims.text[:200]}", exc_info=True, extra=log_ctx)
+            logger.error(f"Celery Task {task_id_celery_internal}: Failed to decode initial AIMS response: {e_json_initial}. Response: {response_aims.text[:200]}", exc_info=True, extra=log_ctx)
             aims_response_data = {"error": "PSWA_AIMS_BAD_INITIAL_JSON", "message": "AIMS service initial response not valid JSON.", "details": str(e_json_initial), "response_preview": response_aims.text[:200] if 'response_aims' in locals() else "N/A"}
         except Exception as e_aims_logic: # Catch any other unexpected error in AIMS interaction logic
-            logger.error(f"Celery Task {task_id_for_logging}: Unexpected error during AIMS interaction: {e_aims_logic}", exc_info=True, extra=log_ctx)
+            logger.error(f"Celery Task {task_id_celery_internal}: Unexpected error during AIMS interaction: {e_aims_logic}", exc_info=True, extra=log_ctx)
             aims_response_data = {"error": "PSWA_AIMS_UNEXPECTED_ERROR", "message": "Unexpected error during AIMS interaction.", "details": str(e_aims_logic)}
         # --- Integrated _call_aims_service_for_script logic ends ---
 
 
         if "error" in aims_response_data: # AIMS returned a logical error or polling failed
-            logger.error(f"Celery Task {task_id_for_logging}: AIMS interaction resulted in an error: {aims_response_data}", extra={**log_ctx, "aims_response": aims_response_data})
+            logger.error(f"Celery Task {task_id_celery_internal}: AIMS interaction resulted in an error: {aims_response_data}", extra={**log_ctx, "aims_response": aims_response_data})
             _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=aims_response_data, is_new_key=False)
             db_conn_idem.commit()
             return aims_response_data # Return the error payload from AIMS interaction
 
         # If aims_response_data is the structured script (i.e., success)
         structured_script = aims_response_data
-        if not (isinstance(structured_script, dict) and all(k in structured_script for k in ["title", "intro", "segments", "outro"])):
-            logger.error(f"Celery Task {task_id_for_logging}: LLM (AIMS) response malformed after successful poll. Preview: {json.dumps(structured_script)[:500]}", extra={**log_ctx, "raw_response_preview": json.dumps(structured_script)[:500]})
-            malformed_error_payload = {"error": "PSWA_MALFORMED_SCRIPT_FROM_AIMS", "message": "AIMS returned a malformed script structure after successful poll.", "details_preview": json.dumps(structured_script)[:200]}
+        if not (isinstance(structured_script, dict) and all(k in structured_script for k in ["title", "intro", "segments", "outro"])): # Check for expected keys after parsing
+            logger.error(f"Celery Task {task_id_celery_internal}: LLM (AIMS) response malformed after successful poll or parsing. Preview: {json.dumps(structured_script)[:500]}", extra={**log_ctx, "raw_response_preview": json.dumps(structured_script)[:500]})
+            malformed_error_payload = {"error": "PSWA_MALFORMED_SCRIPT_FROM_AIMS", "message": "AIMS returned a malformed script structure after successful poll or parsing.", "details_preview": json.dumps(structured_script)[:200]}
             _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_FAILED'], workflow_id=workflow_id, error_payload=malformed_error_payload, is_new_key=False)
             db_conn_idem.commit()
             return malformed_error_payload
@@ -819,11 +812,11 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
         _store_idempotency_record(db_conn_idem, idempotency_key, pswa_config['IDEMPOTENCY_STATUS_COMPLETED'], workflow_id=workflow_id, result_payload=final_success_payload, is_new_key=False)
         db_conn_idem.commit()
         self.update_state(state='SUCCESS', meta={'current_step': 'Script generated successfully via polling', 'progress_percent': 100, 'result_summary': {"script_id": script_id, "title": structured_script.get("title")}, **log_ctx})
-        logger.info(f"Celery Task {task_id_for_logging}: Script generation successful via polling. Script ID: {script_id}", extra={**log_ctx, "script_title": structured_script.get("title")})
+        logger.info(f"Celery Task {task_id_celery_internal}: Script generation successful via polling. Script ID: {script_id}", extra={**log_ctx, "script_title": structured_script.get("title")})
         return final_success_payload
 
     except Exception as e:
-        logger.error(f"Celery Task {task_id_for_logging}: Unhandled exception in main task logic: {e}", exc_info=True, extra=log_ctx)
+        logger.error(f"Celery Task {task_id_celery_internal}: Unhandled exception in main task logic: {e}", exc_info=True, extra=log_ctx)
         if db_conn_idem and idempotency_key and PSYCOPG2_AVAILABLE:
             try:
                 current_status_check = _check_idempotency_key(db_conn_idem, idempotency_key)
@@ -834,7 +827,7 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
                 else:
                     db_conn_idem.rollback()
             except Exception as db_e:
-                logger.error(f"Celery Task {task_id_for_logging}: CRITICAL - Failed to store idempotency FAILED status after main task error: {db_e}", exc_info=True, extra=log_ctx)
+                logger.error(f"Celery Task {task_id_celery_internal}: CRITICAL - Failed to store idempotency FAILED status after main task error: {db_e}", exc_info=True, extra=log_ctx)
                 if db_conn_idem and not db_conn_idem.closed: db_conn_idem.rollback()
         raise
     finally:

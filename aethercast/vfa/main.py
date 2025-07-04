@@ -324,9 +324,6 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
 
     # PSYCOPG2_AVAILABLE check was removed in previous refactors as direct import implies availability.
     # If direct import fails, service won't start. If it's uninstalled while running, _get_vfa_db_connection will fail.
-    # if not PSYCOPG2_AVAILABLE:
-    #     logger.error(f"psycopg2 not available, cannot perform idempotency checks. Failing task.", extra=log_extra_base)
-    #     raise ConnectionError("VFA Task: psycopg2 is required for idempotency but not available.")
 
     # Initial log message already uses log_extra_base.
     # The message "Starting voice forging." is general. Specific details like topic are in log_extra_base.
@@ -371,12 +368,6 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
             _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=sim_result, workflow_id=workflow_id, is_new_key=False)
             db_conn.commit()
             return sim_result
-            # Example error:
-            # test_error_payload = {"error_code": "VFA_TEST_MODE_AIMS_TTS_ERROR", "message": VFA_TEST_SCENARIO_AIMS_TTS_ERROR_MSG}
-            # _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_FAILED'], error_payload=test_error_payload, workflow_id=workflow_id, is_new_key=False)
-            # db_conn.commit()
-            # return test_error_payload
-
 
         if not isinstance(script_input, dict): text_to_synthesize = str(script_input)
         else:

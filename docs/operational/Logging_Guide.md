@@ -20,7 +20,7 @@ All Python services utilize the `python-json-logger` library to produce structur
 
 **Custom Fields (added via filters or `extra` parameter):**
 
-*   `service_name` (string): Identifies the microservice that generated the log (e.g., "api-gateway", "tda", "aims-llm-service"). This is added by a custom `ServiceNameFilter`.
+*   `service_name` (string): Identifies the microservice that generated the log (e.g., "api-gateway", "cpoa", "tda", "wcha", "sca", "pswa", "iga", "vfa", "asf", "aims-service", "aims-tts-service"). This is typically added by a custom `ServiceNameFilter`.
 *   `workflow_id` (string, optional): A unique identifier for an end-to-end CPOA orchestration workflow. Present in logs related to CPOA operations and often in logs from services called by CPOA. Defaults to "N/A" if not applicable.
 *   `task_id` (string, optional): A unique identifier for a specific task within a CPOA workflow (e.g., a call to a particular agent). Present in CPOA task-related logs. Defaults to "N/A" if not applicable.
 *   Additional custom fields (e.g., metric data) can be added via the `extra` parameter in logging calls.

@@ -29,7 +29,7 @@ CPOA's logging is integrated with the Aethercast project's standard logging prac
 
 CPOA is configured via environment variables, typically inherited from the API Gateway's environment.
 
--   **Service URLs:** URLs for downstream services it orchestrates (e.g., `PSWA_SERVICE_URL`, `VFA_SERVICE_URL`, `SCA_SERVICE_URL`, `IGA_SERVICE_URL`, `TDA_SERVICE_URL`, `ASF_NOTIFICATION_URL`, `CPOA_ASF_SEND_UI_UPDATE_URL`).
+-   **Service URLs:** URLs for downstream services it orchestrates (e.g., `WCHA_SERVICE_URL`, `TDA_SERVICE_URL`, `SCA_SERVICE_URL`, `PSWA_SERVICE_URL`, `IGA_SERVICE_URL`, `VFA_SERVICE_URL`, `ASF_NOTIFICATION_URL`, `CPOA_ASF_SEND_UI_UPDATE_URL`).
 -   **Database Configuration:** CPOA uses PostgreSQL for workflow state management and accessing the shared `idempotency_keys` table.
     -   Connection Parameters (typically from `common.env`):
         -   `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`.
@@ -43,11 +43,11 @@ CPOA is configured via environment variables, typically inherited from the API G
     -   Polling Intervals (e.g., `CPOA_WCHA_POLLING_INTERVAL_SECONDS`, `CPOA_PSWA_POLLING_INTERVAL_SECONDS`, etc.): Time between status checks for asynchronous agent tasks. Defaults vary (e.g., 3-10 seconds).
     -   Polling Timeouts (e.g., `CPOA_WCHA_POLLING_TIMEOUT_SECONDS`, `CPOA_PSWA_POLLING_TIMEOUT_SECONDS`, etc.): Maximum time to wait for an agent task to complete. Defaults vary (e.g., 180-600 seconds).
 -   **Idempotency Configuration:**
-    -   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Timeout for CPOA's own orchestration task idempotency locks. Default: `3600` seconds (1 hour). *(Note: Individual services like WCHA, AIMS, AIMS_TTS have their own shorter `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS` for their specific Celery tasks, typically 300 seconds).*
+    -   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Timeout for CPOA's own orchestration task idempotency locks. Default: `3600` seconds (1 hour). *(Note: Individual services like WCHA, TDA, SCA, PSWA, and IGA have their own shorter `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS` for their specific Celery tasks, typically 300-1800 seconds).*
 
 ## Dependencies
 
-Listed in `requirements.txt` (e.g., `requests`, `python-dotenv`, `psycopg2-binary`, `celery`).
+CPOA's dependencies are managed as part of the API Gateway's `requirements.txt`. Key libraries it utilizes include `requests`, `psycopg2-binary`, and `celery` (for interacting with Celery task results).
 
 ## Running and Testing
 

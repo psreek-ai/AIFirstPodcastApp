@@ -14,8 +14,7 @@ from google.api_core import exceptions as google_exceptions
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
 from psycopg2 import extras as psycopg2_extras # For DictCursor
-# time is already imported below, json needs to be imported
-import json # For serializing/deserializing JSON payloads for DB
+# json is imported at the top
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -435,13 +434,6 @@ if __name__ == '__main__':
         logger.warning("WARNING: GOOGLE_APPLICATION_CREDENTIALS is not set. TTS & GCS calls might fail if ADC not configured.")
     if not GCS_BUCKET_NAME:
         logger.warning("WARNING: GCS_BUCKET_NAME is not set. Audio uploads will fail.")
-
-    # Create temp audio directory if still used for temporary files (currently not in main flow)
-    # try:
-    #     os.makedirs(SHARED_AUDIO_DIR_CONTAINER, exist_ok=True)
-    #     logger.info(f"Ensured shared audio directory exists (for temp files if used): {SHARED_AUDIO_DIR_CONTAINER}")
-    # except OSError as e:
-    #     logger.error(f"Could not create shared audio directory {SHARED_AUDIO_DIR_CONTAINER} on startup: {e}")
 
     logger.info(f"--- AIMS_TTS Service starting on {AIMS_TTS_HOST}:{AIMS_TTS_PORT} (Debug: {FLASK_DEBUG}) ---")
     # Initialize DB pool at startup (best effort)

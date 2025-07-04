@@ -4,7 +4,7 @@
 
 The Central Podcast Orchestrator Agent (CPOA) manages complex, multi-step workflows to generate podcasts and other content. To provide robust tracking, observability, debugging capabilities, and to lay the groundwork for future enhancements like workflow resumption, a dedicated state management schema is required.
 
-These tables are designed for **PostgreSQL** and will track the overall state of each workflow initiated within CPOA and the state of individual tasks (agent calls) within those workflows. The same PostgreSQL database instance also hosts the shared `idempotency_keys` table, which is used by downstream services (TDA, SCA, PSWA, IGA, VFA) to ensure their operations are idempotent. CPOA plays a key role in propagating the necessary idempotency headers to these services.
+These tables are designed for **PostgreSQL** and will track the overall state of each workflow initiated within CPOA and the state of individual tasks (agent calls) within those workflows. The same PostgreSQL database instance also hosts the shared `idempotency_keys` table, which is used by downstream services (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS) to ensure their operations are idempotent. CPOA plays a key role in propagating the necessary idempotency headers to these services.
 
 ## 2. Table Definitions
 
@@ -74,8 +74,8 @@ CREATE TABLE task_instances (
 |--------------------------------|--------------|----------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------|
 | `task_id`                      | UUID         | Primary Key, DEFAULT `gen_random_uuid()`                             | Unique identifier for this CPOA task instance record (CPOA's internal ID for this step).                                                                   |
 | `workflow_id`                  | UUID         | NOT NULL, Foreign Key to `workflow_instances.workflow_id`, ON DELETE CASCADE | Identifier of the parent workflow this task belongs to.                                                    |
-| `external_celery_task_id`      | VARCHAR(255) | Nullable                                                             | Stores the Celery task ID returned by downstream asynchronous services (TDA, SCA, PSWA, IGA, VFA). Used by CPOA for polling the actual agent task. |
-| `agent_name`                   | VARCHAR(255) | NOT NULL                                                             | Name of the agent or component responsible for this task (e.g., "TDA", "SCA", "PSWA", "IGA", "ASF_NOTIFY"). |
+| `external_celery_task_id`      | VARCHAR(255) | Nullable                                                             | Stores the Celery task ID returned by downstream asynchronous services (TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS, AIMS_TTS). Used by CPOA for polling the actual agent task. |
+| `agent_name`                   | VARCHAR(255) | NOT NULL                                                             | Name of the agent or component responsible for this task (e.g., "TDA", "WCHA", "SCA", "PSWA", "IGA", "VFA", "AIMS_LLM", "AIMS_TTS", "ASF_NOTIFY"). |
 | `task_order`                   | INTEGER      | NOT NULL                                                             | Sequence number of this task within the workflow.                                                          |
 | `status`                       | VARCHAR(50)  | NOT NULL                                                             | Current status of this specific CPOA-tracked task (e.g., "dispatched", "polling", "agent_completed", "agent_failed"). |
 | `input_params_json`            | JSONB        | Nullable                                                             | Parameters or payload sent to the agent for this task.                                                     |
