@@ -12,33 +12,18 @@ from vertexai.generative_models import GenerativeModel, GenerationConfig, Part, 
 from google.api_core import exceptions as google_exceptions # For specific error handling
 import time # Added for metric logging & idempotency stale check
 
-# --- Database and Idempotency specific imports ---
-import psycopg2
-from psycopg2 import pool as psycopg2_pool
-from psycopg2 import extras as psycopg2_extras # For DictCursor
 import json # For serializing payloads for DB
 
 # --- Load Environment Variables ---
 load_dotenv()
 
-# --- Celery Configuration ---
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
-CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+from aethercast.common.celery import create_celery_app
+from aethercast.common.db import get_db_connection
+from aethercast.common.idempotency import check_idempotency_key, store_idempotency_record
 
-celery_app = Celery(
-    'aims_tasks',
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND
-)
-# Optional: Update Celery app config if needed, e.g., task serializer
-celery_app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],  # Ensure tasks accept json
-    result_serializer='json',
-    timezone='UTC',
-    enable_utc=True,
-)
-celery_app.finalize() # Explicitly finalize the app
+
+# --- Celery Configuration ---
+celery_app = create_celery_app('aims_tasks')
 
 
 # --- Flask App Setup ---
@@ -83,114 +68,12 @@ logger = app.logger
 IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = 300 # 5 minutes (adjust as needed)
 db_connection_pool = None
 
-def get_db_connection():
-    """Establishes and returns a database connection from the pool."""
-    global db_connection_pool
-    if db_connection_pool is None:
-        try:
-            db_connection_pool = psycopg2_pool.SimpleConnectionPool(
-                minconn=1,
-                maxconn=int(os.getenv("DB_POOL_MAX_CONNECTIONS", 5)), # Pool size from env
-                user=os.getenv("POSTGRES_USER"),
-                password=os.getenv("POSTGRES_PASSWORD"),
-                host=os.getenv("POSTGRES_HOST"),
-                port=os.getenv("POSTGRES_PORT", "5432"),
-                database=os.getenv("POSTGRES_DB")
-            )
-            logger.info("Database connection pool created successfully for AIMS.")
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error while creating PostgreSQL connection pool for AIMS: {error}", exc_info=True)
-            raise
-    try:
-        return db_connection_pool.getconn()
-    except Exception as error:
-        logger.error(f"Error getting connection from AIMS pool: {error}", exc_info=True)
-        raise
-
 def release_db_connection(conn):
     """Releases a database connection back to the pool."""
     global db_connection_pool
     if db_connection_pool and conn:
         db_connection_pool.putconn(conn)
 
-def check_idempotency(db_conn, idempotency_key: str, task_name: str):
-    log_extra_idem = {'idempotency_key': idempotency_key, 'task_name': task_name, 'service_name': 'aims-service'}
-    try:
-        with db_conn.cursor(cursor_factory=psycopg2_extras.DictCursor) as cursor:
-            cursor.execute(
-                "SELECT status, result_payload, locked_at, error_payload FROM idempotency_keys WHERE key = %s AND task_name = %s",
-                (idempotency_key, task_name)
-            )
-            record = cursor.fetchone()
-            if record:
-                logger.info(f"Idempotency record found: Status - {record['status']}", extra=log_extra_idem)
-                if record['status'] == 'completed':
-                    # Make sure result_payload (which is JSONB in DB) is loaded as dict
-                    return {'status': 'completed', 'result': record['result_payload'] if isinstance(record['result_payload'], dict) else json.loads(record['result_payload'])}
-                elif record['status'] == 'processing':
-                    if record['locked_at'] and (time.time() - record['locked_at'].timestamp()) < IDEMPOTENCY_LOCK_TIMEOUT_SECONDS:
-                        logger.warning("Task is already processing (lock not expired).", extra=log_extra_idem)
-                        return {'status': 'conflict', 'message': 'Task already processing'}
-                    else:
-                        logger.warning("Task was 'processing' but lock expired. Will attempt to re-acquire.", extra=log_extra_idem)
-                        return None # Stale lock
-                elif record['status'] == 'failed':
-                    logger.warning("Previous attempt for this task failed. Will attempt to re-run.", extra=log_extra_idem)
-                    return None # Failed, proceed
-            return None
-    except (Exception, psycopg2.Error) as error:
-        logger.error(f"Error checking idempotency: {error}", exc_info=True, extra=log_extra_idem)
-        raise
-
-def acquire_idempotency_lock(db_conn, idempotency_key: str, task_name: str, workflow_id: Optional[str] = None):
-    log_extra_idem = {'idempotency_key': idempotency_key, 'task_name': task_name, 'workflow_id': workflow_id or "N/A", 'service_name': 'aims-service'}
-    try:
-        with db_conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO idempotency_keys (key, task_name, workflow_id, status, locked_at, created_at, updated_at)
-                VALUES (%s, %s, %s, 'processing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT (key, task_name) DO UPDATE SET
-                    status = 'processing',
-                    locked_at = CURRENT_TIMESTAMP,
-                    workflow_id = EXCLUDED.workflow_id,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING id;
-                """,
-                (idempotency_key, task_name, workflow_id)
-            )
-            lock_id = cursor.fetchone()
-            db_conn.commit()
-            if lock_id:
-                logger.info("Idempotency lock acquired.", extra=log_extra_idem)
-                return True
-            logger.error("Failed to acquire idempotency lock (no id returned).", extra=log_extra_idem) # Should not happen
-            return False
-    except (Exception, psycopg2.Error) as error:
-        db_conn.rollback()
-        logger.error(f"Error acquiring idempotency lock: {error}", exc_info=True, extra=log_extra_idem)
-        raise
-
-def update_idempotency_record(db_conn, idempotency_key: str, task_name: str, final_status: str, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None):
-    log_extra_idem = {'idempotency_key': idempotency_key, 'task_name': task_name, 'final_status': final_status, 'service_name': 'aims-service'}
-    try:
-        with db_conn.cursor() as cursor:
-            result_payload_db = json.dumps(result_payload) if result_payload is not None else None
-            error_payload_db = json.dumps(error_payload) if error_payload is not None else None
-            cursor.execute(
-                """
-                UPDATE idempotency_keys
-                SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL, updated_at = CURRENT_TIMESTAMP
-                WHERE key = %s AND task_name = %s
-                """,
-                (final_status, result_payload_db, error_payload_db, idempotency_key, task_name)
-            )
-            db_conn.commit()
-            logger.info("Idempotency record updated.", extra=log_extra_idem)
-    except (Exception, psycopg2.Error) as error:
-        db_conn.rollback()
-        logger.error(f"Error updating idempotency record: {error}", exc_info=True, extra=log_extra_idem)
-        raise
 
 # --- AIMS Configuration for Google Cloud Vertex AI ---
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -291,7 +174,7 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
 
     try:
         db_conn = get_db_connection()
-        idempotency_check = check_idempotency(db_conn, idempotency_key_str, task_name_str)
+        idempotency_check = check_idempotency_key(db_conn, idempotency_key_str, task_name_str)
 
         if idempotency_check:
             if idempotency_check['status'] == 'completed':
@@ -301,7 +184,7 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
                 logger.warning(f"Task '{task_name_str}' (req: {request_id}) conflict: {idempotency_check['message']}.", extra=log_extra)
                 return {"error": {"type": "idempotency_conflict", "message": idempotency_check['message']}, "request_id": request_id}
 
-        if not acquire_idempotency_lock(db_conn, idempotency_key_str, task_name_str, log_extra['workflow_id']):
+        if not store_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'processing', workflow_id=log_extra['workflow_id'], is_new_key=True):
             logger.error(f"Failed to acquire idempotency lock for task '{task_name_str}' (req: {request_id}). Aborting.", extra=log_extra)
             return {"error": {"type": "lock_acquisition_failed", "message": "Failed to acquire idempotency lock."}, "request_id": request_id}
 
@@ -349,7 +232,7 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
             logger.warning(f"AIMS Task {celery_task_internal_id}: Content generation blocked by safety for req {request_id}. Reason: {finish_reason_str}", extra=log_extra)
             logger.warning("Vertex AI content blocked by safety (async)", extra={**log_extra, "metric_name": "aims_vertexai_error_count", "value": 1, "tags_metric": {"error_type": "safety_blocked"}})
             task_final_result = {"error": {"type": "generation_blocked_safety", "message": "Content generation blocked by safety filters."}, "model_id": model_name_to_use, "request_id": request_id}
-            update_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'completed', result_payload=task_final_result) # 'completed' as API call finished
+            store_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'completed', result_payload=task_final_result)
             return task_final_result
 
         prompt_tokens = response.usage_metadata.prompt_token_count if response.usage_metadata else 0
@@ -364,7 +247,7 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
             "choices": [{"text": generated_text, "finish_reason": finish_reason_str}],
             "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
         }
-        update_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'completed', result_payload=task_final_result)
+        store_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'completed', result_payload=task_final_result)
         return task_final_result
 
     except google_exceptions.GoogleAPIError as e:
@@ -372,14 +255,14 @@ def invoke_llm_vertex_ai_task(self, request_id: str, prompt_text: str, model_nam
         logger.error("Vertex AI API error (async)", extra={**log_extra, "metric_name": "aims_vertexai_error_count", "value": 1, "tags_metric": {"error_type": "google_api_error"}})
         error_payload_db = {"error_type": type(e).__name__, "message": str(e), "details": e.args[0] if e.args else "N/A"}
         if db_conn: # Ensure db_conn is available before trying to update
-            update_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
+            store_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
         raise self.retry(exc=e, countdown=15, max_retries=2) # Adjusted retry params
 
     except Exception as e:
         logger.error(f"AIMS Task {celery_task_internal_id}: Unexpected error for req {request_id}: {e}", exc_info=True, extra=log_extra)
         error_payload_db = {"error_type": type(e).__name__, "message": str(e)}
         if db_conn: # Ensure db_conn is available
-             update_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
+             store_idempotency_record(db_conn, idempotency_key_str, task_name_str, 'failed', error_payload=error_payload_db)
         # Let Celery handle retries based on task decorator
         raise self.retry(exc=e, countdown=10, max_retries=1) # Adjusted retry params for general errors
 

@@ -6,11 +6,12 @@ from flask import Flask, request, jsonify
 from typing import Optional, Dict, Any
 import requests # Added for AIMS_TTS service call
 import time # Added for retry logic (if needed for AIMS_TTS)
-from celery import Celery
 from celery.result import AsyncResult
-import psycopg2 # For Idempotency DB
-from psycopg2.extras import RealDictCursor # For Idempotency DB
 from datetime import datetime, timezone # For Idempotency locked_at
+
+from aethercast.common.celery import create_celery_app
+from aethercast.common.db import get_db_connection
+from aethercast.common.idempotency import check_idempotency_key, store_idempotency_record
 
 # --- Load Environment Variables ---
 load_dotenv()
@@ -22,22 +23,7 @@ GLOBAL_REQUESTS_SESSION = requests.Session()
 IDEMPOTENCY_KEY_HEADER = "X-Idempotency-Key" # Added
 
 # --- Celery Configuration ---
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
-CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
-
-celery_app = Celery(
-    'vfa_tasks', # Unique name for VFA tasks
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND
-)
-celery_app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    timezone='UTC',
-    enable_utc=True,
-)
-celery_app.finalize() # Explicitly finalize the app
+celery_app = create_celery_app('vfa_tasks')
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -90,14 +76,6 @@ def load_vfa_configuration():
     vfa_config['VFA_PORT'] = int(os.getenv("VFA_PORT", 5005))
     # vfa_config['VFA_DEBUG_MODE'] will be replaced by direct use of FLASK_DEBUG
 
-    # Database Configuration (for Idempotency)
-    vfa_config['POSTGRES_HOST'] = os.getenv("POSTGRES_HOST")
-    vfa_config['POSTGRES_PORT'] = os.getenv("POSTGRES_PORT", "5432")
-    vfa_config['POSTGRES_USER'] = os.getenv("POSTGRES_USER")
-    vfa_config['POSTGRES_PASSWORD'] = os.getenv("POSTGRES_PASSWORD")
-    vfa_config['POSTGRES_DB'] = os.getenv("POSTGRES_DB")
-    vfa_config['VFA_POSTGRES_DB_URL'] = os.getenv("VFA_POSTGRES_DB_URL") # Load new consolidated URL
-
     # Idempotency Configuration from .env.example
     vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS'] = int(os.getenv("VFA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS", "300"))
     vfa_config['IDEMPOTENCY_STATUS_PROCESSING'] = os.getenv("VFA_IDEMPOTENCY_STATUS_PROCESSING", "processing")
@@ -123,39 +101,6 @@ VFA_STATUS_SUCCESS = "success" # Added from CPOA
 VFA_STATUS_SKIPPED = "skipped" # Added from CPOA
 VFA_STATUS_ERROR = "error" # Added from CPOA
 
-# --- Idempotency DB Helpers (VFA specific) ---
-def _get_vfa_db_connection():
-    """Establishes a direct connection to PostgreSQL for VFA idempotency checks using consolidated URL."""
-    db_url = vfa_config.get('VFA_POSTGRES_DB_URL')
-    if not db_url:
-        # Fallback to individual components if consolidated URL is not set (for backward compatibility during transition)
-        # However, ideally, the service should rely on the consolidated URL.
-        logger.warning("VFA: VFA_POSTGRES_DB_URL not set. Attempting to use individual PostgreSQL components.")
-        required_vars = [vfa_config.get('POSTGRES_HOST'), vfa_config.get('POSTGRES_USER'), vfa_config.get('POSTGRES_PASSWORD'), vfa_config.get('POSTGRES_DB')]
-        if not all(required_vars):
-            logger.error("VFA: PostgreSQL individual connection variables for idempotency not fully set in vfa_config.")
-            raise ConnectionError("VFA: PostgreSQL environment variables for idempotency not configured.")
-        try:
-            conn = psycopg2.connect(
-                host=vfa_config['POSTGRES_HOST'], port=vfa_config['POSTGRES_PORT'],
-                user=vfa_config['POSTGRES_USER'], password=vfa_config['POSTGRES_PASSWORD'],
-                dbname=vfa_config['POSTGRES_DB'],
-                cursor_factory=RealDictCursor
-            )
-            logger.info("VFA successfully connected to PostgreSQL for idempotency using individual components.")
-            return conn
-        except psycopg2.Error as e:
-            logger.error(f"VFA: Unable to connect to PostgreSQL using individual components: {e}", exc_info=True)
-            raise ConnectionError(f"VFA: PostgreSQL connection failed (individual components): {e}") from e
-
-    try: # Try with consolidated URL first
-        conn = psycopg2.connect(dsn=db_url, cursor_factory=RealDictCursor)
-        logger.info("VFA successfully connected to PostgreSQL for idempotency using VFA_POSTGRES_DB_URL.")
-        return conn
-    except psycopg2.Error as e:
-        logger.error(f"VFA: Unable to connect to PostgreSQL for idempotency: {e}", exc_info=True)
-        raise ConnectionError(f"VFA: PostgreSQL connection for idempotency failed: {e}") from e
-
 # --- Custom Celery Task Class for VFA with Idempotency ---
 class VfaCeleryTask(celery_app.Task): # Inherit from celery_app.Task
     def on_failure(self, exc, task_id, args, kwargs, einfo):
@@ -164,19 +109,15 @@ class VfaCeleryTask(celery_app.Task): # Inherit from celery_app.Task
         workflow_id = kwargs.get('workflow_id') # Retrieve workflow_id
         task_name = self.name # self.name will be 'forge_voice_task'
 
-        # Check for PSYCOPG2_AVAILABLE - defined globally in main.py
-        # For simplicity, assuming it's accessible here or rely on _get_vfa_db_connection to check/raise.
-        # A more explicit check: if not vfa_main.PSYCOPG2_AVAILABLE: logger.error(...); return
-
         if idempotency_key: # Attempt to mark idempotency record as failed if key is present
             db_conn = None
             try:
-                db_conn = _get_vfa_db_connection()
+                db_conn = get_db_connection()
                 if db_conn:
                     db_conn.autocommit = False # Manage transaction
                     error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
                     # Use the correct config key for failed status
-                    _store_vfa_idempotency_result(db_conn, idempotency_key, task_name,
+                    store_idempotency_record(db_conn, idempotency_key, task_name,
                                               vfa_config['IDEMPOTENCY_STATUS_FAILED'], # Use config
                                               error_payload=error_payload,
                                               workflow_id=workflow_id, # Pass workflow_id
@@ -190,74 +131,6 @@ class VfaCeleryTask(celery_app.Task): # Inherit from celery_app.Task
                 if db_conn and not db_conn.closed:
                     try: db_conn.close()
                     except Exception: pass # Ignore errors on close during failure handling
-        # Default Celery failure handling will still occur
-
-def _check_vfa_idempotency_key(db_conn, idempotency_key: str, task_name: str) -> Optional[Dict[str, Any]]:
-    logger_extra_info = {"task_id": "VFAIdempotencyCheck", "idempotency_key": idempotency_key, "check_task_name": task_name}
-    try:
-        with db_conn.cursor() as cur:
-            cur.execute(
-                "SELECT idempotency_key, task_name, workflow_id, created_at, locked_at, status, result_payload, error_payload FROM idempotency_keys WHERE idempotency_key = %s AND task_name = %s",
-                (idempotency_key, task_name)
-            )
-            record = cur.fetchone()
-            if record:
-                logger.info(f"Idempotency key found with status '{record['status']}'.", extra=logger_extra_info)
-                return dict(record)
-            logger.info("No existing idempotency key found.", extra=logger_extra_info)
-            return None
-    except psycopg2.Error as e:
-        logger.error(f"DB error checking idempotency key: {e}", exc_info=True, extra=logger_extra_info)
-        raise
-    except Exception as e_unexp:
-        logger.error(f"Unexpected error checking idempotency key: {e_unexp}", exc_info=True, extra=logger_extra_info)
-        raise
-
-def _store_vfa_idempotency_result(db_conn, idempotency_key: str, task_name: str, status: str, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None, workflow_id: Optional[str] = None, is_new_key: bool = True):
-    logger_extra_info = {"task_id": "VFAIdempotencyStore", "idempotency_key": idempotency_key, "store_task_name": task_name, "new_status": status}
-    try:
-        with db_conn.cursor() as cur:
-            current_ts_utc = datetime.now(timezone.utc)
-            if is_new_key:
-                logger.info("Storing new idempotency key.", extra=logger_extra_info)
-                cur.execute(
-                    """
-                    INSERT INTO idempotency_keys (idempotency_key, task_name, workflow_id, locked_at, status, result_payload, error_payload, created_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (idempotency_key) DO UPDATE SET
-                        task_name = EXCLUDED.task_name, workflow_id = EXCLUDED.workflow_id,
-                        locked_at = EXCLUDED.locked_at, status = EXCLUDED.status,
-                        result_payload = EXCLUDED.result_payload, error_payload = EXCLUDED.error_payload,
-                        created_at = idempotency_keys.created_at;
-                    """,
-                    (idempotency_key, task_name, workflow_id,
-                     current_ts_utc if status == vfa_config['IDEMPOTENCY_STATUS_PROCESSING'] else None,
-                     status, json.dumps(result_payload) if result_payload else None,
-                     json.dumps(error_payload) if error_payload else None, current_ts_utc)
-                )
-            else: # Update existing key
-                logger.info("Updating existing idempotency key.", extra=logger_extra_info)
-                set_clauses = ["status = %s", "result_payload = %s", "error_payload = %s"]
-                params = [status, json.dumps(result_payload) if result_payload else None, json.dumps(error_payload) if error_payload else None]
-
-                if status == vfa_config['IDEMPOTENCY_STATUS_PROCESSING']:
-                    set_clauses.append("locked_at = %s")
-                    params.append(current_ts_utc)
-                elif status in [vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], vfa_config['IDEMPOTENCY_STATUS_FAILED']]:
-                    set_clauses.append("locked_at = NULL")
-
-                params.extend([idempotency_key, task_name])
-                cur.execute(
-                    f"UPDATE idempotency_keys SET {', '.join(set_clauses)} WHERE idempotency_key = %s AND task_name = %s;",
-                    tuple(params)
-                )
-            logger.info("Successfully stored/updated idempotency key.", extra=logger_extra_info)
-    except psycopg2.Error as e:
-        logger.error(f"DB error storing idempotency key: {e}", exc_info=True, extra=logger_extra_info)
-        raise
-    except Exception as e_unexp:
-        logger.error(f"Unexpected error storing idempotency key: {e_unexp}", exc_info=True, extra=logger_extra_info)
-        raise
 
 
 @celery_app.task(bind=True, base=VfaCeleryTask, name='forge_voice_task') # Use VfaCeleryTask as base
