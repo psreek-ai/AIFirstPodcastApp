@@ -30,6 +30,8 @@ if project_root not in sys.path:
 
 load_dotenv()
 
+app = Flask(__name__)
+
 # --- Logging Setup ---
 # Custom filter to add service_name to log records
 class ServiceNameFilter(logging.Filter): # noqa E501
@@ -560,17 +562,6 @@ orchestrate_search_results_generation = _cpoa_placeholder_search
 orchestrate_landing_page_snippets = _cpoa_placeholder_landing_snippets
 get_popular_categories = _cpoa_placeholder_categories
 # ... (rest of CPOA import logic)
-
-# --- Flask App Initialization & Config ---
-app = Flask(__name__)
-# Ensure Flask app's logger uses the configured root logger level
-app.logger.setLevel(logging.INFO)
-# Note: Flask's app.logger usually propagates to the root logger by default,
-# so handlers added to root_logger should apply unless explicitly overridden on app.logger.
-# If Flask's default handlers were still present and not cleared from app.logger,
-# you might get duplicate logs. Clearing root_logger.handlers helps prevent this.
-
-app.logger.info("API Gateway Flask app initialized and logger configured to use root settings.")
 
 # --- Global Error Handler ---
 @app.errorhandler(Exception)

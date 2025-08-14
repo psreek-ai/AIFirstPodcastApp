@@ -181,7 +181,7 @@ This project uses Docker Compose to manage and run the suite of microservices in
 
 **Prerequisites:**
 -   Docker installed and running.
--   Docker Compose installed.
+-   Docker Compose V2 installed (i.e., the `docker compose` command is available).
 
 **Setup:**
 
@@ -196,26 +196,20 @@ This project uses Docker Compose to manage and run the suite of microservices in
             *   **External API Keys & Test Modes:**
                 *   For services requiring external API keys (e.g., TDA for NewsAPI), populate these in the respective `.env` files if you intend to use the live services.
                 *   For development or testing without external calls, ensure "test mode" or placeholder flags are enabled (e.g., `USE_REAL_NEWS_API=False` in `tda/.env`, `PSWA_TEST_MODE_ENABLED=True` in `pswa/.env`). These are often defaulted in `common.env` but can be overridden.
-            *   **GCP Configuration:** For services interacting with GCP (AIMS, AIMS_TTS, IGA, API Gateway for GCS), follow the '## GCP Prerequisites and Setup for Local Development' section. This includes setting `GCP_PROJECT_ID`, `GCP_LOCATION`, `GCS_BUCKET_NAME` in `common.env`, and ensuring `GOOGLE_APPLICATION_CREDENTIALS` is correctly configured in service-specific `.env` files.
+            *   **GCP Configuration:** For services interacting with GCP (AIMS, AIMS_TTS, IGA, API Gateway for GCS), follow the '## GCP Prerequisites and Setup for Local Development' section. This includes setting `GCP_PROJECT_ID`, `GCP_LOCATION`, `GCS_BUCKET_NAME` in `common.env`, and ensuring `GOOGLE_APPLICATION_CREDENTIALS` is correctly configured in service-specific `.env` files. For local development without real GCP access, you can use a placeholder `gcp-credentials.json` file (e.g., `echo "{}" > aethercast/api_gateway/gcp-credentials.json`) if the services are running in "test mode".
 
 2.  **Database Initialization (PostgreSQL):**
     *   The PostgreSQL service defined in `docker-compose.yml` (`postgres_db`) will initialize itself.
-    *   The `api_gateway` service (which includes CPOA logic) and other services like TDA, WCHA, PSWA, SCA, IGA will attempt to connect to this database.
-    *   **Idempotency Table Migration:** A SQL migration script (`aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql`) creates the necessary `idempotency_keys` table used by TDA, WCHA, SCA, PSWA, and IGA. **This script must be applied manually** to the PostgreSQL database after the `postgres_db` container is up and running. You can use a PostgreSQL client tool (e.g., `psql` via `docker exec`, or a GUI tool like DBeaver or pgAdmin) connected to the PostgreSQL container.
-        *   Example using `psql` via `docker exec`:
-            ```bash
-            docker exec -i $(docker-compose ps -q postgres_db) psql -U your_db_user -d aethercast_db < aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql
-            ```
-            (Replace `your_db_user` and `aethercast_db` with the actual values from your `.env` files if they differ from the defaults in `common.env` used by the `postgres_db` service).
-    *   **Other Tables:** Services like CPOA (via API Gateway) and TDA also manage their own tables (e.g., `cpoa_tasks`, `topics_snippets`). These are typically created or checked for existence by the services themselves on startup (see `init_cpoa_db()` in API Gateway, `init_tda_db()` in TDA).
+    *   The `api_gateway` service automatically handles the creation and migration of the database schema on startup. No manual migration is needed.
 
 3.  **Build and Run Services:**
     Open a terminal at the project root (where `docker-compose.yml` is located) and run:
     ```bash
-    docker-compose up --build
+    docker compose up --build
     ```
     -   `--build`: Forces Docker to rebuild the images if any Dockerfiles or application code has changed.
     -   Use `-d` to run in detached mode (in the background).
+    -   Note: We use `docker compose` (with a space), which is the syntax for Docker Compose V2.
 
 4.  **Accessing Services:**
     *   **API Gateway / Frontend:** `http://localhost:5001`
@@ -237,13 +231,13 @@ This project uses Docker Compose to manage and run the suite of microservices in
     *   `aethercast_audio_data`: (Legacy for local file sharing) With GCS as the primary media store, this volume's importance is reduced.
 
 6.  **Stopping Services:**
-    Press `Ctrl+C` in the terminal where `docker-compose up` is running. If in detached mode, use:
+    Press `Ctrl+C` in the terminal where `docker compose up` is running. If in detached mode, use:
     ```bash
-    docker-compose down
+    docker compose down
     ```
     To remove volumes (and thus delete the PostgreSQL database data), use:
     ```bash
-    docker-compose down -v
+    docker compose down -v
     ```
 
 **Running Integration Tests:**
@@ -254,8 +248,9 @@ Once the Docker Compose environment is up and running (with services in their "t
    ```bash
    python -m unittest tests/integration/test_full_flow.py
    ```
-   (You might need to set `PYTHONPATH=.` or `export PYTHONPATH=$(pwd)` for the tests to find the `aethercast` modules if you add more complex test runners or helper modules locally).
-   The `API_GATEWAY_BASE_URL` in the test script defaults to `http://localhost:5001/api/v1`.
+   - **Note:** The integration tests are skipped by default. To run them, you need to edit `tests/integration/test_full_flow.py` and remove the `@unittest.skip(...)` decorator from the `TestFullPodcastFlow` class.
+   - You might need to set `PYTHONPATH=.` or `export PYTHONPATH=$(pwd)` for the tests to find the `aethercast` modules if you add more complex test runners or helper modules locally.
+   - The `API_GATEWAY_BASE_URL` in the test script defaults to `http://localhost:5001/api/v1`.
 
 ## Individual Service READMEs
 
