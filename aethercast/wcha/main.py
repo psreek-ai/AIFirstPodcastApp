@@ -13,29 +13,19 @@ from python_json_logger import jsonlogger # Added for JSON logging
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
 import time # For stale lock check
+from aethercast.common.celery import create_celery_app
+from aethercast.common.db import get_db_connection, release_db_connection, init_db_connection_pool
+from aethercast.common.idempotency import check_idempotency, acquire_idempotency_lock, update_idempotency_record
+import flask
+
 # --- Load Environment Variables ---
 load_dotenv() # Added
 
 # --- Celery Configuration ---
-CELERY_BROKER_URL = os.getenv('CELERY_BROKER_URL', 'redis://redis:6379/0')
-CELERY_RESULT_BACKEND = os.getenv('CELERY_RESULT_BACKEND', 'redis://redis:6379/0')
+celery_app = create_celery_app('wcha_tasks')
 
-celery_app = Celery(
-    'wcha_tasks',
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND
-)
-celery_app.conf.update(
-    task_serializer='json',
-    accept_content=['json'],
-    result_serializer='json',
-    timezone='UTC',
-    enable_utc=True,
-)
-celery_app.finalize() # Explicitly finalize the app
-
-# --- WCHA Configuration ---
-wcha_config = {}
+# --- Flask App Setup ---
+app = flask.Flask(__name__)
 
 # --- Logging Configuration ---
 # ServiceNameFilter class
@@ -62,159 +52,21 @@ stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False # Disable propagation
+app.logger = logger
 
-# --- Idempotency Configuration ---
+# --- WCHA Configuration ---
+WCHA_SEARCH_MAX_RESULTS = int(os.getenv('WCHA_SEARCH_MAX_RESULTS', '3'))
+WCHA_REQUEST_TIMEOUT = int(os.getenv('WCHA_REQUEST_TIMEOUT', '10'))
+WCHA_USER_AGENT = os.getenv('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')
+USE_REAL_NEWS_API = os.getenv('USE_REAL_NEWS_API', 'False').lower() == 'true'
+TDA_NEWS_API_KEY = os.getenv('TDA_NEWS_API_KEY')
+TDA_NEWS_API_BASE_URL = os.getenv('TDA_NEWS_API_BASE_URL', 'https://newsapi.org/v2/')
+TDA_NEWS_API_ENDPOINT = os.getenv('TDA_NEWS_API_ENDPOINT', 'everything')
+TDA_NEWS_DEFAULT_KEYWORDS = os.getenv('TDA_NEWS_DEFAULT_KEYWORDS', 'technology,AI').split(',')
+TDA_NEWS_DEFAULT_LANGUAGE = os.getenv('TDA_NEWS_DEFAULT_LANGUAGE', 'en')
+TDA_NEWS_PAGE_SIZE = int(os.getenv('TDA_NEWS_PAGE_SIZE', '20'))
+WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION = int(os.getenv('WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION', '150'))
 IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = 300 # 5 minutes
-db_connection_pool = None
-
-def get_db_connection():
-    """Establishes and returns a database connection from the pool."""
-    global db_connection_pool
-    if db_connection_pool is None:
-        try:
-            db_connection_pool = psycopg2_pool.SimpleConnectionPool(
-                minconn=1,
-                maxconn=5, # Adjust maxconn as needed
-                user=os.getenv("POSTGRES_USER"),
-                password=os.getenv("POSTGRES_PASSWORD"),
-                host=os.getenv("POSTGRES_HOST"),
-                port=os.getenv("POSTGRES_PORT", "5432"),
-                database=os.getenv("POSTGRES_DB")
-            )
-            logger.info("Database connection pool created successfully.")
-        except (Exception, psycopg2.Error) as error:
-            logger.error(f"Error while creating PostgreSQL connection pool: {error}", exc_info=True)
-            raise # Re-raise the exception to signal failure
-
-    try:
-        return db_connection_pool.getconn()
-    except Exception as error:
-        logger.error(f"Error getting connection from pool: {error}", exc_info=True)
-        raise
-
-def release_db_connection(conn):
-    """Releases a database connection back to the pool."""
-    global db_connection_pool
-    if db_connection_pool and conn:
-        db_connection_pool.putconn(conn)
-
-def check_idempotency(db_conn, idempotency_key: str, task_name: str):
-    """Checks if a task with the given idempotency key has already been processed or is processing."""
-    log_extra = {'idempotency_key': idempotency_key, 'task_name': task_name}
-    try:
-        with db_conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
-            cursor.execute(
-                """
-                SELECT status, result_payload, locked_at, error_payload
-                FROM idempotency_keys
-                WHERE key = %s AND task_name = %s
-                """,
-                (idempotency_key, task_name)
-            )
-            record = cursor.fetchone()
-            if record:
-                logger.info(f"Idempotency record found: Status - {record['status']}", extra=log_extra)
-                if record['status'] == 'completed':
-                    return {'status': 'completed', 'result': record['result_payload']}
-                elif record['status'] == 'processing':
-                    if record['locked_at'] and (time.time() - record['locked_at'].timestamp()) < IDEMPOTENCY_LOCK_TIMEOUT_SECONDS:
-                        logger.warning("Task is already processing (lock not expired).", extra=log_extra)
-                        return {'status': 'conflict', 'message': 'Task already processing'}
-                    else:
-                        logger.warning("Task was 'processing' but lock expired or missing. Will attempt to re-acquire.", extra=log_extra)
-                        return None # Stale lock, proceed to acquire
-                elif record['status'] == 'failed':
-                     logger.warning("Previous attempt for this task failed. Will attempt to re-run.", extra=log_extra)
-                     return None # Failed, proceed to acquire lock and re-run
-            return None # No record found or status allows re-processing
-    except (Exception, psycopg2.Error) as error:
-        logger.error(f"Error checking idempotency: {error}", exc_info=True, extra=log_extra)
-        raise # Propagate error to task to handle as failure
-
-def acquire_idempotency_lock(db_conn, idempotency_key: str, task_name: str, workflow_id: Optional[str] = None):
-    """Acquires a lock for the task by inserting/updating the idempotency record."""
-    log_extra = {'idempotency_key': idempotency_key, 'task_name': task_name, 'workflow_id': workflow_id or "N/A"}
-    try:
-        with db_conn.cursor() as cursor:
-            cursor.execute(
-                """
-                INSERT INTO idempotency_keys (key, task_name, workflow_id, status, locked_at, created_at, updated_at)
-                VALUES (%s, %s, %s, 'processing', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                ON CONFLICT (key, task_name) DO UPDATE SET
-                    status = 'processing',
-                    locked_at = CURRENT_TIMESTAMP,
-                    workflow_id = EXCLUDED.workflow_id,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING id;
-                """,
-                (idempotency_key, task_name, workflow_id)
-            )
-            lock_id = cursor.fetchone()
-            db_conn.commit()
-            if lock_id:
-                logger.info("Idempotency lock acquired successfully.", extra=log_extra)
-                return True
-            else:
-                logger.error("Failed to acquire idempotency lock (no id returned).", extra=log_extra)
-                return False
-    except (Exception, psycopg2.Error) as error:
-        db_conn.rollback()
-        logger.error(f"Error acquiring idempotency lock: {error}", exc_info=True, extra=log_extra)
-        raise
-
-def update_idempotency_record(db_conn, idempotency_key: str, task_name: str, final_status: str, result_payload: Optional[dict] = None, error_payload: Optional[dict] = None):
-    """Updates the idempotency record with the final status and result/error."""
-    log_extra = {'idempotency_key': idempotency_key, 'task_name': task_name, 'final_status': final_status}
-    try:
-        with db_conn.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE idempotency_keys
-                SET status = %s, result_payload = %s, error_payload = %s, locked_at = NULL, updated_at = CURRENT_TIMESTAMP
-                WHERE key = %s AND task_name = %s
-                """,
-                (final_status, json.dumps(result_payload) if result_payload else None, json.dumps(error_payload) if error_payload else None, idempotency_key, task_name)
-            )
-            db_conn.commit()
-            logger.info("Idempotency record updated successfully.", extra=log_extra)
-    except (Exception, psycopg2.Error) as error:
-        db_conn.rollback()
-        logger.error(f"Error updating idempotency record: {error}", exc_info=True, extra=log_extra)
-        raise
-
-def load_wcha_configuration():
-    """Loads WCHA configurations from environment variables with defaults."""
-    global wcha_config
-    wcha_config['WCHA_SEARCH_MAX_RESULTS'] = int(os.getenv('WCHA_SEARCH_MAX_RESULTS', '3'))
-    wcha_config['WCHA_REQUEST_TIMEOUT'] = int(os.getenv('WCHA_REQUEST_TIMEOUT', '10'))
-    wcha_config['WCHA_USER_AGENT'] = os.getenv('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')
-    wcha_config['USE_REAL_NEWS_API'] = os.getenv('USE_REAL_NEWS_API', 'False').lower() == 'true'
-    wcha_config['TDA_NEWS_API_KEY'] = os.getenv('TDA_NEWS_API_KEY')
-    wcha_config['TDA_NEWS_API_BASE_URL'] = os.getenv('TDA_NEWS_API_BASE_URL', 'https://newsapi.org/v2/')
-    wcha_config['TDA_NEWS_API_ENDPOINT'] = os.getenv('TDA_NEWS_API_ENDPOINT', 'everything')
-    wcha_config['TDA_NEWS_DEFAULT_KEYWORDS'] = os.getenv('TDA_NEWS_DEFAULT_KEYWORDS', 'technology,AI').split(',')
-    wcha_config['TDA_NEWS_DEFAULT_LANGUAGE'] = os.getenv('TDA_NEWS_DEFAULT_LANGUAGE', 'en')
-    wcha_config['TDA_NEWS_PAGE_SIZE'] = int(os.getenv('TDA_NEWS_PAGE_SIZE', '20'))
-    wcha_config['WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION'] = int(os.getenv('WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION', '150'))
-
-    logger.info("--- WCHA Configuration ---")
-    logger.info(f"  WCHA_SEARCH_MAX_RESULTS: {wcha_config['WCHA_SEARCH_MAX_RESULTS']}")
-    logger.info(f"  WCHA_REQUEST_TIMEOUT: {wcha_config['WCHA_REQUEST_TIMEOUT']}")
-    logger.info(f"  WCHA_USER_AGENT: {wcha_config['WCHA_USER_AGENT']}")
-    logger.info(f"  USE_REAL_NEWS_API: {wcha_config['USE_REAL_NEWS_API']}")
-    logger.info("--- End WCHA Configuration ---")
-
-load_wcha_configuration()
-
-try:
-    conn = get_db_connection()
-    if conn:
-        logger.info("Successfully connected to PostgreSQL and primed the connection pool.")
-        release_db_connection(conn)
-    else:
-        logger.warning("Failed to get a DB connection to prime the pool at startup.")
-except Exception as e:
-    logger.error(f"Failed to initialize database connection pool at startup: {e}", exc_info=True)
 
 ERROR_PREFIX_HARVEST_FAILED_FETCH = "Error fetching URL"
 ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED = "WCHA: Trafilatura failed to extract content from URL"
@@ -386,8 +238,8 @@ def fetch_news_articles_task(self, request_id: str, topic: str, language: Option
     db_conn = None
     logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting task '{task_name}' for topic '{topic}'.", extra=log_extra)
     try:
-        db_conn = get_db_connection()
-        idempotency_check_result = check_idempotency(db_conn, idempotency_key, task_name)
+        db_conn = get_db_connection(service_name='wcha')
+        idempotency_check_result = check_idempotency(db_conn, idempotency_key, task_name, IDEMPOTENCY_LOCK_TIMEOUT_SECONDS, service_name='wcha')
         if idempotency_check_result:
             if idempotency_check_result['status'] == 'completed':
                 logger.info(f"Task '{task_name}' already completed. Returning stored result.", extra=log_extra)
@@ -395,31 +247,31 @@ def fetch_news_articles_task(self, request_id: str, topic: str, language: Option
             elif idempotency_check_result['status'] == 'conflict':
                 logger.warning(f"Task '{task_name}' conflict: {idempotency_check_result['message']}.", extra=log_extra)
                 return {"status": "conflict", "message": idempotency_check_result['message']}
-        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, log_extra['workflow_id']):
+        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, log_extra['workflow_id'], service_name='wcha'):
             logger.error(f"Failed to acquire idempotency lock for task '{task_name}'. Aborting.", extra=log_extra)
             return {"status": "error", "message": "Failed to acquire idempotency lock."}
         logger.info(f"Celery Task {self.request.id}: Lock acquired. Fetching news for topic '{topic}'.", extra=log_extra)
-        if not wcha_config.get("USE_REAL_NEWS_API"):
+        if not USE_REAL_NEWS_API:
             logger.info(f"Celery Task {self.request.id}: USE_REAL_NEWS_API is false. Returning mock success.", extra=log_extra)
             result = {"status": "success_mock", "articles": [], "message": "News API is not enabled; mock response."}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
             return result
-        if not wcha_config.get("TDA_NEWS_API_KEY"):
+        if not TDA_NEWS_API_KEY:
             logger.error(f"Celery Task {self.request.id}: TDA_NEWS_API_KEY not configured.", extra=log_extra)
             error_payload = {"error_type": "ConfigurationError", "message": "TDA_NEWS_API_KEY not configured."}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
             raise ValueError("NewsAPI key not configured.")
-        base_url = wcha_config.get("TDA_NEWS_API_BASE_URL", "https://newsapi.org/v2/")
-        endpoint = wcha_config.get("TDA_NEWS_API_ENDPOINT", "everything")
+        base_url = TDA_NEWS_API_BASE_URL
+        endpoint = TDA_NEWS_API_ENDPOINT
         api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
         params = {}
-        query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else wcha_config.get("TDA_NEWS_DEFAULT_KEYWORDS", [])
+        query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else TDA_NEWS_DEFAULT_KEYWORDS
         if query_keywords_list: params["q"] = " OR ".join(query_keywords_list)
-        current_language = language if language else wcha_config.get("TDA_NEWS_DEFAULT_LANGUAGE", "en")
+        current_language = language if language else TDA_NEWS_DEFAULT_LANGUAGE
         if current_language: params["language"] = current_language
-        params["pageSize"] = max_results if max_results else wcha_config.get("TDA_NEWS_PAGE_SIZE", 25)
-        headers = {"X-Api-Key": wcha_config["TDA_NEWS_API_KEY"], "User-Agent": wcha_config.get("WCHA_USER_AGENT", "AethercastContentHarvester/0.2")}
-        request_timeout = wcha_config.get("WCHA_REQUEST_TIMEOUT", 15)
+        params["pageSize"] = max_results if max_results else TDA_NEWS_PAGE_SIZE
+        headers = {"X-Api-Key": TDA_NEWS_API_KEY, "User-Agent": WCHA_USER_AGENT}
+        request_timeout = WCHA_REQUEST_TIMEOUT
         logger.info(f"Celery Task {self.request.id}: Calling NewsAPI: URL={api_url}, Params={params}", extra=log_extra)
         response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
         response.raise_for_status()
@@ -428,29 +280,29 @@ def fetch_news_articles_task(self, request_id: str, topic: str, language: Option
             error_msg = f"NewsAPI returned error: {response_json.get('message', 'Unknown NewsAPI error')}"
             logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
             error_payload = {"error_type": "NewsAPIError", "message": error_msg, "details": response_json}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
             raise requests.exceptions.HTTPError(error_msg, response=response)
         articles = response_json.get("articles", [])
         logger.info(f"Celery Task {self.request.id}: Fetched {len(articles)} articles.", extra=log_extra)
         result = {"status": "success", "articles": articles, "message": f"Fetched {len(articles)} articles."}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result)
+        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
         return result
     except requests.exceptions.RequestException as e_req:
         error_msg = f"NewsAPI request error: {e_req}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
         if db_conn:
             error_payload = {"error_type": type(e_req).__name__, "message": str(e_req)}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
         raise self.retry(exc=e_req, countdown=60, max_retries=3)
     except Exception as e_unexp:
         error_msg = f"Unexpected error fetching news: {e_unexp}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
         if db_conn:
             error_payload = {"error_type": type(e_unexp).__name__, "message": str(e_unexp)}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
         raise self.retry(exc=e_unexp, countdown=60, max_retries=1)
     finally:
-        if db_conn: release_db_connection(db_conn)
+        if db_conn: release_db_connection(db_conn, service_name='wcha')
 
 @celery_app.task(bind=True, name='harvest_url_content_task')
 def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_length: int = 150):
@@ -460,8 +312,8 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
     db_conn = None
     logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting task '{task_name}' for URL: {url_to_harvest}", extra=log_extra)
     try:
-        db_conn = get_db_connection()
-        idempotency_check_result = check_idempotency(db_conn, idempotency_key, task_name)
+        db_conn = get_db_connection(service_name='wcha')
+        idempotency_check_result = check_idempotency(db_conn, idempotency_key, task_name, IDEMPOTENCY_LOCK_TIMEOUT_SECONDS, service_name='wcha')
         if idempotency_check_result:
             if idempotency_check_result['status'] == 'completed':
                 logger.info(f"Task '{task_name}' already completed. Returning stored result.", extra=log_extra)
@@ -469,7 +321,7 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
             elif idempotency_check_result['status'] == 'conflict':
                 logger.warning(f"Task '{task_name}' conflict: {idempotency_check_result['message']}.", extra=log_extra)
                 return {"status": "conflict", "url": url_to_harvest, "message": idempotency_check_result['message']}
-        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, log_extra['workflow_id']):
+        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, log_extra['workflow_id'], service_name='wcha'):
             logger.error(f"Failed to acquire idempotency lock for task '{task_name}'. Aborting.", extra=log_extra)
             return {"status": "error", "url": url_to_harvest, "message": "Failed to acquire idempotency lock."}
         logger.info(f"Celery Task {self.request.id}: Lock acquired. Starting content harvest for URL: {url_to_harvest}", extra=log_extra)
@@ -477,21 +329,21 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
         if not is_safe:
             logger.warning(f"Celery Task {self.request.id}: URL '{url_to_harvest}' is not safe: {reason}. Skipping harvest.", extra=log_extra)
             result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
             return result
-        request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
-        headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
+        request_timeout = WCHA_REQUEST_TIMEOUT
+        headers = {'User-Agent': WCHA_USER_AGENT}
         if not _IMPORTS_SUCCESSFUL_REQUESTS:
             error_msg = f"Required library missing: requests ({_MISSING_IMPORT_ERROR_REQUESTS})"
             logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
             error_payload = {"error_type": "ImportError", "message": error_msg}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
             raise ImportError(error_msg)
         if not _IMPORTS_SUCCESSFUL_TRAFILATURA:
             error_msg = f"Required library missing: trafilatura ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
             logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
             error_payload = {"error_type": "ImportError", "message": error_msg}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
             raise ImportError(error_msg)
         logger.info(f"Celery Task {self.request.id}: Attempting to harvest content from URL: {url_to_harvest} using Trafilatura", extra=log_extra)
         response = requests.get(url_to_harvest, headers=headers, timeout=request_timeout, allow_redirects=False)
@@ -510,24 +362,24 @@ def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_len
         else:
             logger.warning(f"Celery Task {self.request.id}: Trafilatura extracted no content from URL: {url_to_harvest}.", extra=log_extra)
             result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result)
+        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
         return result
     except requests.exceptions.RequestException as e_req:
         error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url_to_harvest}': {e_req}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
         if db_conn:
             error_payload = {"error_type": type(e_req).__name__, "message": str(e_req), "url": url_to_harvest}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
         raise self.retry(exc=e_req, countdown=60, max_retries=3)
     except Exception as e_gen:
         error_msg = f"General error during harvest for '{url_to_harvest}': {type(e_gen).__name__} - {e_gen}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
         if db_conn:
             error_payload = {"error_type": type(e_gen).__name__, "message": str(e_gen), "url": url_to_harvest}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload)
+            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
         raise self.retry(exc=e_gen, countdown=60, max_retries=1)
     finally:
-        if db_conn: release_db_connection(db_conn)
+        if db_conn: release_db_connection(db_conn, service_name='wcha')
 
 def harvest_from_url(url: str, min_length: int = 150, **kwargs) -> dict:
     local_task_id = kwargs.pop('task_id', f"harvest_sync_{uuid.uuid4().hex[:8]}")
@@ -536,8 +388,8 @@ def harvest_from_url(url: str, min_length: int = 150, **kwargs) -> dict:
     safe, reason = is_url_safe(url, task_id=local_task_id, workflow_id=local_workflow_id)
     if not safe:
         return {"url": url, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
-    request_timeout = wcha_config.get('WCHA_REQUEST_TIMEOUT', 10)
-    headers = {'User-Agent': wcha_config.get('WCHA_USER_AGENT', 'AethercastContentHarvester/0.2')}
+    request_timeout = WCHA_REQUEST_TIMEOUT
+    headers = {'User-Agent': WCHA_USER_AGENT}
     if not _IMPORTS_SUCCESSFUL_REQUESTS:
         error_msg = f"Required library missing: requests ({_MISSING_IMPORT_ERROR_REQUESTS})"
         logger.error(f"[WCHA_LOGIC_WEB_SYNC] {error_msg}", extra=log_extra_sync)
@@ -587,16 +439,16 @@ def get_content_for_topic(topic: str, max_results_override: Optional[int] = None
         error_msg = f"{ERROR_WCHA_LIB_MISSING} {MISSING_IMPORT_ERROR}"
         logger.error(error_msg, extra=log_extra)
         return {"status": "failure_dependency", "content": None, "source_urls": [], "message": error_msg, "task_id": None}
-    if wcha_config.get("USE_REAL_NEWS_API"):
+    if USE_REAL_NEWS_API:
         logger.info(f"[WCHA_GET_CONTENT] Using REAL NewsAPI for topic: '{topic}'. Dispatching Celery task.", extra=log_extra)
         task = fetch_news_articles_task.delay(
-            request_id=request_id, topic=topic, language=wcha_config.get("TDA_NEWS_DEFAULT_LANGUAGE", "en"),
-            max_results=(max_results_override if max_results_override is not None else wcha_config.get('WCHA_SEARCH_MAX_RESULTS', 3))
+            request_id=request_id, topic=topic, language=TDA_NEWS_DEFAULT_LANGUAGE,
+            max_results=(max_results_override if max_results_override is not None else WCHA_SEARCH_MAX_RESULTS)
         )
         logger.info(f"[WCHA_GET_CONTENT] Dispatched NewsAPI fetch task {task.id} for topic '{topic}'.", extra=log_extra)
         return {"status": "pending_news_api", "task_id": task.id, "message": "News article fetching initiated.", "source_urls": [], "content": None}
     if max_results_override is not None: actual_max_search_results = max_results_override
-    else: actual_max_search_results = wcha_config.get('WCHA_SEARCH_MAX_RESULTS', 3)
+    else: actual_max_search_results = WCHA_SEARCH_MAX_RESULTS
     logger.info(f"[WCHA_SEARCH_HARVEST] Starting content search and harvest for topic: '{topic}' (max_results: {actual_max_search_results})", extra=log_extra)
     search_urls = []
     try:
@@ -617,7 +469,7 @@ def get_content_for_topic(topic: str, max_results_override: Optional[int] = None
     all_harvested_content_parts = []
     successfully_harvested_urls = []
     failed_harvest_details = []
-    min_content_length_for_aggregation = wcha_config.get('WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION', 150)
+    min_content_length_for_aggregation = WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION
     for i, url in enumerate(search_urls):
         logger.info(f"[WCHA_SEARCH_HARVEST] Attempting to harvest from URL ({i+1}/{len(search_urls)}): {url}", extra=log_extra)
         harvest_result = harvest_from_url(url, min_length=min_content_length_for_aggregation, task_id=request_id, workflow_id=log_extra['workflow_id'])
@@ -650,91 +502,86 @@ def get_content_for_topic(topic: str, max_results_override: Optional[int] = None
     logger.info("WCHA metric", extra={'metric_name': 'wcha_topic_harvest_success_count', 'value': 1, 'tags': {'topic': topic, 'successful_urls': len(successfully_harvested_urls), 'total_urls_tried': len(search_urls), 'content_length': len(final_content)}, **log_extra})
     return {"status": "success", "content": final_content, "source_urls": successfully_harvested_urls, "message": success_message}
 
-try:
-    import flask
-    app = flask.Flask(__name__) 
-    @app.route("/harvest", methods=["POST"])
-    def harvest_api_endpoint():
-        api_request_id = f"wcha_api_req_{uuid.uuid4().hex[:8]}"
-        log_extra_api = {'task_id': api_request_id, 'workflow_id': 'N/A'}
+@app.route("/harvest", methods=["POST"])
+def harvest_api_endpoint():
+    api_request_id = f"wcha_api_req_{uuid.uuid4().hex[:8]}"
+    log_extra_api = {'task_id': api_request_id, 'workflow_id': 'N/A'}
+    try:
         try:
-            try:
-                request_data = flask.request.get_json()
-                if not request_data:
-                    logger.warning("[WCHA_API] Received empty or non-JSON payload for /harvest.", extra=log_extra_api)
-                    return flask.jsonify({"error_code": "WCHA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
-            except Exception as e_json_decode:
-                logger.warning(f"[WCHA_API] Failed to decode JSON payload for /harvest: {e_json_decode}", exc_info=True, extra=log_extra_api)
-                return flask.jsonify({"error_code": "WCHA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
-            topic = request_data.get("topic")
-            url_to_harvest = request_data.get("url")
-            use_search = request_data.get("use_search", False)
-            max_results_override = request_data.get("max_results")
-            min_length_override = request_data.get("min_length")
-            if use_search and topic:
-                logger.info(f"[WCHA_API] Received API request to search and harvest for topic: '{topic}'", extra=log_extra_api)
-                harvest_params_for_search = {}
-                if max_results_override is not None:
-                    try: harvest_params_for_search["max_results_override"] = int(max_results_override)
-                    except ValueError: logger.warning(f"[WCHA_API] Invalid max_results value '{max_results_override}'. Using default.", extra=log_extra_api)
-                result_dict_or_task = get_content_for_topic(topic, task_id=api_request_id, workflow_id='N/A', **harvest_params_for_search)
-                if result_dict_or_task.get("status") == "pending_news_api":
-                    logger.info(f"[WCHA_API] NewsAPI task {result_dict_or_task['task_id']} dispatched for topic '{topic}'.", extra=log_extra_api)
-                    return flask.jsonify({"task_id": result_dict_or_task['task_id'], "status_url": f"/v1/tasks/{result_dict_or_task['task_id']}", "message": "News article fetching initiated. Poll task ID for results. Then, optionally re-call /harvest with specific article URLs if needed."}), 202
-                else:
-                    status_code = 500
-                    if result_dict_or_task["status"] == "success": status_code = 200
-                    elif result_dict_or_task["message"].startswith(ERROR_WCHA_LIB_MISSING): status_code = 503
-                    elif result_dict_or_task["message"].startswith(ERROR_WCHA_NO_SEARCH_RESULTS): status_code = 404
-                    elif result_dict_or_task["message"].startswith(ERROR_WCHA_SEARCH_FAILED): status_code = 502
-                    return flask.jsonify(result_dict_or_task), status_code
-            elif url_to_harvest:
-                logger.info(f"[WCHA_API] Received API request for async direct URL harvest: '{url_to_harvest}'", extra=log_extra_api)
-                safe, reason = is_url_safe(url_to_harvest, task_id=api_request_id, workflow_id='N/A')
-                if not safe:
-                    return flask.jsonify({"error_code": WCHA_ERROR_TYPE_SSRF_BLOCKED, "message": reason, "url": url_to_harvest}), 400
-                min_length_val = 150
-                if min_length_override is not None:
-                    try: min_length_val = int(min_length_override)
-                    except ValueError: logger.warning(f"Invalid min_length override: {min_length_override}, using default {min_length_val}.", extra=log_extra_api)
-                celery_task_request_id = f"wcha_harvest_direct_{uuid.uuid4().hex[:8]}"
-                task = harvest_url_content_task.delay(request_id=celery_task_request_id, url_to_harvest=url_to_harvest, min_length=min_length_val)
-                logger.info(f"[WCHA_API] Dispatched harvest task {task.id} for URL: {url_to_harvest} (Celery task request_id: {celery_task_request_id})", extra=log_extra_api)
-                return flask.jsonify({"task_id": task.id, "status_url": f"/v1/tasks/{task.id}", "message": "Harvest task accepted."}), 202
-            elif topic:
-                logger.info(f"[WCHA_API] Received API request for mock topic (no use_search or url): '{topic}'", extra=log_extra_api)
-                content_result_mock_str = harvest_content(topic, task_id=api_request_id, workflow_id='N/A')
-                if content_result_mock_str.startswith("No pre-defined content found"):
-                    return flask.jsonify({"status": "success", "content": None, "source_urls": ["mock_data_source"], "message": content_result_mock_str }), 200
-                return flask.jsonify({"status": "success", "content": content_result_mock_str, "source_urls": ["mock_data_source"], "message": f"Mock content provided for topic: {topic}"}), 200
+            request_data = flask.request.get_json()
+            if not request_data:
+                logger.warning("[WCHA_API] Received empty or non-JSON payload for /harvest.", extra=log_extra_api)
+                return flask.jsonify({"error_code": "WCHA_INVALID_PAYLOAD", "message": "Invalid or empty JSON payload.", "details": "Request body must be a valid non-empty JSON object."}), 400
+        except Exception as e_json_decode:
+            logger.warning(f"[WCHA_API] Failed to decode JSON payload for /harvest: {e_json_decode}", exc_info=True, extra=log_extra_api)
+            return flask.jsonify({"error_code": "WCHA_MALFORMED_JSON", "message": "Malformed JSON payload.", "details": str(e_json_decode)}), 400
+        topic = request_data.get("topic")
+        url_to_harvest = request_data.get("url")
+        use_search = request_data.get("use_search", False)
+        max_results_override = request_data.get("max_results")
+        min_length_override = request_data.get("min_length")
+        if use_search and topic:
+            logger.info(f"[WCHA_API] Received API request to search and harvest for topic: '{topic}'", extra=log_extra_api)
+            harvest_params_for_search = {}
+            if max_results_override is not None:
+                try: harvest_params_for_search["max_results_override"] = int(max_results_override)
+                except ValueError: logger.warning(f"[WCHA_API] Invalid max_results value '{max_results_override}'. Using default.", extra=log_extra_api)
+            result_dict_or_task = get_content_for_topic(topic, task_id=api_request_id, workflow_id='N/A', **harvest_params_for_search)
+            if result_dict_or_task.get("status") == "pending_news_api":
+                logger.info(f"[WCHA_API] NewsAPI task {result_dict_or_task['task_id']} dispatched for topic '{topic}'.", extra=log_extra_api)
+                return flask.jsonify({"task_id": result_dict_or_task['task_id'], "status_url": f"/v1/tasks/{result_dict_or_task['task_id']}", "message": "News article fetching initiated. Poll task ID for results. Then, optionally re-call /harvest with specific article URLs if needed."}), 202
             else:
-                logger.warning("[WCHA_API] Invalid API request. 'url' or 'topic' (with use_search=true for web search, or alone for mock) must be provided.", extra=log_extra_api)
-                return flask.jsonify({"error_code": "WCHA_MISSING_PARAMETERS", "message": "Invalid input", "details": "'topic' (with use_search=true) or 'url' must be provided."}), 400
-        except Exception as e:
-            logger.error(f"Unexpected error in /harvest endpoint: {e}", exc_info=True, extra=log_extra_api)
-            return flask.jsonify({"error_code": "WCHA_INTERNAL_SERVER_ERROR", "message": "Internal server error", "details": str(e)}), 500
-
-    @app.route('/v1/tasks/<task_id>', methods=['GET'])
-    def get_task_status(task_id: str):
-        log_extra_status = {'task_id': task_id, 'workflow_id': 'N/A'}
-        logger.info(f"Received request for WCHA task status: {task_id}", extra=log_extra_status)
-        task_result = AsyncResult(task_id, app=celery_app)
-        response_data = {"task_id": task_id, "status": task_result.status, "result": None}
-        if task_result.successful():
-            response_data["result"] = task_result.result
-            return flask.jsonify(response_data), 200
-        elif task_result.failed():
-            error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
-            response_data["result"] = error_info
-            logger.warning(f"Task {task_id} failed. Info: {task_result.info}", extra=log_extra_status)
-            return flask.jsonify(response_data), 500
+                status_code = 500
+                if result_dict_or_task["status"] == "success": status_code = 200
+                elif result_dict_or_task["message"].startswith(ERROR_WCHA_LIB_MISSING): status_code = 503
+                elif result_dict_or_task["message"].startswith(ERROR_WCHA_NO_SEARCH_RESULTS): status_code = 404
+                elif result_dict_or_task["message"].startswith(ERROR_WCHA_SEARCH_FAILED): status_code = 502
+                return flask.jsonify(result_dict_or_task), status_code
+        elif url_to_harvest:
+            logger.info(f"[WCHA_API] Received API request for async direct URL harvest: '{url_to_harvest}'", extra=log_extra_api)
+            safe, reason = is_url_safe(url_to_harvest, task_id=api_request_id, workflow_id='N/A')
+            if not safe:
+                return flask.jsonify({"error_code": WCHA_ERROR_TYPE_SSRF_BLOCKED, "message": reason, "url": url_to_harvest}), 400
+            min_length_val = 150
+            if min_length_override is not None:
+                try: min_length_val = int(min_length_override)
+                except ValueError: logger.warning(f"Invalid min_length override: {min_length_override}, using default {min_length_val}.", extra=log_extra_api)
+            celery_task_request_id = f"wcha_harvest_direct_{uuid.uuid4().hex[:8]}"
+            task = harvest_url_content_task.delay(request_id=celery_task_request_id, url_to_harvest=url_to_harvest, min_length=min_length_val)
+            logger.info(f"[WCHA_API] Dispatched harvest task {task.id} for URL: {url_to_harvest} (Celery task request_id: {celery_task_request_id})", extra=log_extra_api)
+            return flask.jsonify({"task_id": task.id, "status_url": f"/v1/tasks/{task.id}", "message": "Harvest task accepted."}), 202
+        elif topic:
+            logger.info(f"[WCHA_API] Received API request for mock topic (no use_search or url): '{topic}'", extra=log_extra_api)
+            content_result_mock_str = harvest_content(topic, task_id=api_request_id, workflow_id='N/A')
+            if content_result_mock_str.startswith("No pre-defined content found"):
+                return flask.jsonify({"status": "success", "content": None, "source_urls": ["mock_data_source"], "message": content_result_mock_str }), 200
+            return flask.jsonify({"status": "success", "content": content_result_mock_str, "source_urls": ["mock_data_source"], "message": f"Mock content provided for topic: {topic}"}), 200
         else:
-            return flask.jsonify(response_data), 202
-except ImportError:
-    app = None
-    logger.info("Flask not installed. API endpoint /harvest will not be available.")
+            logger.warning("[WCHA_API] Invalid API request. 'url' or 'topic' (with use_search=true for web search, or alone for mock) must be provided.", extra=log_extra_api)
+            return flask.jsonify({"error_code": "WCHA_MISSING_PARAMETERS", "message": "Invalid input", "details": "'topic' (with use_search=true) or 'url' must be provided."}), 400
+    except Exception as e:
+        logger.error(f"Unexpected error in /harvest endpoint: {e}", exc_info=True, extra=log_extra_api)
+        return flask.jsonify({"error_code": "WCHA_INTERNAL_SERVER_ERROR", "message": "Internal server error", "details": str(e)}), 500
+
+@app.route('/v1/tasks/<task_id>', methods=['GET'])
+def get_task_status(task_id: str):
+    log_extra_status = {'task_id': task_id, 'workflow_id': 'N/A'}
+    logger.info(f"Received request for WCHA task status: {task_id}", extra=log_extra_status)
+    task_result = AsyncResult(task_id, app=celery_app)
+    response_data = {"task_id": task_id, "status": task_result.status, "result": None}
+    if task_result.successful():
+        response_data["result"] = task_result.result
+        return flask.jsonify(response_data), 200
+    elif task_result.failed():
+        error_info = {"error": {"type": "task_failed", "message": str(task_result.info)}}
+        response_data["result"] = error_info
+        logger.warning(f"Task {task_id} failed. Info: {task_result.info}", extra=log_extra_status)
+        return flask.jsonify(response_data), 500
+    else:
+        return flask.jsonify(response_data), 202
 
 if __name__ == "__main__":
+    init_db_connection_pool(service_name='wcha')
     print("--- Testing WCHA Functionality ---")
     if not IMPORTS_SUCCESSFUL:
         logger.warning(f"Some required libraries are missing: {MISSING_IMPORT_ERROR}. Functionality will be limited.")

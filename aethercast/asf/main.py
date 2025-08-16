@@ -46,46 +46,21 @@ setup_json_logging(app)
 logger = app.logger
 
 # --- ASF Configuration ---
-asf_config = {}
+ASF_SECRET_KEY = os.getenv('ASF_SECRET_KEY', str(uuid.uuid4()))
+ASF_CORS_ALLOWED_ORIGINS = os.getenv('ASF_CORS_ALLOWED_ORIGINS', '*')
+ASF_CHUNK_SIZE = int(os.getenv('ASF_CHUNK_SIZE', '4096'))
+ASF_STREAM_SLEEP_INTERVAL = float(os.getenv('ASF_STREAM_SLEEP_INTERVAL', '0.01'))
+ASF_UI_UPDATES_NAMESPACE = os.getenv('ASF_UI_UPDATES_NAMESPACE', '/ui_updates')
+INTERNAL_API_GW_BASE_URL = os.getenv('INTERNAL_API_GW_BASE_URL', 'http://api_gateway:5001')
+ASF_HOST = os.getenv("ASF_HOST", '0.0.0.0')
+ASF_PORT = int(os.getenv("ASF_PORT", 5006))
+FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
+if not os.getenv('ASF_SECRET_KEY'):
+    logger.warning(f"Using default generated ASF_SECRET_KEY. Please set a persistent secret key for production.")
+if not os.getenv('INTERNAL_API_GW_BASE_URL'):
+    logger.info(f"INTERNAL_API_GW_BASE_URL not set, using default: {INTERNAL_API_GW_BASE_URL}")
 
-def load_asf_configuration():
-    """Loads ASF configurations from environment variables with defaults."""
-    global asf_config
-    default_secret = str(uuid.uuid4())
-    asf_config['ASF_SECRET_KEY'] = os.getenv('ASF_SECRET_KEY', default_secret)
-    if asf_config['ASF_SECRET_KEY'] == default_secret and not os.getenv('ASF_SECRET_KEY'): # Log only if not explicitly set
-        logger.warning(f"Using default generated ASF_SECRET_KEY. Please set a persistent secret key for production.")
-
-    asf_config['ASF_CORS_ALLOWED_ORIGINS'] = os.getenv('ASF_CORS_ALLOWED_ORIGINS', '*')
-    asf_config['ASF_CHUNK_SIZE'] = int(os.getenv('ASF_CHUNK_SIZE', '4096'))
-    asf_config['ASF_STREAM_SLEEP_INTERVAL'] = float(os.getenv('ASF_STREAM_SLEEP_INTERVAL', '0.01'))
-    asf_config['ASF_UI_UPDATES_NAMESPACE'] = os.getenv('ASF_UI_UPDATES_NAMESPACE', '/ui_updates')
-
-    # New configuration for internal API Gateway URL
-    asf_config['INTERNAL_API_GW_BASE_URL'] = os.getenv('INTERNAL_API_GW_BASE_URL', 'http://api_gateway:5001')
-    if not os.getenv('INTERNAL_API_GW_BASE_URL'): # Log if using default because it wasn't set
-        logger.info(f"INTERNAL_API_GW_BASE_URL not set, using default: {asf_config['INTERNAL_API_GW_BASE_URL']}")
-
-
-    asf_config['ASF_HOST'] = os.getenv("ASF_HOST", '0.0.0.0')
-    asf_config['ASF_PORT'] = int(os.getenv("ASF_PORT", 5006))
-    # ASF_DEBUG_MODE is removed, FLASK_DEBUG will be read directly where needed.
-
-    # Adjust logger level based on FLASK_DEBUG mode
-    flask_debug_mode = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
-    logger.setLevel(logging.DEBUG if flask_debug_mode else logging.INFO)
-
-
-    logger.info("--- ASF Configuration ---")
-    for key, value in asf_config.items():
-        if "SECRET_KEY" in key and value and len(value) > 4:
-            logger.info(f"  {key}: {'*' * (len(value) - 4) + value[-4:]}")
-        else:
-            logger.info(f"  {key}: {value}")
-    logger.info("--- End ASF Configuration ---")
-
-# Load configuration at startup
-load_asf_configuration()
+logger.setLevel(logging.DEBUG if FLASK_DEBUG else logging.INFO)
 
 # --- Constants ---
 AUDIO_EVENT_CONNECT_ACK = 'connection_ack'
@@ -103,18 +78,8 @@ UI_EVENT_SUBSCRIBED = 'subscribed_ui_updates'
 
 # --- Flask App and SocketIO Setup ---
 # app is initialized earlier for logging
-app.config['SECRET_KEY'] = asf_config['ASF_SECRET_KEY']
-socketio = SocketIO(app, cors_allowed_origins=asf_config['ASF_CORS_ALLOWED_ORIGINS'], logger=True, engineio_logger=True)
-# Explicitly set SocketIO loggers to use app.logger's level and handlers if desired,
-# or they might log to stderr with their own format.
-# For now, focusing on app.logger for Flask routes and our direct logs.
-# If socketio/engineio logs become noisy or unformatted, address them:
-# logging.getLogger('socketio').setLevel(logging.INFO if not asf_config['ASF_DEBUG_MODE'] else logging.DEBUG)
-# logging.getLogger('engineio').setLevel(logging.INFO if not asf_config['ASF_DEBUG_MODE'] else logging.DEBUG)
-# For them to use JSON format, they'd need their handlers replaced too.
-# This is out of scope for the current subtask if app.logger itself is JSON.
-
-ASF_UI_UPDATES_NAMESPACE = asf_config['ASF_UI_UPDATES_NAMESPACE'] # Set from loaded config
+app.config['SECRET_KEY'] = ASF_SECRET_KEY
+socketio = SocketIO(app, cors_allowed_origins=ASF_CORS_ALLOWED_ORIGINS, logger=True, engineio_logger=True)
 
 # --- Global Data Structures ---
 stream_id_to_filepath_map = {} # Stores mapping from stream_id to GCS URI or local path
@@ -153,80 +118,13 @@ def handle_join_stream(data):
     logger.info(f"ASF: Starting audio stream for {stream_id} from GCS URI: {gcs_uri}")
     logger.info("ASF audio stream started", extra=dict(metric_name="asf_audio_stream_started_count", value=1, tags={"stream_id_prefix": stream_id_prefix_tag}))
 
-
-    chunk_size = asf_config.get('ASF_CHUNK_SIZE', 4096)
-    stream_sleep_interval = asf_config.get('ASF_STREAM_SLEEP_INTERVAL', 0.01)
+    chunk_size = ASF_CHUNK_SIZE
+    stream_sleep_interval = ASF_STREAM_SLEEP_INTERVAL
     signed_url_from_api_gw = None
 
     # --- New Logic to get Signed URL ---
     if gcs_uri.startswith("gs://"):
-        # try:
-            # # Ensure filepath (gcs_uri) is URL-encoded for the query parameter if it could contain special chars
-            # # For gs://bucket/object URIs, this is usually not an issue, but good practice for arbitrary strings.
-            # # from urllib.parse import quote_plus
-            # # encoded_gcs_uri = quote_plus(gcs_uri)
-            # # However, requests usually handles URL encoding for query parameters.
-            #
-            # signed_url_fetch_endpoint = f"{asf_config['INTERNAL_API_GW_BASE_URL']}/api/v1/internal/media_access_url"
-            # params = {'gcs_uri': gcs_uri}
-            #
-            # logger.debug(f"ASF: Requesting signed URL for GCS URI '{gcs_uri}' from endpoint: {signed_url_fetch_endpoint}")
-
-            # signed_url_fetch_start_time = time.time() # Initialize before try block
-            # try:
         pass # Minimal if block
-            #     response = requests.get(signed_url_fetch_endpoint, params=params, timeout=5)
-            #     response.raise_for_status()
-            #     response_data = response.json()
-            #     signed_url_from_api_gw = response_data.get("signed_url")
-            #     # Calculate duration immediately after successful call, if needed here,
-            #     # or rely on calculation within except blocks based on the pre-try start_time
-            #     # For now, let's keep it simple and ensure start_time is always available.
-            #     # signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-            #     # logger.info("ASF signed URL fetch processed", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-            #
-            #
-            #     if not signed_url_from_api_gw:
-            #         logger.error(f"ASF: API Gateway did not return a signed_url for GCS URI {gcs_uri} (stream {stream_id}). Response: {response_data}")
-            #         logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "no_url_in_response"}))
-            #         emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to obtain secure access for audio stream.'}, room=stream_id)
-            #         return
-            #     logger.info(f"ASF: Successfully obtained signed URL for GCS URI {gcs_uri} (stream {stream_id}).")
-            #
-            # except requests.exceptions.Timeout:
-            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-            #     logger.info(f"ASF signed URL fetch processed (timeout) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-            #     logger.error(f"ASF: Timeout requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}).")
-            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "timeout"}))
-            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal timeout.'}, room=stream_id)
-            #     return
-            # except requests.exceptions.HTTPError as e_http:
-            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-            #     logger.info(f"ASF signed URL fetch processed (http_error_{e_http.response.status_code}) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-            #     logger.error(f"ASF: HTTP error {e_http.response.status_code} requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}). Response: {e_http.response.text}")
-            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": f"http_error_{e_http.response.status_code}"}))
-            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream due to internal error.'}, room=stream_id)
-            #     return
-            # except requests.exceptions.RequestException as e_req:
-            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-            #     logger.info(f"ASF signed URL fetch processed (request_exception) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-            #     logger.error(f"ASF: Error requesting signed URL from API Gateway for GCS URI {gcs_uri} (stream {stream_id}): {e_req}", exc_info=True)
-            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "request_exception"}))
-            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Failed to prepare audio stream.'}, room=stream_id)
-            #     return
-            # except json.JSONDecodeError:
-            #     signed_url_fetch_duration_ms = (time.time() - signed_url_fetch_start_time) * 1000
-            #     logger.info(f"ASF signed URL fetch processed (json_decode_error) - duration: {signed_url_fetch_duration_ms:.2f}ms", extra=dict(metric_name="asf_signed_url_fetch_latency_ms", value=round(signed_url_fetch_duration_ms, 2)))
-            #     logger.error(f"ASF: Failed to decode JSON response from API Gateway when fetching signed URL for GCS URI {gcs_uri} (stream {stream_id}). Response: {response.text if 'response' in locals() else 'N/A'}")
-            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "json_decode_error"}))
-            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Invalid response from internal service preparing audio stream.'}, room=stream_id)
-            #     return
-            # except Exception as e_general: # Catch any other unexpected error from the try block
-            #     logger.error(f"ASF: Unexpected error while trying to get signed URL for GCS URI {gcs_uri} (stream {stream_id}): {e_general}", exc_info=True)
-            #     logger.error("ASF signed URL fetch failure", extra=dict(metric_name="asf_signed_url_fetch_failure_count", value=1, tags={"reason": "unexpected_exception_in_get_url"}))
-            #     emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Unexpected error preparing audio stream.'}, room=stream_id)
-            #     return
-        # pass # Explicitly pass after the try-except block within the if
     else:
         logger.warning(f"ASF: Filepath for stream {stream_id} is not a GCS URI: '{gcs_uri}'. Attempting local streaming.")
         if not os.path.exists(gcs_uri):
@@ -247,8 +145,6 @@ def handle_join_stream(data):
                 emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Internal error preparing audio stream (failed to get secure URL).'}, room=stream_id)
                 return
 
-            # The original safeguard check below is now somewhat redundant if the above check is comprehensive,
-            # but it doesn't hurt to keep it as a final defense if signed_url_from_api_gw was manipulated unexpectedly post-check.
             if not signed_url_from_api_gw: # Should have been caught above, but as a safeguard
                 logger.error(f"ASF: Critical error - signed URL is None before attempting GCS stream for {stream_id}.")
                 emit(AUDIO_EVENT_STREAM_ERROR, {'message': 'Internal error preparing stream.'}, room=stream_id)
@@ -307,25 +203,22 @@ def handle_disconnect():
 def health_check():
     # Check connectivity to API Gateway for signed URLs if INTERNAL_API_GW_BASE_URL is set
     api_gw_status = "Not configured or not checked."
-    if asf_config.get('INTERNAL_API_GW_BASE_URL'):
+    if INTERNAL_API_GW_BASE_URL:
         try:
-            # Check if the base URL is reachable, maybe a specific health endpoint on API GW if available
-            # For now, just checking the base URL with a timeout.
-            # This doesn't guarantee the /api/v1/internal/media_access_url endpoint itself is working.
-            health_url = f"{asf_config['INTERNAL_API_GW_BASE_URL']}/health" # Assuming API GW has a health endpoint
+            health_url = f"{INTERNAL_API_GW_BASE_URL}/health" # Assuming API GW has a health endpoint
             response = requests.get(health_url, timeout=2)
             if response.status_code == 200:
-                api_gw_status = f"Successfully connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']} (HTTP {response.status_code})."
+                api_gw_status = f"Successfully connected to API Gateway at {INTERNAL_API_GW_BASE_URL} (HTTP {response.status_code})."
             else:
-                api_gw_status = f"Connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}, but got HTTP {response.status_code}."
+                api_gw_status = f"Connected to API Gateway at {INTERNAL_API_GW_BASE_URL}, but got HTTP {response.status_code}."
         except requests.exceptions.ConnectionError:
-            api_gw_status = f"Failed to connect to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']} (Connection Error)."
+            api_gw_status = f"Failed to connect to API Gateway at {INTERNAL_API_GW_BASE_URL} (Connection Error)."
             logger.warning(f"ASF Health Check: Connection error while checking API Gateway health at {health_url}.")
         except requests.exceptions.Timeout:
-            api_gw_status = f"Timed out connecting to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}."
+            api_gw_status = f"Timed out connecting to API Gateway at {INTERNAL_API_GW_BASE_URL}."
             logger.warning(f"ASF Health Check: Timeout while checking API Gateway health at {health_url}.")
         except requests.exceptions.HTTPError as e_http:
-            api_gw_status = f"Connected to API Gateway at {asf_config['INTERNAL_API_GW_BASE_URL']}, but received HTTP error: {e_http.response.status_code} - {e_http.response.reason}."
+            api_gw_status = f"Connected to API Gateway at {INTERNAL_API_GW_BASE_URL}, but received HTTP error: {e_http.response.status_code} - {e_http.response.reason}."
             logger.warning(f"ASF Health Check: API Gateway at {health_url} returned HTTP {e_http.response.status_code} - {e_http.response.reason}.")
         except Exception as e_gw_health:
              api_gw_status = f"Error checking API Gateway health: {str(e_gw_health)}"
@@ -336,10 +229,10 @@ def health_check():
         "status": "AudioStreamFeeder is healthy and running",
         "api_gateway_connectivity": api_gw_status,
         "config": { # Expose some non-sensitive config for easier debugging
-            "chunk_size": asf_config.get('ASF_CHUNK_SIZE'),
-            "sleep_interval": asf_config.get('ASF_STREAM_SLEEP_INTERVAL'),
+            "chunk_size": ASF_CHUNK_SIZE,
+            "sleep_interval": ASF_STREAM_SLEEP_INTERVAL,
             "ui_namespace": ASF_UI_UPDATES_NAMESPACE,
-            "internal_api_gw_url_configured": bool(asf_config.get('INTERNAL_API_GW_BASE_URL'))
+            "internal_api_gw_url_configured": bool(INTERNAL_API_GW_BASE_URL)
         }
     }), 200
 
@@ -425,15 +318,7 @@ if __name__ == '__main__':
         logger.critical("ASF_UI_UPDATES_NAMESPACE is not defined in config. UI updates will not work. Exiting.")
         exit(1) # Critical configuration missing
 
-    asf_host = asf_config.get('ASF_HOST')
-    asf_port = asf_config.get('ASF_PORT')
-    # Read FLASK_DEBUG directly for running the app
-    flask_debug_mode_run = os.getenv("FLASK_DEBUG", "false").lower() == 'true'
-
-    logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {asf_host}:{asf_port} (Debug: {flask_debug_mode_run}).")
-    # allow_unsafe_werkzeug=True is needed for Werkzeug dev server if debug is True and reloader is on.
-    # Gunicorn with eventlet/gevent worker is preferred for production.
-    socketio.run(app, host=asf_host, port=asf_port, debug=flask_debug_mode_run,
-                 allow_unsafe_werkzeug=True if flask_debug_mode_run else False,
-                 # Consider use_reloader=False if issues with background threads or state
+    logger.info(f"Starting AudioStreamFeeder (ASF) with Flask-SocketIO on {ASF_HOST}:{ASF_PORT} (Debug: {FLASK_DEBUG}).")
+    socketio.run(app, host=ASF_HOST, port=ASF_PORT, debug=FLASK_DEBUG,
+                 allow_unsafe_werkzeug=True if FLASK_DEBUG else False,
                  )

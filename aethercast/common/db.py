@@ -1,43 +1,45 @@
 import os
 import psycopg2
+from psycopg2 import pool as psycopg2_pool
 from psycopg2.extras import RealDictCursor
 import logging
 
-def get_db_connection():
-    """
-    Establishes a connection to the PostgreSQL database using environment variables.
-    It first tries to use a consolidated DB URL, then falls back to individual components.
-    """
-    logger = logging.getLogger(__name__)
-    db_url = os.getenv("DATABASE_URL")
+db_connection_pool = None
+logger = logging.getLogger(__name__)
 
-    try:
-        if db_url:
-            conn = psycopg2.connect(dsn=db_url, cursor_factory=RealDictCursor)
-            logger.info("DB: Successfully connected to PostgreSQL using DATABASE_URL.")
-            return conn
-        else:
-            logger.warning("DB: DATABASE_URL not set. Falling back to individual PostgreSQL components.")
-            host = os.getenv("POSTGRES_HOST")
-            user = os.getenv("POSTGRES_USER")
-            password = os.getenv("POSTGRES_PASSWORD")
-            dbname = os.getenv("POSTGRES_DB")
-            port = os.getenv("POSTGRES_PORT", "5432")
-
-            if not all([host, user, password, dbname]):
-                logger.error("DB: Individual PostgreSQL connection variables not fully configured.")
-                raise ConnectionError("DB: PostgreSQL environment variables not fully configured.")
-
-            conn = psycopg2.connect(
-                host=host,
-                port=port,
-                user=user,
-                password=password,
-                dbname=dbname,
-                cursor_factory=RealDictCursor
+def init_db_connection_pool(service_name="common-db"):
+    """Initializes the database connection pool."""
+    global db_connection_pool
+    if db_connection_pool is None:
+        try:
+            db_connection_pool = psycopg2_pool.SimpleConnectionPool(
+                minconn=1,
+                maxconn=int(os.getenv("DB_POOL_MAX_CONNECTIONS", 5)),
+                user=os.getenv("POSTGRES_USER"),
+                password=os.getenv("POSTGRES_PASSWORD"),
+                host=os.getenv("POSTGRES_HOST"),
+                port=os.getenv("POSTGRES_PORT", "5432"),
+                database=os.getenv("POSTGRES_DB")
             )
-            logger.info("DB: Successfully connected to PostgreSQL using individual components.")
-            return conn
-    except psycopg2.Error as e:
-        logger.error(f"DB: Error connecting to PostgreSQL: {e}", exc_info=True)
-        raise ConnectionError(f"DB: PostgreSQL connection failed: {e}") from e
+            logger.info(f"Database connection pool created successfully for {service_name}.")
+        except (Exception, psycopg2.Error) as error:
+            logger.error(f"Error while creating PostgreSQL connection pool for {service_name}: {error}", exc_info=True)
+            raise
+
+def get_db_connection(service_name="common-db"):
+    """Establishes and returns a database connection from the pool."""
+    global db_connection_pool
+    if db_connection_pool is None:
+        init_db_connection_pool(service_name)
+    try:
+        return db_connection_pool.getconn()
+    except Exception as error:
+        logger.error(f"Error getting connection from pool for {service_name}: {error}", exc_info=True)
+        raise
+
+def release_db_connection(conn, service_name="common-db"):
+    """Releases a database connection back to the pool."""
+    global db_connection_pool
+    if db_connection_pool and conn:
+        db_connection_pool.putconn(conn)
+        logger.debug(f"Database connection released for {service_name}.")
