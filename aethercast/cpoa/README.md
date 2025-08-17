@@ -13,7 +13,7 @@ Key responsibilities include:
 -   **Real-time UI Updates:** Sending status updates to ASF.
 -   **Error Handling and Resilience:** Managing failures and retries within its workflows.
 
-CPOA itself is not a directly exposed service but a Python module called by the API Gateway. Its logic runs within the API Gateway's process.
+CPOA is a standalone service that is called by the API Gateway.
 
 ## Logging
 
@@ -30,13 +30,7 @@ CPOA's logging is integrated with the Aethercast project's standard logging prac
 CPOA is configured via environment variables, typically inherited from the API Gateway's environment.
 
 -   **Service URLs:** URLs for downstream services it orchestrates (e.g., `WCHA_SERVICE_URL`, `TDA_SERVICE_URL`, `SCA_SERVICE_URL`, `PSWA_SERVICE_URL`, `IGA_SERVICE_URL`, `VFA_SERVICE_URL`, `ASF_NOTIFICATION_URL`, `CPOA_ASF_SEND_UI_UPDATE_URL`).
--   **Database Configuration:** CPOA uses PostgreSQL for workflow state management and accessing the shared `idempotency_keys` table.
-    -   Connection Parameters (typically from `common.env`):
-        -   `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`.
-    -   Connection Pooling (CPOA specific):
-        -   CPOA uses `psycopg2.pool.SimpleConnectionPool` for efficient database connection management.
-        -   `DB_POOL_MIN_CONN`: Minimum connections in the CPOA DB pool. Default: `1`.
-        -   `DB_POOL_MAX_CONN`: Maximum connections in the CPOA DB pool. Default: `5`.
+-   **Database Configuration:** CPOA uses the shared PostgreSQL database configuration defined in the main `README.md` and `common.env`.
 -   **Retry and Timeout Configuration:**
     -   `CPOA_SERVICE_RETRY_COUNT`: Retries for HTTP requests to services. Default: `3`.
     -   `CPOA_SERVICE_RETRY_BACKOFF_FACTOR`: Backoff factor for retries. Default: `0.5`.

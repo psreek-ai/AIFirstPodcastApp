@@ -41,18 +41,8 @@ To prevent redundant processing and ensure that operations can be safely retried
 -   **Tasks:**
     -   `fetch_news_articles_task`
     -   `harvest_url_content_task`
--   **Mechanism:** Idempotency is achieved using a shared `idempotency_keys` table in a PostgreSQL database.
+-   **Mechanism:** Idempotency is managed using the shared `aethercast/common` library, which uses a shared `idempotency_keys` table in a PostgreSQL database.
 -   **Idempotency Key:** The `request_id` provided when dispatching these Celery tasks is used as the idempotency key.
--   **Pattern:** A two-phase pattern is used:
-    1.  **Check/Lock:** Before executing the core logic, the task checks the `idempotency_keys` table.
-        -   If the key + task name combination indicates a 'completed' status, the stored result is returned immediately.
-        -   If it's 'processing' and not stale (within `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`), a conflict is indicated.
-        -   Otherwise, the task attempts to acquire a lock by setting the status to 'processing' and updating a `locked_at` timestamp.
-    2.  **Execute & Update:**
-        -   The core task logic is executed.
-        -   Upon completion, the idempotency record is updated to 'completed' with the result payload.
-        -   If an error occurs, the record is updated to 'failed' with error details.
-        -   The `locked_at` timestamp is cleared upon final update.
 
 ## Configuration
 
@@ -66,13 +56,7 @@ WCHA is configured via environment variables, typically managed in a `.env` file
 -   `USE_REAL_NEWS_API`: Set to `true` to use NewsAPI for topic searches, `false` to use DuckDuckGo. Default: `false`.
 -   `TDA_NEWS_API_KEY`: API key for NewsAPI (if `USE_REAL_NEWS_API=true`).
 -   `TDA_NEWS_API_BASE_URL`: Base URL for NewsAPI. Default: `https://newsapi.org/v2/`.
--   `POSTGRES_HOST`: Hostname for the PostgreSQL database (for idempotency).
--   `POSTGRES_PORT`: Port for the PostgreSQL database. Default: `5432`.
--   `POSTGRES_USER`: Username for PostgreSQL.
--   `POSTGRES_PASSWORD`: Password for PostgreSQL.
--   `POSTGRES_DB`: PostgreSQL database name.
--   `WCHA_DB_POOL_MIN_CONN`: Minimum connections for the PostgreSQL pool. Default: `1`.
--   `WCHA_DB_POOL_MAX_CONN`: Maximum connections for the PostgreSQL pool. Default: `5`.
+-   **PostgreSQL Database for Idempotency:** WCHA uses the shared PostgreSQL database configuration defined in the main `README.md` and `common.env`.
 -   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Timeout in seconds for an idempotency lock to be considered stale. Default: `300`.
 
 

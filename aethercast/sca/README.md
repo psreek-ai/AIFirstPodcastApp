@@ -4,7 +4,7 @@
 
 The Snippet Craft Agent (SCA) is a specialized microservice within the Aethercast system. Its primary function is to generate short, engaging podcast snippets (title, text content, and a cover art prompt) based on topic information provided by the Central Podcast Orchestrator Agent (CPOA). SCA achieves this by calling the **AIMS (AI Model Service)** for LLM-based text generation.
 
-SCA now operates **asynchronously using a Celery task queue** for the core snippet crafting process. When a request to craft a snippet is received, a task is dispatched, and clients can poll for the result. The service also features **idempotency** for its snippet crafting task; if the same request (identified by an `X-Idempotency-Key`) is submitted multiple times, it will be processed only once, with state managed in a shared PostgreSQL database.
+SCA operates **asynchronously using a Celery task queue** for the core snippet crafting process. When a request to craft a snippet is received, a task is dispatched, and clients can poll for the result. The service also features **idempotency** for its snippet crafting task; if the same request (identified by an `X-Idempotency-Key`) is submitted multiple times, it will be processed only once. Idempotency is managed using the shared `aethercast/common` library, which uses a shared `idempotency_keys` table in a PostgreSQL database.
 
 Key Responsibilities:
 
@@ -39,13 +39,9 @@ Key environment variables:
     -   `FLASK_DEBUG`: Standard Flask debug mode. *Default: `True`*.
 -   **Celery Configuration:**
     -   `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`: URLs for Celery broker and backend.
--   **PostgreSQL Database for Idempotency:** SCA uses a shared PostgreSQL database. Variables (e.g., `POSTGRES_HOST`) are typically from `common.env`.
--   **Idempotency Behavior Configuration (SCA-specific):**
-    -   These are typically managed by constants within `main.py` but can be overridden by environment variables if `main.py` is adapted to load them into `sca_config` (e.g., `SCA_IDEMPOTENCY_STATUS_PROCESSING`, `SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`). The `.env.example` file shows the default string values used by the application code. Refer to `sca_config` initialization in `main.py` for specifics.
-        -   `SCA_IDEMPOTENCY_STATUS_PROCESSING`: Default "processing"
-        -   `SCA_IDEMPOTENCY_STATUS_COMPLETED`: Default "completed"
-        -   `SCA_IDEMPOTENCY_STATUS_FAILED`: Default "failed"
-        -   `SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Default 1800 seconds (30 minutes)
+-   **PostgreSQL Database for Idempotency:** SCA uses the shared PostgreSQL database configuration defined in the main `README.md` and `common.env`.
+-   **Idempotency Behavior Configuration:**
+    -   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Duration after which a "processing" lock is considered stale.
 
 ## Dependencies
 

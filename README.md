@@ -7,13 +7,13 @@ Aethercast is a multi-service application designed to automate the creation of p
 The system consists of several microservices that work together:
 
 -   **API Gateway (API_GW):** The main entry point for clients (e.g., frontend UI). Routes requests, serves the frontend, and orchestrates calls to CPOA.
--   **Central Podcast Orchestrator (CPOA):** Manages the podcast generation lifecycle, coordinating other agents. Its state and task management are persisted in a PostgreSQL database. (Note: CPOA logic currently runs as part of the API Gateway's process).
+-   **Central Podcast Orchestrator (CPOA):** Manages the podcast generation lifecycle, coordinating other agents. Its state and task management are persisted in a PostgreSQL database.
 -   **Topic Discovery Agent (TDA):** Identifies and suggests potential podcast topics from various sources. Core Celery task operations are idempotent.
 -   **Web Content Harvester Agent (WCHA):** Harvests textual content from specified URLs, providing source material for script generation. Used by PSWA. Core Celery task operations are idempotent.
 -   **Snippet Craft Agent (SCA):** Generates short, engaging text snippets based on topics or content briefs, leveraging AIMS. Core Celery task operations are idempotent.
 -   **Podcast Script Weaver Agent (PSWA):** Generates a full podcast script from harvested content (via WCHA) and a topic, using AIMS. Core Celery task operations are idempotent. It also features script caching in its configured database (SQLite or PostgreSQL, separate from the idempotency store).
 -   **Image Generation Agent (IGA):** Dynamically generates cover art or accompanying images for podcasts using Google Cloud Vertex AI Imagen models, based on input prompts. Stores generated images in GCS. Core Celery task operations are idempotent.
--   **Voice Forge Agent (VFA):** Synthesizes audio from the script by calling the AIMS_TTS service. (Idempotency for VFA tasks is a potential future enhancement).
+-   **Voice Forge Agent (VFA):** Synthesizes audio from the script by calling the AIMS_TTS service. Core Celery task operations are idempotent.
 -   **Audio Stream Feeder (ASF):** Streams the generated audio to clients in real-time via WebSockets.
 
 ### Backend/Supporting Services
@@ -30,12 +30,8 @@ The system consists of several microservices that work together:
 -   Dynamic image generation for podcast visuals (IGA with Vertex AI).
 -   Customizable voice synthesis (VFA with AIMS_TTS using Google Cloud TTS, output to GCS).
 -   Real-time audio streaming (ASF, sourcing from GCS signed URLs).
--   **Idempotent Task Processing:** Key asynchronous operations in TDA, WCHA, SCA, PSWA, IGA, VFA, AIMS (LLM), and AIMS_TTS are designed to be idempotent. Clients making requests to initiate these operations (via the API Gateway and CPOA, or directly to AIMS/AIMS_TTS if applicable) should include an `X-Idempotency-Key` header (typically a UUID). The services use this key, in conjunction with a shared `idempotency_keys` table in the PostgreSQL database, to ensure that identical requests (same key, same task type) are processed only once, preventing duplicate resource creation or processing.
-    -   If a request with a new key is received, the task proceeds and its outcome is stored.
-    -   If a request with a previously seen key is received:
-        -   If the original task is still processing, a conflict status is typically returned (e.g., HTTP 409 from the task status endpoint after initial 202 acceptance).
-        -   If the original task completed successfully, the stored result is returned without re-processing.
-        -   If the original task failed, it may be retried (depending on service logic).
+-   **Idempotent Task Processing:** All asynchronous operations are designed to be idempotent. Clients making requests to initiate these operations should include an `X-Idempotency-Key` header (typically a UUID). The services use this key, in conjunction with a shared `idempotency_keys` table in the PostgreSQL database, to ensure that identical requests (same key, same task type) are processed only once, preventing duplicate resource creation or processing.
+-   **Shared Common Library:** A `common` library (`aethercast/common`) is used by all services to share code for database connections, Celery app creation, and idempotency logic. This reduces code duplication and improves maintainability.
 -   Topic exploration and "go deeper" functionalities.
 -   Header search functionality for discovering podcasts.
 -   Email subscription option for users to receive updates.
@@ -52,7 +48,6 @@ The system consists of several microservices that work together:
 
 ## Features (Conceptual / Future Enhancements)
 
--   Idempotency for VFA (Voice Forge Agent) tasks.
 -   More advanced caching strategies (e.g., distributed caching, semantic caching for LLM results).
 -   More sophisticated user preference models and personalization.
 -   User feedback mechanisms for content quality.
@@ -71,7 +66,8 @@ aethercast/
 ├── aims_service/       # AIMS: AI Model Service (for LLMs).
 ├── aims_tts_service/   # AIMS_TTS: AI Model Text-to-Speech Service.
 ├── asf/                # ASF: Audio Stream Feeder service.
-├── cpoa/               # CPOA: Central Podcast Orchestrator (logic module, runs in API_GW process).
+├── cpoa/               # CPOA: Central Podcast Orchestrator service.
+├── common/             # Shared library for common functionality.
 ├── data_stores/        # Database related files, including:
 │   └── migrations/     # SQL migration scripts (e.g., for idempotency_keys table).
 ├── fend/               # Frontend static files (HTML, CSS, JS).
@@ -201,6 +197,7 @@ This project uses Docker Compose to manage and run the suite of microservices in
 2.  **Database Initialization (PostgreSQL):**
     *   The PostgreSQL service defined in `docker-compose.yml` (`postgres_db`) will initialize itself.
     *   The `api_gateway` service automatically handles the creation and migration of the database schema on startup. No manual migration is needed.
+    *   All services now use a shared `common` library for database connections.
 
 3.  **Build and Run Services:**
     Open a terminal at the project root (where `docker-compose.yml` is located) and run:
@@ -248,7 +245,7 @@ Once the Docker Compose environment is up and running (with services in their "t
    ```bash
    python -m unittest tests/integration/test_full_flow.py
    ```
-   - **Note:** The integration tests are skipped by default. To run them, you need to edit `tests/integration/test_full_flow.py` and remove the `@unittest.skip(...)` decorator from the `TestFullPodcastFlow` class.
+   - **Note:** The integration tests are currently being worked on and may not all pass. There have been issues with Docker Hub rate limiting that have prevented a full run of the integration tests.
    - You might need to set `PYTHONPATH=.` or `export PYTHONPATH=$(pwd)` for the tests to find the `aethercast` modules if you add more complex test runners or helper modules locally.
    - The `API_GATEWAY_BASE_URL` in the test script defaults to `http://localhost:5001/api/v1`.
 

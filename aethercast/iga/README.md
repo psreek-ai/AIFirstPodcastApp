@@ -6,7 +6,7 @@ The Image Generation Agent (IGA) is responsible for generating images based on t
 
 IGA operates asynchronously using a Celery task queue. When a request to generate an image is received, a task is dispatched, allowing the client to poll for completion. The generated image is uploaded to Google Cloud Storage (GCS), and the GCS URI is returned upon successful task completion.
 
-Key operations in IGA are **idempotent**: if the same image generation request (identified by an `X-Idempotency-Key`) is submitted multiple times, it will be processed only once, preventing duplicate image generation and GCS uploads. Idempotency state is managed using a shared PostgreSQL database.
+Key operations in IGA are **idempotent**: if the same image generation request (identified by an `X-Idempotency-Key`) is submitted multiple times, it will be processed only once, preventing duplicate image generation and GCS uploads. Idempotency is managed using the shared `aethercast/common` library, which uses a shared `idempotency_keys` table in a PostgreSQL database.
 
 ## API Contract
 
@@ -117,11 +117,9 @@ Key environment variables:
     -   `IGA_DEFAULT_ASPECT_RATIO`, `IGA_ADD_WATERMARK`: Default image generation parameters.
 -   **Celery Configuration:**
     -   `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`: URLs for your Celery message broker and result backend (e.g., Redis).
--   **PostgreSQL Database for Idempotency:** IGA uses a shared PostgreSQL database to store idempotency records. These variables are typically defined in `common.env` and sourced by IGA's `.env` file:
-    -   `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`.
+-   **PostgreSQL Database for Idempotency:** IGA uses the shared PostgreSQL database configuration defined in the main `README.md` and `common.env`.
 -   **Idempotency Behavior Configuration:**
-    -   `IGA_IDEMPOTENCY_STATUS_PROCESSING`, `IGA_IDEMPOTENCY_STATUS_COMPLETED`, `IGA_IDEMPOTENCY_STATUS_FAILED`: Define the status strings used in the idempotency table.
-    -   `IGA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Duration after which a "processing" lock is considered stale.
+    -   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Duration after which a "processing" lock is considered stale.
 
 ## Dependencies
 

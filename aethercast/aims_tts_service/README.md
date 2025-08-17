@@ -90,18 +90,8 @@ The AIMS TTS (Text-to-Speech) service is responsible for converting text scripts
 
 The `/v1/synthesize` endpoint, through its underlying Celery task `invoke_tts_google_task`, is designed to be idempotent. This prevents redundant processing for identical synthesis requests and allows for safe retries.
 
--   **Mechanism:** Idempotency is managed using a shared `idempotency_keys` table in a PostgreSQL database.
--   **Idempotency Key:** If an `X-Idempotency-Key` header is provided by the client, AIMS_TTS uses this value as the `request_id` for its Celery task. If not provided, AIMS_TTS generates a unique `request_id`. This `request_id` serves as the idempotency key for the Celery task.
--   **Pattern:** A two-phase pattern is employed:
-    1.  **Check/Lock:** Before executing the core TTS synthesis, the Celery task checks the `idempotency_keys` table using its `request_id`.
-        -   If a record with the `request_id` and task name (`aims_invoke_tts_google_task`) exists with a 'completed' status, the stored result (containing GCS URI, duration, etc.) is returned immediately.
-        -   If the record indicates 'processing' and the lock is not stale (within `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`), a conflict is signaled.
-        -   Otherwise, the task attempts to acquire a lock by setting the status to 'processing' and updating a `locked_at` timestamp.
-    2.  **Execute & Update:**
-        -   The core TTS synthesis and GCS upload logic is executed.
-        -   Upon successful completion, the idempotency record is updated to 'completed', and the synthesis metadata is stored in `result_payload`.
-        -   If an error occurs, the record is updated to 'failed', and error details are stored in `error_payload`.
-        -   The `locked_at` timestamp is cleared once the task reaches a terminal state.
+-   **Mechanism:** Idempotency is managed using the shared `aethercast/common` library, which uses a shared `idempotency_keys` table in a PostgreSQL database.
+-   **Idempotency Key:** The `request_id` for the Celery task is used as the idempotency key.
 
 ## Configuration
 
@@ -128,13 +118,7 @@ Refer to the main project README for GCP setup.
 -   `AIMS_TTS_DEFAULT_PITCH`: Default pitch. Default: `0.0`.
 
 ### PostgreSQL Database Configuration (for Idempotency):
--   `POSTGRES_HOST`: Hostname of the PostgreSQL server.
--   `POSTGRES_PORT`: Port for PostgreSQL. Default: `5432`.
--   `POSTGRES_USER`: PostgreSQL username.
--   `POSTGRES_PASSWORD`: PostgreSQL password.
--   `POSTGRES_DB`: Name of the PostgreSQL database.
--   `AIMS_TTS_DB_POOL_MIN_CONN`: Min connections for DB pool. Default: `1`.
--   `AIMS_TTS_DB_POOL_MAX_CONN`: Max connections for DB pool. Default: `3` (can be smaller for TTS).
+This service uses the shared PostgreSQL database configuration defined in the main `README.md` and `common.env`.
 -   `IDEMPOTENCY_LOCK_TIMEOUT_SECONDS`: Timeout for idempotency lock. Default: `300`.
 
 ## Dependencies
