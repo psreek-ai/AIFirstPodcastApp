@@ -50,23 +50,6 @@ class ServiceNameFilter(logging.Filter):
 
 app = Flask(__name__)
 
-def setup_json_logging(flask_app):
-    flask_app.logger.handlers.clear()
-    logHandler = logging.StreamHandler()
-    service_filter = ServiceNameFilter("iga")
-    logHandler.addFilter(service_filter)
-
-    from python_json_logger import jsonlogger
-    formatter = jsonlogger.JsonFormatter(
-        fmt="%(asctime)s %(levelname)s %(name)s %(service_name)s %(module)s %(funcName)s %(lineno)d %(message)s %(task_id)s %(workflow_id)s %(idempotency_key)s %(prompt_preview)s"
-    )
-    logHandler.setFormatter(formatter)
-
-    flask_app.logger.addHandler(logHandler)
-    flask_app.logger.setLevel(logging.INFO)
-    flask_app.logger.info("JSON logging configured for IGA service.", extra={'task_id': 'N/A', 'workflow_id': 'N/A', 'idempotency_key': 'N/A', 'prompt_preview': 'N/A'})
-
-setup_json_logging(app)
 
 
 # --- IGA Configuration ---

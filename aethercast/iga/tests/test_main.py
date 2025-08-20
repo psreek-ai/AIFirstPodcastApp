@@ -3,7 +3,6 @@ from unittest.mock import patch, MagicMock
 import os
 import sys
 import uuid
-print(sys.path)
 
 # Adjust path to import IGA main module components
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -13,6 +12,8 @@ project_root_dir = os.path.dirname(aethercast_dir)
 
 if project_root_dir not in sys.path:
     sys.path.insert(0, project_root_dir)
+if aethercast_dir not in sys.path:
+    sys.path.insert(0, aethercast_dir)
 
 from aethercast.iga.main import generate_image_vertex_ai_task, app as flask_app, celery_app as iga_celery_app
 
