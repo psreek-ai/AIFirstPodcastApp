@@ -26,20 +26,23 @@ def init_db_connection_pool(service_name="common-db"):
             logger.error(f"Error while creating PostgreSQL connection pool for {service_name}: {error}", exc_info=True)
             raise
 
+from contextlib import contextmanager
+
+@contextmanager
 def get_db_connection(service_name="common-db"):
-    """Establishes and returns a database connection from the pool."""
+    """Provides a database connection from the pool as a context manager."""
     global db_connection_pool
     if db_connection_pool is None:
         init_db_connection_pool(service_name)
+
+    conn = None
     try:
-        return db_connection_pool.getconn()
+        conn = db_connection_pool.getconn()
+        yield conn
     except Exception as error:
         logger.error(f"Error getting connection from pool for {service_name}: {error}", exc_info=True)
         raise
-
-def release_db_connection(conn, service_name="common-db"):
-    """Releases a database connection back to the pool."""
-    global db_connection_pool
-    if db_connection_pool and conn:
-        db_connection_pool.putconn(conn)
-        logger.debug(f"Database connection released for {service_name}.")
+    finally:
+        if conn:
+            db_connection_pool.putconn(conn)
+            logger.debug(f"Database connection released for {service_name}.")

@@ -81,7 +81,11 @@ SCA_LLM_TEMPERATURE_SNIPPET = float(os.getenv('SCA_LLM_TEMPERATURE_SNIPPET', '0.
 USE_REAL_LLM_SERVICE = os.getenv('USE_REAL_LLM_SERVICE', 'false').lower() == 'true'
 AIMS_POLLING_INTERVAL_SECONDS = int(os.getenv("AIMS_POLLING_INTERVAL_SECONDS", "5"))
 AIMS_POLLING_TIMEOUT_SECONDS = int(os.getenv("AIMS_POLLING_TIMEOUT_SECONDS", "120"))
-IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = int(os.getenv('SCA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS', '1800'))
+IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = int(os.getenv('IDEMPOTENCY_LOCK_TIMEOUT_SECONDS', '1800'))
+IDEMPOTENCY_STATUS_PROCESSING = os.getenv("IDEMPOTENCY_STATUS_PROCESSING", "processing")
+IDEMPOTENCY_STATUS_COMPLETED = os.getenv("IDEMPOTENCY_STATUS_COMPLETED", "completed")
+IDEMPOTENCY_STATUS_FAILED = os.getenv("IDEMPOTENCY_STATUS_FAILED", "failed")
+SERVICE_NAME_FOR_IDEMPOTENCY = os.getenv("SERVICE_NAME_FOR_IDEMPOTENCY", "SCA")
 
 AIMS_LLM_HARDCODED_RESPONSE = {
     "request_id": "sca_placeholder_req_id", "model_id": "sca_placeholder_model_id",
@@ -197,16 +201,12 @@ class ScaCeleryTask(Task):
         idempotency_key = kwargs.get('idempotency_key')
         task_name = self.name
         if idempotency_key and PSYCOPG2_AVAILABLE:
-            db_conn = None
             try:
-                db_conn = get_db_connection(service_name='sca')
-                err_payload = {"error_type": type(exc).__name__, "message": str(exc), "traceback": str(einfo)}
-                update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=err_payload, service_name='sca')
+                with get_db_connection(service_name='sca') as db_conn:
+                    err_payload = {"error_type": type(exc).__name__, "message": str(exc), "traceback": str(einfo)}
+                    store_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=err_payload, is_new_key=False)
             except Exception as db_e:
                 app.logger.error(f"SCA on_failure: DB error: {db_e}", exc_info=True)
-            finally:
-                if db_conn:
-                    release_db_connection(db_conn, service_name='sca')
 
 @celery_app.task(bind=True, base=ScaCeleryTask, name='craft_snippet_task')
 def craft_snippet_task(self, request_id: str, topic_id: str, content_brief: str, topic_info: dict, error_trigger: Optional[str]=None, idempotency_key: Optional[str]=None, workflow_id: Optional[str]=None):
@@ -217,58 +217,56 @@ def craft_snippet_task(self, request_id: str, topic_id: str, content_brief: str,
     if not idempotency_key: raise ValueError("Idempotency key required.")
     if not PSYCOPG2_AVAILABLE: raise ConnectionError("psycopg2 required for idempotency.")
 
-    db_conn = None
     try:
-        db_conn = get_db_connection(service_name='sca')
-        task_name = self.name
+        with get_db_connection(service_name='sca') as db_conn:
+            task_name = self.name
 
-        idempotency_check = check_idempotency(db_conn, idempotency_key, task_name, IDEMPOTENCY_LOCK_TIMEOUT_SECONDS, service_name='sca')
-        if idempotency_check:
-            if idempotency_check['status'] == 'completed':
-                return idempotency_check['result']
-            if idempotency_check['status'] == 'conflict':
-                return {"status": "PROCESSING_CONFLICT", "message": "Task already processing.", "idempotency_key": idempotency_key}
+            existing_record = check_idempotency_key(db_conn, idempotency_key, task_name)
+            if existing_record:
+                if existing_record['status'] == 'completed':
+                    return existing_record['result_payload']
+                if existing_record['status'] == 'processing':
+                    return {"status": "PROCESSING_CONFLICT", "message": "Task already processing.", "idempotency_key": idempotency_key}
 
-        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, workflow_id, service_name='sca'):
-            raise Exception("Failed to acquire idempotency lock")
+            store_idempotency_record(db_conn, idempotency_key, task_name, 'processing', workflow_id=workflow_id, is_new_key=not existing_record)
 
-        if error_trigger == "sca_error": raise Exception("Simulated SCA error in Celery task.")
+            if error_trigger == "sca_error": raise Exception("Simulated SCA error in Celery task.")
 
-        prompt_parts = [SYSTEM_INSTRUCTION_FOR_LLM, f"Subject: <user_content_brief>{content_brief}</user_content_brief>."]
-        if topic_info:
-            summary, keywords, sources = topic_info.get("summary"), topic_info.get("keywords"), topic_info.get("potential_sources")
-            if summary and summary != content_brief: prompt_parts.append(f"Context: <topic_summary>{summary}</topic_summary>.")
-            if keywords:
-                unique_kw = [kw for kw in keywords if kw.lower() not in content_brief.lower() and (not summary or kw.lower() not in summary.lower())]
-                if unique_kw: prompt_parts.append(f"Keywords: {' '.join([f'<topic_keyword>{kw}</topic_keyword>' for kw in unique_kw])}.")
-            if sources and sources[0]: prompt_parts.append(f"Source inspiration: <source_title>{sources[0].get('title', sources[0].get('url', 'a source'))}</source_title>.")
-        prompt = "\n".join(prompt_parts)
+            prompt_parts = [SYSTEM_INSTRUCTION_FOR_LLM, f"Subject: <user_content_brief>{content_brief}</user_content_brief>."]
+            if topic_info:
+                summary, keywords, sources = topic_info.get("summary"), topic_info.get("keywords"), topic_info.get("potential_sources")
+                if summary and summary != content_brief: prompt_parts.append(f"Context: <topic_summary>{summary}</topic_summary>.")
+                if keywords:
+                    unique_kw = [kw for kw in keywords if kw.lower() not in content_brief.lower() and (not summary or kw.lower() not in summary.lower())]
+                    if unique_kw: prompt_parts.append(f"Keywords: {' '.join([f'<topic_keyword>{kw}</topic_keyword>' for kw in unique_kw])}.")
+                if sources and sources[0]: prompt_parts.append(f"Source inspiration: <source_title>{sources[0].get('title', sources[0].get('url', 'a source'))}</source_title>.")
+            prompt = "\n".join(prompt_parts)
 
-        llm_func = call_real_llm_service if USE_REAL_LLM_SERVICE else call_aims_llm_placeholder
-        llm_result = llm_func(prompt, topic_info)
+            llm_func = call_real_llm_service if USE_REAL_LLM_SERVICE else call_aims_llm_placeholder
+            llm_result = llm_func(prompt, topic_info)
 
-        if "error_code" in llm_result: raise Exception(f"LLM call failed: {llm_result.get('message', 'Unknown LLM error')}")
+            if "error_code" in llm_result: raise Exception(f"LLM call failed: {llm_result.get('message', 'Unknown LLM error')}")
 
-        snippet_title, text_content = llm_result["title"], llm_result["text_content"]
+            snippet_title, text_content = llm_result["title"], llm_result["text_content"]
 
-        snippet_data = {
-            "snippet_id": generate_snippet_id(), "topic_id": topic_id, "title": snippet_title,
-            "summary": text_content, "audio_url": f"https://aethercast.com/placeholder_audio/{uuid.uuid4().hex[:8]}.mp3",
-            "text_content": text_content, "cover_art_prompt": f"Podcast cover: {str(snippet_title)}",
-            "generation_timestamp": datetime.now(timezone.utc).isoformat(), "llm_prompt_used": prompt,
-            "llm_model_used": llm_result.get("llm_model_used"), "original_topic_details_from_tda": topic_info
-        }
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=snippet_data, service_name='sca')
-        app.logger.info(f"SCA Task {task_log_id}: COMPLETED for key '{idempotency_key}'.", extra=log_extra)
-        return snippet_data
+            snippet_data = {
+                "snippet_id": generate_snippet_id(), "topic_id": topic_id, "title": snippet_title,
+                "summary": text_content, "audio_url": f"https://aethercast.com/placeholder_audio/{uuid.uuid4().hex[:8]}.mp3",
+                "text_content": text_content, "cover_art_prompt": f"Podcast cover: {str(snippet_title)}",
+                "generation_timestamp": datetime.now(timezone.utc).isoformat(), "llm_prompt_used": prompt,
+                "llm_model_used": llm_result.get("llm_model_used"), "original_topic_details_from_tda": topic_info
+            }
+            store_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=snippet_data, workflow_id=workflow_id, is_new_key=False)
+            app.logger.info(f"SCA Task {task_log_id}: COMPLETED for key '{idempotency_key}'.", extra=log_extra)
+            return snippet_data
     except Exception as e:
         app.logger.error(f"SCA Task {task_log_id}: Error for key '{idempotency_key}': {e}", exc_info=True, extra=log_extra)
-        if db_conn:
-            update_idempotency_record(db_conn, idempotency_key, self.name, 'failed', error_payload={'error': str(e)}, service_name='sca')
+        try:
+            with get_db_connection(service_name='sca') as db_conn:
+                store_idempotency_record(db_conn, idempotency_key, self.name, 'failed', error_payload={'error': str(e)}, is_new_key=False)
+        except Exception as db_e:
+            app.logger.error(f"SCA Task {task_log_id}: Failed to store failure state for key '{idempotency_key}': {db_e}", exc_info=True, extra=log_extra)
         raise
-    finally:
-        if db_conn:
-            release_db_connection(db_conn, service_name='sca')
 
 
 @app.route("/craft_snippet", methods=["POST"])
@@ -284,22 +282,18 @@ def craft_snippet_async_endpoint():
     log_extra["idempotency_key"] = idem_key
 
     if PSYCOPG2_AVAILABLE:
-        db_conn = None
         try:
-            db_conn = get_db_connection(service_name='sca-http')
-            idempotency_check = check_idempotency(db_conn, idem_key, 'craft_snippet_task', IDEMPOTENCY_LOCK_TIMEOUT_SECONDS, service_name='sca-http')
-            if idempotency_check:
-                if idempotency_check['status'] == 'completed':
-                    app.logger.info(f"Request {req_id}: Key '{idem_key}' COMPLETED. Returning stored.", extra=log_extra)
-                    return flask.jsonify(idempotency_check['result']), 200
-                if idempotency_check['status'] == 'conflict':
-                    app.logger.warning(f"Request {req_id}: Key '{idem_key}' PROCESSING. Conflict.", extra=log_extra)
-                    return flask.jsonify({"error_code": "SCA_IDEMPOTENCY_CONFLICT", "message": "Processing."}), 409
+            with get_db_connection(service_name='sca-http') as db_conn:
+                existing_record = check_idempotency_key(db_conn, idem_key, 'craft_snippet_task')
+                if existing_record:
+                    if existing_record['status'] == 'completed':
+                        app.logger.info(f"Request {req_id}: Key '{idem_key}' COMPLETED. Returning stored.", extra=log_extra)
+                        return flask.jsonify(existing_record['result_payload']), 200
+                    if existing_record['status'] == 'processing':
+                        app.logger.warning(f"Request {req_id}: Key '{idem_key}' PROCESSING. Conflict.", extra=log_extra)
+                        return flask.jsonify({"error_code": "SCA_IDEMPOTENCY_CONFLICT", "message": "Processing."}), 409
         except Exception as db_e:
             app.logger.error(f"Request {req_id}: DB error pre-check key '{idem_key}': {db_e}", exc_info=True, extra=log_extra)
-        finally:
-            if db_conn:
-                release_db_connection(db_conn, service_name='sca-http')
     else:
         app.logger.warning(f"Request {req_id}: psycopg2 N/A. Skipping HTTP pre-check for key '{idem_key}'.", extra=log_extra)
 

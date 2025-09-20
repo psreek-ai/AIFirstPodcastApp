@@ -1,3 +1,3 @@
-requests>=2.20.0
+requests>=2.25.0,<3.0.0
 python-dotenv>=0.20.0
 aethercast

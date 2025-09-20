@@ -1,10 +1,11 @@
-Flask>=2.0.0
+Flask>=2.0.0,<3.0.0
 python-dotenv>=0.20.0
-requests>=2.20.0
+requests>=2.25.0,<3.0.0
 beautifulsoup4>=4.9.0
 duckduckgo_search>=4.0.0
-trafilatura>=1.5.0,<2.0.0
+trafilatura>=1.6.0,<2.0.0
 celery>=5.2.0
 redis>=4.0.0
 python-json-logger==2.0.7
 psycopg2-binary>=2.9.0 # Added for idempotency
+aethercast

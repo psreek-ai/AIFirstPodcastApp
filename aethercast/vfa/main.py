@@ -77,10 +77,12 @@ def load_vfa_configuration():
     # vfa_config['VFA_DEBUG_MODE'] will be replaced by direct use of FLASK_DEBUG
 
     # Idempotency Configuration from .env.example
-    vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS'] = int(os.getenv("VFA_IDEMPOTENCY_LOCK_TIMEOUT_SECONDS", "300"))
-    vfa_config['IDEMPOTENCY_STATUS_PROCESSING'] = os.getenv("VFA_IDEMPOTENCY_STATUS_PROCESSING", "processing")
-    vfa_config['IDEMPOTENCY_STATUS_COMPLETED'] = os.getenv("VFA_IDEMPOTENCY_STATUS_COMPLETED", "completed")
-    vfa_config['IDEMPOTENCY_STATUS_FAILED'] = os.getenv("VFA_IDEMPOTENCY_STATUS_FAILED", "failed")
+    vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS'] = int(os.getenv("IDEMPOTENCY_LOCK_TIMEOUT_SECONDS", "300"))
+    vfa_config['IDEMPOTENCY_STATUS_PROCESSING'] = os.getenv("IDEMPOTENCY_STATUS_PROCESSING", "processing")
+    vfa_config['IDEMPOTENCY_STATUS_COMPLETED'] = os.getenv("IDEMPOTENCY_STATUS_COMPLETED", "completed")
+    vfa_config['IDEMPOTENCY_STATUS_FAILED'] = os.getenv("IDEMPOTENCY_STATUS_FAILED", "failed")
+    vfa_config['SERVICE_NAME_FOR_IDEMPOTENCY'] = os.getenv("SERVICE_NAME_FOR_IDEMPOTENCY", "VFA")
+
 
     logger.info("--- VFA Configuration (AIMS_TTS Client) ---")
     for key, value in vfa_config.items(): logger.info(f"  {key}: {value}")
@@ -110,27 +112,21 @@ class VfaCeleryTask(celery_app.Task): # Inherit from celery_app.Task
         task_name = self.name # self.name will be 'forge_voice_task'
 
         if idempotency_key: # Attempt to mark idempotency record as failed if key is present
-            db_conn = None
             try:
-                db_conn = get_db_connection()
-                if db_conn:
-                    db_conn.autocommit = False # Manage transaction
-                    error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
-                    # Use the correct config key for failed status
-                    store_idempotency_record(db_conn, idempotency_key, task_name,
-                                              vfa_config['IDEMPOTENCY_STATUS_FAILED'], # Use config
-                                              error_payload=error_payload,
-                                              workflow_id=workflow_id, # Pass workflow_id
-                                              is_new_key=False) # Should exist if task started
-                    db_conn.commit()
-                    logger.info(f"Idempotency record for key {idempotency_key} marked as FAILED for VFA task {task_name}.")
+                with get_db_connection() as db_conn:
+                    if db_conn:
+                        db_conn.autocommit = False # Manage transaction
+                        error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
+                        # Use the correct config key for failed status
+                        store_idempotency_record(db_conn, idempotency_key, task_name,
+                                                  vfa_config['IDEMPOTENCY_STATUS_FAILED'], # Use config
+                                                  error_payload=error_payload,
+                                                  workflow_id=workflow_id, # Pass workflow_id
+                                                  is_new_key=False) # Should exist if task started
+                        db_conn.commit()
+                        logger.info(f"Idempotency record for key {idempotency_key} marked as FAILED for VFA task {task_name}.")
             except Exception as db_err:
                 logger.error(f"Failed to update idempotency record to FAILED for key {idempotency_key} (VFA task {task_name}) after task failure: {db_err}", exc_info=True)
-                if db_conn: db_conn.rollback()
-            finally:
-                if db_conn and not db_conn.closed:
-                    try: db_conn.close()
-                    except Exception: pass # Ignore errors on close during failure handling
 
 
 @celery_app.task(bind=True, base=VfaCeleryTask, name='forge_voice_task') # Use VfaCeleryTask as base
@@ -196,142 +192,135 @@ def forge_voice_task(self, request_id_celery: str, script_input: dict, voice_par
         raise ValueError("Idempotency key is required for VFA task execution.")
 
     # PSYCOPG2_AVAILABLE check was removed in previous refactors as direct import implies availability.
-    # If direct import fails, service won't start. If it's uninstalled while running, _get_vfa_db_connection will fail.
+    # If direct import fails, service won't start. If it's uninstalled while running, get_db_connection will fail.
 
     # Initial log message already uses log_extra_base.
     # The message "Starting voice forging." is general. Specific details like topic are in log_extra_base.
     self.update_state(state='PENDING', meta={'message': 'Initiated, checking idempotency.'})
 
-    db_conn = None
     try:
-        db_conn = _get_vfa_db_connection()
-        db_conn.autocommit = False
+        with get_db_connection() as db_conn:
+            db_conn.autocommit = False
 
-        existing_record = _check_vfa_idempotency_key(db_conn, idempotency_key, vfa_task_name_for_idempotency)
-        if existing_record:
-            status = existing_record['status']
-            locked_at = existing_record['locked_at']
-            if status == vfa_config['IDEMPOTENCY_STATUS_COMPLETED']:
-                logger.info(f"Idempotency: Found completed record for key '{idempotency_key}'. Returning stored result.", extra={"orig_req_id": request_id_celery})
-                db_conn.rollback()
-                return existing_record['result_payload']
-            elif status == vfa_config['IDEMPOTENCY_STATUS_PROCESSING']:
-                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']:
-                    logger.warning(f"Idempotency: Key '{idempotency_key}' is already processing. Returning conflict.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
+            existing_record = check_idempotency_key(db_conn, idempotency_key, vfa_task_name_for_idempotency)
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record['locked_at']
+                if status == vfa_config['IDEMPOTENCY_STATUS_COMPLETED']:
+                    logger.info(f"Idempotency: Found completed record for key '{idempotency_key}'. Returning stored result.", extra={"orig_req_id": request_id_celery})
                     db_conn.rollback()
-                    return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
-                else:
-                    logger.warning(f"Idempotency: Key '{idempotency_key}' was 'processing' but lock timed out. Re-processing.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
-                    _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-            elif status == vfa_config['IDEMPOTENCY_STATUS_FAILED']:
-                logger.info(f"Idempotency: Key '{idempotency_key}' previously failed. Retrying.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
-                _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-        else:
-            _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
-        db_conn.commit()
-        self.update_state(state='PROGRESS', meta={'message': 'Idempotency check passed. Starting main logic.'})
-
-        # --- Original Task Logic (after idempotency check) ---
-        requested_tts_settings = {k: v for k, v in {"voice_id": voice_params_input.get("voice_name"), "audio_format": voice_params_input.get("audio_encoding"), "speech_rate": voice_params_input.get("speaking_rate"), "pitch": voice_params_input.get("pitch")}.items() if v is not None}
-
-        if vfa_config.get('VFA_TEST_MODE_ENABLED'):
-            # ... (existing test mode logic - kept for brevity, ensure it returns a dict that can be stored as result_payload)
-            # Example success:
-            sim_result = {"status": VFA_STATUS_SUCCESS, "message": "Audio successfully synthesized (VFA TEST MODE - dummy file).", "audio_filepath": "/dummy/path.mp3", "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
-            _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=sim_result, workflow_id=workflow_id, is_new_key=False)
-            db_conn.commit()
-            return sim_result
-
-        if not isinstance(script_input, dict): text_to_synthesize = str(script_input)
-        else:
-            full_raw_script = script_input.get("full_raw_script", "")
-            if any(full_raw_script.startswith(prefix) for prefix in PSWA_ERROR_PREFIXES):
-                vfa_skip_result = {"status": VFA_STATUS_SKIPPED, "message": "PSWA script error, TTS skipped.", "audio_filepath": None, "stream_id": stream_id, "tts_settings_used": None}
-                _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=vfa_skip_result, workflow_id=workflow_id, is_new_key=False)
-                db_conn.commit()
-                return vfa_skip_result
-            segments = script_input.get("segments", [])
-            if segments:
-                tts_parts = []; title = script_input.get("title", original_topic)
-                if title and not title.startswith("Error: Insufficient Content"): tts_parts.append(f"{title}.")
-                for segment in segments:
-                    seg_title = segment.get("segment_title", ""); seg_content = segment.get("content", "")
-                    if seg_title and seg_title not in ["INTRO", "OUTRO", "ERROR"]: tts_parts.append(f"{seg_title}.")
-                    if seg_content: tts_parts.append(seg_content)
-                text_to_synthesize = "\n\n".join(tts_parts)
-            elif full_raw_script: text_to_synthesize = full_raw_script
+                    return existing_record['result_payload']
+                elif status == vfa_config['IDEMPOTENCY_STATUS_PROCESSING']:
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']:
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' is already processing. Returning conflict.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
+                        db_conn.rollback()
+                        return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                    else:
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' was 'processing' but lock timed out. Re-processing.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
+                        store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                elif status == vfa_config['IDEMPOTENCY_STATUS_FAILED']:
+                    logger.info(f"Idempotency: Key '{idempotency_key}' previously failed. Retrying.", extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
+                    store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
             else:
-                no_text_error = {"error_code": "VFA_SCRIPT_ERROR_NO_TEXT", "message": "Script has no usable text.", "stream_id": stream_id, "tts_settings_used": None}
-                _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_FAILED'], error_payload=no_text_error, workflow_id=workflow_id, is_new_key=False)
-                db_conn.commit()
-                return no_text_error
-
-
-        synthesized_char_count = len(text_to_synthesize)
-        if synthesized_char_count < vfa_config.get('VFA_MIN_SCRIPT_LENGTH', 20):
-            too_short_result = {"status": VFA_STATUS_SKIPPED, "message": f"Text too short ({synthesized_char_count} chars), TTS skipped.", "audio_filepath": None, "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
-            _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=too_short_result, workflow_id=workflow_id, is_new_key=False)
+                store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
             db_conn.commit()
-            return too_short_result
+            self.update_state(state='PROGRESS', meta={'message': 'Idempotency check passed. Starting main logic.'})
 
-        aims_tts_payload = {"text": text_to_synthesize, **requested_tts_settings}
-        aims_tts_url = vfa_config['AIMS_TTS_SERVICE_URL']
-        aims_tts_initial_request_timeout = vfa_config.get('AIMS_TTS_REQUEST_TIMEOUT_SECONDS')
-        polling_interval = vfa_config.get('AIMS_TTS_POLLING_INTERVAL_SECONDS')
-        polling_timeout = vfa_config.get('AIMS_TTS_POLLING_TIMEOUT_SECONDS')
+            # --- Original Task Logic (after idempotency check) ---
+            requested_tts_settings = {k: v for k, v in {"voice_id": voice_params_input.get("voice_name"), "audio_format": voice_params_input.get("audio_encoding"), "speaking_rate": voice_params_input.get("speaking_rate"), "pitch": voice_params_input.get("pitch")}.items() if v is not None}
 
-        logger.info(f"Celery Task {self.request.id}: Sending initial request to AIMS_TTS. URL: {aims_tts_url}", extra={"orig_req_id": request_id_celery})
-        # ... (AIMS_TTS call and polling logic as before) ...
-        # --- Start of AIMS_TTS interaction (copied and adapted from original) ---
-        initial_response = GLOBAL_REQUESTS_SESSION.post(aims_tts_url, json=aims_tts_payload, timeout=aims_tts_initial_request_timeout)
-        initial_response.raise_for_status()
-        if initial_response.status_code != 202:
-            raise Exception(f"AIMS_TTS task not accepted: {initial_response.status_code} - {initial_response.text}")
-        aims_tts_task_init_data = initial_response.json()
-        task_id_from_aims_tts = aims_tts_task_init_data.get("task_id")
-        status_url_suffix = aims_tts_task_init_data.get("status_url")
-        if not task_id_from_aims_tts or not status_url_suffix:
-            raise ValueError(f"AIMS_TTS task submission response invalid: {aims_tts_task_init_data}")
-        aims_tts_base_url = '/'.join(aims_tts_url.split('/')[:-2])
-        poll_status_url = f"{aims_tts_base_url}{status_url_suffix}"
-        polling_start_time = time.time()
-        aims_tts_data = None
-        while True:
-            if time.time() - polling_start_time > polling_timeout:
-                raise Exception(f"Polling AIMS_TTS task {task_id_from_aims_tts} timed out.")
-            try:
-                    poll_response = GLOBAL_REQUESTS_SESSION.get(poll_status_url, timeout=10)
-                poll_response.raise_for_status(); task_status_data = poll_response.json(); task_state = task_status_data.get("status")
-                if task_state == "SUCCESS":
-                    aims_tts_data = task_status_data.get("result")
-                    if not aims_tts_data or not aims_tts_data.get("audio_url"): raise ValueError(f"AIMS_TTS result invalid: {task_status_data}")
-                    break
-                elif task_state == "FAILURE": raise Exception(f"AIMS_TTS task failed: {task_status_data.get('result', {}).get('error', {}).get('message', 'Unknown')}")
-                time.sleep(polling_interval)
-            except requests.exceptions.RequestException as e_poll: logger.warning(f"Polling AIMS_TTS task {task_id_from_aims_tts} failed: {e_poll}. Retrying.", extra={"orig_req_id": request_id_celery}); time.sleep(polling_interval)
-        # --- End of AIMS_TTS interaction ---
+            if vfa_config.get('VFA_TEST_MODE_ENABLED'):
+                # ... (existing test mode logic - kept for brevity, ensure it returns a dict that can be stored as result_payload)
+                # Example success:
+                sim_result = {"status": VFA_STATUS_SUCCESS, "message": "Audio successfully synthesized (VFA TEST MODE - dummy file).", "audio_filepath": "/dummy/path.mp3", "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
+                store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=sim_result, workflow_id=workflow_id, is_new_key=False)
+                db_conn.commit()
+                return sim_result
 
-        final_tts_settings_used = {k:v for k,v in {"voice_name": aims_tts_data.get("voice_id", requested_tts_settings.get("voice_id")), "audio_encoding": aims_tts_data.get("audio_format", requested_tts_settings.get("audio_format")), "speaking_rate": requested_tts_settings.get("speech_rate"), "pitch": requested_tts_settings.get("pitch")}.items() if v is not None}
-        vfa_success_payload = {"status": VFA_STATUS_SUCCESS, "message": "Audio successfully synthesized via AIMS_TTS (async).", "audio_filepath": aims_tts_data.get("audio_url"), "stream_id": stream_id, "audio_format": aims_tts_data.get("audio_format", "unknown").lower(), "script_char_count": synthesized_char_count, "engine_used": f"aims_tts_via_{aims_tts_data.get('voice_id', 'unknown_voice')}", "tts_settings_used": final_tts_settings_used}
+            if not isinstance(script_input, dict): text_to_synthesize = str(script_input)
+            else:
+                full_raw_script = script_input.get("full_raw_script", "")
+                if any(full_raw_script.startswith(prefix) for prefix in PSWA_ERROR_PREFIXES):
+                    vfa_skip_result = {"status": VFA_STATUS_SKIPPED, "message": "PSWA script error, TTS skipped.", "audio_filepath": None, "stream_id": stream_id, "tts_settings_used": None}
+                    store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=vfa_skip_result, workflow_id=workflow_id, is_new_key=False)
+                    db_conn.commit()
+                    return vfa_skip_result
+                segments = script_input.get("segments", [])
+                if segments:
+                    tts_parts = []; title = script_input.get("title", original_topic)
+                    if title and not title.startswith("Error: Insufficient Content"): tts_parts.append(f"{title}.")
+                    for segment in segments:
+                        seg_title = segment.get("segment_title", ""); seg_content = segment.get("content", "")
+                        if seg_title and seg_title not in ["INTRO", "OUTRO", "ERROR"]: tts_parts.append(f"{seg_title}.")
+                        if seg_content: tts_parts.append(seg_content)
+                    text_to_synthesize = "\n\n".join(tts_parts)
+                elif full_raw_script: text_to_synthesize = full_raw_script
+                else:
+                    no_text_error = {"error_code": "VFA_SCRIPT_ERROR_NO_TEXT", "message": "Script has no usable text.", "stream_id": stream_id, "tts_settings_used": None}
+                    store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_FAILED'], error_payload=no_text_error, workflow_id=workflow_id, is_new_key=False)
+                    db_conn.commit()
+                    return no_text_error
 
-        _store_vfa_idempotency_result(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=vfa_success_payload, workflow_id=workflow_id, is_new_key=False)
-        db_conn.commit()
-        self.update_state(state='SUCCESS', meta=vfa_success_payload)
-        return vfa_success_payload
+
+            synthesized_char_count = len(text_to_synthesize)
+            if synthesized_char_count < vfa_config.get('VFA_MIN_SCRIPT_LENGTH', 20):
+                too_short_result = {"status": VFA_STATUS_SKIPPED, "message": f"Text too short ({synthesized_char_count} chars), TTS skipped.", "audio_filepath": None, "stream_id": stream_id, "tts_settings_used": requested_tts_settings}
+                store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=too_short_result, workflow_id=workflow_id, is_new_key=False)
+                db_conn.commit()
+                return too_short_result
+
+            aims_tts_payload = {"text": text_to_synthesize, **requested_tts_settings}
+            aims_tts_url = vfa_config['AIMS_TTS_SERVICE_URL']
+            aims_tts_initial_request_timeout = vfa_config.get('AIMS_TTS_REQUEST_TIMEOUT_SECONDS')
+            polling_interval = vfa_config.get('AIMS_TTS_POLLING_INTERVAL_SECONDS')
+            polling_timeout = vfa_config.get('AIMS_TTS_POLLING_TIMEOUT_SECONDS')
+
+            logger.info(f"Celery Task {self.request.id}: Sending initial request to AIMS_TTS. URL: {aims_tts_url}", extra={"orig_req_id": request_id_celery})
+            # ... (AIMS_TTS call and polling logic as before) ...
+            # --- Start of AIMS_TTS interaction (copied and adapted from original) ---
+            initial_response = GLOBAL_REQUESTS_SESSION.post(aims_tts_url, json=aims_tts_payload, timeout=aims_tts_initial_request_timeout)
+            initial_response.raise_for_status()
+            if initial_response.status_code != 202:
+                raise Exception(f"AIMS_TTS task not accepted: {initial_response.status_code} - {initial_response.text}")
+            aims_tts_task_init_data = initial_response.json()
+            task_id_from_aims_tts = aims_tts_task_init_data.get("task_id")
+            status_url_suffix = aims_tts_task_init_data.get("status_url")
+            if not task_id_from_aims_tts or not status_url_suffix:
+                raise ValueError(f"AIMS_TTS task submission response invalid: {aims_tts_task_init_data}")
+            aims_tts_base_url = '/'.join(aims_tts_url.split('/')[:-2])
+            poll_status_url = f"{aims_tts_base_url}{status_url_suffix}"
+            polling_start_time = time.time()
+            aims_tts_data = None
+            while True:
+                if time.time() - polling_start_time > polling_timeout:
+                    raise Exception(f"Polling AIMS_TTS task {task_id_from_aims_tts} timed out.")
+                try:
+                        poll_response = GLOBAL_REQUESTS_SESSION.get(poll_status_url, timeout=10)
+                    poll_response.raise_for_status(); task_status_data = poll_response.json(); task_state = task_status_data.get("status")
+                    if task_state == "SUCCESS":
+                        aims_tts_data = task_status_data.get("result")
+                        if not aims_tts_data or not aims_tts_data.get("audio_url"): raise ValueError(f"AIMS_TTS result invalid: {task_status_data}")
+                        break
+                    elif task_state == "FAILURE": raise Exception(f"AIMS_TTS task failed: {task_status_data.get('result', {}).get('error', {}).get('message', 'Unknown')}")
+                    time.sleep(polling_interval)
+                except requests.exceptions.RequestException as e_poll: logger.warning(f"Polling AIMS_TTS task {task_id_from_aims_tts} failed: {e_poll}. Retrying.", extra={"orig_req_id": request_id_celery}); time.sleep(polling_interval)
+            # --- End of AIMS_TTS interaction ---
+
+            final_tts_settings_used = {k:v for k,v in {"voice_name": aims_tts_data.get("voice_id", requested_tts_settings.get("voice_id")), "audio_encoding": aims_tts_data.get("audio_format", requested_tts_settings.get("audio_format")), "speaking_rate": requested_tts_settings.get("speech_rate"), "pitch": requested_tts_settings.get("pitch")}.items() if v is not None}
+            vfa_success_payload = {"status": VFA_STATUS_SUCCESS, "message": "Audio successfully synthesized via AIMS_TTS (async).", "audio_filepath": aims_tts_data.get("audio_url"), "stream_id": stream_id, "audio_format": aims_tts_data.get("audio_format", "unknown").lower(), "script_char_count": synthesized_char_count, "engine_used": f"aims_tts_via_{aims_tts_data.get('voice_id', 'unknown_voice')}", "tts_settings_used": final_tts_settings_used}
+
+            store_idempotency_record(db_conn, idempotency_key, vfa_task_name_for_idempotency, vfa_config['IDEMPOTENCY_STATUS_COMPLETED'], result_payload=vfa_success_payload, workflow_id=workflow_id, is_new_key=False)
+            db_conn.commit()
+            self.update_state(state='SUCCESS', meta=vfa_success_payload)
+            return vfa_success_payload
 
     except Exception as e:
         logger.error(f"Celery Task {self.request.id} (Idempotency Key: {idempotency_key}): Error in forge_voice_task: {e}", exc_info=True, extra={"orig_req_id": request_id_celery, "workflow_id": workflow_id})
         # The on_failure handler will now manage updating the idempotency record.
         # Re-raise the exception so Celery calls on_failure.
         # If using self.retry, on_failure is only called if retries are exhausted or it's not a retryable exception.
-        # For simplicity here, just re-raise. If specific retry logic for certain exceptions is needed
-        # before marking as FAILED, that would be more complex.
+        # For simplicity here, just re-raise.
         raise # This will trigger VfaCeleryTask.on_failure
-    finally:
-        if db_conn:
-            try:
-                if not db_conn.closed: db_conn.close()
-            except Exception as e_close: logger.error(f"Error closing VFA DB connection: {e_close}", exc_info=True, extra={"orig_req_id": request_id_celery})
 
 
 @app.route('/v1/forge_voice', methods=['POST'])
@@ -361,42 +350,41 @@ def handle_forge_voice_async():
 
     # --- Idempotency Pre-check at Endpoint Level ---
     idem_task_name_for_db = 'forge_voice_task' # Matches Celery task name
-    db_conn_http = None
     # Assuming PSYCOPG2_AVAILABLE is defined (it is, based on imports)
     # For VFA, psycopg2 is imported directly, so we can assume it's available if no import error.
     # A more robust check would be `if 'psycopg2' in sys.modules:` or a PSYCOPG2_AVAILABLE flag if set.
-    # For now, let's assume it's available if the service starts and _get_vfa_db_connection handles it.
+    # For now, let's assume it's available if the service starts and get_db_connection handles it.
     try:
-        db_conn_http = _get_vfa_db_connection()
-        db_conn_http.autocommit = False # Manage transaction for pre-check
+        with get_db_connection() as db_conn_http:
+            db_conn_http.autocommit = False # Manage transaction for pre-check
 
-        existing_record = _check_vfa_idempotency_key(db_conn_http, idempotency_key_header, idem_task_name_for_db)
-        if existing_record:
-            status = existing_record['status']
-            locked_at = existing_record.get('locked_at')
-            lock_timeout = vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+            existing_record = check_idempotency_key(db_conn_http, idempotency_key_header, idem_task_name_for_db)
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record.get('locked_at')
+                lock_timeout = vfa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
 
-            if status == vfa_config['IDEMPOTENCY_STATUS_COMPLETED']:
-                logger.info(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' already COMPLETED. Returning stored result.", extra={'workflow_id': workflow_id_header})
-                db_conn_http.rollback()
-                return jsonify(existing_record['result_payload']), 200
-            elif status == vfa_config['IDEMPOTENCY_STATUS_PROCESSING']:
-                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
-                    logger.warning(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' is PROCESSING. Returning conflict.", extra={'workflow_id': workflow_id_header})
+                if status == vfa_config['IDEMPOTENCY_STATUS_COMPLETED']:
+                    logger.info(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' already COMPLETED. Returning stored result.", extra={'workflow_id': workflow_id_header})
                     db_conn_http.rollback()
-                    return jsonify({"error_code": "VFA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409
-                else: # Lock expired
-                    logger.info(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' was PROCESSING but lock expired. Re-processing.", extra={'workflow_id': workflow_id_header})
-                    _store_vfa_idempotency_result(db_conn_http, idempotency_key_header, idem_task_name_for_db, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id_header, is_new_key=False)
+                    return jsonify(existing_record['result_payload']), 200
+                elif status == vfa_config['IDEMPOTENCY_STATUS_PROCESSING']:
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
+                        logger.warning(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' is PROCESSING. Returning conflict.", extra={'workflow_id': workflow_id_header})
+                        db_conn_http.rollback()
+                        return jsonify({"error_code": "VFA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409
+                    else: # Lock expired
+                        logger.info(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' was PROCESSING but lock expired. Re-processing.", extra={'workflow_id': workflow_id_header})
+                        store_idempotency_record(db_conn_http, idempotency_key_header, idem_task_name_for_db, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id_header, is_new_key=False)
+                        db_conn_http.commit()
+                elif status == vfa_config['IDEMPOTENCY_STATUS_FAILED']:
+                    logger.info(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' previously FAILED. Re-processing.", extra={'workflow_id': workflow_id_header})
+                    store_idempotency_record(db_conn_http, idempotency_key_header, idem_task_name_for_db, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id_header, is_new_key=False)
                     db_conn_http.commit()
-            elif status == vfa_config['IDEMPOTENCY_STATUS_FAILED']:
-                logger.info(f"VFA Request {request_id_main}: Idempotency key '{idempotency_key_header}' previously FAILED. Re-processing.", extra={'workflow_id': workflow_id_header})
-                _store_vfa_idempotency_result(db_conn_http, idempotency_key_header, idem_task_name_for_db, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id_header, is_new_key=False)
+            else: # No existing record
+                logger.info(f"VFA Request {request_id_main}: New idempotency key '{idempotency_key_header}'. Storing as PROCESSING.", extra={'workflow_id': workflow_id_header})
+                store_idempotency_record(db_conn_http, idempotency_key_header, idem_task_name_for_db, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id_header, is_new_key=True)
                 db_conn_http.commit()
-        else: # No existing record
-            logger.info(f"VFA Request {request_id_main}: New idempotency key '{idempotency_key_header}'. Storing as PROCESSING.", extra={'workflow_id': workflow_id_header})
-            _store_vfa_idempotency_result(db_conn_http, idempotency_key_header, idem_task_name_for_db, vfa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id_header, is_new_key=True)
-            db_conn_http.commit()
     except psycopg2.Error as db_err_http: # More specific error catch
         logger.error(f"VFA Request {request_id_main}: Database error during HTTP idempotency pre-check: {db_err_http}", exc_info=True, extra={'workflow_id': workflow_id_header})
         if db_conn_http: db_conn_http.rollback()
@@ -405,10 +393,6 @@ def handle_forge_voice_async():
         logger.error(f"VFA Request {request_id_main}: Unexpected error during HTTP idempotency pre-check: {e_idem_http}", exc_info=True, extra={'workflow_id': workflow_id_header})
         if db_conn_http: db_conn_http.rollback()
         logger.warning(f"VFA Request {request_id_main}: Proceeding to Celery dispatch despite unexpected error in pre-check.")
-    finally:
-        if db_conn_http and not db_conn_http.closed:
-            db_conn_http.close()
-    # Continue to dispatch Celery task
 
     logger.info(f"Request {request_id_main}: Dispatching forge_voice task. Topic: '{script_payload.get('topic', 'N/A')}', Idempotency Key: {idempotency_key_header}, Workflow ID: {workflow_id_header}")
     task = forge_voice_task.delay(

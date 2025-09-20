@@ -1,7 +1,9 @@
-Flask>=2.0
+Flask>=2.0.0,<3.0.0
 python-dotenv>=0.15
 google-cloud-aiplatform>=1.0.0
 google-cloud-storage>=1.30.0
 celery>=5.2.0
 redis>=4.0.0
 psycopg2-binary>=2.9.0
+aethercast
+gunicorn>=20.0.0

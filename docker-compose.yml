@@ -68,8 +68,8 @@ services:
 
   aims_service:
     build:
-      context: ./aethercast/aims_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./aethercast/aims_service/Dockerfile
     container_name: aims_service
     ports:
       - "8008:8000" # Host:Container
@@ -92,8 +92,8 @@ services:
 
   aims_tts_service:
     build:
-      context: ./aethercast/aims_tts_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./aethercast/aims_tts_service/Dockerfile
     container_name: aims_tts_service
     ports:
       - "9009:9000" # Host:Container
@@ -268,8 +268,8 @@ services:
 
   iga:
     build:
-      context: ./aethercast/iga # Corrected context
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./aethercast/iga/Dockerfile
     ports:
       - "5007:5007" # Expose port 5007 for IGA
     env_file:

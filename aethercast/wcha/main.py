@@ -13,9 +13,10 @@ from python_json_logger import jsonlogger # Added for JSON logging
 import psycopg2
 from psycopg2 import pool as psycopg2_pool
 import time # For stale lock check
+from datetime import datetime, timezone
 from aethercast.common.celery import create_celery_app
-from aethercast.common.db import get_db_connection, release_db_connection, init_db_connection_pool
-from aethercast.common.idempotency import check_idempotency, acquire_idempotency_lock, update_idempotency_record
+from aethercast.common.db import get_db_connection, init_db_connection_pool
+from aethercast.common.idempotency import check_idempotency_key, store_idempotency_record
 import flask
 
 # --- Load Environment Variables ---
@@ -66,7 +67,12 @@ TDA_NEWS_DEFAULT_KEYWORDS = os.getenv('TDA_NEWS_DEFAULT_KEYWORDS', 'technology,A
 TDA_NEWS_DEFAULT_LANGUAGE = os.getenv('TDA_NEWS_DEFAULT_LANGUAGE', 'en')
 TDA_NEWS_PAGE_SIZE = int(os.getenv('TDA_NEWS_PAGE_SIZE', '20'))
 WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION = int(os.getenv('WCHA_MIN_CONTENT_LENGTH_FOR_AGGREGATION', '150'))
-IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = 300 # 5 minutes
+IDEMPOTENCY_LOCK_TIMEOUT_SECONDS = int(os.getenv('IDEMPOTENCY_LOCK_TIMEOUT_SECONDS', 1800))
+IDEMPOTENCY_STATUS_PROCESSING = os.getenv("IDEMPOTENCY_STATUS_PROCESSING", "processing")
+IDEMPOTENCY_STATUS_COMPLETED = os.getenv("IDEMPOTENCY_STATUS_COMPLETED", "completed")
+IDEMPOTENCY_STATUS_FAILED = os.getenv("IDEMPOTENCY_STATUS_FAILED", "failed")
+SERVICE_NAME_FOR_IDEMPOTENCY = os.getenv("SERVICE_NAME_FOR_IDEMPOTENCY", "WCHA")
+
 
 ERROR_PREFIX_HARVEST_FAILED_FETCH = "Error fetching URL"
 ERROR_PREFIX_HARVEST_TRAFILATURA_FAILED = "WCHA: Trafilatura failed to extract content from URL"
@@ -234,152 +240,190 @@ def is_url_safe(url_string: str, task_id: Optional[str] = None, workflow_id: Opt
 def fetch_news_articles_task(self, request_id: str, topic: str, language: Optional[str] = None, max_results: Optional[int] = None):
     log_extra = {'task_id': request_id, 'workflow_id': 'N/A'}
     idempotency_key = request_id
-    task_name = "wcha_fetch_news_articles_task"
-    db_conn = None
+    task_name = self.name
     logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting task '{task_name}' for topic '{topic}'.", extra=log_extra)
     try:
-        db_conn = get_db_connection(service_name='wcha')
-        idempotency_check_result = check_idempotency(db_conn, idempotency_key, task_name, IDEMPOTENCY_LOCK_TIMEOUT_SECONDS, service_name='wcha')
-        if idempotency_check_result:
-            if idempotency_check_result['status'] == 'completed':
-                logger.info(f"Task '{task_name}' already completed. Returning stored result.", extra=log_extra)
-                return idempotency_check_result['result']
-            elif idempotency_check_result['status'] == 'conflict':
-                logger.warning(f"Task '{task_name}' conflict: {idempotency_check_result['message']}.", extra=log_extra)
-                return {"status": "conflict", "message": idempotency_check_result['message']}
-        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, log_extra['workflow_id'], service_name='wcha'):
-            logger.error(f"Failed to acquire idempotency lock for task '{task_name}'. Aborting.", extra=log_extra)
-            return {"status": "error", "message": "Failed to acquire idempotency lock."}
-        logger.info(f"Celery Task {self.request.id}: Lock acquired. Fetching news for topic '{topic}'.", extra=log_extra)
-        if not USE_REAL_NEWS_API:
-            logger.info(f"Celery Task {self.request.id}: USE_REAL_NEWS_API is false. Returning mock success.", extra=log_extra)
-            result = {"status": "success_mock", "articles": [], "message": "News API is not enabled; mock response."}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
+        with get_db_connection(service_name='wcha') as db_conn:
+            db_conn.autocommit = False
+
+            existing_record = check_idempotency_key(db_conn, idempotency_key, task_name)
+
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record['locked_at']
+                if status == IDEMPOTENCY_STATUS_COMPLETED:
+                    logger.info(f"Idempotency: Found COMPLETED record for key '{idempotency_key}'. Returning stored result.", extra=log_extra)
+                    db_conn.rollback()
+                    return existing_record['result_payload']
+                elif status == IDEMPOTENCY_STATUS_PROCESSING:
+                    lock_timeout_seconds = IDEMPOTENCY_LOCK_TIMEOUT_SECONDS
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout_seconds:
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' is already PROCESSING. Returning conflict status.", extra=log_extra)
+                        db_conn.rollback()
+                        return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                    else: # Lock expired or was null
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' was 'processing' but lock timed out/null. Re-processing.", extra=log_extra)
+                        store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                elif status == IDEMPOTENCY_STATUS_FAILED:
+                     logger.info(f"Idempotency: Key '{idempotency_key}' previously FAILED. Retrying.", extra=log_extra)
+                     store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            else: # No existing record for this service
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=log_extra['workflow_id'], is_new_key=True)
+
+            db_conn.commit()
+
+            if not USE_REAL_NEWS_API:
+                logger.info(f"Celery Task {self.request.id}: USE_REAL_NEWS_API is false. Returning mock success.", extra=log_extra)
+                result = {"status": "success_mock", "articles": [], "message": "News API is not enabled; mock response."}
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_COMPLETED, result_payload=result, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                db_conn.commit()
+                return result
+            if not TDA_NEWS_API_KEY:
+                logger.error(f"Celery Task {self.request.id}: TDA_NEWS_API_KEY not configured.", extra=log_extra)
+                error_payload = {"error_type": "ConfigurationError", "message": "TDA_NEWS_API_KEY not configured."}
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                db_conn.commit()
+                raise ValueError("NewsAPI key not configured.")
+            base_url = TDA_NEWS_API_BASE_URL
+            endpoint = TDA_NEWS_API_ENDPOINT
+            api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+            params = {}
+            query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else TDA_NEWS_DEFAULT_KEYWORDS
+            if query_keywords_list: params["q"] = " OR ".join(query_keywords_list)
+            current_language = language if language else TDA_NEWS_DEFAULT_LANGUAGE
+            if current_language: params["language"] = current_language
+            params["pageSize"] = max_results if max_results else TDA_NEWS_PAGE_SIZE
+            headers = {"X-Api-Key": TDA_NEWS_API_KEY, "User-Agent": WCHA_USER_AGENT}
+            request_timeout = WCHA_REQUEST_TIMEOUT
+            logger.info(f"Celery Task {self.request.id}: Calling NewsAPI: URL={api_url}, Params={params}", extra=log_extra)
+            response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
+            response.raise_for_status()
+            response_json = response.json()
+            if response_json.get("status") != "ok":
+                error_msg = f"NewsAPI returned error: {response_json.get('message', 'Unknown NewsAPI error')}"
+                logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
+                error_payload = {"error_type": "NewsAPIError", "message": error_msg, "details": response_json}
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                db_conn.commit()
+                raise requests.exceptions.HTTPError(error_msg, response=response)
+            articles = response_json.get("articles", [])
+            logger.info(f"Celery Task {self.request.id}: Fetched {len(articles)} articles.", extra=log_extra)
+            result = {"status": "success", "articles": articles, "message": f"Fetched {len(articles)} articles."}
+            store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_COMPLETED, result_payload=result, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            db_conn.commit()
             return result
-        if not TDA_NEWS_API_KEY:
-            logger.error(f"Celery Task {self.request.id}: TDA_NEWS_API_KEY not configured.", extra=log_extra)
-            error_payload = {"error_type": "ConfigurationError", "message": "TDA_NEWS_API_KEY not configured."}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
-            raise ValueError("NewsAPI key not configured.")
-        base_url = TDA_NEWS_API_BASE_URL
-        endpoint = TDA_NEWS_API_ENDPOINT
-        api_url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
-        params = {}
-        query_keywords_list = [kw.strip() for kw in topic.split(',')] if topic else TDA_NEWS_DEFAULT_KEYWORDS
-        if query_keywords_list: params["q"] = " OR ".join(query_keywords_list)
-        current_language = language if language else TDA_NEWS_DEFAULT_LANGUAGE
-        if current_language: params["language"] = current_language
-        params["pageSize"] = max_results if max_results else TDA_NEWS_PAGE_SIZE
-        headers = {"X-Api-Key": TDA_NEWS_API_KEY, "User-Agent": WCHA_USER_AGENT}
-        request_timeout = WCHA_REQUEST_TIMEOUT
-        logger.info(f"Celery Task {self.request.id}: Calling NewsAPI: URL={api_url}, Params={params}", extra=log_extra)
-        response = requests.get(api_url, headers=headers, params=params, timeout=request_timeout)
-        response.raise_for_status()
-        response_json = response.json()
-        if response_json.get("status") != "ok":
-            error_msg = f"NewsAPI returned error: {response_json.get('message', 'Unknown NewsAPI error')}"
-            logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
-            error_payload = {"error_type": "NewsAPIError", "message": error_msg, "details": response_json}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
-            raise requests.exceptions.HTTPError(error_msg, response=response)
-        articles = response_json.get("articles", [])
-        logger.info(f"Celery Task {self.request.id}: Fetched {len(articles)} articles.", extra=log_extra)
-        result = {"status": "success", "articles": articles, "message": f"Fetched {len(articles)} articles."}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
-        return result
     except requests.exceptions.RequestException as e_req:
         error_msg = f"NewsAPI request error: {e_req}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        if db_conn:
+        with get_db_connection(service_name='wcha') as db_conn:
             error_payload = {"error_type": type(e_req).__name__, "message": str(e_req)}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
+            store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            db_conn.commit()
         raise self.retry(exc=e_req, countdown=60, max_retries=3)
     except Exception as e_unexp:
         error_msg = f"Unexpected error fetching news: {e_unexp}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        if db_conn:
+        with get_db_connection(service_name='wcha') as db_conn:
             error_payload = {"error_type": type(e_unexp).__name__, "message": str(e_unexp)}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
+            store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            db_conn.commit()
         raise self.retry(exc=e_unexp, countdown=60, max_retries=1)
-    finally:
-        if db_conn: release_db_connection(db_conn, service_name='wcha')
 
 @celery_app.task(bind=True, name='harvest_url_content_task')
 def harvest_url_content_task(self, request_id: str, url_to_harvest: str, min_length: int = 150):
     log_extra = {'task_id': request_id, 'workflow_id': 'N/A'}
     idempotency_key = request_id
-    task_name = "wcha_harvest_url_content_task"
-    db_conn = None
+    task_name = self.name
     logger.info(f"Celery Task {self.request.id} (Orig Req ID: {request_id}): Starting task '{task_name}' for URL: {url_to_harvest}", extra=log_extra)
     try:
-        db_conn = get_db_connection(service_name='wcha')
-        idempotency_check_result = check_idempotency(db_conn, idempotency_key, task_name, IDEMPOTENCY_LOCK_TIMEOUT_SECONDS, service_name='wcha')
-        if idempotency_check_result:
-            if idempotency_check_result['status'] == 'completed':
-                logger.info(f"Task '{task_name}' already completed. Returning stored result.", extra=log_extra)
-                return idempotency_check_result['result']
-            elif idempotency_check_result['status'] == 'conflict':
-                logger.warning(f"Task '{task_name}' conflict: {idempotency_check_result['message']}.", extra=log_extra)
-                return {"status": "conflict", "url": url_to_harvest, "message": idempotency_check_result['message']}
-        if not acquire_idempotency_lock(db_conn, idempotency_key, task_name, log_extra['workflow_id'], service_name='wcha'):
-            logger.error(f"Failed to acquire idempotency lock for task '{task_name}'. Aborting.", extra=log_extra)
-            return {"status": "error", "url": url_to_harvest, "message": "Failed to acquire idempotency lock."}
-        logger.info(f"Celery Task {self.request.id}: Lock acquired. Starting content harvest for URL: {url_to_harvest}", extra=log_extra)
-        is_safe, reason = is_url_safe(url_to_harvest, task_id=request_id, workflow_id='N/A')
-        if not is_safe:
-            logger.warning(f"Celery Task {self.request.id}: URL '{url_to_harvest}' is not safe: {reason}. Skipping harvest.", extra=log_extra)
-            result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
+        with get_db_connection(service_name='wcha') as db_conn:
+            db_conn.autocommit = False
+
+            existing_record = check_idempotency_key(db_conn, idempotency_key, task_name)
+
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record['locked_at']
+                if status == IDEMPOTENCY_STATUS_COMPLETED:
+                    logger.info(f"Idempotency: Found COMPLETED record for key '{idempotency_key}'. Returning stored result.", extra=log_extra)
+                    db_conn.rollback()
+                    return existing_record['result_payload']
+                elif status == IDEMPOTENCY_STATUS_PROCESSING:
+                    lock_timeout_seconds = IDEMPOTENCY_LOCK_TIMEOUT_SECONDS
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout_seconds:
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' is already PROCESSING. Returning conflict status.", extra=log_extra)
+                        db_conn.rollback()
+                        return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                    else: # Lock expired or was null
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' was 'processing' but lock timed out/null. Re-processing.", extra=log_extra)
+                        store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                elif status == IDEMPOTENCY_STATUS_FAILED:
+                     logger.info(f"Idempotency: Key '{idempotency_key}' previously FAILED. Retrying.", extra=log_extra)
+                     store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            else: # No existing record for this service
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_PROCESSING, workflow_id=log_extra['workflow_id'], is_new_key=True)
+
+            db_conn.commit()
+
+            is_safe, reason = is_url_safe(url_to_harvest, task_id=request_id, workflow_id='N/A')
+            if not is_safe:
+                logger.warning(f"Celery Task {self.request.id}: URL '{url_to_harvest}' is not safe: {reason}. Skipping harvest.", extra=log_extra)
+                result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_SSRF_BLOCKED, "error_message": reason}
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_COMPLETED, result_payload=result, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                db_conn.commit()
+                return result
+            request_timeout = WCHA_REQUEST_TIMEOUT
+            headers = {'User-Agent': WCHA_USER_AGENT}
+            if not _IMPORTS_SUCCESSFUL_REQUESTS:
+                error_msg = f"Required library missing: requests ({_MISSING_IMPORT_ERROR_REQUESTS})"
+                logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
+                error_payload = {"error_type": "ImportError", "message": error_msg}
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                db_conn.commit()
+                raise ImportError(error_msg)
+            if not _IMPORTS_SUCCESSFUL_TRAFILATURA:
+                error_msg = f"Required library missing: trafilatura ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
+                logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
+                error_payload = {"error_type": "ImportError", "message": error_msg}
+                store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+                db_conn.commit()
+                raise ImportError(error_msg)
+            logger.info(f"Celery Task {self.request.id}: Attempting to harvest content from URL: {url_to_harvest} using Trafilatura", extra=log_extra)
+            response = requests.get(url_to_harvest, headers=headers, timeout=request_timeout, allow_redirects=False)
+            response.raise_for_status()
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
+                logger.warning(f"Celery Task {self.request.id}: Content at URL '{url_to_harvest}' may not be HTML (Content-Type: {content_type}).", extra=log_extra)
+            extracted_text = trafilatura.extract(response.content, url=url_to_harvest, output_format='txt',
+                                                 include_comments=False, include_tables=False, favor_precision=True)
+            result = None
+            if extracted_text:
+                if len(extracted_text) < min_length:
+                    logger.warning(f"Celery Task {self.request.id}: Content from {url_to_harvest} is shorter ({len(extracted_text)}) than min_length ({min_length}).", extra=log_extra)
+                logger.info(f"Celery Task {self.request.id}: Trafilatura successfully extracted {len(extracted_text)} characters from {url_to_harvest}.", extra=log_extra)
+                result = {"url": url_to_harvest, "content": extracted_text, "error_type": None, "error_message": None}
+            else:
+                logger.warning(f"Celery Task {self.request.id}: Trafilatura extracted no content from URL: {url_to_harvest}.", extra=log_extra)
+                result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
+            store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_COMPLETED, result_payload=result, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            db_conn.commit()
             return result
-        request_timeout = WCHA_REQUEST_TIMEOUT
-        headers = {'User-Agent': WCHA_USER_AGENT}
-        if not _IMPORTS_SUCCESSFUL_REQUESTS:
-            error_msg = f"Required library missing: requests ({_MISSING_IMPORT_ERROR_REQUESTS})"
-            logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
-            error_payload = {"error_type": "ImportError", "message": error_msg}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
-            raise ImportError(error_msg)
-        if not _IMPORTS_SUCCESSFUL_TRAFILATURA:
-            error_msg = f"Required library missing: trafilatura ({_MISSING_IMPORT_ERROR_TRAFILATURA})"
-            logger.error(f"Celery Task {self.request.id}: {error_msg}", extra=log_extra)
-            error_payload = {"error_type": "ImportError", "message": error_msg}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
-            raise ImportError(error_msg)
-        logger.info(f"Celery Task {self.request.id}: Attempting to harvest content from URL: {url_to_harvest} using Trafilatura", extra=log_extra)
-        response = requests.get(url_to_harvest, headers=headers, timeout=request_timeout, allow_redirects=False)
-        response.raise_for_status()
-        content_type = response.headers.get('Content-Type', '').lower()
-        if 'text/html' not in content_type and 'application/xhtml+xml' not in content_type:
-            logger.warning(f"Celery Task {self.request.id}: Content at URL '{url_to_harvest}' may not be HTML (Content-Type: {content_type}).", extra=log_extra)
-        extracted_text = trafilatura.extract(response.content, url=url_to_harvest, output_format='txt',
-                                             include_comments=False, include_tables=False, favor_precision=True)
-        result = None
-        if extracted_text:
-            if len(extracted_text) < min_length:
-                logger.warning(f"Celery Task {self.request.id}: Content from {url_to_harvest} is shorter ({len(extracted_text)}) than min_length ({min_length}).", extra=log_extra)
-            logger.info(f"Celery Task {self.request.id}: Trafilatura successfully extracted {len(extracted_text)} characters from {url_to_harvest}.", extra=log_extra)
-            result = {"url": url_to_harvest, "content": extracted_text, "error_type": None, "error_message": None}
-        else:
-            logger.warning(f"Celery Task {self.request.id}: Trafilatura extracted no content from URL: {url_to_harvest}.", extra=log_extra)
-            result = {"url": url_to_harvest, "content": None, "error_type": WCHA_ERROR_TYPE_NO_CONTENT, "error_message": "Trafilatura extracted no content."}
-        update_idempotency_record(db_conn, idempotency_key, task_name, 'completed', result_payload=result, service_name='wcha')
-        return result
     except requests.exceptions.RequestException as e_req:
         error_msg = f"RequestException ({type(e_req).__name__}) while fetching '{url_to_harvest}': {e_req}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        if db_conn:
+        with get_db_connection(service_name='wcha') as db_conn:
             error_payload = {"error_type": type(e_req).__name__, "message": str(e_req), "url": url_to_harvest}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
+            store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            db_conn.commit()
         raise self.retry(exc=e_req, countdown=60, max_retries=3)
     except Exception as e_gen:
         error_msg = f"General error during harvest for '{url_to_harvest}': {type(e_gen).__name__} - {e_gen}"
         logger.error(f"Celery Task {self.request.id}: {error_msg}", exc_info=True, extra=log_extra)
-        if db_conn:
+        with get_db_connection(service_name='wcha') as db_conn:
             error_payload = {"error_type": type(e_gen).__name__, "message": str(e_gen), "url": url_to_harvest}
-            update_idempotency_record(db_conn, idempotency_key, task_name, 'failed', error_payload=error_payload, service_name='wcha')
+            store_idempotency_record(db_conn, idempotency_key, task_name, IDEMPOTENCY_STATUS_FAILED, error_payload=error_payload, workflow_id=log_extra['workflow_id'], is_new_key=False)
+            db_conn.commit()
         raise self.retry(exc=e_gen, countdown=60, max_retries=1)
-    finally:
-        if db_conn: release_db_connection(db_conn, service_name='wcha')
 
 def harvest_from_url(url: str, min_length: int = 150, **kwargs) -> dict:
     local_task_id = kwargs.pop('task_id', f"harvest_sync_{uuid.uuid4().hex[:8]}")
@@ -580,64 +624,14 @@ def get_task_status(task_id: str):
     else:
         return flask.jsonify(response_data), 202
 
-if __name__ == "__main__":
+def init_wcha_db():
+    """Initializes the database connection pool for the WCHA service."""
     init_db_connection_pool(service_name='wcha')
-    print("--- Testing WCHA Functionality ---")
-    if not IMPORTS_SUCCESSFUL:
-        logger.warning(f"Some required libraries are missing: {MISSING_IMPORT_ERROR}. Functionality will be limited.")
-    logger.info("--- Testing harvest_content (mock data) ---")
-    existing_topic_mock = "ai in healthcare"
-    logger.info(f"Requesting mock content for topic: '{existing_topic_mock}'")
-    mock_main_task_id = "main_test_task_harvest_content"
-    mock_data_content_str = harvest_content(existing_topic_mock, task_id=mock_main_task_id)
-    logger.info(f"Content for '{existing_topic_mock}' (first 100 chars): {mock_data_content_str[:100]}...\n")
-    logger.info("--- Testing is_url_safe ---")
-    mock_main_task_id_url_safe = "main_test_task_url_safe"
-    safe_url_test = "https://www.google.com"
-    unsafe_url_test_private = "http://192.168.1.1"
-    unsafe_url_test_loopback = "http://127.0.0.1"
-    unsafe_url_test_scheme = "ftp://example.com"
-    unresolvable_url = "http://domain.that.does.not.exist.hopefully"
-    is_safe, reason = is_url_safe(safe_url_test, task_id=mock_main_task_id_url_safe)
-    is_safe, reason = is_url_safe(unsafe_url_test_private, task_id=mock_main_task_id_url_safe)
-    is_safe, reason = is_url_safe(unsafe_url_test_loopback, task_id=mock_main_task_id_url_safe)
-    is_safe, reason = is_url_safe(unsafe_url_test_scheme, task_id=mock_main_task_id_url_safe)
-    is_safe, reason = is_url_safe(unresolvable_url, task_id=mock_main_task_id_url_safe)
-    logger.info("--- Testing harvest_from_url (single URL) ---")
-    mock_main_task_id_harvest_url = "main_test_task_harvest_url"
-    if not _IMPORTS_SUCCESSFUL_REQUESTS or not _IMPORTS_SUCCESSFUL_TRAFILATURA:
-        missing_libs_harvest_url = []
-        if not _IMPORTS_SUCCESSFUL_REQUESTS: missing_libs_harvest_url.append("requests")
-        if not _IMPORTS_SUCCESSFUL_TRAFILATURA: missing_libs_harvest_url.append("trafilatura")
-        logger.warning(f"Skipping harvest_from_url test as libraries are missing: {', '.join(missing_libs_harvest_url)}\n", extra={'task_id': mock_main_task_id_harvest_url})
-    else:
-        python_wiki_url = "https://en.wikipedia.org/wiki/Python_(programming_language)"
-        logger.info(f"Requesting content from URL: '{python_wiki_url}'", extra={'task_id': mock_main_task_id_harvest_url})
-        url_harvest_result = harvest_from_url(python_wiki_url, task_id=mock_main_task_id_harvest_url)
-        if url_harvest_result.get("content"):
-            logger.info(f"Content from '{python_wiki_url}' (first 200 chars): {url_harvest_result['content'][:200]}...\n", extra={'task_id': mock_main_task_id_harvest_url})
-    logger.info("--- Testing get_content_for_topic (web search & consolidation) ---")
-    mock_main_task_id_get_content = "main_test_task_get_content"
-    if not IMPORTS_SUCCESSFUL:
-        logger.warning(f"Skipping get_content_for_topic test as libraries are missing: {MISSING_IMPORT_ERROR}\n", extra={'task_id': mock_main_task_id_get_content})
-    else:
-        search_topic_exercise = "benefits of regular exercise"
-        test_max_results_exercise = 2
-        logger.info(f"Requesting consolidated content for topic: '{search_topic_exercise}' (max {test_max_results_exercise} results for test)", extra={'task_id': mock_main_task_id_get_content})
-        consolidated_result_dict = get_content_for_topic(search_topic_exercise, max_results_override=test_max_results_exercise, task_id=mock_main_task_id_get_content)
-        logger.info(f"Status from get_content_for_topic: {consolidated_result_dict['status']}", extra={'task_id': mock_main_task_id_get_content})
-        logger.info(f"Message from get_content_for_topic: {consolidated_result_dict['message']}", extra={'task_id': mock_main_task_id_get_content})
-        if consolidated_result_dict["status"] == "success" and consolidated_result_dict["content"]:
-            logger.info(f"Source URLs from get_content_for_topic: {consolidated_result_dict['source_urls']}", extra={'task_id': mock_main_task_id_get_content})
-            logger.info(f"Consolidated content for '{search_topic_exercise}' (first 500 chars):\n{consolidated_result_dict['content'][:500]}...\n", extra={'task_id': mock_main_task_id_get_content})
-            if len(consolidated_result_dict["content"]) > 500:
-                logger.info(f"... (Total length: {len(consolidated_result_dict['content'])} characters)", extra={'task_id': mock_main_task_id_get_content})
-        elif consolidated_result_dict["content"]:
-             logger.info(f"Content was returned but might be empty or partial. Length: {len(consolidated_result_dict['content'])}", extra={'task_id': mock_main_task_id_get_content})
-    logger.info("--- WCHA functionality testing in __main__ complete ---")
-    if app:
-        logger.info("--- Flask app /harvest is defined (run separately if needed) ---")
-        # Example POST request (using curl or a tool like Postman):
-        # curl -X POST -H "Content-Type: application/json" -d '{"topic":"ai in healthcare", "use_search":true}' http://localhost:5003/harvest
-        # curl -X POST -H "Content-Type: application/json" -d '{"url":"https://en.wikipedia.org/wiki/Python_(programming_language)"}' http://localhost:5003/harvest
-        # curl -X POST -H "Content-Type: application/json" -d '{"topic":"climate change"}' http://localhost:5003/harvest
+
+if __name__ == "__main__":
+    init_wcha_db()
+    host = os.getenv("WCHA_HOST", "0.0.0.0")
+    port = int(os.getenv("WCHA_PORT", 5003))
+    debug_mode = os.getenv("FLASK_DEBUG", "True").lower() == "true"
+    logger.info(f"--- WCHA Service starting on {host}:{port} (Debug: {debug_mode}) ---")
+    app.run(host=host, port=port, debug=debug_mode)

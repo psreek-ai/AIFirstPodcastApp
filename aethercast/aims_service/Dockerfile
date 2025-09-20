@@ -7,13 +7,13 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 # Copy the requirements file into the container at /app
-COPY requirements.txt .
+COPY aethercast/aims_service/requirements.txt .
 
 # Install any needed packages specified in requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code into the container at /app
-COPY . .
+COPY aethercast/aims_service/ .
 
 # Make port 8000 available to the world outside this container
 # (Note: This is documentation, actual port exposure is in docker-compose.yml)

@@ -25,8 +25,6 @@ try:
 except ImportError:
     logging.warning("psycopg2 not found. PostgreSQL functionality will be disabled for PSWA.")
 
-# Conditional import for sqlite3 (standard library, should always be available)
-import sqlite3 # For type hinting and explicit error handling
 import requests # Added for AIMS calls
 
 from dotenv import load_dotenv
@@ -54,8 +52,6 @@ def load_pswa_config():
     # Simulate loading config from environment variables, similar to how it might be done
     # in a __init__.py or config.py and then imported.
     pswa_config = {
-        "DATABASE_TYPE": os.getenv("DATABASE_TYPE", "sqlite"),
-        "SHARED_DATABASE_PATH": os.getenv("SHARED_DATABASE_PATH", "var/pswa_cache.db"), # e.g., /app/var/pswa_cache.db
         "POSTGRES_HOST": os.getenv("POSTGRES_HOST"),
         "POSTGRES_PORT": os.getenv("POSTGRES_PORT", "5432"),
         "POSTGRES_USER": os.getenv("POSTGRES_USER"),
@@ -85,7 +81,6 @@ def load_pswa_config():
         "IDEMPOTENCY_STATUS_COMPLETED": os.getenv("IDEMPOTENCY_STATUS_COMPLETED", "completed"),
         "IDEMPOTENCY_STATUS_FAILED": os.getenv("IDEMPOTENCY_STATUS_FAILED", "failed"),
         "IDEMPOTENCY_LOCK_TIMEOUT_SECONDS": int(os.getenv("IDEMPOTENCY_LOCK_TIMEOUT_SECONDS", "3600")), # 1 hour
-        "PSWA_POSTGRES_DB_URL": os.getenv("PSWA_POSTGRES_DB_URL"), # Added for idempotency
         "SERVICE_NAME_FOR_IDEMPOTENCY": os.getenv("SERVICE_NAME_FOR_IDEMPOTENCY", "PSWA"), # Added for idempotency
         # Flask specific (though app.config is more common)
         "PSWA_HOST": os.getenv("PSWA_HOST", "0.0.0.0"),
@@ -169,18 +164,17 @@ CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
 CREATE INDEX IF NOT EXISTS idx_generation_timestamp ON generated_scripts (generation_timestamp);
 """
 
-DB_SCHEMA_PSWA_CACHE_TABLE_SQLITE = """
-CREATE TABLE IF NOT EXISTS generated_scripts (
-    script_id TEXT PRIMARY KEY,
-    topic_hash TEXT UNIQUE NOT NULL,
-    structured_script_json TEXT,
-    generation_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    llm_model_used TEXT,
-    last_accessed_timestamp TIMESTAMP
-);
-CREATE INDEX IF NOT EXISTS idx_topic_hash ON generated_scripts (topic_hash);
-CREATE INDEX IF NOT EXISTS idx_generation_timestamp ON generated_scripts (generation_timestamp);
-"""
+def init_pswa_db():
+    """Initializes the database for PSWA service, creating tables if they don't exist."""
+    try:
+        with get_db_connection() as conn:
+            if conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(DB_SCHEMA_PSWA_CACHE_TABLE_POSTGRES)
+                conn.commit()
+                logger.info("PSWA database table 'generated_scripts' checked/created successfully.")
+    except Exception as e:
+        logger.error(f"Error initializing PSWA database: {e}", exc_info=True)
 # Idempotency table schema is expected to be in 'aethercast/data_stores/migrations/001_create_idempotency_keys_table.sql'
 # and applied separately to the PostgreSQL database.
 
@@ -219,104 +213,77 @@ def _calculate_content_hash(topic: str, content: str) -> str:
 def _get_cached_script(topic_hash: str, max_age_hours: int) -> Optional[Dict[str, Any]]:
     if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'): return None
     logger.info(f"[PSWA_CACHE_DB] Fetching script from cache for hash: {topic_hash}")
-    conn = None; cursor = None
     try:
-        conn = get_db_connection()
-        if not conn: return None # Could not connect
-        cursor = conn.cursor()
-        cutoff_timestamp = (datetime.utcnow() - timedelta(hours=max_age_hours))
+        with get_db_connection() as conn:
+            if not conn: return None # Could not connect
+            with conn.cursor() as cursor:
+                cutoff_timestamp = (datetime.utcnow() - timedelta(hours=max_age_hours))
 
-        sql_query = """
-            SELECT script_id, structured_script_json, llm_model_used, generation_timestamp
-            FROM generated_scripts
-            WHERE topic_hash = %s AND generation_timestamp >= %s;
-        """
-        params = (topic_hash, cutoff_timestamp)
+                sql_query = """
+                    SELECT script_id, structured_script_json, llm_model_used, generation_timestamp
+                    FROM generated_scripts
+                    WHERE topic_hash = %s AND generation_timestamp >= %s;
+                """
+                params = (topic_hash, cutoff_timestamp)
 
-        if pswa_config.get("DATABASE_TYPE") == "sqlite":
-            sql_query = sql_query.replace("%s", "?")
-            params = (topic_hash, cutoff_timestamp.isoformat())
+                cursor.execute(sql_query, params)
+                row = cursor.fetchone()
 
-        cursor.execute(sql_query, params)
-        row = cursor.fetchone()
+                if row:
+                    logger.info(f"[PSWA_CACHE_DB] Cache hit for hash {topic_hash}. Script ID: {row['script_id']}")
+                    structured_script = row['structured_script_json']
 
-        if row:
-            logger.info(f"[PSWA_CACHE_DB] Cache hit for hash {topic_hash}. Script ID: {row['script_id']}")
-            structured_script = row['structured_script_json'] if isinstance(row['structured_script_json'], dict) else json.loads(row['structured_script_json'])
+                    update_access_sql = "UPDATE generated_scripts SET last_accessed_timestamp = %s WHERE script_id = %s;"
+                    update_params = (datetime.utcnow(), row['script_id'])
 
-            update_access_sql = "UPDATE generated_scripts SET last_accessed_timestamp = %s WHERE script_id = %s;"
-            update_params = (datetime.utcnow(), row['script_id'])
-            if pswa_config.get("DATABASE_TYPE") == "sqlite":
-                update_access_sql = update_access_sql.replace("%s", "?")
-                update_params = (datetime.utcnow().isoformat(), row['script_id'])
+                    with conn.cursor() as update_cursor:
+                        update_cursor.execute(update_access_sql, update_params)
+                    conn.commit()
 
-            update_cursor = conn.cursor()
-            update_cursor.execute(update_access_sql, update_params)
-            conn.commit()
-            update_cursor.close()
-
-            structured_script['source'] = "cache"
-            if 'script_id' not in structured_script: structured_script['script_id'] = row['script_id']
-            if 'llm_model_used' not in structured_script: structured_script['llm_model_used'] = row['llm_model_used']
-            structured_script['generation_timestamp_from_cache'] = row['generation_timestamp'].isoformat() if isinstance(row['generation_timestamp'], datetime) else str(row['generation_timestamp'])
-            return structured_script
-        else:
-            logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash}")
-            return None
-    except (psycopg2.Error, sqlite3.Error, json.JSONDecodeError) as e: # type: ignore
+                    structured_script['source'] = "cache"
+                    if 'script_id' not in structured_script: structured_script['script_id'] = row['script_id']
+                    if 'llm_model_used' not in structured_script: structured_script['llm_model_used'] = row['llm_model_used']
+                    structured_script['generation_timestamp_from_cache'] = row['generation_timestamp'].isoformat()
+                    return structured_script
+                else:
+                    logger.info(f"[PSWA_CACHE_DB] Cache miss or stale for hash {topic_hash}")
+                    return None
+    except (psycopg2.Error, json.JSONDecodeError) as e: # type: ignore
         logger.error(f"[PSWA_CACHE_DB] Error accessing/decoding cache for {topic_hash}: {e}", exc_info=True)
-        if conn and pswa_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
         return None
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
 
 def _save_script_to_cache(script_id: str, topic_hash: str, structured_script: Dict[str, Any], llm_model_used: str):
     if not pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'): return
     logger.info(f"[PSWA_CACHE_DB] Saving script {script_id} to cache with hash: {topic_hash}")
-    conn = None; cursor = None
     try:
-        conn = get_db_connection()
-        if not conn: return # Could not connect
-        cursor = conn.cursor()
+        with get_db_connection() as conn:
+            if not conn: return # Could not connect
+            with conn.cursor() as cursor:
+                script_to_save_db = structured_script.copy()
+                script_to_save_db.pop('source', None)
+                script_to_save_db.pop('generation_timestamp_from_cache', None)
 
-        script_to_save_db = structured_script.copy()
-        script_to_save_db.pop('source', None)
-        script_to_save_db.pop('generation_timestamp_from_cache', None)
+                script_json_for_db = script_to_save_db
+                current_ts = datetime.utcnow()
 
-        script_json_for_db = script_to_save_db if pswa_config.get("DATABASE_TYPE") == "postgres" else json.dumps(script_to_save_db)
-        current_ts = datetime.utcnow()
+                sql_insert = """
+                    INSERT INTO generated_scripts
+                        (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (topic_hash) DO UPDATE SET
+                        script_id = EXCLUDED.script_id,
+                        structured_script_json = EXCLUDED.structured_script_json,
+                        generation_timestamp = EXCLUDED.generation_timestamp,
+                        llm_model_used = EXCLUDED.llm_model_used,
+                        last_accessed_timestamp = EXCLUDED.last_accessed_timestamp;
+                """
+                params = (script_id, topic_hash, json.dumps(script_json_for_db), current_ts, llm_model_used, current_ts)
 
-        sql_insert = """
-            INSERT INTO generated_scripts
-                (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (topic_hash) DO UPDATE SET
-                script_id = EXCLUDED.script_id,
-                structured_script_json = EXCLUDED.structured_script_json,
-                generation_timestamp = EXCLUDED.generation_timestamp,
-                llm_model_used = EXCLUDED.llm_model_used,
-                last_accessed_timestamp = EXCLUDED.last_accessed_timestamp;
-        """
-        params = (script_id, topic_hash, script_json_for_db, current_ts, llm_model_used, current_ts)
-
-        if pswa_config.get("DATABASE_TYPE") == "sqlite":
-            sql_insert = """
-                INSERT OR REPLACE INTO generated_scripts
-                    (script_id, topic_hash, structured_script_json, generation_timestamp, llm_model_used, last_accessed_timestamp)
-                VALUES (?, ?, ?, ?, ?, ?);
-            """
-            params = (script_id, topic_hash, json.dumps(script_json_for_db) if isinstance(script_json_for_db, dict) else script_json_for_db, current_ts.isoformat(), llm_model_used, current_ts.isoformat())
-
-        cursor.execute(sql_insert, params)
-        conn.commit()
-        logger.info(f"[PSWA_CACHE_DB] Successfully saved script {script_id} to cache.")
-    except (psycopg2.Error, sqlite3.Error, json.JSONEncodeError) as e: # type: ignore
+                cursor.execute(sql_insert, params)
+                conn.commit()
+                logger.info(f"[PSWA_CACHE_DB] Successfully saved script {script_id} to cache.")
+    except (psycopg2.Error, json.JSONEncodeError) as e: # type: ignore
         logger.error(f"[PSWA_CACHE_DB] Error saving script {script_id} to cache: {e}", exc_info=True)
-        if conn and pswa_config.get("DATABASE_TYPE") == "postgres": conn.rollback()
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
 
 # --- LLM Output Parsing (parse_llm_script_output - remains the same) ---
 # This function is defined after the DB helpers in the original file.
@@ -403,30 +370,24 @@ class WeaveScriptTask(Task): # Inherit from Celery's Task class
         current_logger.error(f'Celery Task {task_id} (PSWA WeaveScript) failed: {exc}. Idempotency Key: {idempotency_key}, Workflow ID: {workflow_id}', exc_info=einfo)
 
         if idempotency_key and PSYCOPG2_AVAILABLE: # Attempt to mark idempotency record as failed
-            db_conn = None
             try:
-                db_conn = get_db_connection()
-                if db_conn:
-                    db_conn.autocommit = False
-                    error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
-                    store_idempotency_record( # Use renamed helper
-                        db_conn,
-                        idempotency_key,
-                        self.name,
-                        pswa_config['IDEMPOTENCY_STATUS_FAILED'],
-                        workflow_id=workflow_id, # Pass workflow_id
-                        error_payload=error_payload,
-                        is_new_key=False
-                    )
-                    db_conn.commit()
-                    current_logger.info(f"Idempotency record for key '{idempotency_key}' (service: {pswa_config['SERVICE_NAME_FOR_IDEMPOTENCY']}) marked as FAILED due to task exception.")
+                with get_db_connection() as db_conn:
+                    if db_conn:
+                        db_conn.autocommit = False
+                        error_payload = {"error_type": type(exc).__name__, "error_message": str(exc), "traceback": str(einfo)}
+                        store_idempotency_record( # Use renamed helper
+                            db_conn,
+                            idempotency_key,
+                            self.name,
+                            pswa_config['IDEMPOTENCY_STATUS_FAILED'],
+                            workflow_id=workflow_id, # Pass workflow_id
+                            error_payload=error_payload,
+                            is_new_key=False
+                        )
+                        db_conn.commit()
+                        current_logger.info(f"Idempotency record for key '{idempotency_key}' (service: {pswa_config['SERVICE_NAME_FOR_IDEMPOTENCY']}) marked as FAILED due to task exception.")
             except Exception as db_err:
                 current_logger.error(f"Failed to update idempotency record to FAILED for key '{idempotency_key}' (service: {pswa_config['SERVICE_NAME_FOR_IDEMPOTENCY']}) after task failure: {db_err}", exc_info=True)
-                if db_conn: db_conn.rollback()
-            finally:
-                if db_conn and not db_conn.closed:
-                    try: db_conn.close()
-                    except Exception: pass # Ignore errors on close during failure handling
         # Default Celery failure handling will still occur (e.g., marking task as FAILED in backend)
 
 
@@ -454,42 +415,39 @@ def weave_script_task(self, request_id_celery: str, content: str, topic: str, pe
     logger.info(f"Celery Task {task_id_celery_internal}: Weaving script for topic '{topic}'. Persona: {persona or 'default'}", extra=log_ctx)
     self.update_state(state='PROGRESS', meta={'current_step': 'Initiated, checking idempotency', 'progress_percent': 1, **log_ctx})
 
-    db_conn_idem = None
     try:
         if not PSYCOPG2_AVAILABLE:
              logger.error(f"Celery Task {task_id_celery_internal}: psycopg2 not available in Celery worker. Cannot perform idempotency operations.", extra=log_ctx)
              raise ConnectionError("psycopg2 not available in PSWA Celery worker.") # Will trigger on_failure
 
-        db_conn_idem = get_db_connection()
-        # _get_pswa_db_connection_idempotency already raises ConnectionError if it fails
+        with get_db_connection() as db_conn_idem:
+            db_conn_idem.autocommit = False # Manage transactions manually
 
-        db_conn_idem.autocommit = False # Manage transactions manually
+            existing_record = check_idempotency_key(db_conn_idem, idempotency_key, self.name) # Uses SERVICE_NAME_FOR_IDEMPOTENCY
 
-        existing_record = check_idempotency_key(db_conn_idem, idempotency_key, self.name) # Uses SERVICE_NAME_FOR_IDEMPOTENCY
-
-        if existing_record:
-            status = existing_record['status']
-            locked_at = existing_record['locked_at']
-            if status == pswa_config['IDEMPOTENCY_STATUS_COMPLETED']:
-                logger.info(f"Idempotency: Found COMPLETED record for key '{idempotency_key}'. Returning stored result.", extra=log_ctx)
-                db_conn_idem.rollback()
-                return existing_record['result_payload']
-            elif status == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']:
-                lock_timeout_seconds = pswa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
-                if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout_seconds:
-                    logger.warning(f"Idempotency: Key '{idempotency_key}' is already PROCESSING. Returning conflict status.", extra=log_ctx)
+            if existing_record:
+                status = existing_record['status']
+                locked_at = existing_record['locked_at']
+                if status == pswa_config['IDEMPOTENCY_STATUS_COMPLETED']:
+                    logger.info(f"Idempotency: Found COMPLETED record for key '{idempotency_key}'. Returning stored result.", extra=log_ctx)
                     db_conn_idem.rollback()
-                    return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
-                else: # Lock expired or was null
-                    logger.warning(f"Idempotency: Key '{idempotency_key}' was 'processing' but lock timed out/null. Re-processing.", extra=log_ctx)
-                    store_idempotency_record(db_conn_idem, idempotency_key, self.name, pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-            elif status == pswa_config['IDEMPOTENCY_STATUS_FAILED']:
-                 logger.info(f"Idempotency: Key '{idempotency_key}' previously FAILED. Retrying.", extra=log_ctx)
-                 store_idempotency_record(db_conn_idem, idempotency_key, self.name, pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-        else: # No existing record for this service
-            store_idempotency_record(db_conn_idem, idempotency_key, self.name, pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+                    return existing_record['result_payload']
+                elif status == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']:
+                    lock_timeout_seconds = pswa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout_seconds:
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' is already PROCESSING. Returning conflict status.", extra=log_ctx)
+                        db_conn_idem.rollback()
+                        return {"status": "PROCESSING_CONFLICT", "message": "Task with this idempotency key is already processing.", "idempotency_key": idempotency_key}
+                    else: # Lock expired or was null
+                        logger.warning(f"Idempotency: Key '{idempotency_key}' was 'processing' but lock timed out/null. Re-processing.", extra=log_ctx)
+                        store_idempotency_record(db_conn_idem, idempotency_key, self.name, pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                elif status == pswa_config['IDEMPOTENCY_STATUS_FAILED']:
+                     logger.info(f"Idempotency: Key '{idempotency_key}' previously FAILED. Retrying.", extra=log_ctx)
+                     store_idempotency_record(db_conn_idem, idempotency_key, self.name, pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+            else: # No existing record for this service
+                store_idempotency_record(db_conn_idem, idempotency_key, self.name, pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
 
-        db_conn_idem.commit()
+            db_conn_idem.commit()
         self.update_state(state='PROGRESS', meta={'current_step': 'Idempotency check passed/updated. Starting main logic.', 'progress_percent': 5, **log_ctx})
 
         # --- Test Mode Handling ---
@@ -700,43 +658,40 @@ def weave_script_async_endpoint():
         logger.warning(f"Request {request_id_main}: {IDEMPOTENCY_KEY_HEADER} header missing.", extra=log_ctx_http)
         return jsonify({"error_code": "PSWA_MISSING_IDEMPOTENCY_KEY", "message": f"{IDEMPOTENCY_KEY_HEADER} header is required."}), 400
 
-    db_conn_http = None
     if PSYCOPG2_AVAILABLE:
         try:
-            db_conn_http = get_db_connection()
-            # autocommit=True for read or single writes not needing rollback for this pre-check
-            db_conn_http.autocommit = True
+            with get_db_connection() as db_conn_http:
+                # autocommit=True for read or single writes not needing rollback for this pre-check
+                db_conn_http.autocommit = True
 
-            existing_record = check_idempotency_key(db_conn_http, idempotency_key, 'pswa.weave_script_task')
-            if existing_record:
-                status = existing_record['status']
-                locked_at = existing_record['locked_at']
-                lock_timeout = pswa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
+                existing_record = check_idempotency_key(db_conn_http, idempotency_key, 'pswa.weave_script_task')
+                if existing_record:
+                    status = existing_record['status']
+                    locked_at = existing_record['locked_at']
+                    lock_timeout = pswa_config['IDEMPOTENCY_LOCK_TIMEOUT_SECONDS']
 
-                if status == pswa_config['IDEMPOTENCY_STATUS_COMPLETED']:
-                    logger.info(f"Request {request_id_main}: Idempotency key already COMPLETED. Returning stored result.", extra=log_ctx_http)
-                    return jsonify(existing_record['result_payload']), 200
-                elif status == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']:
-                    if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
-                        logger.warning(f"Request {request_id_main}: Idempotency key is PROCESSING. Returning conflict.", extra=log_ctx_http)
-                        return jsonify({"error_code": "PSWA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409
-                    else: # Lock expired
-                        logger.info(f"Request {request_id_main}: Idempotency key was PROCESSING but lock expired. Proceeding to re-process.", extra=log_ctx_http)
+                    if status == pswa_config['IDEMPOTENCY_STATUS_COMPLETED']:
+                        logger.info(f"Request {request_id_main}: Idempotency key already COMPLETED. Returning stored result.", extra=log_ctx_http)
+                        return jsonify(existing_record['result_payload']), 200
+                    elif status == pswa_config['IDEMPOTENCY_STATUS_PROCESSING']:
+                        if locked_at and (datetime.now(timezone.utc) - locked_at).total_seconds() < lock_timeout:
+                            logger.warning(f"Request {request_id_main}: Idempotency key is PROCESSING. Returning conflict.", extra=log_ctx_http)
+                            return jsonify({"error_code": "PSWA_IDEMPOTENCY_CONFLICT", "message": "Request with this idempotency key is currently processing."}), 409
+                        else: # Lock expired
+                            logger.info(f"Request {request_id_main}: Idempotency key was PROCESSING but lock expired. Proceeding to re-process.", extra=log_ctx_http)
+                            store_idempotency_record(db_conn_http, idempotency_key, 'pswa.weave_script_task', pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
+                    elif status == pswa_config['IDEMPOTENCY_STATUS_FAILED']:
+                        logger.info(f"Request {request_id_main}: Idempotency key previously FAILED. Proceeding to re-process.", extra=log_ctx_http)
                         store_idempotency_record(db_conn_http, idempotency_key, 'pswa.weave_script_task', pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-                elif status == pswa_config['IDEMPOTENCY_STATUS_FAILED']:
-                    logger.info(f"Request {request_id_main}: Idempotency key previously FAILED. Proceeding to re-process.", extra=log_ctx_http)
-                    store_idempotency_record(db_conn_http, idempotency_key, 'pswa.weave_script_task', pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=False)
-            else: # No existing record
-                logger.info(f"Request {request_id_main}: New idempotency key. Storing as PROCESSING.", extra=log_ctx_http)
-                store_idempotency_record(db_conn_http, idempotency_key, 'pswa.weave_script_task', pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
+                else: # No existing record
+                    logger.info(f"Request {request_id_main}: New idempotency key. Storing as PROCESSING.", extra=log_ctx_http)
+                    store_idempotency_record(db_conn_http, idempotency_key, 'pswa.weave_script_task', pswa_config['IDEMPOTENCY_STATUS_PROCESSING'], workflow_id=workflow_id, is_new_key=True)
         except psycopg2.Error as db_err_http: # Catch specific psycopg2 errors for DB issues
             logger.error(f"Request {request_id_main}: Database error during HTTP idempotency pre-check: {db_err_http}", exc_info=True, extra=log_ctx_http)
             return jsonify({"error_code": "PSWA_DATABASE_ERROR", "message": "Could not verify idempotency due to a database issue."}), 503 # Service Unavailable
         except Exception as e_idem_http: # Catch other unexpected errors
             logger.error(f"Request {request_id_main}: Unexpected error during HTTP idempotency pre-check: {e_idem_http}", exc_info=True, extra=log_ctx_http)
             return jsonify({"error_code": "PSWA_IDEMPOTENCY_CHECK_FAILED", "message": "Failed to verify idempotency due to an internal error."}), 500
-        finally:
-            if db_conn_http and not db_conn_http.closed: db_conn_http.close()
     else: # psycopg2 not available
         logger.warning(f"Request {request_id_main}: psycopg2 not available. Skipping HTTP idempotency pre-check. Celery task will handle.", extra=log_ctx_http)
         # Fall through to dispatch Celery task, which will handle idempotency.
@@ -821,15 +776,13 @@ def get_pswa_task_status(task_id: str):
 
 if __name__ == '__main__':
     # Logging calls here will use the configured app.logger via the global logger alias
-    if pswa_config.get("DATABASE_TYPE") == "sqlite" and not pswa_config.get("SHARED_DATABASE_PATH") and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        logger.warning("SHARED_DATABASE_PATH not configured for PSWA SQLite mode with caching. Caching may fail.")
-    elif pswa_config.get("DATABASE_TYPE") == "postgres" and not all(pswa_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]) and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
-        logger.warning("PostgreSQL is cache DB_TYPE, but connection vars missing. Caching may fail.")
+    if not all(pswa_config.get(k) for k in ["POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DB"]) and pswa_config.get('PSWA_SCRIPT_CACHE_ENABLED'):
+        logger.warning("PostgreSQL connection vars missing. Caching may fail.")
 
-    init_pswa_db() # Call init_db based on configured DB_TYPE
+    init_pswa_db()
 
     host = pswa_config.get("PSWA_HOST", "0.0.0.0")
     port = pswa_config.get("PSWA_PORT", 5004)
     debug_mode = pswa_config.get("PSWA_DEBUG_MODE", True)
-    logger.info(f"--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}, DB: {pswa_config.get('DATABASE_TYPE')}) ---")
+    logger.info(f"--- PSWA Service (AIMS Client) starting on {host}:{port} (Debug: {debug_mode}, DB: postgres) ---")
     app.run(host=host, port=port, debug=debug_mode)
